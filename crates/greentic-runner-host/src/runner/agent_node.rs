@@ -664,6 +664,74 @@ mod aw {
         Some(Arc::new(runtime))
     }
 
+    /// Whether `provider` needs an API key to authenticate.
+    ///
+    /// Authoritative when `greentic-llm-backend` is compiled in: the answer
+    /// comes from `greentic_llm::ProviderKind::requires_api_key()`. The local
+    /// table is the fallback for builds without that feature (where
+    /// `greentic_llm` is not linked at all) and for a provider string that
+    /// crate does not recognise; `keyless_table_matches_greentic_llm` pins the
+    /// two together.
+    ///
+    /// Keyless providers talk to a local daemon with no auth (Ollama,
+    /// Llamafile) or authenticate out of band (Bedrock, via the AWS credential
+    /// chain), so an absent or empty `GREENTIC_LLM_API_KEY` is the NORMAL state
+    /// for them and must not disqualify the multi-provider backend.
+    ///
+    /// `None` — nothing named a provider anywhere — is treated as
+    /// key-requiring, because the historical default is OpenAI.
+    pub(super) fn provider_requires_api_key(provider: Option<&str>) -> bool {
+        let Some(provider) = provider.map(str::trim).filter(|p| !p.is_empty()) else {
+            return true;
+        };
+        #[cfg(feature = "greentic-llm-backend")]
+        if let Ok(kind) = provider.parse::<greentic_llm::ProviderKind>() {
+            return kind.requires_api_key();
+        }
+        keyless_table_requires_api_key(provider)
+    }
+
+    /// The local mirror of `greentic_llm::ProviderKind::requires_api_key()`,
+    /// used for builds without the `greentic-llm-backend` feature and for
+    /// provider strings greentic-llm does not recognise. Pinned to the real
+    /// thing by `keyless_table_matches_greentic_llm`.
+    fn keyless_table_requires_api_key(provider: &str) -> bool {
+        !matches!(
+            provider.to_ascii_lowercase().as_str(),
+            "ollama" | "llamafile" | "bedrock"
+        )
+    }
+
+    /// Whether a resolved (key, provider) pair selects the in-process
+    /// multi-provider greentic-llm backend rather than the single-provider
+    /// OpenAI fall-through. A non-empty key always does; an empty one does
+    /// only for a keyless provider.
+    #[cfg(feature = "greentic-llm-backend")]
+    pub(super) fn selects_multi_provider_backend(api_key: &str, provider: Option<&str>) -> bool {
+        !api_key.trim().is_empty() || !provider_requires_api_key(provider)
+    }
+
+    /// The provider name an explicit `GREENTIC_LLM_PROVIDER` names, if any.
+    pub(super) fn env_llm_provider() -> Option<String> {
+        std::env::var("GREENTIC_LLM_PROVIDER")
+            .ok()
+            .filter(|provider| !provider.trim().is_empty())
+    }
+
+    /// The provider to judge keylessness by: the env override first (it is the
+    /// deployment's explicit statement), then the first agent that declares
+    /// one. The in-process backend carries a single key, so a single provider
+    /// decides — matching the one-key model in
+    /// [`in_process_llm_backend_with_key`].
+    pub(super) fn configured_llm_provider(agents: &HashMap<String, AgentConfig>) -> Option<String> {
+        env_llm_provider().or_else(|| {
+            agents
+                .values()
+                .map(|agent| agent.llm.provider.trim().to_string())
+                .find(|provider| !provider.is_empty())
+        })
+    }
+
     /// Resolve the [`LlmBackend`] from the environment.
     ///
     /// Prefers the LLM bridge extension when `GREENTIC_AW_LLM_EXTENSION` is set
@@ -705,8 +773,10 @@ mod aw {
                     }
                     None => {
                         tracing::warn!(
-                            "GREENTIC_AW_LLM_EXTENSION set but no LLM API key; \
-                             falling back to in-process OpenAI client"
+                            provider = env_llm_provider().as_deref().unwrap_or("openai"),
+                            "GREENTIC_AW_LLM_EXTENSION set but no LLM API key and the \
+                             configured provider requires one; falling back to in-process \
+                             OpenAI client"
                         );
                         Arc::new(RetryingLlmBackend::new(
                             OpenAiLlmBackend::new(String::new()),
@@ -722,14 +792,18 @@ mod aw {
 
     /// In-process LLM backend when no bridge extension is configured.
     ///
-    /// With the `greentic-llm-backend` feature and an LLM key present, routes the
-    /// worker's LLM call through greentic-llm so a `dw.agent` can use any provider
-    /// its `AgentConfig.llm` declares (DeepSeek, Anthropic, Gemini, …) — the
-    /// provider + model ride on each request, the key + optional base URL come
-    /// from the env. Otherwise falls back to the legacy env-keyed OpenAI client.
-    /// Shared by every non-bridge construction path so they never drift.
+    /// With the `greentic-llm-backend` feature and an LLM key present — or a
+    /// keyless provider configured — routes the worker's LLM call through
+    /// greentic-llm so a `dw.agent` can use any provider its `AgentConfig.llm`
+    /// declares (DeepSeek, Anthropic, Gemini, Ollama, …): the provider + model
+    /// ride on each request, the key + optional base URL come from the env.
+    /// Otherwise falls back to the legacy env-keyed OpenAI client. Shared by
+    /// every non-bridge construction path so they never drift.
+    ///
+    /// This path sees no agent configs, so the provider is whatever
+    /// `GREENTIC_LLM_PROVIDER` names.
     pub(crate) fn in_process_llm_backend() -> Arc<dyn greentic_aw_runtime::LlmBackend> {
-        in_process_llm_backend_with_key(None)
+        in_process_llm_backend_with_key(None, env_llm_provider())
     }
 
     /// In-process LLM backend, optionally given a store-resolved API key.
@@ -739,8 +813,17 @@ mod aw {
     /// this is what makes the in-process desktop LLM path zero-env. When `None`,
     /// the key comes from `GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY` exactly as
     /// before, so env-based and bridge-less runs are unaffected.
+    ///
+    /// `provider` is the configured LLM provider (see
+    /// [`configured_llm_provider`]). It decides one thing: whether an EMPTY key
+    /// still selects the multi-provider backend. For a keyless provider it
+    /// must, or an Ollama worker silently talks to `api.openai.com` with an
+    /// empty bearer — which is what made `GREENTIC_LLM_API_KEY=ollama` a
+    /// necessary workaround. For every key-requiring provider the behaviour is
+    /// unchanged.
     pub(crate) fn in_process_llm_backend_with_key(
         override_key: Option<String>,
+        provider: Option<String>,
     ) -> Arc<dyn greentic_aw_runtime::LlmBackend> {
         use greentic_aw_runtime::{OpenAiLlmBackend, RetryingLlmBackend};
         use std::time::Duration;
@@ -761,10 +844,23 @@ mod aw {
                 .or_else(|| std::env::var("GREENTIC_LLM_API_KEY").ok())
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                 .unwrap_or_default();
-            if !api_key.trim().is_empty() {
+            if selects_multi_provider_backend(&api_key, provider.as_deref()) {
                 let base_url = std::env::var("GREENTIC_LLM_BASE_URL").ok();
+                if api_key.trim().is_empty() {
+                    // Once per backend construction, not per token: the returned
+                    // `Arc` serves the whole agent handler's lifetime.
+                    tracing::warn!(
+                        provider = provider.as_deref().unwrap_or_default(),
+                        "AW LLM provider is keyless: running with an empty API key. \
+                         This is expected for Ollama / Llamafile / Bedrock (which \
+                         authenticate through a local daemon or the AWS credential \
+                         chain); set GREENTIC_LLM_API_KEY only if your endpoint \
+                         actually demands one"
+                    );
+                }
                 tracing::info!(
                     store_resolved = _store_resolved,
+                    provider = provider.as_deref().unwrap_or_default(),
                     "AW LLM via in-process greentic-llm (multi-provider)"
                 );
                 return Arc::new(RetryingLlmBackend::new(
@@ -781,9 +877,11 @@ mod aw {
 
         // Fall-through: the single-provider OpenAI-protocol client. Reached
         // either because `greentic-llm-backend` is not compiled in (the block
-        // above does not exist at all), or because it is compiled in and no key
-        // resolved. Both mean the agent's `AgentConfig.llm.provider` is IGNORED
-        // and every request goes to one OpenAI-shaped endpoint — which is a
+        // above does not exist at all), or because it is compiled in and no
+        // key resolved for a provider that REQUIRES one — a keyless provider
+        // (Ollama, Llamafile, Bedrock) takes the branch above with an empty
+        // key. Both mean the agent's `AgentConfig.llm.provider` is IGNORED and
+        // every request goes to one OpenAI-shaped endpoint — which is a
         // silent, total misroute if the agent declared DeepSeek/Anthropic/… So
         // say so. This runs once per backend construction, not per token: the
         // returned `Arc` is reused for the whole agent handler's lifetime.
@@ -795,6 +893,7 @@ mod aw {
                       so the multi-provider backend is not compiled in";
         tracing::warn!(
             reason,
+            provider = provider.as_deref().unwrap_or_default(),
             endpoint = %std::env::var("GREENTIC_LLM_BASE_URL")
                 .ok()
                 .filter(|url| !url.trim().is_empty())
@@ -838,22 +937,26 @@ mod aw {
         if key.is_empty() { None } else { Some(key) }
     }
 
-    /// Build a vault-style `BridgeCredential` from resolved parts. `None` when no
-    /// API key is present. Defaults: provider "openai", model "gpt-4o". Pure (no
-    /// env) so it is unit-testable without global state.
+    /// Build a vault-style `BridgeCredential` from resolved parts. `None` when
+    /// no API key is present AND the resolved provider needs one — a keyless
+    /// provider (Ollama, Llamafile, Bedrock) is credential-complete with an
+    /// empty key, and dropping it here is what used to route an Ollama worker
+    /// to the OpenAI fall-through. Defaults: provider "openai", model "gpt-4o".
+    /// Pure (no env) so it is unit-testable without global state.
     pub(super) fn bridge_credential(
         provider: Option<String>,
         model: Option<String>,
         api_key: String,
         base_url: Option<String>,
     ) -> Option<greentic_aw_runtime::BridgeCredential> {
-        if api_key.trim().is_empty() {
+        let provider = provider
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "openai".into());
+        if api_key.trim().is_empty() && provider_requires_api_key(Some(&provider)) {
             return None;
         }
         Some(greentic_aw_runtime::BridgeCredential {
-            provider: provider
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "openai".into()),
+            provider,
             model: model
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "gpt-4o".into()),
@@ -963,7 +1066,10 @@ mod aw {
                         "AW LLM key resolved from store via credential_ref (zero-env)"
                     );
                 }
-                in_process_llm_backend_with_key(store_key)
+                // This path DOES see the agent configs, so a worker that
+                // declares a keyless provider (Ollama) reaches the
+                // multi-provider backend even with no key anywhere.
+                in_process_llm_backend_with_key(store_key, configured_llm_provider(&merged_agents))
             }
         };
 
@@ -2011,6 +2117,94 @@ mod aw {
             assert!(
                 super::bridge_credential(Some("openai".into()), None, "  ".into(), None).is_none()
             );
+        }
+
+        #[test]
+        fn bridge_credential_allows_a_keyless_provider_without_a_key() {
+            let c = super::bridge_credential(Some("ollama".into()), None, String::new(), None)
+                .expect("Ollama needs no API key, so an empty one must still build a credential");
+            assert_eq!(c.provider, "ollama");
+            assert!(c.api_key.is_empty());
+        }
+
+        #[test]
+        fn keyless_providers_do_not_require_an_api_key() {
+            for provider in ["ollama", "llamafile", "bedrock", "Ollama", " ollama "] {
+                assert!(
+                    !super::provider_requires_api_key(Some(provider)),
+                    "{provider} authenticates without an API key"
+                );
+            }
+            for provider in ["openai", "anthropic", "deepseek", "gemini"] {
+                assert!(
+                    super::provider_requires_api_key(Some(provider)),
+                    "{provider} needs an API key"
+                );
+            }
+            // Nothing named a provider, or a name nothing recognises: assume the
+            // historical OpenAI default, which needs a key.
+            assert!(super::provider_requires_api_key(None));
+            assert!(super::provider_requires_api_key(Some("  ")));
+            assert!(super::provider_requires_api_key(Some("not-a-provider")));
+        }
+
+        /// The local table and greentic-llm must agree, or a build without the
+        /// `greentic-llm-backend` feature judges keylessness differently from
+        /// one with it.
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn keyless_table_matches_greentic_llm() {
+            for kind in greentic_llm::ProviderKind::all() {
+                assert_eq!(
+                    super::keyless_table_requires_api_key(kind.as_str()),
+                    kind.requires_api_key(),
+                    "local keyless table disagrees with greentic-llm about {}",
+                    kind.as_str()
+                );
+            }
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn ollama_without_a_key_selects_the_multi_provider_backend() {
+            assert!(
+                super::selects_multi_provider_backend("", Some("ollama")),
+                "an Ollama worker with no key must reach greentic-llm, not the \
+                 OpenAI fall-through"
+            );
+            assert!(super::selects_multi_provider_backend("  ", Some("bedrock")));
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn openai_without_a_key_keeps_the_openai_fall_through() {
+            assert!(!super::selects_multi_provider_backend("", Some("openai")));
+            assert!(!super::selects_multi_provider_backend("  ", None));
+            // A key still selects the multi-provider backend for everyone.
+            assert!(super::selects_multi_provider_backend(
+                "sk-x",
+                Some("openai")
+            ));
+            assert!(super::selects_multi_provider_backend("sk-x", None));
+        }
+
+        #[test]
+        fn configured_llm_provider_falls_back_to_an_agents_declared_provider() {
+            // No env var is read here beyond `GREENTIC_LLM_PROVIDER`, which this
+            // test does not set: the agent's own declaration must be found.
+            let mut agents = HashMap::new();
+            let mut agent = sample_agent_config("greeter");
+            agent.llm.provider = "ollama".into();
+            agents.insert("greeter".to_string(), agent);
+            // Only assert the agent leg when the env is not overriding it, so the
+            // test is not at the mercy of the developer's shell.
+            if super::env_llm_provider().is_none() {
+                assert_eq!(
+                    super::configured_llm_provider(&agents).as_deref(),
+                    Some("ollama")
+                );
+                assert_eq!(super::configured_llm_provider(&HashMap::new()), None);
+            }
         }
 
         #[tokio::test]

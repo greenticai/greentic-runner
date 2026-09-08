@@ -35,7 +35,11 @@ greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 # block permanently false. Every published binary therefore routed EVERY dw.agent
 # LLM call to api.openai.com regardless of the agent's configured `llm.provider`,
 # with nothing reporting it. Off by default, exactly as on main.
-greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-backend"]
+greentic-llm-backend = [
+    "agentic-worker",
+    "dep:greentic-llm",
+    "greentic-aw-runtime?/greentic-llm-backend",
+]
 # Adds the ephemeral (in-memory) agent builder for desktop/local runs, so a
 # single-process runner serves dw.agent turns with no Redis. Enables the
 # test-mock types from greentic-aw-runtime; must NOT be enabled in the server
@@ -80,6 +84,13 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [dependencies]
 greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.2.0-dev, <1.3.0-0", features = ["serve"], optional = true }
 greentic-ext-runtime = { version = "=1.2.34077794832", optional = true }
+# Only for `ProviderKind::requires_api_key()`, which decides whether an empty
+# API key is acceptable for the configured provider (Ollama / Llamafile /
+# Bedrock are keyless). Pinned to the exact version greentic-aw-runtime already
+# resolves, so both crates share one instance. Optional: without the
+# `greentic-llm-backend` feature the multi-provider backend is not compiled in
+# at all and `agent_node`'s local keyless table is used instead.
+greentic-llm = { version = "=1.3.1-research.0", optional = true }
 async-nats = "0.49"
 async-trait.workspace = true
 anyhow.workspace = true
