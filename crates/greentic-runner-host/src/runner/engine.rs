@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx};
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, SecondsFormat, Utc};
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -3825,6 +3826,55 @@ fn merge_submitted_fields_into_entry(mut entry: Value, fields: JsonMap<String, V
     entry
 }
 
+/// The wall-clock namespace flow templates read as `{{now.*}}`.
+///
+/// Until this existed a flow had no way to name the current time at all. The
+/// template context is exactly `entry`/`in`/`prev`/`node`/`state`/`vars`, and
+/// the handlebars registry is built with **no helpers registered**, so
+/// `{{now}}` rendered as the empty string — silently, because strict mode is
+/// off. Any step needing a timestamp it had not been handed as input was
+/// therefore unauthorable: HubSpot's notes and tasks both require
+/// `hs_timestamp` and the component supplies no default, so the step failed
+/// with a message naming a field the author had no way to fill.
+///
+/// A helper would not have worked. `render_template_string` intercepts an
+/// exact `{{…}}` expression and resolves it as a PATH before handlebars is
+/// consulted, so a bare `{{now}}` would resolve against the context, miss, and
+/// return the empty string without the helper ever running. The value has to
+/// be in the context.
+///
+/// Three fields rather than one string, because callers want different shapes
+/// and this grammar cannot derive one from another — no helpers, no arithmetic,
+/// no formatting:
+///
+/// - `iso` — RFC3339 with milliseconds, UTC (`…Z`). What HubSpot and most HTTP
+///   APIs accept.
+/// - `epoch_ms` — a JSON **number**, so a routing condition or a component
+///   expecting epoch millis gets one rather than a quoted string.
+/// - `date` — `YYYY-MM-DD`, for a human-facing line in a card or a note body.
+///
+/// Taken as a parameter rather than read inside so a test can pin an instant.
+fn now_namespace(at: DateTime<Utc>) -> Value {
+    json!({
+        "iso": at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "epoch_ms": at.timestamp_millis(),
+        "date": at.format("%Y-%m-%d").to_string(),
+    })
+}
+
+/// Build the template context a node's config and params are rendered against.
+///
+/// `now` is sampled once per call, so every field of ONE node's config sees the
+/// same instant and two fields cannot disagree by a millisecond. Across nodes
+/// it advances, which is what "now" means.
+///
+/// Deliberately not mirrored into [`build_routing_context`]. The designer's
+/// condition grammar has a fixed set of reserved heads
+/// (`entry`/`in`/`node`/`response`/`event`); `now` is not among them, so a
+/// condition naming it is rewritten to `node.<source>.now.…` before it ever
+/// reaches the runner. Exposing it on this side alone would make `now.x` in a
+/// condition resolve to nothing while looking supported. Routing needs the
+/// matching designer change first.
 fn template_context(state: &ExecutionState, prev: Value) -> Value {
     let entry = if state.entry.is_null() {
         Value::Object(JsonMap::new())
@@ -3842,6 +3892,7 @@ fn template_context(state: &ExecutionState, prev: Value) -> Value {
     ctx.insert("node".into(), Value::Object(state.outputs_map()));
     ctx.insert("state".into(), state.context());
     ctx.insert("vars".into(), Value::Object(state.vars.clone()));
+    ctx.insert("now".into(), now_namespace(Utc::now()));
     Value::Object(ctx)
 }
 
@@ -9093,9 +9144,113 @@ mod tests {
         let st = ExecutionState::new(serde_json::json!({"user": {"id": 7}}));
         let ctx = template_context(&st, serde_json::Value::Null);
         let obj = ctx.as_object().expect("ctx object");
-        for key in ["entry", "in", "prev", "node", "state", "vars"] {
+        for key in ["entry", "in", "prev", "node", "state", "vars", "now"] {
             assert!(obj.contains_key(key), "context must expose `{key}`");
         }
+    }
+
+    // ── now namespace tests ────────────────────────────────────────────────
+
+    /// A pinned instant, so the shapes below are asserted rather than described.
+    fn fixed_instant() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-09T10:53:04.250Z")
+            .expect("a literal RFC3339 instant")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn now_namespace_carries_iso_epoch_ms_and_date() {
+        let now = now_namespace(fixed_instant());
+        assert_eq!(now["iso"], serde_json::json!("2026-09-09T10:53:04.250Z"));
+        assert_eq!(now["epoch_ms"], serde_json::json!(1_788_951_184_250i64));
+        assert_eq!(now["date"], serde_json::json!("2026-09-09"));
+    }
+
+    /// `hs_timestamp` is the field this exists for: HubSpot's notes and tasks
+    /// require it, the component supplies no default, and until now a flow had
+    /// no expression that could produce one.
+    #[test]
+    fn a_node_config_can_render_a_timestamp_it_was_never_given() {
+        let st = ExecutionState::new(serde_json::json!({}));
+        let ctx = template_context(&st, serde_json::Value::Null);
+
+        let rendered = render_template_value(
+            &serde_json::json!({ "hs_timestamp": "{{now.iso}}" }),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render");
+
+        let stamp = rendered["hs_timestamp"]
+            .as_str()
+            .expect("an ISO string, not an object");
+        assert!(
+            DateTime::parse_from_rfc3339(stamp).is_ok(),
+            "`{stamp}` must parse as RFC3339 — an API rejecting it is the \
+             failure this field exists to prevent"
+        );
+    }
+
+    /// The exact-expression path returns the JSON value itself rather than its
+    /// rendered text, so a component expecting epoch millis gets a NUMBER. A
+    /// quoted string here would be a decode error at the component boundary.
+    #[test]
+    fn epoch_ms_resolves_as_a_number_not_a_string() {
+        let st = ExecutionState::new(serde_json::json!({}));
+        let ctx = template_context(&st, serde_json::Value::Null);
+
+        let rendered = render_template_value(
+            &serde_json::json!("{{now.epoch_ms}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render");
+
+        assert!(
+            rendered.is_i64(),
+            "expected a JSON number, got {rendered:?}"
+        );
+    }
+
+    /// Regression for the silence this closes. Strict mode is off, so before
+    /// the namespace existed every `{{now.*}}` rendered as the empty string
+    /// with no error at any layer — the author saw a blank field and an API
+    /// error naming something else.
+    #[test]
+    fn a_now_reference_no_longer_renders_as_the_empty_string() {
+        let st = ExecutionState::new(serde_json::json!({}));
+        let ctx = template_context(&st, serde_json::Value::Null);
+
+        for expression in ["{{now.iso}}", "{{now.date}}"] {
+            let rendered = render_template_value(
+                &serde_json::json!(expression),
+                &ctx,
+                TemplateOptions::default(),
+            )
+            .expect("render");
+            assert_ne!(
+                rendered,
+                serde_json::json!(""),
+                "`{expression}` must resolve to something"
+            );
+        }
+    }
+
+    /// One sample per context build, so two fields of the same node's config
+    /// cannot disagree by a millisecond.
+    #[test]
+    fn one_context_sees_a_single_instant() {
+        let st = ExecutionState::new(serde_json::json!({}));
+        let ctx = template_context(&st, serde_json::Value::Null);
+
+        let rendered = render_template_value(
+            &serde_json::json!({ "a": "{{now.iso}}", "b": "{{now.iso}}" }),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render");
+
+        assert_eq!(rendered["a"], rendered["b"]);
     }
 
     // ── vars_init tests ────────────────────────────────────────────────────
