@@ -67,7 +67,7 @@ greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.1.0-0, <
 # come from greentic-dw-providers; the SurrealDB driver + GraphDriver trait come
 # from greentic-chronicle-ext and are built at this edge (bindgen / RocksDB live
 # here). All optional, gated by the `knowledge-chronicle` feature.
-greentic-ext-runtime = { version = "=1.2.24", optional = true }
+greentic-ext-runtime = { version = "=1.2.26", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
