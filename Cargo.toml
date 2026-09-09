@@ -79,7 +79,7 @@ toml = "1"
 # `gt.pack_id` for the C5.4 export path; earlier dev publishes lack it.
 greentic-telemetry = ">=1.1.0-0, <1.2.0-0"
 walkdir = "2"
-wasmtime-wasi-http = "45"
+wasmtime-wasi-http = "47"
 wasmtime-wasi-tls = "45"
 jsonschema = "0.45"
 handlebars = "6"
