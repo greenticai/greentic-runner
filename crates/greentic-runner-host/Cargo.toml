@@ -145,7 +145,7 @@ greentic-dw-operala-bridge = { git = "https://github.com/greenticai/greentic-dw.
 # Pinned to the exact registry version already resolved elsewhere in the
 # workspace; unified with greentic-dw-operala-invoker's own git-tag pin of the
 # same crate via the root `[patch."https://github.com/greenticai/greentic-llm"]`.
-greentic-llm = { version = "=1.3.0-research.0", optional = true }
+greentic-llm = { version = "=1.3.1-research.0", optional = true }
 chronicle-core = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
 chronicle-driver-surreal = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
 chronicle-driver-neo4j = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
