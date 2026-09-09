@@ -257,7 +257,7 @@ features = [
 ]
 
 [workspace.dependencies.wasmtime-environ]
-version = "45"
+version = "48"
 
 [workspace.dependencies.insta]
 version = "1"
