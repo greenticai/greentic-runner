@@ -46,7 +46,7 @@ greentic-dw-manifest = "=1.1.1"
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
 greentic-dw-memory-long-term = "=1.1.0"
-greentic-ext-runtime = "=1.2.24"
+greentic-ext-runtime = "=1.2.26"
 greentic-extension-sdk-contract = "=1.1.2"
 # Multi-provider LLM door (rig-core under the hood). Optional — see the
 # `greentic-llm-backend` feature.
