@@ -26,6 +26,7 @@ use tokio::signal;
 
 pub mod boot;
 pub mod cache;
+pub mod caller_identity;
 pub mod component_api;
 pub mod config;
 pub mod engine;
