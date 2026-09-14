@@ -96,7 +96,7 @@ pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryReco
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
-pub use tenant::TenantContext;
+pub use tenant::{TenantContext, VerifiedCaller};
 pub use tools::{RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
