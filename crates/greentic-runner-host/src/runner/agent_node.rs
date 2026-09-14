@@ -11,6 +11,12 @@ pub trait AgentNodeHandler: Send + Sync {
     /// Execute one agentic step. `flow_input` is the upstream node's
     /// JSON payload (expects at least `{"user_text": "..."}`); returns
     /// the node output JSON (`{"reply", "trail", "terminated_by"}`).
+    ///
+    /// `caller` is the block the messaging provider verified for this run,
+    /// carried on `FlowContext` rather than inside `flow_input` — see
+    /// [`crate::caller_identity`] for why identity must not arrive through a
+    /// flow's own node mapping. `None` means the turn is anonymous, which is
+    /// what every provider predating the contract produces.
     async fn execute(
         &self,
         tenant_id: &str,
@@ -18,6 +24,7 @@ pub trait AgentNodeHandler: Send + Sync {
         agent_id: &str,
         session_id: &str,
         flow_input: &Value,
+        caller: Option<&Value>,
     ) -> Result<Value>;
 }
 
@@ -235,14 +242,34 @@ mod aw {
             agent_id: &str,
             session_id: &str,
             flow_input: &Value,
+            caller: Option<&Value>,
         ) -> Result<Value> {
             let user_text = flow_input
                 .get("user_text")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let tenant =
-                TenantContext::new(tenant_id, env_id).with_project_id(self.project_id.clone());
+            // A block the provider stamped but this runtime cannot decode is
+            // NOT silently treated as verified: the decode failure warns and
+            // the turn proceeds anonymously, which is the restrictive
+            // direction and the same state a provider that stamped nothing
+            // produces.
+            let verified_caller = caller.and_then(|block| {
+                match serde_json::from_value::<greentic_aw_runtime::VerifiedCaller>(block.clone()) {
+                    Ok(caller) => Some(caller),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "provider stamped a caller block this runtime cannot decode; \
+                             running the turn anonymously"
+                        );
+                        None
+                    }
+                }
+            });
+            let tenant = TenantContext::new(tenant_id, env_id)
+                .with_project_id(self.project_id.clone())
+                .with_caller(verified_caller);
             let input = AgentInput { text: user_text };
 
             // Off by default: with no audit sink configured, this is exactly
@@ -1700,7 +1727,14 @@ mod aw {
             let handler = RuntimeAgentNodeHandler::new(runtime, None, None);
 
             let output = handler
-                .execute("t", "e", "greeter", "sess-1", &json!({"user_text": "ping"}))
+                .execute(
+                    "t",
+                    "e",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "ping"}),
+                    None,
+                )
                 .await
                 .expect("execute should succeed");
 
@@ -1782,7 +1816,14 @@ mod aw {
             );
 
             RuntimeAgentNodeHandler::new(runtime, None, project_id)
-                .execute("t", "e", "greeter", "sess-1", &json!({"user_text": "ping"}))
+                .execute(
+                    "t",
+                    "e",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "ping"}),
+                    None,
+                )
                 .await
                 .expect("execute should succeed");
 
@@ -1871,7 +1912,14 @@ mod aw {
             .expect("handler should build from mock stores");
 
             let _ = handler
-                .execute("acme", "prod", "greeter", "s", &json!({"user_text": "hi"}))
+                .execute(
+                    "acme",
+                    "prod",
+                    "greeter",
+                    "s",
+                    &json!({"user_text": "hi"}),
+                    None,
+                )
                 .await;
 
             unsafe {
@@ -1979,6 +2027,7 @@ mod aw {
                     "greeter",
                     "sess-1",
                     &json!({"user_text": "remember this"}),
+                    None,
                 )
                 .await
                 .expect("execute should succeed");
@@ -2018,6 +2067,7 @@ mod aw {
                     "greeter",
                     "sess-1",
                     &json!({"user_text": "remember this"}),
+                    None,
                 )
                 .await
                 .expect("execute should succeed");

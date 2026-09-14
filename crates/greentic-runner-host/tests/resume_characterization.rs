@@ -261,6 +261,7 @@ fn flow_ctx<'a>(
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     }
 }
 

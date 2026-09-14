@@ -2252,6 +2252,11 @@ impl PackRuntime {
         let mocks = pack.mocks.as_deref();
         let tenant = self.config.tenant.as_str();
 
+        // Same single establishment point as the ingress path, for callers
+        // that drive a flow directly — see `crate::caller_identity`.
+        // Cloned rather than borrowed: `input` is moved into the run below,
+        // and the context must outlive that move.
+        let caller_block = crate::caller_identity::caller_block(&input).cloned();
         let ctx = FlowContext {
             tenant,
             pack_id: pack.metadata().pack_id.as_str(),
@@ -2266,6 +2271,7 @@ impl PackRuntime {
             attempt: 1,
             observer: None,
             mocks,
+            caller: caller_block.as_ref(),
         };
 
         let execution = engine.execute(ctx, input).await?;
