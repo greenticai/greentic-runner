@@ -232,45 +232,23 @@ pub mod aw {
     }
 
     /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
-    /// preferring a pack-carried route and falling back to the flow-editor
-    /// MCP catalog.
+    /// preferring a pack-carried route and falling back to the flow-editor MCP
+    /// catalog, with the secrets manager supplied explicitly.
     ///
     /// Infallible by contract: every failure path (no route anywhere, missing
-    /// credential, server/tool not in the flow-editor catalog, transport
-    /// error) returns a structured `{"error": "..."}` value. The caller binds
-    /// the value as-is.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn invoke(
-        source: Option<&Arc<McpToolSource>>,
-        pack_routes: Option<&PackMcpRoutes>,
-        tenant: &str,
-        env: &str,
-        team: Option<&str>,
-        server_id: &str,
-        tool: &str,
-        arguments: &Value,
-    ) -> Value {
-        let secrets = secrets_from_env();
-        invoke_with_secrets(
-            source,
-            pack_routes,
-            secrets.as_ref(),
-            tenant,
-            env,
-            team,
-            server_id,
-            tool,
-            arguments,
-        )
-        .await
-    }
-
-    /// [`invoke`] with the secrets manager supplied explicitly.
+    /// credential, server/tool not in the flow-editor catalog, transport error)
+    /// returns a structured `{"error": "..."}` value. The caller binds the
+    /// value as-is.
     ///
-    /// Public because [`invoke`] reads the process-global memoized manager
-    /// ([`secrets_from_env`]), which a test cannot substitute — and the
-    /// pack-route path is defined by which credential it resolves, so a test
-    /// that cannot control the backend cannot cover it at all.
+    /// The manager is a parameter rather than read from
+    /// [`secrets_from_env`] because the caller — `FlowEngine::execute_mcp` —
+    /// must be able to prefer the one its host injected: a Cloud Run or
+    /// Kubernetes workload sets no `SECRETS_BACKEND`, so the env-derived
+    /// manager there resolves a `secrets://` URI as a literal variable name and
+    /// finds nothing. See
+    /// [`choose_mcp_secrets`] for the precedence. It is also what lets a test
+    /// control the backend at all, and the pack-route path is defined by which
+    /// credential it resolves.
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_with_secrets(
         source: Option<&Arc<McpToolSource>>,
@@ -533,7 +511,7 @@ pub mod aw {
 }
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) use aw::{invoke, source_from_env};
+pub(crate) use aw::source_from_env;
 
 use serde_json::Value;
 
