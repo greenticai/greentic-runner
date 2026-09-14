@@ -16,6 +16,12 @@ pub trait AgentNodeHandler: Send + Sync {
     /// true the agent is offered the host `end_conversation` tool so it can end
     /// the segment the engine park-loop maintains, regardless of the agent's
     /// own config default.
+    ///
+    /// `caller` is the block the messaging provider verified for this run,
+    /// carried on `FlowContext` rather than inside `flow_input` — see
+    /// [`crate::caller_identity`] for why identity must not arrive through a
+    /// flow's own node mapping. `None` means the turn is anonymous, which is
+    /// what every provider predating the contract produces.
     async fn execute(
         &self,
         tenant_id: &str,
@@ -24,6 +30,7 @@ pub trait AgentNodeHandler: Send + Sync {
         session_id: &str,
         flow_input: &Value,
         conversational: bool,
+        caller: Option<&Value>,
     ) -> Result<Value>;
 }
 
@@ -259,14 +266,34 @@ mod aw {
             session_id: &str,
             flow_input: &Value,
             conversational: bool,
+            caller: Option<&Value>,
         ) -> Result<Value> {
             let user_text = flow_input
                 .get("user_text")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let tenant =
-                TenantContext::new(tenant_id, env_id).with_project_id(self.project_id.clone());
+            // A block the provider stamped but this runtime cannot decode is
+            // NOT silently treated as verified: the decode failure warns and
+            // the turn proceeds anonymously, which is the restrictive
+            // direction and the same state a provider that stamped nothing
+            // produces.
+            let verified_caller = caller.and_then(|block| {
+                match serde_json::from_value::<greentic_aw_runtime::VerifiedCaller>(block.clone()) {
+                    Ok(caller) => Some(caller),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "provider stamped a caller block this runtime cannot decode; \
+                             running the turn anonymously"
+                        );
+                        None
+                    }
+                }
+            });
+            let tenant = TenantContext::new(tenant_id, env_id)
+                .with_project_id(self.project_id.clone())
+                .with_caller(verified_caller);
             let input = AgentInput {
                 text: user_text,
                 conversational,
@@ -2077,6 +2104,7 @@ mod aw {
                     "sess-1",
                     &json!({"user_text": "ping"}),
                     false,
+                    None,
                 )
                 .await
                 .expect("execute should succeed");
@@ -2166,6 +2194,7 @@ mod aw {
                     "sess-1",
                     &json!({"user_text": "ping"}),
                     false,
+                    None,
                 )
                 .await
                 .expect("execute should succeed");
@@ -2282,6 +2311,7 @@ mod aw {
                     "sess-1",
                     &json!({"user_text": "remember this"}),
                     false,
+                    None,
                 )
                 .await
                 .expect("execute should succeed");
@@ -2424,6 +2454,7 @@ mod aw {
                     "sess-1",
                     &json!({"user_text": "remember this"}),
                     false,
+                    None,
                 )
                 .await
                 .expect("execute should succeed");

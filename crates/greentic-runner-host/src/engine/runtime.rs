@@ -868,6 +868,12 @@ impl Adapter for PackFlowAdapter {
         };
 
         let mocks = self.mocks.as_deref();
+        // Read ONCE, here, from the provider's own envelope — see
+        // `crate::caller_identity`. Everything downstream propagates this
+        // value; nothing downstream may establish one from a node payload.
+        // Cloned rather than borrowed: `payload` is moved into the run below,
+        // and the context must outlive that move.
+        let caller_block = crate::caller_identity::caller_block(&payload).cloned();
         let ctx = FlowContext {
             tenant: &self.tenant,
             pack_id: effective_pack_id.as_str(),
@@ -887,6 +893,7 @@ impl Adapter for PackFlowAdapter {
                 .as_ref()
                 .map(|recorder| recorder as &dyn crate::runner::engine::ExecutionObserver),
             mocks,
+            caller: caller_block.as_ref(),
         };
 
         let execution = if let Some(snapshot) = resume_snapshot {

@@ -245,6 +245,7 @@ fn runtime_extension_preserves_component_config_for_direct_component_nodes() -> 
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
 
     let execution = rt

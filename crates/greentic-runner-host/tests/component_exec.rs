@@ -526,6 +526,7 @@ nodes:
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
 
     let execution = rt
@@ -607,6 +608,7 @@ nodes:
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
 
     let execution = rt
@@ -741,6 +743,7 @@ timers: []\n",
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
 
         let execution = rt
@@ -879,6 +882,7 @@ nodes:
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
 
     let execution = rt
@@ -961,6 +965,7 @@ fn runtime_extension_flow_overrides_manifest_flow() -> Result<()> {
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
 
     let execution = rt
