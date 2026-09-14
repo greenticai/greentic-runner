@@ -702,13 +702,63 @@ mod aw {
         )
     }
 
+    /// The operator's explicitly configured LLM endpoint, if any.
+    ///
+    /// Unset, blank or whitespace-only all mean "the operator configured
+    /// nothing", matching `llm_openai::normalize_base_url`'s reading of the
+    /// same variable.
+    #[cfg(feature = "greentic-llm-backend")]
+    fn custom_llm_base_url() -> Option<String> {
+        std::env::var("GREENTIC_LLM_BASE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+    }
+
     /// Whether a resolved (key, provider) pair selects the in-process
     /// multi-provider greentic-llm backend rather than the single-provider
-    /// OpenAI fall-through. A non-empty key always does; an empty one does
-    /// only for a keyless provider.
+    /// OpenAI fall-through.
     #[cfg(feature = "greentic-llm-backend")]
     pub(super) fn selects_multi_provider_backend(api_key: &str, provider: Option<&str>) -> bool {
-        !api_key.trim().is_empty() || !provider_requires_api_key(provider)
+        selects_multi_provider_backend_with(api_key, provider, custom_llm_base_url().as_deref())
+    }
+
+    /// The pure half of [`selects_multi_provider_backend`], split out so the
+    /// rules below are testable without mutating process-global env — which
+    /// races every other test in the binary, the same reasoning
+    /// `llm_openai::normalize_base_url` was split for.
+    ///
+    /// Three ways in, and the third is the one that had to be added:
+    ///
+    /// 1. **A non-empty key.** Always.
+    /// 2. **A keyless provider** (Ollama, Llamafile, Bedrock), which
+    ///    authenticates through a local daemon or the AWS credential chain.
+    /// 3. **An explicitly configured endpoint**, whatever the provider name.
+    ///
+    /// Rule 3 exists because `provider = "openai"` means "speaks the OpenAI
+    /// protocol", not "is api.openai.com". An operator pointing
+    /// `GREENTIC_LLM_BASE_URL` at Ollama's `/v1`, LM Studio, vLLM or any other
+    /// local gateway has named an endpoint that legitimately wants no key —
+    /// and without this they had to invent a dummy one, because an empty key
+    /// dropped them onto the fall-through client.
+    ///
+    /// **That fall-through does not merely lack a key — it cannot reach the
+    /// endpoint at all.** `OpenAiLlmBackend` appends `/v1/...` to whatever base
+    /// URL it is given (see `normalize_base_url`'s doc comment), so a base URL
+    /// that already ends in `/v1` becomes `/v1/v1/chat/completions` and every
+    /// request 404s. Recorded here because the symptom — "keyless works with a
+    /// dummy key, 404s without one" — reads like an authentication problem and
+    /// is a path-construction one. The path behaviour is that client's
+    /// documented contract and is deliberately left alone; this stops the
+    /// keyless case from landing on it.
+    #[cfg(feature = "greentic-llm-backend")]
+    fn selects_multi_provider_backend_with(
+        api_key: &str,
+        provider: Option<&str>,
+        base_url: Option<&str>,
+    ) -> bool {
+        !api_key.trim().is_empty()
+            || !provider_requires_api_key(provider)
+            || base_url.map(str::trim).is_some_and(|url| !url.is_empty())
     }
 
     /// The provider name an explicit `GREENTIC_LLM_PROVIDER` names, if any.
@@ -2168,24 +2218,79 @@ mod aw {
         #[test]
         fn ollama_without_a_key_selects_the_multi_provider_backend() {
             assert!(
-                super::selects_multi_provider_backend("", Some("ollama")),
+                super::selects_multi_provider_backend_with("", Some("ollama"), None),
                 "an Ollama worker with no key must reach greentic-llm, not the \
                  OpenAI fall-through"
             );
-            assert!(super::selects_multi_provider_backend("  ", Some("bedrock")));
+            assert!(super::selects_multi_provider_backend_with(
+                "  ",
+                Some("bedrock"),
+                None
+            ));
         }
 
         #[cfg(feature = "greentic-llm-backend")]
         #[test]
-        fn openai_without_a_key_keeps_the_openai_fall_through() {
-            assert!(!super::selects_multi_provider_backend("", Some("openai")));
-            assert!(!super::selects_multi_provider_backend("  ", None));
-            // A key still selects the multi-provider backend for everyone.
-            assert!(super::selects_multi_provider_backend(
-                "sk-x",
-                Some("openai")
+        fn openai_without_a_key_or_an_endpoint_keeps_the_openai_fall_through() {
+            // Nothing configured: the historical default really is OpenAI, and
+            // a keyless request to it is going to fail either way.
+            assert!(!super::selects_multi_provider_backend_with(
+                "",
+                Some("openai"),
+                None
             ));
-            assert!(super::selects_multi_provider_backend("sk-x", None));
+            assert!(!super::selects_multi_provider_backend_with(
+                "  ", None, None
+            ));
+            // A key still selects the multi-provider backend for everyone.
+            assert!(super::selects_multi_provider_backend_with(
+                "sk-x",
+                Some("openai"),
+                None
+            ));
+            assert!(super::selects_multi_provider_backend_with(
+                "sk-x", None, None
+            ));
+        }
+
+        /// `provider = "openai"` means "speaks the OpenAI protocol", not "is
+        /// api.openai.com". An operator who pointed the endpoint at a local
+        /// gateway had to invent a dummy key, because an empty one dropped them
+        /// onto a fall-through client that appends `/v1/...` to a base URL
+        /// already ending in `/v1` and 404s every request.
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn a_configured_endpoint_makes_an_empty_key_legitimate() {
+            assert!(super::selects_multi_provider_backend_with(
+                "",
+                Some("openai"),
+                Some("http://127.0.0.1:11434/v1")
+            ));
+            // Also for a provider nobody named at all.
+            assert!(super::selects_multi_provider_backend_with(
+                "",
+                None,
+                Some("http://127.0.0.1:1234/v1")
+            ));
+        }
+
+        /// Blank and whitespace-only mean "configured nothing", matching how
+        /// `llm_openai::normalize_base_url` reads the same variable. Without
+        /// this, an env var someone exported empty would silently change which
+        /// backend every keyless deployment gets.
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn a_blank_endpoint_is_not_a_configured_one() {
+            assert!(!super::selects_multi_provider_backend_with(
+                "",
+                Some("openai"),
+                Some("")
+            ));
+            assert!(!super::selects_multi_provider_backend_with(
+                "",
+                Some("openai"),
+                Some("   ")
+            ));
         }
 
         #[test]
