@@ -688,6 +688,15 @@ impl TenantRuntime {
         // standalone runner is unaffected.
         #[cfg(feature = "agentic-worker")]
         let engine = engine.with_mcp_source(mcp_source);
+        // An `mcp` flow node resolves its credential through the manager this
+        // runtime already holds — dev-store in a Cloud Run or Kubernetes
+        // deployment, which is the only backend there that can read a
+        // `secrets://` URI. Without this the node built its own manager from
+        // `SECRETS_BACKEND`, which no remote deployment sets, and every lookup
+        // missed. An explicit `SECRETS_BACKEND` still wins; see
+        // `mcp_node::aw::choose_mcp_secrets`.
+        #[cfg(feature = "agentic-worker")]
+        let engine = engine.with_mcp_secrets(Some(Arc::clone(&secrets_manager)));
         #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
         let mut engine = engine;
 

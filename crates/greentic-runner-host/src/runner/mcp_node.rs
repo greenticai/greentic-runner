@@ -83,6 +83,73 @@ pub mod aw {
         CACHED.get_or_init(build_secrets_manager).clone()
     }
 
+    /// Which secrets manager an MCP credential resolves through, for BOTH the
+    /// flow-node path (`invoke_with_secrets`, via `FlowEngine::execute_mcp`)
+    /// and the agent path (`agent_node::mcp_secrets_manager`).
+    ///
+    /// Precedence, most specific first:
+    ///
+    /// 1. `requested` — `SECRETS_BACKEND`, when the operator set it. An
+    ///    explicit instruction wins, and this is how a designer-spawned child
+    ///    keeps using the broker `child_env` projects onto it. `greentic-start`
+    ///    injects a manager whose kind is one of `dev-store` / `env` / `vault`
+    ///    — there is no broker variant — so without this arm the projection
+    ///    arrives intact and resolves against a manager that never heard of it.
+    /// 2. `injected` — the manager the host built from the bundle's secrets
+    ///    pack. A Cloud Run or Kubernetes workload sets no `SECRETS_BACKEND` at
+    ///    all, so this is the only arm that can resolve a `secrets://` URI
+    ///    there.
+    /// 3. `env_built` — the env-derived default ([`secrets_from_env`]), for a
+    ///    standalone runner with no host injection.
+    ///
+    /// # Why an unset variable must NOT pin the env backend
+    ///
+    /// `SecretsBackend::from_env` returns `Env` for an absent value, and the
+    /// `env` backend looks a secret up by its literal path — so a
+    /// `secrets://…` URI becomes a variable name nothing can set. Preferring
+    /// it over an injected manager silently downgrades every host that
+    /// deliberately supplies one, which is exactly what the flow path did in
+    /// every Cloud Run and Kubernetes deployment, with no error anywhere.
+    ///
+    /// A `requested` backend that fails to BUILD falls back to `injected`
+    /// rather than to nothing: a malformed broker endpoint should degrade to
+    /// the host's own resolution, not strip the node of every credential.
+    ///
+    /// Split out from its callers so it is testable without mutating the
+    /// process-wide `SECRETS_BACKEND` — [`secrets_from_env`] memoizes in a
+    /// `OnceLock`, so a test driving this through the environment would pass or
+    /// fail on which test ran first.
+    ///
+    /// `injected` is optional because the flow path may have neither manager.
+    /// Whenever it is `Some` the result is `Some`, so the agent path's
+    /// behaviour is unchanged.
+    pub(crate) fn choose_mcp_secrets(
+        requested: Option<&str>,
+        env_built: Option<crate::secrets::DynSecretsManager>,
+        injected: Option<&crate::secrets::DynSecretsManager>,
+    ) -> Option<crate::secrets::DynSecretsManager> {
+        let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+            return injected.cloned().or(env_built);
+        };
+        match env_built {
+            Some(manager) => {
+                tracing::info!(
+                    backend = %requested,
+                    "MCP credentials resolve through the SECRETS_BACKEND manager"
+                );
+                Some(manager)
+            }
+            None => {
+                tracing::warn!(
+                    backend = %requested,
+                    "SECRETS_BACKEND is set but its manager could not be built; \
+                     MCP credentials fall back to the host's injected manager"
+                );
+                injected.cloned()
+            }
+        }
+    }
+
     /// Build a dispatchable route from a pack-carried record, resolving the
     /// credential from the secrets backend.
     ///
@@ -165,45 +232,23 @@ pub mod aw {
     }
 
     /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
-    /// preferring a pack-carried route and falling back to the flow-editor
-    /// MCP catalog.
+    /// preferring a pack-carried route and falling back to the flow-editor MCP
+    /// catalog, with the secrets manager supplied explicitly.
     ///
     /// Infallible by contract: every failure path (no route anywhere, missing
-    /// credential, server/tool not in the flow-editor catalog, transport
-    /// error) returns a structured `{"error": "..."}` value. The caller binds
-    /// the value as-is.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn invoke(
-        source: Option<&Arc<McpToolSource>>,
-        pack_routes: Option<&PackMcpRoutes>,
-        tenant: &str,
-        env: &str,
-        team: Option<&str>,
-        server_id: &str,
-        tool: &str,
-        arguments: &Value,
-    ) -> Value {
-        let secrets = secrets_from_env();
-        invoke_with_secrets(
-            source,
-            pack_routes,
-            secrets.as_ref(),
-            tenant,
-            env,
-            team,
-            server_id,
-            tool,
-            arguments,
-        )
-        .await
-    }
-
-    /// [`invoke`] with the secrets manager supplied explicitly.
+    /// credential, server/tool not in the flow-editor catalog, transport error)
+    /// returns a structured `{"error": "..."}` value. The caller binds the
+    /// value as-is.
     ///
-    /// Public because [`invoke`] reads the process-global memoized manager
-    /// ([`secrets_from_env`]), which a test cannot substitute — and the
-    /// pack-route path is defined by which credential it resolves, so a test
-    /// that cannot control the backend cannot cover it at all.
+    /// The manager is a parameter rather than read from
+    /// [`secrets_from_env`] because the caller — `FlowEngine::execute_mcp` —
+    /// must be able to prefer the one its host injected: a Cloud Run or
+    /// Kubernetes workload sets no `SECRETS_BACKEND`, so the env-derived
+    /// manager there resolves a `secrets://` URI as a literal variable name and
+    /// finds nothing. See
+    /// [`choose_mcp_secrets`] for the precedence. It is also what lets a test
+    /// control the backend at all, and the pack-route path is defined by which
+    /// credential it resolves.
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_with_secrets(
         source: Option<&Arc<McpToolSource>>,
@@ -255,6 +300,102 @@ pub mod aw {
 
         let scope = call_scope(tenant_ctx, secrets);
         dispatch_route(route, &args_str, &scope).await
+    }
+
+    #[cfg(test)]
+    mod precedence_tests {
+        use super::choose_mcp_secrets;
+        use std::sync::Arc;
+
+        /// A distinguishable no-op manager. These tests assert WHICH manager
+        /// was chosen via `Arc::ptr_eq`, so all they need is two separately
+        /// allocated instances of something implementing the trait.
+        struct StubSecrets;
+
+        #[async_trait::async_trait]
+        impl greentic_secrets_lib::SecretsManager for StubSecrets {
+            async fn read(&self, _path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            async fn write(&self, _path: &str, _bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn manager() -> crate::secrets::DynSecretsManager {
+            Arc::new(StubSecrets)
+        }
+
+        fn same(
+            a: &crate::secrets::DynSecretsManager,
+            b: &crate::secrets::DynSecretsManager,
+        ) -> bool {
+            Arc::ptr_eq(a, b)
+        }
+
+        /// The whole point. A Cloud Run or Kubernetes workload sets no
+        /// `SECRETS_BACKEND`, and the host injects a manager that CAN resolve a
+        /// `secrets://` URI. Falling back to the env default here is what made
+        /// every deployed `mcp` node fail.
+        #[test]
+        fn an_unset_backend_keeps_the_injected_manager() {
+            let injected = manager();
+            let chosen = choose_mcp_secrets(None, Some(manager()), Some(&injected))
+                .expect("an injected manager is always a choice");
+            assert!(same(&chosen, &injected));
+        }
+
+        #[test]
+        fn an_empty_backend_is_treated_as_unset() {
+            let injected = manager();
+            for requested in [Some(""), Some("   ")] {
+                let chosen = choose_mcp_secrets(requested, Some(manager()), Some(&injected))
+                    .expect("an injected manager is always a choice");
+                assert!(
+                    same(&chosen, &injected),
+                    "requested={requested:?} must keep the injected manager"
+                );
+            }
+        }
+
+        /// The operator said so. A designer-spawned child gets
+        /// `SECRETS_BACKEND=broker` from `child_env` and must keep using it.
+        #[test]
+        fn an_explicit_backend_wins_over_the_injected_manager() {
+            let injected = manager();
+            let env_built = manager();
+            let chosen =
+                choose_mcp_secrets(Some("broker"), Some(env_built.clone()), Some(&injected))
+                    .expect("a built manager is a choice");
+            assert!(same(&chosen, &env_built));
+        }
+
+        /// A malformed broker endpoint should degrade to the host's own
+        /// resolution, not strip the node of every credential.
+        #[test]
+        fn an_unbuildable_backend_falls_back_to_the_injected_manager() {
+            let injected = manager();
+            let chosen = choose_mcp_secrets(Some("broker"), None, Some(&injected))
+                .expect("the injected manager is the fallback");
+            assert!(same(&chosen, &injected));
+        }
+
+        /// A standalone runner, which is today's behaviour for both paths.
+        #[test]
+        fn with_no_injected_manager_the_env_built_one_is_used() {
+            let env_built = manager();
+            let chosen = choose_mcp_secrets(None, Some(env_built.clone()), None)
+                .expect("the env-built manager is the only choice");
+            assert!(same(&chosen, &env_built));
+        }
+
+        #[test]
+        fn with_nothing_available_there_is_no_manager() {
+            assert!(choose_mcp_secrets(None, None, None).is_none());
+        }
     }
 
     #[cfg(test)]
@@ -370,7 +511,7 @@ pub mod aw {
 }
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) use aw::{invoke, source_from_env};
+pub(crate) use aw::source_from_env;
 
 use serde_json::Value;
 

@@ -99,6 +99,15 @@ pub struct FlowEngine {
     /// in which case MCP nodes fail gracefully with a clear node error.
     #[cfg(feature = "agentic-worker")]
     mcp_tool_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+    /// The secrets manager the HOST injected, used to resolve an `mcp` node's
+    /// credential. `None` for a standalone runner, which then falls back to the
+    /// env-derived manager exactly as before.
+    ///
+    /// Separate from the engine's other state because it is not the engine's
+    /// own: `TenantRuntime` owns it and hands it over, the same way it hands
+    /// over `mcp_tool_source`.
+    #[cfg(feature = "agentic-worker")]
+    mcp_secrets: Option<crate::secrets::DynSecretsManager>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -575,6 +584,8 @@ impl FlowEngine {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: crate::runner::mcp_node::source_from_env(),
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
         })
     }
 
@@ -617,6 +628,33 @@ impl FlowEngine {
             self.mcp_tool_source = Some(source);
         }
         self
+    }
+
+    /// Bind the host's secrets manager for MCP credential resolution.
+    ///
+    /// Same shape and same reason as [`with_mcp_source`](Self::with_mcp_source):
+    /// `None` leaves the env-derived behaviour alone, so a standalone runner is
+    /// unaffected.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_mcp_secrets(mut self, secrets: Option<crate::secrets::DynSecretsManager>) -> Self {
+        if let Some(secrets) = secrets {
+            self.mcp_secrets = Some(secrets);
+        }
+        self
+    }
+
+    /// The manager an `mcp` node dispatches with, per
+    /// [`crate::runner::mcp_node::aw::choose_mcp_secrets`] — an explicit
+    /// `SECRETS_BACKEND` first, then the host-injected manager, then the
+    /// env-derived default.
+    #[cfg(feature = "agentic-worker")]
+    fn mcp_secrets_for_dispatch(&self) -> Option<crate::secrets::DynSecretsManager> {
+        let requested = std::env::var("SECRETS_BACKEND").ok();
+        crate::runner::mcp_node::aw::choose_mcp_secrets(
+            requested.as_deref(),
+            crate::runner::mcp_node::aw::secrets_from_env(),
+            self.mcp_secrets.as_ref(),
+        )
     }
 
     /// Set an optional cross-pack resolver for `provider.invoke` nodes that
@@ -1830,9 +1868,15 @@ impl FlowEngine {
             .and_then(|routes| routes.get(server_id))
             .and_then(|route| route.auth_team.as_deref());
 
-        let result = crate::runner::mcp_node::invoke(
+        // The manager the HOST injected, not one built from `SECRETS_BACKEND`:
+        // no Cloud Run or Kubernetes deployment sets that variable, so the
+        // env-derived fallback resolved a `secrets://` URI as a literal
+        // variable name and every credential lookup missed.
+        let secrets = self.mcp_secrets_for_dispatch();
+        let result = crate::runner::mcp_node::aw::invoke_with_secrets(
             self.mcp_tool_source.as_ref(),
             pack_routes,
+            secrets.as_ref(),
             ctx.tenant,
             &self.default_env,
             auth_team,
@@ -5470,8 +5514,74 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         }
+    }
+
+    /// A distinguishable no-op manager. The tests below assert WHICH manager
+    /// an `mcp` node would dispatch with, via `Arc::ptr_eq`.
+    #[cfg(feature = "agentic-worker")]
+    struct StubSecrets;
+
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl greentic_secrets_lib::SecretsManager for StubSecrets {
+        async fn read(&self, _path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn write(&self, _path: &str, _bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `execute_mcp` reads `mcp_secrets_for_dispatch`; before this it read a
+    /// process-global built from `SECRETS_BACKEND`, which no Cloud Run or
+    /// Kubernetes deployment sets — so a `secrets://` URI resolved as a literal
+    /// variable name and every credential lookup missed.
+    ///
+    /// `#[serial]` because `mcp_secrets_for_dispatch` reads `SECRETS_BACKEND`,
+    /// which the env-mutating tests in `mcp_node` set and restore.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    #[serial_test::serial]
+    fn an_injected_manager_is_what_an_mcp_node_dispatches_with() {
+        let injected: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+        let engine = minimal_engine().with_mcp_secrets(Some(injected.clone()));
+        let chosen = engine
+            .mcp_secrets_for_dispatch()
+            .expect("an injected manager is always a choice");
+        assert!(std::sync::Arc::ptr_eq(&chosen, &injected));
+    }
+
+    /// A standalone runner must be unaffected: with nothing injected the engine
+    /// still falls back to the env-derived manager exactly as before.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn no_injection_leaves_the_env_derived_behaviour_alone() {
+        let engine = minimal_engine();
+        assert!(engine.mcp_secrets.is_none());
+    }
+
+    /// `None` must LEAVE an already-bound manager in place, mirroring
+    /// `with_mcp_source`: callers thread this straight through from a host that
+    /// may not have one.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    #[serial_test::serial]
+    fn binding_no_manager_does_not_clear_one_already_bound() {
+        let injected: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+        let engine = minimal_engine()
+            .with_mcp_secrets(Some(injected.clone()))
+            .with_mcp_secrets(None);
+        let chosen = engine
+            .mcp_secrets_for_dispatch()
+            .expect("the bound manager must survive");
+        assert!(std::sync::Arc::ptr_eq(&chosen, &injected));
     }
 
     fn flow_desc(id: &str, pack_id: &str, flow_type: &str, entry: bool) -> FlowDescriptor {
@@ -6419,6 +6529,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -6663,6 +6775,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
         let ctx = FlowContext {
@@ -6807,6 +6921,8 @@ mod tests {
             graph_node_handler: Some(handler_dyn),
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
         let ctx = FlowContext {
@@ -6982,6 +7098,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
 
@@ -7103,6 +7221,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         }
     }
@@ -7559,6 +7679,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
         }
     }
 
@@ -8114,6 +8236,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -9026,6 +9150,7 @@ mod tests {
             agent_node_handler: None,
             graph_node_handler: None,
             mcp_tool_source: None,
+            mcp_secrets: None,
             operala_node_handler: None,
         };
 
@@ -9427,6 +9552,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
 
@@ -9542,6 +9669,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
 
@@ -9687,6 +9816,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -10242,6 +10373,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
@@ -10421,6 +10554,7 @@ mod tests {
             agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
             graph_node_handler: None,
             mcp_tool_source: None,
+            mcp_secrets: None,
             operala_node_handler: None,
         }
     }
@@ -10629,6 +10763,7 @@ mod tests {
             agent_node_handler: None,
             graph_node_handler: None,
             mcp_tool_source: None,
+            mcp_secrets: None,
             operala_node_handler: None,
         }
     }
@@ -11186,6 +11321,7 @@ mod tests {
             agent_node_handler: Some(handler),
             graph_node_handler: None,
             mcp_tool_source: None,
+            mcp_secrets: None,
             operala_node_handler: None,
         }
     }
@@ -11277,6 +11413,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: handler,
         }
     }
@@ -11921,6 +12059,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
             operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
