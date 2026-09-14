@@ -106,7 +106,7 @@ pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_kv::KvAgentStateStore;
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
-pub use tenant::TenantContext;
+pub use tenant::{TenantContext, VerifiedCaller};
 pub use tool_wire_name::{ToolNameCodec, is_wire_safe, wire_tool_name};
 pub use tools::{KvToolLedger, RedisToolLedger, ToolLedger};
 

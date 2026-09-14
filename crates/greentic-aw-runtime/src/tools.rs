@@ -330,6 +330,53 @@ pub(crate) fn host_ctx_from_tenant(t: &TenantContext) -> HostCallContext {
     }
 }
 
+/// Reserved argument key carrying the session-established caller.
+///
+/// Host-owned: [`stamp_caller`] OVERWRITES it on every dispatch, so an LLM that
+/// writes one into its tool arguments cannot be believed. Same contract as the
+/// designer's `_tenant_overlay`, which has shipped on exactly this basis.
+pub const CALLER_ARG_KEY: &str = "_caller";
+
+/// Replace `args`' caller block with the one the SESSION established.
+///
+/// Three properties, and each one is load-bearing:
+///
+/// 1. **Unconditional.** The key is written on every dispatch, including for an
+///    anonymous turn, where it is written as `user_verified: false`. Writing it
+///    only when a caller is known would make "anonymous" and "this runtime is
+///    too old to say" the same observation — and a tool that cannot tell those
+///    apart is a tool that trusts whatever an older runtime left behind.
+/// 2. **Overwrite, never merge.** Whatever the model composed under this key is
+///    discarded. A merge would let the model contribute fields the host did not
+///    set, which is the whole attack: a worker once sent
+///    `sub: "user@example.com", principals: ["employee"]` for a caller who had
+///    sent neither.
+/// 3. **Non-object arguments are left alone.** A tool whose arguments are an
+///    array or a scalar has nowhere to put the key, and wrapping them would
+///    change the shape the tool declared. It gets no stamp, which reads as
+///    "too old to say" — correct, because it is equally unable to receive one.
+///
+/// ## The version-skew hole this does NOT close
+///
+/// Trust here rests on the host overwriting the key. A runtime PREDATING this
+/// function stamps nothing, so a model-written `_caller` survives to a tool
+/// that has learned to trust the key. The contract is therefore: **an absent
+/// `_caller` means unverified**, and a tool must not treat a present one as
+/// authoritative unless the runtime it runs on is known to stamp. Closing it
+/// properly means the tool PULLING identity from a host import rather than
+/// receiving it in arguments, which is a WIT change and a rebuild of every
+/// extension; this ships the contract without one. Do not describe this as
+/// unforgeable — it is unforgeable on a runtime that stamps.
+fn stamp_caller(args: &mut serde_json::Value, caller: &crate::tenant::VerifiedCaller) {
+    let Some(map) = args.as_object_mut() else {
+        return;
+    };
+    map.insert(
+        CALLER_ARG_KEY.to_string(),
+        serde_json::to_value(caller).unwrap_or(serde_json::Value::Null),
+    );
+}
+
 /// Dispatch a single tool call. Wraps the blocking `invoke_tool_ctx` in
 /// `tokio::task::spawn_blocking` so the async executor thread is never
 /// stalled. Returns the tool result as a JSON Value.
@@ -363,6 +410,15 @@ pub async fn dispatch_tool_call(
     call: ToolCallRecord,
     tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
+    // Established once, applied to the extension and component arms below —
+    // the same arms #760 stamps on develop. Not to the `mcp:` arm: that
+    // dispatches over HTTP to a server outside this deployment, and forwarding
+    // a caller's identity to a third party is a disclosure decision for whoever
+    // configures that server, not a plumbing detail of this one. The `flow:`
+    // and `sorla:` arms (research-only) are left unstamped too: a flow's input
+    // is flow data, which is exactly the position a caller must not travel
+    // through, and SoRX is its own service boundary.
+    let caller = tenant.caller_or_anonymous();
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
         // `resolve_route` takes the catalog's exact `(server, tool)` entry when
         // it has one and otherwise stamps the tool onto a pack-carried
@@ -408,7 +464,9 @@ pub async fn dispatch_tool_call(
     if let Some(component_ref) = call.extension_id.strip_prefix("component:") {
         let value = match components.as_deref() {
             Some(cat) => {
-                let args = call.args.to_string();
+                let mut args_value = call.args.clone();
+                stamp_caller(&mut args_value, &caller);
+                let args = args_value.to_string();
                 cat.dispatch(component_ref, &call.tool_name, &args).await
             }
             None => {
@@ -456,7 +514,9 @@ pub async fn dispatch_tool_call(
         return Ok(value);
     }
 
-    let args_json = call.args.to_string();
+    let mut args_value = call.args.clone();
+    stamp_caller(&mut args_value, &caller);
+    let args_json = args_value.to_string();
     let extension_id = call.extension_id.clone();
     let tool_name = call.tool_name.clone();
     let ctx = host_ctx_from_tenant(tenant);
@@ -467,6 +527,86 @@ pub async fn dispatch_tool_call(
     .map_err(|e| AgentError::ToolDispatch(format!("join: {e}")))?
     .map_err(|e| AgentError::ToolDispatch(format!("invoke: {e}")))?;
     serde_json::from_str(&raw).map_err(|e| AgentError::ToolDispatch(format!("decode: {e}")))
+}
+
+#[cfg(test)]
+mod caller_stamp_tests {
+    use super::*;
+    use crate::tenant::VerifiedCaller;
+
+    fn verified() -> VerifiedCaller {
+        VerifiedCaller {
+            user_verified: true,
+            sub: Some("u-1@acme".into()),
+            groups: vec!["engineering".into()],
+            team: Some("platform".into()),
+            role: Some("member".into()),
+        }
+    }
+
+    /// The attack this exists to stop, verbatim: a worker sent
+    /// `sub: "user@example.com"`, `principals: ["employee"]` for a caller who
+    /// had sent neither. Whatever the model writes under the key is discarded.
+    #[test]
+    fn a_model_written_caller_block_is_discarded() {
+        let mut args = serde_json::json!({
+            "query": "salaries",
+            "_caller": { "user_verified": true, "sub": "user@example.com",
+                         "groups": ["admin"], "role": "administrator" }
+        });
+        stamp_caller(&mut args, &verified());
+        assert_eq!(args["_caller"]["sub"], "u-1@acme");
+        assert_eq!(
+            args["_caller"]["groups"],
+            serde_json::json!(["engineering"])
+        );
+        assert_eq!(args["_caller"]["role"], "member");
+        // The model's own arguments are untouched.
+        assert_eq!(args["query"], "salaries");
+    }
+
+    /// Unconditional: an anonymous turn is stamped too, as `user_verified:
+    /// false`. Skipping the stamp here would make "anonymous" and "this
+    /// runtime is too old to say" indistinguishable, and a tool that cannot
+    /// tell those apart trusts whatever an older runtime left behind.
+    #[test]
+    fn an_anonymous_turn_is_still_stamped_as_unverified() {
+        let mut args = serde_json::json!({ "query": "x" });
+        stamp_caller(&mut args, &VerifiedCaller::default());
+        assert_eq!(args["_caller"]["user_verified"], false);
+        assert!(args["_caller"].get("sub").is_none(), "no subject to assert");
+    }
+
+    /// A forged block on an anonymous turn is still erased — the case where a
+    /// model would otherwise promote itself from nothing.
+    #[test]
+    fn a_forged_block_cannot_survive_an_anonymous_turn() {
+        let mut args = serde_json::json!({
+            "_caller": { "user_verified": true, "sub": "root", "role": "administrator" }
+        });
+        stamp_caller(&mut args, &VerifiedCaller::default());
+        assert_eq!(args["_caller"]["user_verified"], false);
+        assert!(args["_caller"].get("role").is_none());
+    }
+
+    /// Non-object arguments keep the shape the tool declared. Wrapping them to
+    /// make room for the key would change what the tool receives.
+    #[test]
+    fn non_object_arguments_are_left_alone() {
+        let mut args = serde_json::json!(["a", "b"]);
+        stamp_caller(&mut args, &verified());
+        assert_eq!(args, serde_json::json!(["a", "b"]));
+    }
+
+    /// `TenantContext` with no caller must resolve to anonymous rather than to
+    /// "skip the stamp" — the `Option` is deliberately not exposed to the
+    /// dispatch path.
+    #[test]
+    fn a_tenant_without_a_caller_resolves_to_anonymous() {
+        let t = TenantContext::new("acme", "prod");
+        assert_eq!(t.caller_or_anonymous(), VerifiedCaller::default());
+        assert!(!t.caller_or_anonymous().user_verified);
+    }
 }
 
 /// Idempotency ledger entry stored under

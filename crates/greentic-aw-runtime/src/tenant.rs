@@ -33,6 +33,63 @@ pub struct TenantContext {
     /// missing key under `"unknown"`.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Who the turn is running on behalf of, as established by the SESSION —
+    /// never by anything the model produced. See [`VerifiedCaller`].
+    ///
+    /// `None` on every path with no session identity to establish: autonomous
+    /// workers, the process-level serve path, tests. A tool receiving the
+    /// stamp built from a `None` here sees `user_verified: false`, which is
+    /// the honest answer and the same one an anonymous caller gets.
+    #[serde(default)]
+    pub caller: Option<VerifiedCaller>,
+}
+
+/// The caller a tool may trust, as opposed to the one the model describes.
+///
+/// ## Why this type exists
+///
+/// An agent's tool call is a JSON object the LLM composed. Before this, that
+/// was the ONLY thing a tool received, so a tool asking "who is calling" was
+/// asking the model — which answers whatever the conversation suggests. It
+/// really happened: a worker sent `sub: "user@example.com"`, `principals:
+/// ["employee"]` for a caller who had sent neither, so the extension on the
+/// other side had to ignore identity arguments entirely and serve only public
+/// data. There was no channel through which a truthful answer could arrive.
+///
+/// This is that channel. It is populated by the host from the session and
+/// travels beside the model's arguments, never inside them.
+///
+/// ## What `user_verified` actually asserts
+///
+/// That the messaging provider which received the turn verified the caller's
+/// bearer token. The provider is WASM the operator installed, so it is inside
+/// the trust boundary — but the boundary stops there. This flag means "the
+/// provider vouched", not "this runtime proved it". A deployment that does not
+/// trust its own provider cannot recover trust from this field.
+///
+/// Everything else is descriptive and only meaningful when `user_verified` is
+/// true. A consumer MUST gate on the flag first: the other fields are carried
+/// unconditionally so that an unverified caller is distinguishable from a
+/// verified one with no groups, rather than being erased into the same shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VerifiedCaller {
+    /// Whether the provider verified this caller's credential. `false` for an
+    /// anonymous turn, and the default everywhere — a caller is unverified
+    /// until something says otherwise, never the reverse.
+    #[serde(default)]
+    pub user_verified: bool,
+    /// Stable subject id from the verified credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    /// Group / principal slugs the credential carries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// The team this turn is scoped to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// The caller's role, when the credential asserts one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl TenantContext {
@@ -42,6 +99,7 @@ impl TenantContext {
             env_id: env_id.into(),
             user_email: None,
             project_id: None,
+            caller: None,
         }
     }
 
@@ -59,6 +117,24 @@ impl TenantContext {
     pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
         self.project_id = project_id;
         self
+    }
+
+    /// Attach the session-established caller. `None` leaves the turn
+    /// anonymous, which is what every path with no session identity gets.
+    #[must_use]
+    pub fn with_caller(mut self, caller: Option<VerifiedCaller>) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    /// The caller a tool may trust, defaulted to anonymous.
+    ///
+    /// Returns an owned value rather than an `Option` so a call site cannot
+    /// accidentally treat "no caller" as "skip the stamp" — an absent caller
+    /// must still be stamped, as `user_verified: false`, or a tool cannot tell
+    /// an anonymous turn from a runtime too old to say.
+    pub fn caller_or_anonymous(&self) -> VerifiedCaller {
+        self.caller.clone().unwrap_or_default()
     }
 
     /// Prefix used by Redis key builders. Returns `aw:{tenant}:{env}`.
