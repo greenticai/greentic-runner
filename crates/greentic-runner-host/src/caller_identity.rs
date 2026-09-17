@@ -70,10 +70,176 @@ pub fn caller_block(payload: &Value) -> Option<&Value> {
         .filter(|block| block.is_object())
 }
 
+/// `TenantCtx.attributes` key carrying the verified subject verbatim.
+///
+/// The typed `user` slot of `greentic_types::TenantCtx` only accepts an id made
+/// of ASCII letters, digits, `.`, `-` and `_`, so a subject such as
+/// `u-1@acme` cannot live there. The attribute always carries it unchanged.
+pub const ATTR_CALLER_SUB: &str = "caller.sub";
+/// `TenantCtx.attributes` key carrying the verified team.
+pub const ATTR_CALLER_TEAM: &str = "caller.team";
+/// `TenantCtx.attributes` key carrying the verified groups as a JSON array.
+pub const ATTR_CALLER_GROUPS: &str = "caller.groups";
+/// `TenantCtx.attributes` key carrying the verified role.
+pub const ATTR_CALLER_ROLE: &str = "caller.role";
+/// `TenantCtx.attributes` key present (value `"true"`) exactly when the
+/// runtime is presenting a provider-verified caller.
+pub const ATTR_CALLER_VERIFIED: &str = "caller.user_verified";
+
+/// The verified caller as a `component.exec` invocation is told about it.
+///
+/// Built only from a block whose `user_verified` is `true`: an unverified or
+/// undecodable block yields no caller at all, so a component never mistakes a
+/// claim for a verified identity.
+///
+/// This is what the component SEES. It deliberately does not change the scope
+/// the host itself uses for a component's secrets and state
+/// (`ExecCtx.tenant.user` / `.team`): moving those to the caller's team would
+/// make every tenant-wide secret unreachable for a verified caller, and moving
+/// the state user would re-key existing component state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComponentCaller {
+    pub sub: Option<String>,
+    pub team: Option<String>,
+    pub groups: Vec<String>,
+    pub role: Option<String>,
+}
+
+/// Mirror of `greentic_aw_runtime::VerifiedCaller`'s wire shape, which this
+/// crate's core cannot name (see [`caller_block`]).
+#[derive(serde::Deserialize)]
+struct CallerWire {
+    #[serde(default)]
+    user_verified: bool,
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+impl ComponentCaller {
+    /// The caller a component may be told about, from the block the run entry
+    /// established (`FlowContext::caller`).
+    ///
+    /// `None` for an anonymous turn, an unverified block, a block that does not
+    /// decode (warned, same restrictive direction the agent node takes), and a
+    /// verified block that names neither a subject nor a team.
+    pub fn from_block(block: &Value) -> Option<Self> {
+        let wire = match serde_json::from_value::<CallerWire>(block.clone()) {
+            Ok(wire) => wire,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "provider stamped a caller block this runtime cannot decode; \
+                     the component invocation runs without a caller"
+                );
+                return None;
+            }
+        };
+        if !wire.user_verified {
+            return None;
+        }
+        let caller = Self {
+            sub: non_empty(wire.sub),
+            team: non_empty(wire.team),
+            groups: wire
+                .groups
+                .into_iter()
+                .map(|g| g.trim().to_string())
+                .filter(|g| !g.is_empty())
+                .collect(),
+            role: non_empty(wire.role),
+        };
+        if caller.sub.is_none() && caller.team.is_none() {
+            return None;
+        }
+        Some(caller)
+    }
+
+    /// The caller as `TenantCtx.attributes` entries, in a stable order.
+    ///
+    /// This is where `groups` and `role` travel: no component WIT world has a
+    /// typed slot for them, and only the attribute map is free-form.
+    pub fn attributes(&self) -> Vec<(String, String)> {
+        let mut attrs = vec![(ATTR_CALLER_VERIFIED.to_string(), "true".to_string())];
+        if let Some(sub) = &self.sub {
+            attrs.push((ATTR_CALLER_SUB.to_string(), sub.clone()));
+        }
+        if let Some(team) = &self.team {
+            attrs.push((ATTR_CALLER_TEAM.to_string(), team.clone()));
+        }
+        if !self.groups.is_empty() {
+            attrs.push((
+                ATTR_CALLER_GROUPS.to_string(),
+                Value::from(self.groups.clone()).to_string(),
+            ));
+        }
+        if let Some(role) = &self.role {
+            attrs.push((ATTR_CALLER_ROLE.to_string(), role.clone()));
+        }
+        attrs
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_verified_block_becomes_a_component_caller() {
+        let caller = ComponentCaller::from_block(&json!({
+            "user_verified": true,
+            "sub": "u-1@acme",
+            "team": "sales",
+            "groups": ["employee", " ", "admins"],
+            "role": "member"
+        }))
+        .expect("caller");
+        assert_eq!(caller.sub.as_deref(), Some("u-1@acme"));
+        assert_eq!(caller.team.as_deref(), Some("sales"));
+        assert_eq!(caller.groups, vec!["employee", "admins"]);
+        assert_eq!(caller.role.as_deref(), Some("member"));
+        assert_eq!(
+            caller.attributes(),
+            vec![
+                ("caller.user_verified".to_string(), "true".to_string()),
+                ("caller.sub".to_string(), "u-1@acme".to_string()),
+                ("caller.team".to_string(), "sales".to_string()),
+                (
+                    "caller.groups".to_string(),
+                    r#"["employee","admins"]"#.to_string()
+                ),
+                ("caller.role".to_string(), "member".to_string()),
+            ]
+        );
+    }
+
+    /// A claim is not an identity: only `user_verified: true` is presented.
+    #[test]
+    fn an_unverified_or_malformed_block_is_no_caller() {
+        assert!(ComponentCaller::from_block(&json!({ "sub": "u-1@acme" })).is_none());
+        assert!(
+            ComponentCaller::from_block(&json!({ "user_verified": false, "sub": "u-1" })).is_none()
+        );
+        assert!(
+            ComponentCaller::from_block(&json!({ "user_verified": "yes", "sub": "u-1" })).is_none()
+        );
+        assert!(ComponentCaller::from_block(&json!({ "user_verified": true })).is_none());
+        assert!(
+            ComponentCaller::from_block(&json!({ "user_verified": true, "sub": "  " })).is_none()
+        );
+    }
 
     fn envelope_with(extensions: Value) -> Value {
         json!({ "id": "m-1", "text": "hello", "extensions": extensions })

@@ -2454,6 +2454,7 @@ impl FlowEngine {
         // context `payload: {}`).
         let is_card = is_card_invocation(&call.input);
 
+        let exec_ctx = component_exec_ctx(ctx, node_id);
         let input_json = if is_card {
             serde_json::to_string(&call.input)?
         } else {
@@ -2466,6 +2467,7 @@ impl FlowEngine {
                 provider_id: ctx.provider_id,
                 session_id: ctx.session_id,
                 attempt: ctx.attempt,
+                caller: exec_ctx.caller.as_ref(),
             };
             let invocation_envelope =
                 build_invocation_envelope(meta, call.operation.as_str(), call.input)
@@ -2478,7 +2480,6 @@ impl FlowEngine {
             Some(serde_json::to_string(&call.config)?)
         };
 
-        let exec_ctx = component_exec_ctx(ctx, node_id);
         #[cfg(feature = "fault-injection")]
         {
             let fault_ctx = FaultContext {
@@ -3319,6 +3320,15 @@ impl NodeOutput {
     }
 }
 
+/// The context a component invocation runs under.
+///
+/// `tenant` is the HOST's scope for the component's secrets and state, and is
+/// unchanged by a caller: `team` stays `None` so tenant-wide secrets keep
+/// resolving, and `user` stays the provider id so existing component state is
+/// not re-keyed. The provider-verified caller travels separately in `caller`
+/// (from `FlowContext::caller`, never from the node payload) and is what the
+/// component is told its `user`/`team` are — see
+/// [`crate::caller_identity::ComponentCaller`].
 fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx {
     ComponentExecCtx {
         tenant: ComponentTenantCtx {
@@ -3335,6 +3345,9 @@ fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx 
         i18n_id: None,
         flow_id: ctx.flow_id.to_string(),
         node_id: Some(node_id.to_string()),
+        caller: ctx
+            .caller
+            .and_then(crate::caller_identity::ComponentCaller::from_block),
     }
 }
 
@@ -7395,6 +7408,48 @@ mod tests {
             observer: None,
             mocks: None,
             caller: None,
+        }
+    }
+
+    /// #765: a component invocation is told the verified caller, while the
+    /// host scope that keys its secrets and state stays what it always was.
+    #[test]
+    fn component_exec_ctx_presents_the_verified_caller() {
+        let block = json!({
+            "user_verified": true,
+            "sub": "u-1@acme",
+            "team": "sales",
+            "groups": ["employee"]
+        });
+        let mut ctx = jump_ctx("caller.flow");
+        ctx.provider_id = Some("messaging-webchat");
+        ctx.caller = Some(&block);
+
+        let exec = component_exec_ctx(&ctx, "lookup");
+        assert_eq!(exec.presented_user().as_deref(), Some("u-1@acme"));
+        assert_eq!(exec.presented_team().as_deref(), Some("sales"));
+        let v06 = crate::component_api::envelope_v0_6(&exec, "c", "{}").unwrap();
+        assert_eq!(v06.ctx.user_id.as_deref(), Some("u-1@acme"));
+        assert_eq!(v06.ctx.team_id.as_deref(), Some("sales"));
+        // Host scope: unchanged, so tenant-wide secrets and existing
+        // component state keep resolving.
+        assert_eq!(exec.tenant.user.as_deref(), Some("messaging-webchat"));
+        assert_eq!(exec.tenant.team, None);
+    }
+
+    /// An unverified block, or none at all, presents exactly what was
+    /// presented before #765.
+    #[test]
+    fn component_exec_ctx_without_a_verified_caller_is_unchanged() {
+        let unverified = json!({ "user_verified": false, "sub": "u-1", "team": "sales" });
+        for caller in [None, Some(&unverified)] {
+            let mut ctx = jump_ctx("caller.flow");
+            ctx.provider_id = Some("messaging-webchat");
+            ctx.caller = caller;
+            let exec = component_exec_ctx(&ctx, "lookup");
+            assert!(exec.caller.is_none());
+            assert_eq!(exec.presented_user().as_deref(), Some("messaging-webchat"));
+            assert_eq!(exec.presented_team(), None);
         }
     }
 
