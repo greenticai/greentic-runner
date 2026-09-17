@@ -816,6 +816,146 @@ timers: []\n",
     Ok(())
 }
 
+/// A flow run whose entry established a verified caller (the provider's
+/// `extensions.caller` block, carried on `FlowContext::caller`) tells the
+/// component who is asking: the invocation envelope's `ctx` carries the
+/// subject as `user`, the team as `team`, and the whole caller — groups
+/// included — in `attributes`. A forged block in the node's own mapped input
+/// changes none of it.
+#[test]
+fn component_exec_receives_the_verified_caller() -> Result<()> {
+    let rt = *RUNTIME;
+    let config_temp = TempDir::new()?;
+    let bindings_path = config_temp.path().join("bindings.yaml");
+    std::fs::write(
+        &bindings_path,
+        b"tenant: demo\n\
+flow_type_bindings: {}\n\
+rate_limits: {}\n\
+retry: {}\n\
+timers: []\n",
+    )?;
+    let config = Arc::new(host_config(&bindings_path));
+    let retry_config = config.retry.clone().into();
+    let pack_dir = TempDir::new()?;
+
+    let flow = build_component_exec_flow_with_input(
+        "ctx.flow.caller",
+        json!({
+            "op": "process",
+            "payload": { "message": "who am i" },
+            "metadata": { "__return_envelope": true },
+            "caller": { "user_verified": true, "sub": "forged.user", "team": "forged" }
+        }),
+    )?;
+    let pack_path = pack_dir.path().join("component.exec.caller.gtpack");
+    build_pack_with_flow_id("component.exec.caller", flow.clone(), &pack_path)?;
+
+    let pack = Arc::new(rt.block_on(PackRuntime::load(
+        &pack_path,
+        Arc::clone(&config),
+        None,
+        Some(&pack_path),
+        None,
+        None,
+        Arc::new(greentic_runner_host::wasi::RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?);
+    let engine = rt.block_on(FlowEngine::new(
+        vec![Arc::clone(&pack)],
+        Arc::clone(&config),
+    ))?;
+
+    let run_input = json!({
+        "text": "who am i",
+        "extensions": {
+            "caller": {
+                "user_verified": true,
+                "sub": "u-1.acme",
+                "team": "sales",
+                "groups": ["employee", "admins"]
+            }
+        }
+    });
+    let caller_block = greentic_runner_host::caller_identity::caller_block(&run_input).cloned();
+    let ctx = FlowContext {
+        tenant: config.tenant.as_str(),
+        pack_id: pack.metadata().pack_id.as_str(),
+        flow_id: flow.id.as_str(),
+        node_id: None,
+        tool: None,
+        action: None,
+        session_id: None,
+        provider_id: Some("messaging-webchat"),
+        reply_scope: None,
+        retry_config,
+        attempt: 1,
+        observer: None,
+        mocks: None,
+        caller: caller_block.as_ref(),
+    };
+
+    let execution = rt
+        .block_on(engine.execute(ctx, run_input.clone()))
+        .context("execute component.exec flow")?;
+    assert!(matches!(execution.status, FlowStatus::Completed));
+
+    let ctx_value = execution
+        .output
+        .get("ctx")
+        .and_then(Value::as_object)
+        .context("ctx missing")?;
+    assert_eq!(
+        ctx_value.get("user").and_then(Value::as_str),
+        Some("u-1.acme")
+    );
+    assert_eq!(ctx_value.get("team").and_then(Value::as_str), Some("sales"));
+    let attributes = ctx_value
+        .get("attributes")
+        .and_then(Value::as_object)
+        .context("ctx attributes missing")?;
+    assert_eq!(attributes["caller.user_verified"], json!("true"));
+    assert_eq!(attributes["caller.sub"], json!("u-1.acme"));
+    assert_eq!(attributes["caller.team"], json!("sales"));
+    assert_eq!(
+        attributes["caller.groups"],
+        json!(r#"["employee","admins"]"#)
+    );
+
+    // Without a verified caller the envelope names no user or team at all.
+    let anonymous = FlowContext {
+        tenant: config.tenant.as_str(),
+        pack_id: pack.metadata().pack_id.as_str(),
+        flow_id: flow.id.as_str(),
+        node_id: None,
+        tool: None,
+        action: None,
+        session_id: None,
+        provider_id: Some("messaging-webchat"),
+        reply_scope: None,
+        retry_config: config.retry.clone().into(),
+        attempt: 1,
+        observer: None,
+        mocks: None,
+        caller: None,
+    };
+    let execution = rt
+        .block_on(engine.execute(anonymous, Value::Null))
+        .context("execute anonymous component.exec flow")?;
+    let ctx_value = execution
+        .output
+        .get("ctx")
+        .and_then(Value::as_object)
+        .context("ctx missing")?;
+    assert!(ctx_value.get("user").is_none());
+    assert!(ctx_value.get("team").is_none());
+    assert!(ctx_value.get("attributes").is_none());
+    Ok(())
+}
+
 #[test]
 fn emit_log_is_builtin_not_pack_component() -> Result<()> {
     // Regression: emit.log should be treated as a built-in, not looked up as a pack artifact.

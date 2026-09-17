@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use greentic_types::{EnvId, InvocationEnvelope, TenantCtx, TenantId};
+use greentic_types::{EnvId, InvocationEnvelope, TeamId, TenantCtx, TenantId, UserId};
 use serde_json::Value;
 use std::str::FromStr;
 
@@ -15,6 +15,33 @@ pub struct InvocationMeta<'a> {
     pub provider_id: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub attempt: u32,
+    /// The provider-verified caller, stamped onto the envelope `ctx`. Runtime
+    /// owned like everything else here; a flow cannot supply it.
+    pub caller: Option<&'a crate::caller_identity::ComponentCaller>,
+}
+
+/// Present a verified caller on the envelope's `TenantCtx`.
+///
+/// The typed `user`/`team` slots only take identifier-shaped values, so a
+/// subject such as `u-1@acme` is left out of them rather than mangled; the
+/// attribute map always carries the caller verbatim, groups and role included.
+fn stamp_caller(mut ctx: TenantCtx, caller: &crate::caller_identity::ComponentCaller) -> TenantCtx {
+    if let Some(user) = caller
+        .sub
+        .as_deref()
+        .and_then(|sub| UserId::from_str(sub).ok())
+    {
+        ctx = ctx.with_user(Some(user));
+    }
+    if let Some(team) = caller
+        .team
+        .as_deref()
+        .and_then(|team| TeamId::from_str(team).ok())
+    {
+        ctx = ctx.with_team(Some(team));
+    }
+    ctx.attributes.extend(caller.attributes());
+    ctx
 }
 
 pub fn build_invocation_envelope(
@@ -43,6 +70,9 @@ pub fn build_invocation_envelope(
         ctx = ctx.with_node(node.to_string());
     }
     ctx = ctx.with_attempt(meta.attempt);
+    if let Some(caller) = meta.caller {
+        ctx = stamp_caller(ctx, caller);
+    }
 
     let payload_bytes =
         to_binary_payload(&parsed.payload).context("serialize payload for invocation envelope")?;
