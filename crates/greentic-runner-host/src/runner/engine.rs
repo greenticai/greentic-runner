@@ -18,7 +18,7 @@ use super::mocks::MockLayer;
 use super::templating::{TemplateOptions, render_template_value};
 use crate::config::{FlowRetryConfig, HostConfig};
 use crate::pack::{FlowDescriptor, PackRuntime};
-use crate::runner::invocation::{InvocationMeta, build_invocation_envelope};
+use crate::runner::invocation::{InvocationMeta, build_invocation_envelope_as};
 use crate::telemetry::{
     FlowSpanAttributes, RolloutIds, annotate_span, backoff_delay_ms, set_flow_context,
 };
@@ -2455,6 +2455,7 @@ impl FlowEngine {
         let is_card = is_card_invocation(&call.input);
 
         let exec_ctx = component_exec_ctx(ctx, node_id);
+        let caller = component_caller(ctx);
         let input_json = if is_card {
             serde_json::to_string(&call.input)?
         } else {
@@ -2467,11 +2468,14 @@ impl FlowEngine {
                 provider_id: ctx.provider_id,
                 session_id: ctx.session_id,
                 attempt: ctx.attempt,
-                caller: exec_ctx.caller.as_ref(),
             };
-            let invocation_envelope =
-                build_invocation_envelope(meta, call.operation.as_str(), call.input)
-                    .context("build invocation envelope for component call")?;
+            let invocation_envelope = build_invocation_envelope_as(
+                meta,
+                caller.as_ref(),
+                call.operation.as_str(),
+                call.input,
+            )
+            .context("build invocation envelope for component call")?;
             serde_json::to_string(&invocation_envelope)?
         };
         let config_json = if call.config.is_null() {
@@ -2492,9 +2496,10 @@ impl FlowEngine {
                 .map_err(|err| anyhow!(err.to_string()))?;
         }
         let value = pack
-            .invoke_component(
+            .invoke_component_as(
                 call.component_ref.as_str(),
                 exec_ctx,
+                caller,
                 call.operation.as_str(),
                 config_json,
                 input_json,
@@ -3328,7 +3333,7 @@ impl NodeOutput {
 /// not re-keyed. The provider-verified caller travels separately in `caller`
 /// (from `FlowContext::caller`, never from the node payload) and is what the
 /// component is told its `user`/`team` are — see
-/// [`crate::caller_identity::ComponentCaller`].
+/// [`crate::caller_identity::ComponentCaller`] and [`component_caller`].
 fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx {
     ComponentExecCtx {
         tenant: ComponentTenantCtx {
@@ -3345,10 +3350,15 @@ fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx 
         i18n_id: None,
         flow_id: ctx.flow_id.to_string(),
         node_id: Some(node_id.to_string()),
-        caller: ctx
-            .caller
-            .and_then(crate::caller_identity::ComponentCaller::from_block),
     }
+}
+
+/// The provider-verified caller a component invocation is told about, from
+/// `FlowContext::caller` (never from the node payload). Carried beside the
+/// `ExecCtx` rather than inside it — see `PackRuntime::invoke_component_as`.
+fn component_caller(ctx: &FlowContext<'_>) -> Option<crate::caller_identity::ComponentCaller> {
+    ctx.caller
+        .and_then(crate::caller_identity::ComponentCaller::from_block)
 }
 
 /// Surface a component-emitted `outcome` (from its output envelope) as node
@@ -7430,9 +7440,12 @@ mod tests {
         ctx.caller = Some(&block);
 
         let exec = component_exec_ctx(&ctx, "lookup");
-        assert_eq!(exec.presented_user().as_deref(), Some("u-1@acme"));
-        assert_eq!(exec.presented_team().as_deref(), Some("sales"));
-        let v06 = crate::component_api::envelope_v0_6(&exec, "c", "{}").unwrap();
+        let caller = component_caller(&ctx);
+        let v05 = crate::component_api::exec_ctx_v0_5_as(&exec, caller.as_ref());
+        assert_eq!(v05.tenant.user_id.as_deref(), Some("u-1@acme"));
+        assert_eq!(v05.tenant.team_id.as_deref(), Some("sales"));
+        let v06 =
+            crate::component_api::envelope_v0_6_as(&exec, caller.as_ref(), "c", "{}").unwrap();
         assert_eq!(v06.ctx.user_id.as_deref(), Some("u-1@acme"));
         assert_eq!(v06.ctx.team_id.as_deref(), Some("sales"));
         // Host scope: unchanged, so tenant-wide secrets and existing
@@ -7451,9 +7464,12 @@ mod tests {
             ctx.provider_id = Some("messaging-webchat");
             ctx.caller = caller;
             let exec = component_exec_ctx(&ctx, "lookup");
-            assert!(exec.caller.is_none());
-            assert_eq!(exec.presented_user().as_deref(), Some("messaging-webchat"));
-            assert_eq!(exec.presented_team(), None);
+            let caller = component_caller(&ctx);
+            assert!(caller.is_none());
+            let v05 = crate::component_api::exec_ctx_v0_5_as(&exec, caller.as_ref());
+            assert_eq!(v05.tenant.user_id.as_deref(), Some("messaging-webchat"));
+            assert_eq!(v05.tenant.team_id, None);
+            assert!(v05.tenant.attributes.is_empty());
         }
     }
 

@@ -15,9 +15,6 @@ pub struct InvocationMeta<'a> {
     pub provider_id: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub attempt: u32,
-    /// The provider-verified caller, stamped onto the envelope `ctx`. Runtime
-    /// owned like everything else here; a flow cannot supply it.
-    pub caller: Option<&'a crate::caller_identity::ComponentCaller>,
 }
 
 /// Present a verified caller on the envelope's `TenantCtx`.
@@ -49,6 +46,19 @@ pub fn build_invocation_envelope(
     operation: &str,
     payload: Value,
 ) -> Result<InvocationEnvelope> {
+    build_invocation_envelope_as(meta, None, operation, payload)
+}
+
+/// [`build_invocation_envelope`] on behalf of a provider-verified caller,
+/// stamped onto the envelope `ctx`. Runtime owned like everything else here; a
+/// flow cannot supply it. A separate argument rather than an `InvocationMeta`
+/// field so that struct keeps the shape downstream crates construct.
+pub fn build_invocation_envelope_as(
+    meta: InvocationMeta<'_>,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+    operation: &str,
+    payload: Value,
+) -> Result<InvocationEnvelope> {
     let parsed = InvocationPayload::parse(payload);
     let env_id = EnvId::from_str(meta.env)
         .unwrap_or_else(|_| EnvId::from_str("local").expect("local env id is valid"));
@@ -70,7 +80,7 @@ pub fn build_invocation_envelope(
         ctx = ctx.with_node(node.to_string());
     }
     ctx = ctx.with_attempt(meta.attempt);
-    if let Some(caller) = meta.caller {
+    if let Some(caller) = caller {
         ctx = stamp_caller(ctx, caller);
     }
 

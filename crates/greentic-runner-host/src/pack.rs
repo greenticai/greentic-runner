@@ -395,11 +395,13 @@ impl HostState {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn instantiate_component_result(
         linker: &mut Linker<ComponentState>,
         store: &mut Store<ComponentState>,
         component: &Component,
         ctx: &ComponentExecCtx,
+        caller: Option<&crate::caller_identity::ComponentCaller>,
         component_ref: &str,
         operation: &str,
         input_json: &str,
@@ -407,7 +409,8 @@ impl HostState {
         let pre_instance = linker.instantiate_pre(component)?;
         match component_api::v0_6::ComponentPre::new(pre_instance) {
             Ok(pre) => {
-                let envelope = component_api::envelope_v0_6(ctx, component_ref, input_json)?;
+                let envelope =
+                    component_api::envelope_v0_6_as(ctx, caller, component_ref, input_json)?;
                 let operation_owned = operation.to_string();
                 let result = block_on(async {
                     let bindings = pre.instantiate_async(&mut *store).await?;
@@ -426,7 +429,7 @@ impl HostState {
                         let result = block_on(async {
                             let bindings = pre.instantiate_async(&mut *store).await?;
                             let node = bindings.greentic_component_node();
-                            let ctx_v05 = component_api::exec_ctx_v0_5(ctx);
+                            let ctx_v05 = component_api::exec_ctx_v0_5_as(ctx, caller);
                             let operation_owned = operation.to_string();
                             let input_owned = input_json.to_string();
                             node.call_invoke(&mut *store, &ctx_v05, &operation_owned, &input_owned)
@@ -443,7 +446,7 @@ impl HostState {
                                 let result = block_on(async {
                                     let bindings = pre.instantiate_async(&mut *store).await?;
                                     let node = bindings.greentic_component_node();
-                                    let ctx_v04 = component_api::exec_ctx_v0_4(ctx);
+                                    let ctx_v04 = component_api::exec_ctx_v0_4_as(ctx, caller);
                                     let operation_owned = operation.to_string();
                                     let input_owned = input_json.to_string();
                                     node.call_invoke(
@@ -2364,6 +2367,26 @@ impl PackRuntime {
         config_json: Option<String>,
         input_json: String,
     ) -> Result<Value> {
+        self.invoke_component_as(component_ref, ctx, None, operation, config_json, input_json)
+            .await
+    }
+
+    /// [`Self::invoke_component`] on behalf of a provider-verified caller.
+    ///
+    /// `caller` is presented to the component as its `user`/`team` (and, where
+    /// the world has one, the `caller.*` attribute map). It is an argument
+    /// rather than a field of `ExecCtx` because downstream crates build that
+    /// struct with literal initializers; and it never touches `ctx.tenant`,
+    /// which stays the host's scope for the component's secrets and state.
+    pub async fn invoke_component_as(
+        &self,
+        component_ref: &str,
+        ctx: ComponentExecCtx,
+        caller: Option<crate::caller_identity::ComponentCaller>,
+        operation: &str,
+        config_json: Option<String>,
+        input_json: String,
+    ) -> Result<Value> {
         let component_ref = resolve_component_key(component_ref, operation, |key| {
             self.components.contains_key(key)
         });
@@ -2420,6 +2443,7 @@ impl PackRuntime {
                 &mut store,
                 &component,
                 &ctx_owned,
+                caller.as_ref(),
                 &component_ref_owned,
                 &operation_owned,
                 &input_owned,

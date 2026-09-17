@@ -82,7 +82,6 @@ fn build_exec_ctx(tenant: &str, component_ref: &str) -> ComponentExecCtx {
         i18n_id: None,
         flow_id: COMPONENT_TOOL_FLOW_ID.to_string(),
         node_id: Some(component_ref.to_string()),
-        caller: None,
     }
 }
 
@@ -105,7 +104,6 @@ fn build_invocation_input(
         provider_id: None,
         session_id: None,
         attempt: 1,
-        caller: None,
     };
     let envelope = build_invocation_envelope(meta, operation, payload)
         .map_err(|e| format!("build invocation envelope: {e}"))?;
