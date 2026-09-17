@@ -1369,6 +1369,7 @@ fn mcp_tool_error_with_route_completes_instead_of_bailing() -> Result<()> {
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
 
     let execution = rt.block_on(engine.execute(ctx, Value::Null)).context(
@@ -1471,6 +1472,7 @@ fn mcp_tool_error_without_route_still_bails() -> Result<()> {
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
 
     let err = rt.block_on(engine.execute(ctx, Value::Null)).expect_err(

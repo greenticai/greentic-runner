@@ -6698,6 +6698,7 @@ mod tests {
                 _agent_id: &str,
                 _session_id: &str,
                 _flow_input: &Value,
+                _conversational: bool,
                 caller: Option<&Value>,
             ) -> anyhow::Result<Value> {
                 *self.0.lock().unwrap() = caller.cloned();
@@ -6772,6 +6773,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
 
         let trusted = json!({ "user_verified": true, "sub": "u-1@acme" });
@@ -9783,6 +9787,7 @@ mod tests {
             attempt: 1,
             observer: Some(&observer),
             mocks: None,
+            caller: None,
         };
 
         let rt = Runtime::new().unwrap();
@@ -10685,6 +10690,7 @@ mod tests {
             _session_id: &str,
             _flow_input: &serde_json::Value,
             _conversational: bool,
+            _caller: Option<&serde_json::Value>,
         ) -> anyhow::Result<serde_json::Value> {
             Ok(self.payload.clone())
         }
@@ -10791,6 +10797,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         }
     }
 
@@ -11493,6 +11500,7 @@ mod tests {
             _session_id: &str,
             _flow_input: &serde_json::Value,
             _conversational: bool,
+            _caller: Option<&serde_json::Value>,
         ) -> anyhow::Result<serde_json::Value> {
             Ok(self
                 .script
@@ -11650,6 +11658,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         }
     }
 

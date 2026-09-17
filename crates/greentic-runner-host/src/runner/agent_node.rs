@@ -22,6 +22,10 @@ pub trait AgentNodeHandler: Send + Sync {
     /// [`crate::caller_identity`] for why identity must not arrive through a
     /// flow's own node mapping. `None` means the turn is anonymous, which is
     /// what every provider predating the contract produces.
+    // `caller` is deliberately its own argument rather than a field folded
+    // into `flow_input` (authorable) — so this lane, which also carries
+    // `conversational`, crosses clippy's seven-argument line.
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
         tenant_id: &str,
@@ -2395,6 +2399,7 @@ mod aw {
                     "sess-1",
                     &json!({"user_text": "remember this"}),
                     false,
+                    None,
                 )
                 .await
                 .expect("execute should succeed");
@@ -2430,6 +2435,7 @@ mod aw {
                     "sess-1",
                     &json!({"user_text": "remember this"}),
                     false,
+                    None,
                 )
                 .await
                 .expect("execute should succeed");
