@@ -524,6 +524,11 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         observer: Some(recorder_ref),
         mocks: Some(mock_ref),
         reply_scope: None,
+        // The desktop runner drives a pack from the local CLI: there is no
+        // messaging provider in the path, so nothing has verified a caller and
+        // the turn is anonymous. `crate::caller_identity` explains why only a
+        // provider may establish one.
+        caller: None,
     };
 
     // Resume support: if the caller wired up a session_state_dir AND ctx

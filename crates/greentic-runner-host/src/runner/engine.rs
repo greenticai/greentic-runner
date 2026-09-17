@@ -966,6 +966,9 @@ impl FlowEngine {
                 attempt: ctx.attempt,
                 observer: ctx.observer,
                 mocks: ctx.mocks,
+                // Propagated, never re-established: only the run entry may
+                // read a caller (see `crate::caller_identity`).
+                caller: ctx.caller,
             };
             let node = flow_ir
                 .nodes
@@ -1608,6 +1611,9 @@ impl FlowEngine {
                 session_id,
                 &payload,
                 conversational,
+                // From the context, NOT from `payload`: the node's payload is
+                // whatever the flow mapped, and a flow's mapping is authorable.
+                ctx.caller,
             )
             .await?;
         // Per-node timing: record this agent step's own execution time on its
@@ -2252,6 +2258,9 @@ impl FlowEngine {
             attempt: ctx.attempt,
             observer: ctx.observer,
             mocks: ctx.mocks,
+            // A called sub-flow runs on behalf of the same caller. Dropping
+            // it here would silently anonymise every `flow.call`.
+            caller: ctx.caller,
         };
 
         let execution = Box::pin(self.execute(sub_ctx, sub_input))
@@ -2445,6 +2454,7 @@ impl FlowEngine {
         // context `payload: {}`).
         let is_card = is_card_invocation(&call.input);
 
+        let exec_ctx = component_exec_ctx(ctx, node_id);
         let input_json = if is_card {
             serde_json::to_string(&call.input)?
         } else {
@@ -2457,6 +2467,7 @@ impl FlowEngine {
                 provider_id: ctx.provider_id,
                 session_id: ctx.session_id,
                 attempt: ctx.attempt,
+                caller: exec_ctx.caller.as_ref(),
             };
             let invocation_envelope =
                 build_invocation_envelope(meta, call.operation.as_str(), call.input)
@@ -2469,7 +2480,6 @@ impl FlowEngine {
             Some(serde_json::to_string(&call.config)?)
         };
 
-        let exec_ctx = component_exec_ctx(ctx, node_id);
         #[cfg(feature = "fault-injection")]
         {
             let fault_ctx = FaultContext {
@@ -3310,6 +3320,15 @@ impl NodeOutput {
     }
 }
 
+/// The context a component invocation runs under.
+///
+/// `tenant` is the HOST's scope for the component's secrets and state, and is
+/// unchanged by a caller: `team` stays `None` so tenant-wide secrets keep
+/// resolving, and `user` stays the provider id so existing component state is
+/// not re-keyed. The provider-verified caller travels separately in `caller`
+/// (from `FlowContext::caller`, never from the node payload) and is what the
+/// component is told its `user`/`team` are — see
+/// [`crate::caller_identity::ComponentCaller`].
 fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx {
     ComponentExecCtx {
         tenant: ComponentTenantCtx {
@@ -3326,6 +3345,9 @@ fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx 
         i18n_id: None,
         flow_id: ctx.flow_id.to_string(),
         node_id: Some(node_id.to_string()),
+        caller: ctx
+            .caller
+            .and_then(crate::caller_identity::ComponentCaller::from_block),
     }
 }
 
@@ -6285,6 +6307,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
         let node = HostNode {
             kind: NodeKind::Exec {
@@ -6352,6 +6375,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
         let node = HostNode {
             kind: NodeKind::Exec {
@@ -6551,6 +6575,7 @@ mod tests {
             attempt: 1,
             observer: Some(&observer),
             mocks: None,
+            caller: None,
         };
 
         let rt = Runtime::new().unwrap();
@@ -6648,6 +6673,144 @@ mod tests {
     }
 
     #[cfg(feature = "agentic-worker")]
+    /// The property the whole caller mechanism rests on: the agent node is
+    /// handed the caller from the CONTEXT, and a block sitting in the node's
+    /// own payload is not mistaken for one.
+    ///
+    /// A node payload is whatever the flow mapped, and a flow's mapping is
+    /// authorable — so identity read from there is identity the flow, and the
+    /// model behind it, could have written. That is the exact failure this
+    /// exists to end.
+    #[test]
+    fn the_agent_node_receives_the_context_caller_not_a_payload_one() {
+        use crate::runner::agent_node::AgentNodeHandler;
+        use std::sync::Mutex;
+
+        /// Records the `caller` argument and answers with a fixed reply.
+        struct Recorder(Arc<Mutex<Option<Value>>>);
+
+        #[async_trait::async_trait]
+        impl AgentNodeHandler for Recorder {
+            async fn execute(
+                &self,
+                _tenant_id: &str,
+                _env_id: &str,
+                _agent_id: &str,
+                _session_id: &str,
+                _flow_input: &Value,
+                _conversational: bool,
+                caller: Option<&Value>,
+            ) -> anyhow::Result<Value> {
+                *self.0.lock().unwrap() = caller.cloned();
+                Ok(json!({ "reply": "ok", "trail": [], "terminated_by": "done" }))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let handler: Arc<dyn AgentNodeHandler> = Arc::new(Recorder(Arc::clone(&seen)));
+
+        let node_id = NodeId::from_str("agent").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "dw.agent".parse().unwrap(),
+                pack_alias: None,
+                operation: Some("greeter".to_string()),
+            },
+            // The forged block rides in the node's own mapped input.
+            input: InputMapping {
+                mapping: json!({
+                    "user_text": "ping",
+                    "caller": { "user_verified": true, "sub": "forged@evil" }
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("dw.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: Default::default(),
+        };
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "dw.flow".to_string(),
+                },
+                HostFlow::from(flow),
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: Some(handler),
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
+        };
+
+        let trusted = json!({ "user_verified": true, "sub": "u-1@acme" });
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "dw.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-1"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+            caller: Some(&trusted),
+        };
+
+        let rt = Runtime::new().unwrap();
+        rt.block_on(engine.execute(ctx, json!({ "user_text": "ping" })))
+            .unwrap();
+
+        let got = seen.lock().unwrap().clone().expect("handler saw a caller");
+        assert_eq!(
+            got["sub"], "u-1@acme",
+            "the context caller must win over the payload one"
+        );
+        assert_ne!(got["sub"], "forged@evil");
+    }
+
     #[test]
     fn dw_agent_node_routes_to_handler_and_returns_reply() {
         use crate::runner::agent_node::{AgentNodeHandler, RuntimeAgentNodeHandler};
@@ -6796,6 +6959,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
 
         let rt = Runtime::new().unwrap();
@@ -6942,6 +7106,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
 
         let rt = Runtime::new().unwrap();
@@ -7120,6 +7285,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
 
         let rt = Runtime::new().unwrap();
@@ -7245,6 +7411,49 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
+        }
+    }
+
+    /// #765: a component invocation is told the verified caller, while the
+    /// host scope that keys its secrets and state stays what it always was.
+    #[test]
+    fn component_exec_ctx_presents_the_verified_caller() {
+        let block = json!({
+            "user_verified": true,
+            "sub": "u-1@acme",
+            "team": "sales",
+            "groups": ["employee"]
+        });
+        let mut ctx = jump_ctx("caller.flow");
+        ctx.provider_id = Some("messaging-webchat");
+        ctx.caller = Some(&block);
+
+        let exec = component_exec_ctx(&ctx, "lookup");
+        assert_eq!(exec.presented_user().as_deref(), Some("u-1@acme"));
+        assert_eq!(exec.presented_team().as_deref(), Some("sales"));
+        let v06 = crate::component_api::envelope_v0_6(&exec, "c", "{}").unwrap();
+        assert_eq!(v06.ctx.user_id.as_deref(), Some("u-1@acme"));
+        assert_eq!(v06.ctx.team_id.as_deref(), Some("sales"));
+        // Host scope: unchanged, so tenant-wide secrets and existing
+        // component state keep resolving.
+        assert_eq!(exec.tenant.user.as_deref(), Some("messaging-webchat"));
+        assert_eq!(exec.tenant.team, None);
+    }
+
+    /// An unverified block, or none at all, presents exactly what was
+    /// presented before #765.
+    #[test]
+    fn component_exec_ctx_without_a_verified_caller_is_unchanged() {
+        let unverified = json!({ "user_verified": false, "sub": "u-1", "team": "sales" });
+        for caller in [None, Some(&unverified)] {
+            let mut ctx = jump_ctx("caller.flow");
+            ctx.provider_id = Some("messaging-webchat");
+            ctx.caller = caller;
+            let exec = component_exec_ctx(&ctx, "lookup");
+            assert!(exec.caller.is_none());
+            assert_eq!(exec.presented_user().as_deref(), Some("messaging-webchat"));
+            assert_eq!(exec.presented_team(), None);
         }
     }
 
@@ -7703,6 +7912,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         }
     }
 
@@ -8256,6 +8466,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
         let result = engine.execute(ctx, Value::Null).await;
         assert!(result.is_err(), "non-user-facing flow must propagate Err");
@@ -9171,6 +9382,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
 
         // ── 6. Execute: the dw.agent NATS path must PAUSE the flow ──
@@ -9575,6 +9787,7 @@ mod tests {
             attempt: 1,
             observer: Some(&observer),
             mocks: None,
+            caller: None,
         };
 
         let rt = Runtime::new().unwrap();
@@ -9692,6 +9905,7 @@ mod tests {
             attempt: 1,
             observer: Some(&observer),
             mocks: None,
+            caller: None,
         };
 
         let rt = Runtime::new().unwrap();
@@ -9838,6 +10052,7 @@ mod tests {
             attempt: 1,
             observer: Some(&observer),
             mocks: None,
+            caller: None,
         };
         let rt = Runtime::new().unwrap();
         let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
@@ -9926,6 +10141,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
         let node = HostNode {
             kind: NodeKind::VarSet {
@@ -10397,6 +10613,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
         let result1 = rt.block_on(engine.execute(ctx1, Value::Null)).unwrap();
         let snapshot = match result1.status {
@@ -10435,6 +10652,7 @@ mod tests {
             attempt: 1,
             observer: Some(&observer2),
             mocks: None,
+            caller: None,
         };
         let result2 = rt
             .block_on(engine.resume(ctx2, snapshot, Value::Null))
@@ -10472,6 +10690,7 @@ mod tests {
             _session_id: &str,
             _flow_input: &serde_json::Value,
             _conversational: bool,
+            _caller: Option<&serde_json::Value>,
         ) -> anyhow::Result<serde_json::Value> {
             Ok(self.payload.clone())
         }
@@ -10578,6 +10797,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         }
     }
 
@@ -11280,6 +11500,7 @@ mod tests {
             _session_id: &str,
             _flow_input: &serde_json::Value,
             _conversational: bool,
+            _caller: Option<&serde_json::Value>,
         ) -> anyhow::Result<serde_json::Value> {
             Ok(self
                 .script
@@ -11437,6 +11658,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         }
     }
 
@@ -12082,6 +12304,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
         // First turn: no `response.action` yet, so `card`'s conditional
         // routing falls through and it parks awaiting the submit.
@@ -12117,6 +12340,7 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
+            caller: None,
         };
         let input = json!({ "email": "a@b.c", "metadata": { "action": "submit" } });
         let result2 = rt.block_on(engine.resume(ctx2, snapshot, input)).unwrap();
@@ -12160,6 +12384,21 @@ pub struct FlowContext<'a> {
     pub attempt: u32,
     pub observer: Option<&'a dyn ExecutionObserver>,
     pub mocks: Option<&'a MockLayer>,
+    /// The caller the messaging PROVIDER verified for this run, as raw JSON.
+    ///
+    /// Established once at the run's entry from the provider's own envelope
+    /// (`crate::caller_identity::caller_block`) and carried BESIDE the flow's
+    /// data, never through it: a flow's node mapping is authorable, so identity
+    /// read from a node payload is identity the flow — and the model behind it
+    /// — could have written.
+    ///
+    /// Raw JSON rather than `greentic_aw_runtime::VerifiedCaller` because that
+    /// crate is optional behind `agentic-worker` while this struct is not; the
+    /// typed parse happens at the agent node, which is already gated.
+    ///
+    /// `None` is ordinary: a provider predating the contract, or an autonomous
+    /// turn. It becomes an anonymous caller downstream, never an error.
+    pub caller: Option<&'a serde_json::Value>,
 }
 
 #[derive(Copy, Clone)]

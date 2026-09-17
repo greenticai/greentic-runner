@@ -310,6 +310,7 @@ fn flow_ctx<'a>(config: &'a HostConfig, pack_id: &'a str) -> FlowContext<'a> {
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     }
 }
 
