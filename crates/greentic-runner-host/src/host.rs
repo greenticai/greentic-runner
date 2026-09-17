@@ -517,6 +517,7 @@ impl RunnerHost {
             i18n_id: None,
             flow_id: format!("provider-webhook/{provider_type}"),
             node_id: None,
+            caller: None,
         };
         pack.invoke_provider(&binding, exec_ctx, op, input_json)
             .await
