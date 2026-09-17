@@ -526,7 +526,6 @@ fn demo_exec_ctx(node_id: &str) -> greentic_runner_host::component_api::node::Ex
         i18n_id: None,
         flow_id: "demo.flow".into(),
         node_id: Some(node_id.into()),
-        caller: None,
     }
 }
 

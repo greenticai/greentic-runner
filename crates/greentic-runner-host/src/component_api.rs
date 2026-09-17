@@ -276,44 +276,10 @@ pub mod node {
 
     #[derive(Clone, Debug)]
     pub struct ExecCtx {
-        /// The scope the HOST uses for this invocation's secrets and state.
         pub tenant: TenantCtx,
         pub i18n_id: Option<String>,
         pub flow_id: String,
         pub node_id: Option<String>,
-        /// The provider-verified caller, presented to the component in its
-        /// `TenantCtx` (`user`, `team`, and — where the world has one — the
-        /// attribute map). Kept apart from `tenant` on purpose: see
-        /// [`crate::caller_identity::ComponentCaller`].
-        pub caller: Option<crate::caller_identity::ComponentCaller>,
-    }
-
-    impl ExecCtx {
-        /// The `user` a component is told: the verified subject when there is
-        /// one, otherwise the host scope's user.
-        pub fn presented_user(&self) -> Option<String> {
-            self.caller
-                .as_ref()
-                .and_then(|caller| caller.sub.clone())
-                .or_else(|| self.tenant.user.clone())
-        }
-
-        /// The `team` a component is told: the verified team when there is
-        /// one, otherwise the host scope's team.
-        pub fn presented_team(&self) -> Option<String> {
-            self.caller
-                .as_ref()
-                .and_then(|caller| caller.team.clone())
-                .or_else(|| self.tenant.team.clone())
-        }
-
-        /// The caller as attribute entries; empty for an anonymous invocation.
-        pub fn caller_attributes(&self) -> Vec<(String, String)> {
-            self.caller
-                .as_ref()
-                .map(crate::caller_identity::ComponentCaller::attributes)
-                .unwrap_or_default()
-        }
     }
 
     #[derive(Clone, Debug)]
@@ -332,12 +298,51 @@ pub mod node {
     }
 }
 
+// The provider-verified caller, as the component-world conversions present it.
+//
+// Deliberately NOT a field of `node::ExecCtx`: downstream crates
+// (greentic-start, greentic-setup) build that struct with literal
+// initializers, so a new public field is a breaking change. The caller
+// travels beside it as an argument instead (the `*_as` conversions below),
+// and `ExecCtx.tenant` stays the HOST's scope for the invocation's secrets
+// and state.
+
+/// The `user` a component is told: the verified subject when there is one,
+/// otherwise the host scope's user.
+fn presented_user(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+) -> Option<String> {
+    caller
+        .and_then(|caller| caller.sub.clone())
+        .or_else(|| ctx.tenant.user.clone())
+}
+
+/// The `team` a component is told: the verified team when there is one,
+/// otherwise the host scope's team.
+fn presented_team(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+) -> Option<String> {
+    caller
+        .and_then(|caller| caller.team.clone())
+        .or_else(|| ctx.tenant.team.clone())
+}
+
 pub fn exec_ctx_v0_4(ctx: &node::ExecCtx) -> v0_4::exports::greentic::component::node::ExecCtx {
+    exec_ctx_v0_4_as(ctx, None)
+}
+
+/// [`exec_ctx_v0_4`], presenting `caller` as the component's user and team.
+pub fn exec_ctx_v0_4_as(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+) -> v0_4::exports::greentic::component::node::ExecCtx {
     v0_4::exports::greentic::component::node::ExecCtx {
         tenant: v0_4::exports::greentic::component::node::TenantCtx {
             tenant: ctx.tenant.tenant.clone(),
-            team: ctx.presented_team(),
-            user: ctx.presented_user(),
+            team: presented_team(ctx, caller),
+            user: presented_user(ctx, caller),
             trace_id: ctx.tenant.trace_id.clone(),
             correlation_id: ctx.tenant.correlation_id.clone(),
             deadline_unix_ms: ctx.tenant.deadline_unix_ms,
@@ -350,9 +355,18 @@ pub fn exec_ctx_v0_4(ctx: &node::ExecCtx) -> v0_4::exports::greentic::component:
 }
 
 pub fn exec_ctx_v0_5(ctx: &node::ExecCtx) -> v0_5::exports::greentic::component::node::ExecCtx {
+    exec_ctx_v0_5_as(ctx, None)
+}
+
+/// [`exec_ctx_v0_5`], presenting `caller` as the component's user, team and
+/// `caller.*` attributes.
+pub fn exec_ctx_v0_5_as(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+) -> v0_5::exports::greentic::component::node::ExecCtx {
     let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
-    let team_id = ctx.presented_team();
-    let user_id = ctx.presented_user();
+    let team_id = presented_team(ctx, caller);
+    let user_id = presented_user(ctx, caller);
     let deadline_ms = ctx
         .tenant
         .deadline_unix_ms
@@ -369,7 +383,9 @@ pub fn exec_ctx_v0_5(ctx: &node::ExecCtx) -> v0_5::exports::greentic::component:
             trace_id: ctx.tenant.trace_id.clone(),
             i18n_id: ctx.tenant.i18n_id.clone(),
             correlation_id: ctx.tenant.correlation_id.clone(),
-            attributes: ctx.caller_attributes(),
+            attributes: caller
+                .map(crate::caller_identity::ComponentCaller::attributes)
+                .unwrap_or_default(),
             session_id: ctx.tenant.correlation_id.clone(),
             flow_id: Some(ctx.flow_id.clone()),
             node_id: ctx.node_id.clone(),
@@ -387,6 +403,16 @@ pub fn exec_ctx_v0_5(ctx: &node::ExecCtx) -> v0_5::exports::greentic::component:
 
 pub fn envelope_v0_6(
     ctx: &node::ExecCtx,
+    component_id: &str,
+    payload_json: &str,
+) -> Result<v0_6::exports::greentic::component::node::InvocationEnvelope> {
+    envelope_v0_6_as(ctx, None, component_id, payload_json)
+}
+
+/// [`envelope_v0_6`], presenting `caller` as the component's user and team.
+pub fn envelope_v0_6_as(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
     component_id: &str,
     payload_json: &str,
 ) -> Result<v0_6::exports::greentic::component::node::InvocationEnvelope> {
@@ -420,8 +446,8 @@ pub fn envelope_v0_6(
         v0_6::exports::greentic::component::node::InvocationEnvelope {
             ctx: v0_6::exports::greentic::component::node::TenantCtx {
                 tenant_id: ctx.tenant.tenant.clone(),
-                team_id: ctx.presented_team(),
-                user_id: ctx.presented_user(),
+                team_id: presented_team(ctx, caller),
+                user_id: presented_user(ctx, caller),
                 env_id: env,
                 trace_id,
                 correlation_id,
@@ -537,8 +563,9 @@ pub fn invoke_result_from_v0_6_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        cbor_to_json_string, envelope_v0_6, exec_ctx_v0_4, exec_ctx_v0_5, invoke_result_from_v0_4,
-        invoke_result_from_v0_5, invoke_result_from_v0_6, invoke_result_from_v0_6_run, node,
+        cbor_to_json_string, envelope_v0_6, envelope_v0_6_as, exec_ctx_v0_4, exec_ctx_v0_4_as,
+        exec_ctx_v0_5, exec_ctx_v0_5_as, invoke_result_from_v0_4, invoke_result_from_v0_5,
+        invoke_result_from_v0_6, invoke_result_from_v0_6_run, node,
     };
     use greentic_types::{EnvId, InvocationEnvelope, TenantCtx, TenantId};
     use std::str::FromStr;
@@ -559,7 +586,6 @@ mod tests {
             i18n_id: Some("en-US".to_string()),
             flow_id: "flow.demo".to_string(),
             node_id: Some("node.demo".to_string()),
-            caller: None,
         }
     }
 
@@ -568,19 +594,20 @@ mod tests {
     /// exactly as it was.
     #[test]
     fn a_verified_caller_is_presented_in_every_world() {
-        let mut ctx = sample_exec_ctx();
-        ctx.caller = Some(crate::caller_identity::ComponentCaller {
+        let ctx = sample_exec_ctx();
+        let verified = crate::caller_identity::ComponentCaller {
             sub: Some("u-1@acme".to_string()),
             team: Some("sales".to_string()),
             groups: vec!["employee".to_string()],
             role: None,
-        });
+        };
+        let caller = Some(&verified);
 
-        let v04 = exec_ctx_v0_4(&ctx);
+        let v04 = exec_ctx_v0_4_as(&ctx, caller);
         assert_eq!(v04.tenant.user.as_deref(), Some("u-1@acme"));
         assert_eq!(v04.tenant.team.as_deref(), Some("sales"));
 
-        let v05 = exec_ctx_v0_5(&ctx);
+        let v05 = exec_ctx_v0_5_as(&ctx, caller);
         assert_eq!(v05.tenant.user.as_deref(), Some("u-1@acme"));
         assert_eq!(v05.tenant.user_id.as_deref(), Some("u-1@acme"));
         assert_eq!(v05.tenant.team_id.as_deref(), Some("sales"));
@@ -590,7 +617,7 @@ mod tests {
                 .contains(&("caller.groups".to_string(), r#"["employee"]"#.to_string()))
         );
 
-        let envelope = envelope_v0_6(&ctx, "component.demo", "{}").expect("envelope");
+        let envelope = envelope_v0_6_as(&ctx, caller, "component.demo", "{}").expect("envelope");
         assert_eq!(envelope.ctx.user_id.as_deref(), Some("u-1@acme"));
         assert_eq!(envelope.ctx.team_id.as_deref(), Some("sales"));
 
