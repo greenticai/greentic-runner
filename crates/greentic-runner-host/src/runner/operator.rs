@@ -1172,7 +1172,6 @@ fn build_exec_ctx(
         i18n_id: None,
         flow_id: format!("operator/{operation_id}"),
         node_id: None,
-        caller: None,
     }
 }
 
