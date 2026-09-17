@@ -265,7 +265,6 @@ fn component_exec_ctx(trace: &TraceEnvelope, node_id: &str) -> ComponentExecCtx 
         i18n_id: None,
         flow_id: trace.flow.id.clone(),
         node_id: Some(node_id.to_string()),
-        caller: None,
     }
 }
 

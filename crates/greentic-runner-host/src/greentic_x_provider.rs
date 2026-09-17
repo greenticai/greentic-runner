@@ -95,7 +95,6 @@ impl RunnerPackComponentProvider {
                 .clone()
                 .unwrap_or_else(|| self.flow_id.clone()),
             node_id: Some(envelope.component_id.clone()),
-            caller: None,
         }
     }
 }
@@ -240,7 +239,6 @@ impl RunnerPackFast2FlowRoutingProvider {
             i18n_id: Some(request.input_locale.clone()),
             flow_id: self.flow_id.clone(),
             node_id: Some(self.component_ref.clone()),
-            caller: None,
         }
     }
 }
