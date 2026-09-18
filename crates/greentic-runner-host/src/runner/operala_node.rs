@@ -219,10 +219,48 @@ mod dw {
             }))
         }
     }
+
+    /// What the runtime should do with `operala.call` in this process.
+    pub enum OperalaSelection {
+        /// `GREENTIC_OPERALA_DISPATCH=nats`: keep the NATS `RemoteDispatchHandler`.
+        Nats,
+        /// In-process requested, but no LLM key resolved (env or store).
+        NoKey,
+        /// Wire this handler into the `FlowEngine`.
+        InProcess(Arc<dyn OperalaNodeHandler>),
+    }
+
+    /// Decide how `operala.call` dispatches and, for the in-process path,
+    /// build the handler. `resolve_key` runs only when the in-process path is
+    /// selected, so `nats` never touches the secrets store.
+    pub async fn select_operala_handler<F, Fut>(
+        dispatch_env: Option<&str>,
+        resolve_key: F,
+        base_url: Option<String>,
+        fallback_provider: Option<String>,
+        fallback_model: Option<String>,
+    ) -> OperalaSelection
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
+        if !super::operala_dispatch_in_process(dispatch_env) {
+            return OperalaSelection::Nats;
+        }
+        match resolve_key().await {
+            Some(api_key) => OperalaSelection::InProcess(Arc::new(RuntimeOperalaNodeHandler::new(
+                api_key,
+                base_url,
+                fallback_provider,
+                fallback_model,
+            ))),
+            None => OperalaSelection::NoKey,
+        }
+    }
 }
 
 #[cfg(feature = "operala-in-process")]
-pub use dw::RuntimeOperalaNodeHandler;
+pub use dw::{OperalaSelection, RuntimeOperalaNodeHandler, select_operala_handler};
 
 #[cfg(test)]
 mod tests {
@@ -275,5 +313,81 @@ mod tests {
         assert!(operala_dispatch_in_process(Some("")));
         assert!(operala_dispatch_in_process(Some("inprocess")));
         assert!(operala_dispatch_in_process(Some("nat")));
+    }
+}
+
+#[cfg(all(test, feature = "operala-in-process"))]
+mod in_process_selection_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use serde_json::json;
+
+    use super::{OperalaSelection, select_operala_handler};
+
+    #[tokio::test]
+    async fn nats_skips_wiring_and_never_resolves_a_key() {
+        let resolved = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&resolved);
+        let selection = select_operala_handler(
+            Some("NATS"),
+            move || {
+                probe.store(true, Ordering::SeqCst);
+                async { Some("sk-test".to_string()) }
+            },
+            None,
+            Some("openai".to_string()),
+            Some("gpt-4o-mini".to_string()),
+        )
+        .await;
+        assert!(matches!(selection, OperalaSelection::Nats));
+        assert!(
+            !resolved.load(Ordering::SeqCst),
+            "GREENTIC_OPERALA_DISPATCH=nats must not read an LLM key from the secrets store"
+        );
+    }
+
+    #[tokio::test]
+    async fn unset_dispatch_with_a_key_wires_the_real_handler() {
+        let selection = select_operala_handler(
+            None,
+            || async { Some("sk-test".to_string()) },
+            None,
+            None,
+            None,
+        )
+        .await;
+        let OperalaSelection::InProcess(handler) = selection else {
+            panic!("a resolved key with dispatch unset must wire the in-process handler");
+        };
+        // It is the DeepWorkerInvoker-backed handler: with no node `input.llm`
+        // and no fallback it refuses before any network call, naming the gap.
+        let err = handler
+            .execute("demo", "local", "w1", "run", "s1", &json!({ "goal": "hi" }))
+            .await
+            .expect_err("no provider/model anywhere must error, never guess");
+        assert!(
+            err.to_string().contains("worker LLM config missing"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_dispatch_values_with_a_key_stay_in_process() {
+        let selection = select_operala_handler(
+            Some("inprocess"),
+            || async { Some("sk-test".to_string()) },
+            None,
+            Some("openai".to_string()),
+            Some("gpt-4o-mini".to_string()),
+        )
+        .await;
+        assert!(matches!(selection, OperalaSelection::InProcess(_)));
+    }
+
+    #[tokio::test]
+    async fn no_key_leaves_the_nats_fallback() {
+        let selection = select_operala_handler(None, || async { None }, None, None, None).await;
+        assert!(matches!(selection, OperalaSelection::NoKey));
     }
 }
