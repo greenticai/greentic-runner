@@ -218,11 +218,13 @@ pub(crate) fn augment_system_prompt(base: &str, chunks: &[RetrievedChunk]) -> St
 /// Surface an auto knowledge retrieval as a trace step, so the UI can show which
 /// corpus chunks were pulled into context — doc id, chunk index, score, and text.
 ///
-/// Emitted through the tool-call observer seam ONLY, and deliberately NOT pushed
-/// onto `AgentOutput.trail`. Retrieval is automatic pre-context, not a
-/// model-invoked tool: it belongs in the live trace the test-chat UI streams, but
-/// must stay out of the flow trail / metering, whose consumers treat each entry
-/// as a real agent action. A no-op when nothing was retrieved (no empty step).
+/// This is the LIVE trace, emitted through the tool-call observer seam so the
+/// test-chat UI can stream it. It is not how the retrieval is recorded: the
+/// loop also pushes an `AgentStep::KnowledgeRetrieval` onto `AgentOutput.trail`
+/// (#770), a distinct kind rather than a `ToolCall`, because retrieval is
+/// automatic pre-context and must not be counted as a model-invoked tool. A
+/// trail consumer that also listens to this observer sees the retrieval twice
+/// and must pick one. A no-op when nothing was retrieved (no empty step).
 ///
 /// The synthetic `call_id` is per-call so the UI pairs this result with its own
 /// call and never a neighbouring tool's. `doc`/`index` ride through as JSON `null`
