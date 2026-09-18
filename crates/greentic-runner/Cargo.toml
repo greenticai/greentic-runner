@@ -104,7 +104,13 @@ long-term-chronicle = ["greentic-runner-host/long-term-chronicle"]
 # GREENTIC_AW_REDIS_URL is unset, so a single-process runner runs dw.agent turns
 # without Redis. For local/sidecar use (e.g. the designer's loopback test-chat
 # runner sidecar) — NOT production deploys (use the Redis-backed stores). Off by default.
-desktop-agent-ephemeral = ["greentic-runner-host/desktop-agent-ephemeral"]
+# Forwarded to the desktop crate as well as the host: `greentic-runner-desktop`'s
+# `build_host_config` carries its OWN `#[cfg(feature = "desktop-agent-ephemeral")]`
+# no-Redis branch, so forwarding only to the host leaves that copy dead (#739).
+desktop-agent-ephemeral = [
+    "greentic-runner-host/desktop-agent-ephemeral",
+    "greentic-runner-desktop/desktop-agent-ephemeral",
+]
 # Skips extension signature verification when GREENTIC_EXT_ALLOW_UNSIGNED=1.
 # LOCAL DEV ONLY — never in a build that serves production traffic. Split out of
 # desktop-agent-ephemeral so the bypass has to be asked for by name.
