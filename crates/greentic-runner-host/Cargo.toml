@@ -32,7 +32,13 @@ agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
 state-disk = ["greentic-aw-runtime?/state-disk"]
 # Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…),
 # routing the worker LLM call through greentic-llm. Opt-in (pulls rig-core).
-greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-backend"]
+greentic-llm-backend = [
+    "agentic-worker",
+    # `agent_node` asks `greentic_llm::ProviderKind::requires_api_key()` whether
+    # an empty key is legitimate for the configured provider (#743).
+    "dep:greentic-llm",
+    "greentic-aw-runtime?/greentic-llm-backend",
+]
 # Adds the ephemeral (in-memory) agent builder for desktop/local runs.
 # Enables the test-mock types from greentic-aw-runtime; must NOT be enabled
 # in the server binary — the server always uses the Redis path.
