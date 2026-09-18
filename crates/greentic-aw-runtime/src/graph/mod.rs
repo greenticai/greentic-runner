@@ -4,6 +4,7 @@
 pub mod checkpoint;
 pub mod executor;
 pub mod http_provider;
+pub mod kv_checkpoint;
 pub mod model;
 pub mod redis_checkpoint;
 pub mod router;
@@ -22,6 +23,7 @@ pub use executor::{
     SupervisorResult, ToolCallRequest, ToolFn,
 };
 pub use http_provider::{CachingGraphProvider, HttpGraphProvider};
+pub use kv_checkpoint::KvCheckpointStore;
 pub use model::{
     Edge, Graph, GraphConfig, GraphError, Node, NodeKind, SUPPORTED_SCHEMA_VERSIONS,
     SupervisorRoute,

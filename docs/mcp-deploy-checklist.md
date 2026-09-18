@@ -168,8 +168,8 @@ exclude it.
 
 The `HostServer` router exposes exactly:
 `/operator/op/invoke`, `/healthz`, `/admin/packs/status`, `/admin/packs/reload`,
-`/sql/{conn}/schema`, `/sql/{conn}/query`
-(`crates/greentic-runner-host/src/runner/mod.rs:75-85`).
+`/admin/capabilities`, `/sql/{conn}/schema`, `/sql/{conn}/query`
+(`crates/greentic-runner-host/src/runner/mod.rs:138-159`, the `router()` function).
 
 `/operator/op/invoke` runs a single **operator/component** (CBOR in/out,
 `operator::invoke`), **not** a flow, and the MCP node is a *native flow node*, so

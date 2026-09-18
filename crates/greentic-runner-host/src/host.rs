@@ -36,12 +36,31 @@ pub struct TelemetryCfg {
     pub export: greentic_telemetry::export::ExportConfig,
 }
 
+/// An LLM port an embedding host can inject so in-process tool extensions that
+/// call `host.llm.complete()` (e.g. adaptive-cards `generate_card`) resolve the
+/// LLM via the host's own per-tenant, admin-backed path instead of the env-only
+/// fallback. Only meaningful with the agentic-worker runtime, so the type — and
+/// everything that threads it — is gated behind that feature.
+#[cfg(feature = "agentic-worker")]
+pub type ExtLlmPort = Arc<dyn greentic_ext_runtime::host_ports::LlmPort>;
+
+/// An MCP tool source an embedding host can inject so `mcp` flow nodes resolve
+/// their catalog through the host's own per-tenant admin path instead of the
+/// process-global `GREENTIC_AW_*` environment. See
+/// [`HostBuilder::with_mcp_source`].
+#[cfg(feature = "agentic-worker")]
+pub type McpSource = Arc<greentic_aw_runtime::McpToolSource>;
+
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
     telemetry: Option<TelemetryCfg>,
     wasi_policy: RunnerWasiPolicy,
     secrets: Option<DynSecretsManager>,
+    #[cfg(feature = "agentic-worker")]
+    ext_llm_port: Option<ExtLlmPort>,
+    #[cfg(feature = "agentic-worker")]
+    mcp_source: Option<McpSource>,
 }
 
 impl HostBuilder {
@@ -51,6 +70,10 @@ impl HostBuilder {
             telemetry: None,
             wasi_policy: RunnerWasiPolicy::default(),
             secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
         }
     }
 
@@ -71,6 +94,35 @@ impl HostBuilder {
 
     pub fn with_secrets_manager(mut self, manager: DynSecretsManager) -> Self {
         self.secrets = Some(manager);
+        self
+    }
+
+    /// Inject a host-provided LLM port for the in-process extension runtime.
+    ///
+    /// When `Some`, tool extensions that call `host.llm.complete()` resolve the
+    /// LLM through this port (the embedding host's per-tenant, admin-backed
+    /// path) instead of the env-only fallback. When `None`, the extension
+    /// runtime falls back to the env-keyed `EnvLlmPort` (standalone runners) —
+    /// so leaving this unset preserves the prior behaviour exactly.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_ext_llm_port(mut self, port: Option<ExtLlmPort>) -> Self {
+        self.ext_llm_port = port;
+        self
+    }
+
+    /// Inject a host-built MCP tool source for this host's flow engines.
+    ///
+    /// When `Some`, `mcp` flow nodes resolve their catalog through it. When
+    /// `None`, each engine keeps deriving one from the process-global
+    /// `GREENTIC_AW_*` environment — the standalone runner path, unchanged.
+    ///
+    /// A host that serves many tenants from one process must inject: the
+    /// environment names a single tenant, so it cannot express a per-tenant
+    /// catalog. Build one source per tenant, identified with
+    /// `greentic_aw_runtime::McpCallerIdentity`.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_mcp_source(mut self, source: Option<McpSource>) -> Self {
+        self.mcp_source = source;
         self
     }
 
@@ -102,6 +154,12 @@ impl HostBuilder {
             state_host,
             wasi_policy,
             secrets_manager: secrets,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: self.ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: self.mcp_source,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: self.telemetry,
         })
     }
@@ -111,6 +169,23 @@ impl Default for HostBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Result of [`RunnerHost::handle_activity_traced`]: the same outbound replies
+/// as [`RunnerHost::handle_activity`], plus this turn's per-step node outputs
+/// (keyed by each step's `operation`; for a `dw.agent` step that is the
+/// agent_id). Observability only.
+pub struct TurnTrace {
+    pub replies: Vec<Activity>,
+    pub node_outputs: HashMap<String, Value>,
+}
+
+/// Outcome of [`RunnerHost::build_prepared`]: either a fast2flow short-circuit
+/// (a pre-built response returned without entering the state machine) or a
+/// canonical ingress envelope the caller runs through `handle`/`handle_traced`.
+enum Prepared {
+    ShortCircuit(Vec<Activity>),
+    Run(Box<IngressEnvelope>),
 }
 
 /// Runtime host that manages tenant-bound packs and flow execution.
@@ -124,6 +199,19 @@ pub struct RunnerHost {
     state_host: Arc<dyn StateHost>,
     wasi_policy: Arc<RunnerWasiPolicy>,
     secrets_manager: DynSecretsManager,
+    #[cfg(feature = "agentic-worker")]
+    ext_llm_port: Option<ExtLlmPort>,
+    /// MCP tool source injected by an embedding host, or `None` to let each
+    /// flow engine derive one from `GREENTIC_AW_*` env (standalone runners).
+    #[cfg(feature = "agentic-worker")]
+    mcp_source: Option<McpSource>,
+    /// Session-id → active streaming observer, shared by every `dw.agent`
+    /// node handler this host builds (writer: the `POST /agent/chat/stream`
+    /// SSE handler via `ServerState`; reader: `RuntimeAgentNodeHandler::execute`).
+    /// Always present (an empty registry, not `None`) — no external
+    /// dependency gates it, unlike `ext_llm_port`.
+    #[cfg(feature = "agentic-worker")]
+    stream_observers: crate::http::agent_stream::StreamObserverRegistry,
     telemetry: Option<TelemetryCfg>,
 }
 
@@ -160,11 +248,61 @@ impl RunnerHost {
     }
 
     pub async fn handle_activity(&self, tenant: &str, activity: Activity) -> Result<Vec<Activity>> {
+        let (runtime, prepared) = self.prepare_turn(tenant, activity).await?;
+        match prepared {
+            Prepared::ShortCircuit(replies) => Ok(replies),
+            Prepared::Run(envelope) => {
+                let result = runtime.state_machine().handle(*envelope).await?;
+                Ok(normalize_replies(result, tenant))
+            }
+        }
+    }
+
+    /// Like [`Self::handle_activity`], but also returns this turn's per-step
+    /// node-output map (keyed by each step's `operation`; for a `dw.agent` step
+    /// that is the agent_id). Observability only — `replies` are byte-identical
+    /// to [`Self::handle_activity`] for the same input.
+    pub async fn handle_activity_traced(
+        &self,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<TurnTrace> {
+        let (runtime, prepared) = self.prepare_turn(tenant, activity).await?;
+        match prepared {
+            Prepared::ShortCircuit(replies) => Ok(TurnTrace {
+                replies,
+                node_outputs: HashMap::new(),
+            }),
+            Prepared::Run(envelope) => {
+                let (result, node_outputs) =
+                    runtime.state_machine().handle_traced(*envelope).await?;
+                let replies = normalize_replies(result, tenant);
+                let node_outputs = match node_outputs {
+                    Value::Object(map) => map.into_iter().collect(),
+                    _ => HashMap::new(),
+                };
+                Ok(TurnTrace {
+                    replies,
+                    node_outputs,
+                })
+            }
+        }
+    }
+
+    /// Shared setup for [`Self::handle_activity`] / [`Self::handle_activity_traced`]:
+    /// resolve the tenant runtime and build the canonical ingress envelope. The
+    /// single seam guarantees the traced and untraced paths cannot diverge.
+    async fn prepare_turn(
+        &self,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<(Arc<TenantRuntime>, Prepared)> {
         let runtime = self
             .active
             .load_pack(tenant)
             .with_context(|| format!("tenant {tenant} not loaded"))?;
-        self.dispatch_activity(&runtime, tenant, activity).await
+        let prepared = self.build_prepared(&runtime, tenant, activity).await?;
+        Ok((runtime, prepared))
     }
 
     /// Execute an activity against a specific deployment/bundle/revision runtime.
@@ -526,12 +664,17 @@ impl RunnerHost {
     /// ingress envelope, run the state machine, and normalize replies. Both the
     /// legacy and revision entry points funnel through here so flow resolution
     /// and reply shaping never drift between them.
-    async fn dispatch_activity(
+    /// Build the ingress envelope for a turn (fast2flow routing + welcome-flow
+    /// override), or short-circuit with a pre-built response (fast2flow
+    /// Respond/Deny). The caller runs the state machine on the `Run` arm,
+    /// so the traced (`handle_traced`) and untraced (`handle`) paths share this
+    /// single envelope-building seam and cannot diverge.
+    async fn build_prepared(
         &self,
         runtime: &TenantRuntime,
         tenant: &str,
         activity: Activity,
-    ) -> Result<Vec<Activity>> {
+    ) -> Result<Prepared> {
         let activity = apply_fast2flow_routing(runtime, tenant, activity)?;
 
         // Fast2Flow Respond/Deny returns a pre-built response activity
@@ -540,7 +683,7 @@ impl RunnerHost {
         // enter the state machine, otherwise a Deny still executes the
         // tenant entry flow with the denial payload.
         if activity.action() == Some("response") && activity.flow_id().is_none() {
-            return Ok(vec![activity]);
+            return Ok(Prepared::ShortCircuit(vec![activity]));
         }
 
         let (pack_id, flow_id) = resolve_flow_id(runtime, &activity)?;
@@ -626,8 +769,25 @@ impl RunnerHost {
             hint_flow_type,
         )?;
 
-        let result = runtime.state_machine().handle(envelope).await?;
-        Ok(normalize_replies(result, tenant))
+        Ok(Prepared::Run(Box::new(envelope)))
+    }
+
+    /// Execute an activity against a specific deployment/bundle/revision runtime.
+    /// Builds the envelope via [`Self::build_prepared`] then runs the state
+    /// machine (or returns the fast2flow short-circuit replies directly).
+    async fn dispatch_activity(
+        &self,
+        runtime: &TenantRuntime,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<Vec<Activity>> {
+        match self.build_prepared(runtime, tenant, activity).await? {
+            Prepared::ShortCircuit(replies) => Ok(replies),
+            Prepared::Run(envelope) => {
+                let result = runtime.state_machine().handle(*envelope).await?;
+                Ok(normalize_replies(result, tenant))
+            }
+        }
     }
 
     pub async fn tenant(&self, tenant: &str) -> Option<TenantHandle> {
@@ -666,6 +826,31 @@ impl RunnerHost {
 
     pub fn secrets_manager(&self) -> DynSecretsManager {
         Arc::clone(&self.secrets_manager)
+    }
+
+    /// The host-injected extension LLM port, if any. `None` for standalone
+    /// runners, in which case the extension runtime uses its env-keyed fallback.
+    #[cfg(feature = "agentic-worker")]
+    pub fn ext_llm_port(&self) -> Option<ExtLlmPort> {
+        self.ext_llm_port.clone()
+    }
+
+    /// The host-injected MCP tool source, if any. `None` for standalone
+    /// runners, in which case each flow engine derives one from
+    /// `GREENTIC_AW_*` env.
+    #[cfg(feature = "agentic-worker")]
+    pub fn mcp_source(&self) -> Option<McpSource> {
+        self.mcp_source.clone()
+    }
+
+    /// The shared session-keyed streaming-observer registry (R2). Cloning
+    /// this `Arc` and handing it to both `TenantRuntime` construction (so
+    /// `RuntimeAgentNodeHandler::execute` can read it) and `ServerState` (so
+    /// the `POST /agent/chat/stream` SSE handler can write to it) is what
+    /// keeps the two sides talking about the same registry.
+    #[cfg(feature = "agentic-worker")]
+    pub fn stream_observers(&self) -> crate::http::agent_stream::StreamObserverRegistry {
+        self.stream_observers.clone()
     }
 
     pub fn tenant_configs(&self) -> HashMap<String, Arc<HostConfig>> {
@@ -721,6 +906,12 @@ impl RunnerHost {
             state_host,
             wasi_policy: Arc::new(RunnerWasiPolicy::default()),
             secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: None,
         })
     }
@@ -754,6 +945,12 @@ impl RunnerHost {
             self.state_store(),
             self.state_host(),
             self.secrets_manager(),
+            #[cfg(feature = "agentic-worker")]
+            self.ext_llm_port(),
+            #[cfg(feature = "agentic-worker")]
+            self.mcp_source(),
+            #[cfg(feature = "agentic-worker")]
+            Some(self.stream_observers()),
         )
         .await?;
         let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
@@ -1444,6 +1641,12 @@ mod identify_endpoints_tests {
         let session_store = new_session_store();
         let state_store = new_state_store();
         RunnerHost {
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: Arc::new(dashmap::DashMap::new()),
             configs: HashMap::new(),
             active: Arc::new(ActivePacks::new()),
             health: Arc::new(HealthState::new()),

@@ -110,6 +110,8 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
         memory: None,
         knowledge: None,
         guardrails: vec![],
+        conversational: false,
+        opening_message: None,
     }
 }
 
@@ -161,7 +163,7 @@ fn build_runtime(
     let cp = Arc::new(cp);
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger = Arc::new(NoopToolLedger);
-    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
     let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None)
         .with_component_source(components);
     (rt, tc)
@@ -185,11 +187,22 @@ async fn component_tool_offered_called_and_result_in_trail() {
     let allowed = vec![ToolRef {
         extension_id: "component:greentic.refund".into(),
         tool_name: "issue_refund".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
 
@@ -235,11 +248,22 @@ async fn empty_component_source_offers_no_tool() {
     let allowed = vec![ToolRef {
         extension_id: "component:greentic.refund".into(),
         tool_name: "issue_refund".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
 

@@ -1,6 +1,6 @@
 //! Test helpers shared across unit and integration test submodules.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, unsafe_code)]
 
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
@@ -8,6 +8,7 @@ use std::io::Write as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+pub(super) mod cert_verify;
 pub(super) mod pull;
 pub(super) mod unit;
 

@@ -11,10 +11,30 @@ use std::time::Duration;
 /// Composer extensions emit short names; runner-host derives full IDs
 /// (extension_id + tool_name) via `ExtensionRuntime::list_tools` before
 /// constructing the `AgentConfig` (see runner-host Phase 4).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` deliberately omitted: `input_schema` holds `serde_json::Value`, which is not `Eq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolRef {
     pub extension_id: String,
     pub tool_name: String,
+    /// Author-defined LLM description. Honoured by the `flow:` and `mcp:` tool
+    /// branches; ignored by the `component:`/`sorla:` branches and by plain
+    /// extension refs, whose runtimes are always locally introspectable.
+    ///
+    /// The two honouring branches use OPPOSITE precedence, deliberately. A
+    /// `flow:` ref prefers this author contract over the catalog. An `mcp:` ref
+    /// prefers the catalog and falls back to this, because the catalog entry was
+    /// probed from the live MCP server this run while this field is a snapshot
+    /// taken when the tool was bound — see `tools::list_tools_for_llm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Author-defined JSON-schema for the tool's input. Same branches and same
+    /// precedence rules as [`ToolRef::description`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+    /// Author-defined LLM usage note, appended to the tool's resolved
+    /// description at request time. `None`/blank adds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +104,23 @@ impl Default for KnowledgeSettings {
     }
 }
 
+/// What to do when a guardrail returns an explicit `deny` verdict.
+///
+/// Orthogonal to [`crate::guardrail::ResolvedGuardrail::mandatory`], which decides
+/// fail-open vs fail-closed when the evaluator *errors*. This decides what an
+/// explicit deny *means*. The guardrail component never sees this value — a
+/// verdict is a detection result; acting on it is the runner's policy decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardrailMode {
+    /// Deny blocks the turn. The historical (and default) behaviour: a payload
+    /// that predates this field means Enforce.
+    #[default]
+    Enforce,
+    /// Deny is recorded but does NOT block; the content passes through unchanged.
+    Monitor,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GuardrailRef {
     pub cap_id: String,
@@ -91,6 +128,8 @@ pub struct GuardrailRef {
     pub offer_id: Option<String>,
     #[serde(default)]
     pub config: serde_json::Value,
+    #[serde(default)]
+    pub mode: GuardrailMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,6 +146,19 @@ pub struct AgentConfig {
     pub memory: Option<MemorySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<KnowledgeSettings>,
+    /// Opt-in: when true this agent is a multi-turn conversation segment and is
+    /// offered the host built-in `end_conversation` tool (SP1). Threaded from the
+    /// flow node's `conversational` flag by SP2/SP3. Default false = today's
+    /// one-shot behaviour.
+    #[serde(default)]
+    pub conversational: bool,
+    /// Optional author-configured greeting. When set, the FIRST turn that
+    /// arrives with no user text (e.g. the flow entered the agent via a
+    /// button/card, not a typed message) replies with this verbatim instead of
+    /// making an LLM call — an instant, deterministic welcome. `None` keeps the
+    /// prior behaviour (the model fabricates a greeting from the system prompt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,6 +278,89 @@ mod limits_serde_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tool_ref_author_contract_tests {
+    use super::*;
+
+    #[test]
+    fn tool_ref_deserializes_without_author_contract_fields() {
+        // Old payload: no description / input_schema keys.
+        let json = r#"{"extension_id":"flow:lookup","tool_name":"look_up"}"#;
+        let t: ToolRef = serde_json::from_str(json).expect("old ToolRef must still deserialize");
+        assert_eq!(t.extension_id, "flow:lookup");
+        assert_eq!(t.tool_name, "look_up");
+        assert!(t.description.is_none());
+        assert!(t.input_schema.is_none());
+    }
+
+    #[test]
+    fn tool_ref_omits_none_author_contract_fields_on_serialize() {
+        let t = ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(
+            !json.contains("description"),
+            "None description must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("input_schema"),
+            "None input_schema must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn tool_ref_round_trips_with_author_contract() {
+        let t = ToolRef {
+            extension_id: "flow:refund".into(),
+            tool_name: "refund_lookup".into(),
+            description: Some("Look up a refund".into()),
+            input_schema: Some(
+                serde_json::json!({"type":"object","properties":{"order_id":{"type":"string"}}}),
+            ),
+            usage_note: None,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: ToolRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+    }
+
+    #[test]
+    fn tool_ref_carries_and_roundtrips_usage_note() {
+        let t = ToolRef {
+            extension_id: "greentic.hubspot".into(),
+            tool_name: "hubspot_deals".into(),
+            description: None,
+            input_schema: None,
+            usage_note: Some("Treat every deal as an order.".into()),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"usage_note\":\"Treat every deal as an order.\""));
+        let back: ToolRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.usage_note.as_deref(),
+            Some("Treat every deal as an order.")
+        );
+    }
+
+    #[test]
+    fn tool_ref_omits_usage_note_when_none() {
+        let t = ToolRef {
+            extension_id: "e".into(),
+            tool_name: "t".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        };
+        assert!(!serde_json::to_string(&t).unwrap().contains("usage_note"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -257,6 +392,9 @@ mod tests {
             tools: vec![ToolRef {
                 extension_id: "http".into(),
                 tool_name: "fetch".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             }],
             guardrails: vec![],
             llm: LlmProviderRef {
@@ -267,6 +405,8 @@ mod tests {
             limits: AgentLimits::default(),
             memory: None,
             knowledge: None,
+            conversational: false,
+            opening_message: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let round: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -289,15 +429,52 @@ mod tests {
     }
 
     #[test]
+    fn conversational_defaults_false_when_absent() {
+        let json = r#"{
+            "agent_id": "a",
+            "system_prompt": "s",
+            "tools": [],
+            "llm": { "provider": "openai", "model": "m" }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.conversational);
+    }
+
+    #[test]
     fn guardrail_ref_round_trips() {
         let r = GuardrailRef {
             cap_id: "greentic.cap.guardrail.v1".to_string(),
             offer_id: Some("pii".to_string()),
             config: serde_json::json!({ "mask": ["email"] }),
+            mode: GuardrailMode::Enforce,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: GuardrailRef = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn guardrail_ref_without_mode_defaults_to_enforce() {
+        // Every policy payload in the wild today omits `mode`. It must mean Enforce.
+        let r: GuardrailRef =
+            serde_json::from_str(r#"{"cap_id":"greentic:guardrail/pii"}"#).unwrap();
+        assert_eq!(r.mode, GuardrailMode::Enforce);
+    }
+
+    #[test]
+    fn guardrail_ref_parses_monitor_mode() {
+        let r: GuardrailRef =
+            serde_json::from_str(r#"{"cap_id":"greentic:guardrail/pii","mode":"monitor"}"#)
+                .unwrap();
+        assert_eq!(r.mode, GuardrailMode::Monitor);
+    }
+
+    #[test]
+    fn guardrail_mode_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&GuardrailMode::Monitor).unwrap(),
+            r#""monitor""#
+        );
     }
 
     #[test]

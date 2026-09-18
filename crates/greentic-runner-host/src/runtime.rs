@@ -350,6 +350,11 @@ impl TenantRuntime {
         state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
     ) -> Result<Arc<Self>> {
         let pack = Self::load_pack_runtime(
             pack_path,
@@ -374,6 +379,12 @@ impl TenantRuntime {
             state_store,
             state_host,
             secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers,
         )
         .await
     }
@@ -490,6 +501,17 @@ impl TenantRuntime {
             state_store,
             state_host,
             secrets_manager,
+            // No host-injected ports on the revision-keyed path: it is
+            // constructed from a pinned pack list rather than from a
+            // `RunnerHost`, so there is none to read them from. Matches what
+            // `ext_llm_port` already does here — an engine built this way
+            // falls back to env for both.
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
             rollout,
         )
         .await
@@ -574,6 +596,11 @@ impl TenantRuntime {
         state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
     ) -> Result<Arc<Self>> {
         Self::from_packs_with_rollout(
             config,
@@ -584,6 +611,12 @@ impl TenantRuntime {
             state_store,
             state_host,
             secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers,
             RolloutIds::default(),
         )
         .await
@@ -603,6 +636,11 @@ impl TenantRuntime {
         _state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
         rollout: RolloutIds,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
@@ -641,11 +679,26 @@ impl TenantRuntime {
         // to a non-unique in-pack agent id.
         #[cfg(feature = "agentic-worker")]
         let agent_project_id = rollout.bundle_id.clone();
-        #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
-        let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
+        let engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
             .await
             .context("failed to prime flow engine")?
             .with_rollout_ids(rollout);
+        // A host-injected MCP source replaces the one `FlowEngine::new` derives
+        // from env; `None` leaves that env-derived source alone, so a
+        // standalone runner is unaffected.
+        #[cfg(feature = "agentic-worker")]
+        let engine = engine.with_mcp_source(mcp_source);
+        // An `mcp` flow node resolves its credential through the manager this
+        // runtime already holds — dev-store in a Cloud Run or Kubernetes
+        // deployment, which is the only backend there that can read a
+        // `secrets://` URI. Without this the node built its own manager from
+        // `SECRETS_BACKEND`, which no remote deployment sets, and every lookup
+        // missed. An explicit `SECRETS_BACKEND` still wins; see
+        // `mcp_node::aw::choose_mcp_secrets`.
+        #[cfg(feature = "agentic-worker")]
+        let engine = engine.with_mcp_secrets(Some(Arc::clone(&secrets_manager)));
+        #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
+        let mut engine = engine;
 
         // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
         // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
@@ -739,7 +792,16 @@ impl TenantRuntime {
             // the `knowledge-chronicle` feature or when no pack carries a corpus.
             #[cfg(feature = "knowledge-chronicle")]
             {
-                let corpus = crate::runner::knowledge_corpus::collect(&pack_runtimes);
+                // The expectation comes from the same config `ingest_corpus` will
+                // build its embedder from, so precomputed vectors are validated
+                // against the embedder that actually runs.
+                let expectation = crate::runner::knowledge_mount::embedding_expectation();
+                let corpus = crate::runner::knowledge_corpus::collect(
+                    &pack_runtimes,
+                    expectation.as_ref().map(|(model, dim)| {
+                        crate::runner::knowledge_corpus::EmbeddingExpectation { model, dim: *dim }
+                    }),
+                );
                 crate::runner::knowledge_mount::ingest_corpus(&config.tenant_ctx(), corpus).await;
             }
 
@@ -761,13 +823,26 @@ impl TenantRuntime {
             let agent_audit_sink = audit_nats_client
                 .clone()
                 .map(crate::trace::audit_sink::AuditSink::new);
+            // `merged_agents` is MOVED into `build_agent_node_handler` below
+            // (redis/ephemeral branches); clone for the graph handler first so
+            // it can resolve a graph node's `agent_ref` (SP1) against the same
+            // process-level merged config map.
+            let graph_agents = merged_agents.clone();
+            // Also needed after `merged_agents` is moved into
+            // `build_agent_node_handler`/`_ephemeral` below, to resolve the
+            // in-process operala.call LLM key the same way (see the
+            // `desktop-agent-ephemeral` block after the DwAgent wiring).
+            #[cfg(feature = "desktop-agent-ephemeral")]
+            let operala_agents = merged_agents.clone();
             let agent_handler = if redis_set {
                 crate::runner::agent_node::build_agent_node_handler(
                     merged_agents,
                     config.tenant.clone(),
                     Arc::clone(&secrets_manager),
+                    ext_llm_port.clone(),
                     pack_runtimes.clone(),
                     agent_audit_sink.clone(),
+                    stream_observers.clone(),
                     agent_project_id.clone(),
                 )
                 .await
@@ -778,8 +853,10 @@ impl TenantRuntime {
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
+                        ext_llm_port.clone(),
                         pack_runtimes.clone(),
                         agent_audit_sink.clone(),
+                        stream_observers.clone(),
                         agent_project_id.clone(),
                     )
                     .await
@@ -790,8 +867,10 @@ impl TenantRuntime {
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
+                        ext_llm_port.clone(),
                         pack_runtimes.clone(),
                         agent_audit_sink.clone(),
+                        stream_observers.clone(),
                         agent_project_id.clone(),
                     )
                     .await
@@ -800,6 +879,93 @@ impl TenantRuntime {
             if let Some(handler) = agent_handler {
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
+            }
+
+            // In-process deep-worker runtime for `operala.call` nodes
+            // (desktop-agent-ephemeral only, e.g. the designer's offline
+            // Test-chat sidecar — same feature the ephemeral DwAgent handler
+            // above uses). Reuses the exact key-resolution policy the
+            // in-process dw.agent LLM backend uses (env key wins; otherwise
+            // the first agent's `llm.credential_ref` resolved from the
+            // per-tenant secrets store), then builds a
+            // `greentic_llm::RigBackend` — the same OpenAI-compatible,
+            // multi-provider client `GreenticLlmBackend` uses for dw.agent —
+            // and wraps it in `DeepWorkerInvoker`. No handler is wired (and
+            // `operala.call` falls back to the NATS `RemoteDispatchHandler`,
+            // failing without it) when no LLM key resolves or the provider
+            // fails to build.
+            #[cfg(feature = "desktop-agent-ephemeral")]
+            {
+                let env_key = std::env::var("GREENTIC_LLM_API_KEY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        std::env::var("OPENAI_API_KEY")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                    });
+                let api_key = match env_key {
+                    Some(key) => Some(key),
+                    None => {
+                        crate::runner::agent_node::resolve_in_process_llm_key(
+                            &secrets_manager,
+                            &config.tenant,
+                            &operala_agents,
+                        )
+                        .await
+                    }
+                };
+                match api_key {
+                    Some(api_key) => {
+                        // Provider/model are resolved PER WORKER from each
+                        // `operala.call` node's `input.llm` binding (stamped by
+                        // greentic-dw-authoring for authored deep-worker packs);
+                        // the handler builds the LLM per dispatch. For a node
+                        // that carries NO `input.llm` — e.g. an operala.call
+                        // synthesized at runtime for a dw.agent's chronicle
+                        // knowledge/memory retrieval — fall back to the agent's
+                        // OWN configured provider/model (the same `operala_agents`
+                        // the api_key is resolved from), which is NOT a guess: it
+                        // is this worker's declared LLM, consistent with its key.
+                        // The process-level env still OVERRIDES both. Only when
+                        // neither the node, the agent config, nor the env carries
+                        // a provider/model does the dispatch error explicitly.
+                        let agent_llm =
+                            operala_agents.values().map(|agent| &agent.llm).find(|llm| {
+                                !llm.provider.trim().is_empty() && !llm.model.trim().is_empty()
+                            });
+                        let fallback_provider = std::env::var("GREENTIC_LLM_PROVIDER")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| agent_llm.map(|llm| llm.provider.clone()));
+                        let fallback_model = std::env::var("GREENTIC_LLM_MODEL")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| agent_llm.map(|llm| llm.model.clone()));
+                        let base_url = std::env::var("GREENTIC_LLM_BASE_URL")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty());
+                        engine.set_operala_node_handler(Arc::new(
+                            crate::runner::operala_node::RuntimeOperalaNodeHandler::new(
+                                api_key,
+                                base_url,
+                                fallback_provider,
+                                fallback_model,
+                            ),
+                        ));
+                        tracing::info!(
+                            "operala.call in-process deep-worker runtime wired into FlowEngine \
+                             (provider/model resolved per-worker from node input.llm)"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            "no LLM API key resolved (env or store) for operala.call \
+                             in-process wiring; operala.call nodes will fall back to NATS \
+                             (and fail without it)"
+                        );
+                    }
+                }
             }
 
             // Collect agent-graph sidecars from each pack. Unlike agents (a
@@ -837,6 +1003,8 @@ impl TenantRuntime {
             if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(
                 graphs,
                 agent_audit_sink.clone(),
+                Arc::new(pack_runtimes.clone()),
+                graph_agents,
             )
             .await
             {

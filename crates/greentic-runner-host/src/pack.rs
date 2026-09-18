@@ -83,11 +83,11 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::p2::LinkOptions;
+use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker};
 use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
-use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
+use crate::runner::engine::{FlowContext, FlowEngine, FlowExecution, FlowStatus};
 use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow, is_native_op_key};
 use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, MockLayer};
 #[cfg(feature = "fault-injection")]
@@ -127,10 +127,6 @@ pub struct PackRuntime {
     session_store: Option<DynSessionStore>,
     state_store: Option<DynStateStore>,
     wasi_policy: Arc<RunnerWasiPolicy>,
-    /// Lazily-parsed `assets/mcp-routes.json` sidecar — see
-    /// [`PackRuntime::mcp_routes`]. Read on first use rather than at load so a
-    /// pack with no MCP nodes never touches the archive for it.
-    mcp_routes: std::sync::OnceLock<Option<crate::runner::mcp_pack_routes::PackMcpRoutes>>,
     assets_tempdir: Option<TempDir>,
     provider_registry: RwLock<Option<ProviderRegistry>>,
     /// Per-revision lazy cache of `describe-identify-instance` results,
@@ -157,6 +153,10 @@ pub struct PackRuntime {
     ///
     /// [`RuntimeRefResolver`]: crate::runtime_refs::RuntimeRefResolver
     runtime_refs: Option<RuntimeRefsInjection>,
+    /// Lazily-parsed `assets/mcp-routes.json` sidecar — see
+    /// [`PackRuntime::mcp_routes`]. Read on first use rather than at load so a
+    /// pack with no MCP nodes never touches the archive for it.
+    mcp_routes: std::sync::OnceLock<Option<crate::runner::mcp_pack_routes::PackMcpRoutes>>,
 }
 
 struct PackComponent {
@@ -1450,6 +1450,7 @@ pub struct ComponentState {
     wasi_ctx: WasiCtx,
     wasi_tls_ctx: WasiTlsCtx,
     wasi_http_ctx: WasiHttpCtx,
+    http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks,
     resource_table: ResourceTable,
 }
 
@@ -1483,6 +1484,7 @@ impl ComponentState {
             wasi_ctx,
             wasi_tls_ctx: WasiTlsCtxBuilder::new().build(),
             wasi_http_ctx: WasiHttpCtx::new(),
+            http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks::from_env(),
             resource_table: ResourceTable::new(),
         })
     }
@@ -1635,7 +1637,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    wasmtime_wasi_tls::p2::add_to_linker(linker, &opts)?;
+    add_wasi_tls_to_linker(linker, &opts)?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -1807,7 +1809,7 @@ impl WasiHttpView for ComponentState {
         WasiHttpCtxView {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
-            hooks: Default::default(),
+            hooks: &mut self.http_timeout_hooks,
         }
     }
 }
@@ -2165,7 +2167,6 @@ impl PackRuntime {
             session_store,
             state_store,
             wasi_policy,
-            mcp_routes: std::sync::OnceLock::new(),
             assets_tempdir,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
@@ -2174,6 +2175,7 @@ impl PackRuntime {
             cache,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
         })
     }
 
@@ -2227,12 +2229,45 @@ impl PackRuntime {
         Ok(Vec::new())
     }
 
-    #[allow(dead_code)]
-    pub async fn run_flow(
+    /// Synchronous accessor for the cached flow descriptors. Reads the same
+    /// in-memory fields as `list_flows` but without `.await`, so it is safe to
+    /// call from a synchronous context (e.g. `FlowInvoker::list_flows`).
+    /// This avoids a `block_on`-in-async-context panic on the runner thread.
+    ///
+    /// Its only caller is `runner::flow_invoker::PackRuntimeFlowInvoker`,
+    /// which is entirely `#![cfg(feature = "agentic-worker")]`; gate this the
+    /// same way so it isn't flagged dead when that feature is off.
+    #[cfg(feature = "agentic-worker")]
+    pub(crate) fn flow_descriptors(&self) -> Vec<FlowDescriptor> {
+        if let Some(cache) = &self.flows {
+            return cache.descriptors.clone();
+        }
+        if let Some(manifest) = &self.manifest {
+            return manifest
+                .flows
+                .iter()
+                .map(|flow| FlowDescriptor {
+                    id: flow.id.as_str().to_string(),
+                    flow_type: flow_kind_to_str(flow.kind).to_string(),
+                    pack_id: manifest.pack_id.as_str().to_string(),
+                    profile: manifest.pack_id.as_str().to_string(),
+                    version: manifest.version.to_string(),
+                    description: None,
+                    entry: tags_indicate_entry(flow.tags.iter().map(String::as_str)),
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Shared load + engine + execute body for `run_flow` and
+    /// `run_flow_for_tool`. Returns the raw `FlowExecution` so each caller can
+    /// match on `FlowStatus` according to its own contract.
+    async fn execute_flow_inner(
         &self,
         flow_id: &str,
         input: serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<FlowExecution> {
         let pack = Arc::new(
             PackRuntime::load(
                 &self.path,
@@ -2277,7 +2312,16 @@ impl PackRuntime {
             caller: caller_block.as_ref(),
         };
 
-        let execution = engine.execute(ctx, input).await?;
+        engine.execute(ctx, input).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn run_flow(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let execution = self.execute_flow_inner(flow_id, input).await?;
         match execution.status {
             FlowStatus::Completed => Ok(execution.output),
             FlowStatus::Waiting(wait) => Ok(serde_json::json!({
@@ -2286,6 +2330,30 @@ impl PackRuntime {
                 "resume": wait.snapshot,
                 "response": execution.output,
             })),
+        }
+    }
+
+    /// Non-interactive flow execution for use as an agent tool. Identical to
+    /// `run_flow` in its load + execute path, but `FlowStatus::Waiting` is an
+    /// error because agent tools must be non-interactive (they cannot pause and
+    /// resume mid-LLM-turn).
+    ///
+    /// Returns `Ok(output)` on `Completed`, `Err(message)` on any failure.
+    pub async fn run_flow_for_tool(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let execution = self
+            .execute_flow_inner(flow_id, input)
+            .await
+            .map_err(|e| e.to_string())?;
+        match execution.status {
+            FlowStatus::Completed => Ok(execution.output),
+            FlowStatus::Waiting(wait) => Err(format!(
+                "flow '{flow_id}' tried to pause ({:?}); agent tools must be non-interactive",
+                wait.reason
+            )),
         }
     }
 
@@ -3102,6 +3170,103 @@ impl PackRuntime {
         self.read_pack_file("agent-graph.json")
     }
 
+    /// Archive-relative entry names of the design-extension `.gtxpack` archives
+    /// this pack carries, sorted and deduplicated.
+    ///
+    /// Reads the materialized pack directory and the `.gtpack` archive, the
+    /// same two sources — in the same order — as [`PackRuntime::read_pack_file`],
+    /// so an entry this returns is one that call can then read.
+    ///
+    /// The `.gtxpack` suffix, not membership of `extensions/`, is what makes an
+    /// entry an extension: that directory already carries the wizard's
+    /// `extensions/*.json` manifest sidecars, which predate this feature and are
+    /// not extensions. The rule lives in
+    /// [`crate::runner::pack_extensions::is_extension_archive_entry`], beside
+    /// the contract it comes from.
+    ///
+    /// An empty result is the normal reading of a pack built before the feature,
+    /// and of any pack whose worker binds no extension tools.
+    #[cfg(feature = "agentic-worker")]
+    pub fn extension_archive_entries(&self) -> Vec<String> {
+        use crate::runner::pack_extensions::{EXTENSIONS_PREFIX, is_extension_archive_entry};
+
+        let mut names = std::collections::BTreeSet::new();
+
+        if self.path.is_dir() {
+            let dir = self.path.join(EXTENSIONS_PREFIX.trim_end_matches('/'));
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if !entry
+                            .file_type()
+                            .map(|kind| kind.is_file())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                            continue;
+                        };
+                        let candidate = format!("{EXTENSIONS_PREFIX}{file_name}");
+                        if is_extension_archive_entry(&candidate) {
+                            names.insert(candidate);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "failed to list the pack's extensions directory"
+                ),
+            }
+        }
+
+        if let Some(archive_path) = self
+            .archive_path
+            .as_ref()
+            .or_else(|| path_is_gtpack(&self.path).then_some(&self.path))
+        {
+            match File::open(archive_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|file| ZipArchive::new(file).map_err(anyhow::Error::from))
+            {
+                Ok(archive) => names.extend(
+                    archive
+                        .file_names()
+                        .filter(|name| is_extension_archive_entry(name))
+                        .map(str::to_string),
+                ),
+                Err(error) => tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to read the pack archive while listing extensions"
+                ),
+            }
+        }
+
+        names.into_iter().collect()
+    }
+
+    /// MCP route material from the optional `assets/mcp-routes.json` sidecar.
+    ///
+    /// `None` when the pack carries none — which is how a pack built before
+    /// the feature reads, and means "fall back to the tenant's admin catalog"
+    /// rather than "this pack has no MCP servers".
+    ///
+    /// Parsed at most once per `PackRuntime` and memoized: a hot reload
+    /// allocates a fresh `PackRuntime`, so there is nothing to invalidate.
+    pub fn mcp_routes(&self) -> Option<&crate::runner::mcp_pack_routes::PackMcpRoutes> {
+        self.mcp_routes
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::mcp_pack_routes::MCP_ROUTES_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::mcp_pack_routes::PackMcpRoutes::from_sidecar_bytes(&bytes)
+                    })
+            })
+            .as_ref()
+    }
+
     /// Raw agent-config blobs from the optional `dw-agents.json` sidecar.
     ///
     /// Designer-built packs (old greentic-pack, which cannot populate
@@ -3130,37 +3295,6 @@ impl PackRuntime {
     /// a fallback. Returns `None` when the file is absent (or on a read error,
     /// which is logged). Used for sidecar files (`agent-graph.json`) and bundled
     /// assets (`knowledge_corpus.json`, `assets/knowledge/*.txt`).
-    /// The secrets manager this pack was built with — the HOST's, not one
-    /// derived from the environment.
-    ///
-    /// The MCP flow node needs it to resolve a pack-carried route's credential.
-    /// Deriving its own from `SECRETS_BACKEND` cannot work: that only knows
-    /// `env` and `broker`, while an operator booting a bundle runs on
-    /// greentic-start's dev store, which the runner has no variant for. So the
-    /// only manager that can read the credential is the one the host already
-    /// handed us.
-    pub fn secrets(&self) -> &crate::secrets::DynSecretsManager {
-        &self.secrets
-    }
-
-    /// The pack's own MCP route sidecar, if it carries one.
-    ///
-    /// A pack's `mcp` node names only an opaque `server` id; resolving it
-    /// otherwise needs the tenant's admin catalog, which a deployed runner has
-    /// no credentials for. Parsed once and cached; every failure path yields
-    /// `None` so the caller falls back to the admin catalog rather than taking
-    /// the whole pack down.
-    pub fn mcp_routes(&self) -> Option<&crate::runner::mcp_pack_routes::PackMcpRoutes> {
-        self.mcp_routes
-            .get_or_init(|| {
-                self.read_pack_file(crate::runner::mcp_pack_routes::MCP_ROUTES_ENTRY)
-                    .and_then(|bytes| {
-                        crate::runner::mcp_pack_routes::PackMcpRoutes::from_sidecar_bytes(&bytes)
-                    })
-            })
-            .as_ref()
-    }
-
     pub fn read_pack_file(&self, name: &str) -> Option<Vec<u8>> {
         // Materialized pack directory (root holds manifest.cbor + sidecars/assets).
         if self.path.is_dir() {
@@ -3467,7 +3601,6 @@ impl PackRuntime {
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(RunnerWasiPolicy::new()),
-            mcp_routes: std::sync::OnceLock::new(),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
@@ -3476,6 +3609,7 @@ impl PackRuntime {
             cache,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
         })
     }
 }
@@ -3995,6 +4129,9 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 err_map: None,
                 routing,
                 telemetry,
+                // Pack-manifest component nodes are not conversational chat
+                // segments; the SP3 flag flows via the flow-doc parse path
+                // (greentic_flow -> types::Node.conversational).
                 conversational: false,
             },
         );
@@ -5431,7 +5568,7 @@ async fn load_components_from_archive(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use greentic_flow::model::{FlowDoc, NodeDoc};
     use indexmap::IndexMap;
@@ -5510,7 +5647,15 @@ mod tests {
     /// resolves files from that directory via `self.path.is_dir()`.
     /// Mirrors the `for_component_test` constructor but sets `path` to the
     /// caller-supplied directory instead of `PathBuf::new()`.
-    fn pack_runtime_for_dir(dir: &std::path::Path) -> PackRuntime {
+    ///
+    /// `pub(crate)` so sibling modules whose subject is what a pack CARRIES —
+    /// `runner::pack_extensions` — can drive the real reader rather than a
+    /// stand-in that could disagree with it.
+    ///
+    /// Passing a path to a `.gtpack` file rather than a directory exercises the
+    /// archive branch of the same readers: `self.path.is_dir()` is false, and
+    /// `path_is_gtpack(&self.path)` then supplies the archive.
+    pub(crate) fn pack_runtime_for_dir(dir: &std::path::Path) -> PackRuntime {
         let engine = Engine::default();
         let engine_profile =
             EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
@@ -5560,7 +5705,6 @@ mod tests {
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
-            mcp_routes: std::sync::OnceLock::new(),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
@@ -5568,6 +5712,7 @@ mod tests {
             oauth_config: None,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
             cache,
         }
     }
@@ -5588,6 +5733,75 @@ mod tests {
         let blobs = pack.dw_agents_sidecar_blobs();
         assert!(blobs.contains_key("greeter"));
         assert_eq!(blobs["greeter"]["agent_id"], "greeter");
+    }
+
+    /// The contract's rule 2, exercised against a real pack directory: the
+    /// `.gtxpack` suffix decides, not membership of `extensions/`.
+    ///
+    /// The `.json` sidecar here is not hypothetical — the pack wizard writes
+    /// `extensions/*.json` manifest sidecars and they are walked into the
+    /// archive verbatim, so treating that directory as homogeneous would hand
+    /// the extension loader a file that has never been an extension.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_lists_only_gtxpack_files_from_a_pack_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(extensions.join("nested")).unwrap();
+        std::fs::write(extensions.join("acme.tool.gtxpack"), b"archive").unwrap();
+        std::fs::write(extensions.join("wizard-answers.json"), b"{}").unwrap();
+        std::fs::write(extensions.join("nested/deep.gtxpack"), b"archive").unwrap();
+        std::fs::write(dir.path().join("manifest.cbor"), b"").unwrap();
+
+        let pack = pack_runtime_for_dir(dir.path());
+        assert_eq!(
+            pack.extension_archive_entries(),
+            vec!["extensions/acme.tool.gtxpack".to_string()]
+        );
+        assert_eq!(
+            pack.read_pack_file("extensions/acme.tool.gtxpack")
+                .as_deref(),
+            Some(b"archive".as_slice()),
+            "every listed entry must be readable by the same reader"
+        );
+    }
+
+    /// The same rule over a real `.gtpack` ZIP, which is the shape a deployed
+    /// runner actually sees — a container never has the pack materialised.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_lists_only_gtxpack_files_from_a_gtpack_archive() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("worker.gtpack");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            ("extensions/acme.tool.gtxpack", b"archive".as_slice()),
+            ("extensions/wizard-answers.json", b"{}".as_slice()),
+            ("extensions/design/kinded.gtxpack", b"archive".as_slice()),
+            ("assets/mcp-routes.json", b"{}".as_slice()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let pack = pack_runtime_for_dir(&archive_path);
+        assert_eq!(
+            pack.extension_archive_entries(),
+            vec!["extensions/acme.tool.gtxpack".to_string()]
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_is_empty_for_a_pack_built_before_the_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.extension_archive_entries().is_empty());
     }
 
     #[test]

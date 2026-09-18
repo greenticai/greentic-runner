@@ -15,6 +15,17 @@ pub struct AdapterCall {
 #[async_trait]
 pub trait Adapter: Send + Sync {
     async fn call(&self, call: &AdapterCall) -> GResult<Value>;
+
+    /// Like [`Adapter::call`], but also returns the flow's per-node output map
+    /// (`node_id → node_output_view(payload)`) when the adapter drives a flow.
+    /// Default: delegate to `call` and contribute no node map. Observability
+    /// only — the returned `Value` is identical to `call`.
+    async fn call_traced(
+        &self,
+        call: &AdapterCall,
+    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
+        Ok((self.call(call).await?, serde_json::Map::new()))
+    }
 }
 
 #[derive(Default, Clone)]

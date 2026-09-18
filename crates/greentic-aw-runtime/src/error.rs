@@ -138,9 +138,11 @@ pub enum TerminationReason {
     Timeout,
     Error,
     TokenBudgetExceeded,
+    ConversationEnded,
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::config::{AgentConfig, AgentLimits, LlmProviderRef};
@@ -162,6 +164,8 @@ mod tests {
             },
             memory: None,
             knowledge: None,
+            conversational: false,
+            opening_message: None,
         }
     }
 
@@ -198,5 +202,13 @@ mod tests {
             budget,
             AgentError::Internal("x".into()).user_facing_message(&cfg)
         );
+    }
+
+    #[test]
+    fn conversation_ended_serde_snake_case() {
+        let json = serde_json::to_string(&TerminationReason::ConversationEnded).unwrap();
+        assert_eq!(json, "\"conversation_ended\"");
+        let back: TerminationReason = serde_json::from_str("\"conversation_ended\"").unwrap();
+        assert_eq!(back, TerminationReason::ConversationEnded);
     }
 }

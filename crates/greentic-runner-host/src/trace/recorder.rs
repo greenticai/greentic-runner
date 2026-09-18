@@ -22,6 +22,22 @@ const DEFAULT_TRACE_FILE: &str = "trace.json";
 const DEFAULT_BUFFER_SIZE: usize = 20;
 const HASH_ALGORITHM: &str = "blake3";
 
+/// Format an error together with its full `source()` chain into one line,
+/// mirroring anyhow's `{:#}` formatting. A bare `err.to_string()` only yields
+/// the outermost context (e.g. "in-process operala dispatch to '…' failed"),
+/// dropping the real root cause; walking `source()` keeps the underlying
+/// error (e.g. the LLM auth failure) in the recorded trace.
+fn error_chain_message(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 #[derive(Clone, Debug)]
 pub struct TraceConfig {
     pub mode: TraceMode,
@@ -183,7 +199,7 @@ impl TraceRecorder {
                     validation_issues: in_flight.validation_issues,
                     error: Some(TraceError {
                         code: "node_error".to_string(),
-                        message: err.to_string(),
+                        message: error_chain_message(err),
                         details: Value::Null,
                     }),
                 }
@@ -201,7 +217,7 @@ impl TraceRecorder {
                     validation_issues: Vec::new(),
                     error: Some(TraceError {
                         code: "flow_error".to_string(),
-                        message: err.to_string(),
+                        message: error_chain_message(err),
                         details: Value::Null,
                     }),
                 }
@@ -358,7 +374,7 @@ impl ExecutionObserver for TraceRecorder {
                 validation_issues: in_flight.validation_issues,
                 error: Some(TraceError {
                     code: "node_error".to_string(),
-                    message: error.to_string(),
+                    message: error_chain_message(error),
                     details: Value::Null,
                 }),
             }
@@ -380,7 +396,7 @@ impl ExecutionObserver for TraceRecorder {
                 validation_issues: Vec::new(),
                 error: Some(TraceError {
                     code: "node_error".to_string(),
-                    message: error.to_string(),
+                    message: error_chain_message(error),
                     details: Value::Null,
                 }),
             }
@@ -479,6 +495,24 @@ mod tests {
             EnvId::try_from("prod").expect("valid env id"),
             TenantId::try_from("t1").expect("valid tenant id"),
         )
+    }
+
+    #[test]
+    fn error_chain_message_flattens_full_source_chain() {
+        // An anyhow error with two context layers over a root cause: a bare
+        // `to_string()` would only yield the outermost context, so assert the
+        // recorded message keeps the real root cause too.
+        let err = anyhow::anyhow!("llm auth failed: 401 unauthorized")
+            .context("deep-worker plan creation failed")
+            .context("in-process operala dispatch to 'pack.dw.x' failed");
+        let msg = error_chain_message(err.as_ref());
+        assert_eq!(
+            msg,
+            "in-process operala dispatch to 'pack.dw.x' failed: \
+             deep-worker plan creation failed: llm auth failed: 401 unauthorized"
+        );
+        // The outermost-only form must NOT be what we record.
+        assert_ne!(msg, err.to_string());
     }
 
     fn trace_config(out_path: PathBuf) -> TraceConfig {

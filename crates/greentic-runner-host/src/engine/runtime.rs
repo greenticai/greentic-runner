@@ -28,7 +28,9 @@ use super::state_machine::{FlowDefinition, FlowStep, PAYLOAD_FROM_LAST_INPUT};
 
 use crate::config::{HostConfig, SecretsPolicy};
 use crate::pack::FlowDescriptor;
-use crate::runner::engine::{FlowContext, FlowEngine, FlowSnapshot, FlowStatus, FlowWait};
+use crate::runner::engine::{
+    FlowContext, FlowEngine, FlowExecution, FlowSnapshot, FlowStatus, FlowWait,
+};
 use crate::runner::mocks::MockLayer;
 use crate::secrets::{DynSecretsManager, read_secret_blocking};
 use crate::storage::session::DynSessionStore;
@@ -613,6 +615,30 @@ impl StateMachineRuntime {
 
     /// Execute the flow associated with the provided ingress event.
     pub async fn handle(&self, envelope: IngressEnvelope) -> Result<Value> {
+        let result = self.run_flow_result(envelope).await?;
+        let outcome = result.outcome;
+        Ok(outcome.get("response").cloned().unwrap_or(outcome))
+    }
+
+    /// Like [`Self::handle`], but also returns this turn's per-step node-output
+    /// map (keyed by each step's `operation`; for a `dw.agent` step that is the
+    /// agent_id). Observability only — the returned response `Value` is computed
+    /// byte-identically to [`Self::handle`].
+    pub async fn handle_traced(&self, envelope: IngressEnvelope) -> Result<(Value, Value)> {
+        let result = self.run_flow_result(envelope).await?;
+        let node_outputs = result.node_outputs;
+        let outcome = result.outcome;
+        let response = outcome.get("response").cloned().unwrap_or(outcome);
+        Ok((response, node_outputs))
+    }
+
+    /// Shared body for [`Self::handle`] / [`Self::handle_traced`]: build the
+    /// ingress request and run the flow. Keeping this single seam guarantees the
+    /// traced and untraced paths can never diverge on the outcome.
+    async fn run_flow_result(
+        &self,
+        envelope: IngressEnvelope,
+    ) -> Result<super::api::RunFlowResult> {
         let tenant_ctx = envelope.tenant_ctx();
         let session_hint = envelope
             .session_hint
@@ -630,13 +656,10 @@ impl StateMachineRuntime {
             input,
             session_hint: Some(session_hint),
         };
-        let result: super::api::RunFlowResult = self
-            .runner
+        self.runner
             .run_flow(request)
             .await
-            .map_err(|err| anyhow!("flow execution failed: {err}"))?;
-        let outcome = result.outcome;
-        Ok(outcome.get("response").cloned().unwrap_or(outcome))
+            .map_err(|err| anyhow!("flow execution failed: {err}"))
     }
 }
 
@@ -746,6 +769,13 @@ impl PackFlowAdapter {
 #[async_trait::async_trait]
 impl Adapter for PackFlowAdapter {
     async fn call(&self, call: &AdapterCall) -> GResult<Value> {
+        Ok(self.call_traced(call).await?.0)
+    }
+
+    async fn call_traced(
+        &self,
+        call: &AdapterCall,
+    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
         let envelope: IngressEnvelope =
             serde_json::from_value(call.payload.clone()).map_err(|err| {
                 RunnerError::AdapterCall {
@@ -901,25 +931,35 @@ impl Adapter for PackFlowAdapter {
                     tracing::warn!(error = %write_err, "failed to write trace");
                 }
                 return Err(RunnerError::AdapterCall {
-                    reason: err.to_string(),
+                    // `{:#}` flattens the full anyhow source chain; a bare
+                    // `to_string()` keeps only the outermost context and drops
+                    // the real root cause (e.g. the underlying LLM/dispatch
+                    // error behind "in-process operala dispatch … failed").
+                    reason: format!("{err:#}"),
                 });
             }
         };
 
-        match execution.status {
+        let FlowExecution {
+            output,
+            status,
+            node_outputs,
+        } = execution;
+        match status {
             FlowStatus::Completed => {
                 self.resume.clear(&envelope)?;
-                Ok(execution.output)
+                Ok((output, node_outputs))
             }
             FlowStatus::Waiting(wait) => {
                 let reply_scope = self.resume.save(&envelope, &wait)?;
-                Ok(json!({
+                let outcome = json!({
                     "status": "pending",
                     "reason": wait.reason,
                     "resume": wait.snapshot,
                     "reply_scope": reply_scope,
-                    "response": execution.output,
-                }))
+                    "response": output,
+                });
+                Ok((outcome, node_outputs))
             }
         }
     }

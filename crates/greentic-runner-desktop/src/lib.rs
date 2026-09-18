@@ -476,8 +476,17 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             // rather than falling back to an in-pack agent id, which is not
             // unique across packs.
             let handler = if redis_set {
-                build_agent_node_handler(merged, tenant, sm, vec![Arc::clone(&pack)], None, None)
-                    .await
+                build_agent_node_handler(
+                    merged,
+                    tenant,
+                    sm,
+                    None,
+                    vec![Arc::clone(&pack)],
+                    None,
+                    None,
+                    None,
+                )
+                .await
             } else {
                 #[cfg(feature = "desktop-agent-ephemeral")]
                 {
@@ -485,7 +494,9 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                         merged,
                         tenant,
                         sm,
+                        None,
                         vec![Arc::clone(&pack)],
+                        None,
                         None,
                         None,
                     )

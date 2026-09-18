@@ -126,6 +126,7 @@ mod tests {
     }
 
     fn server_state(admin: AdminAuth) -> AppState {
+        let host = crate::host::RunnerHost::for_test();
         AppState {
             server: ServerState {
                 active: Arc::new(ActivePacks::new()),
@@ -133,7 +134,11 @@ mod tests {
                 health: Arc::new(HealthState::new()),
                 reload: None,
                 admin,
-                host: crate::host::RunnerHost::for_test(),
+                #[cfg(feature = "agentic-worker")]
+                stream_observers: host.stream_observers(),
+                #[cfg(feature = "agentic-worker")]
+                ext_runtime: None,
+                host,
                 sql: crate::sql::SqlGateway::new(std::collections::HashMap::new(), String::new()),
             },
         }

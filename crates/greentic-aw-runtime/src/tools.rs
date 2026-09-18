@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use greentic_ext_runtime::ExtensionRuntime;
+use greentic_ext_runtime::host_ports::HostCallContext;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -22,10 +23,22 @@ use serde::{Deserialize, Serialize};
 use crate::component_source::ComponentToolCatalog;
 use crate::config::ToolRef;
 use crate::error::{AgentError, StateError};
+use crate::flow_source::FlowToolCatalog;
+use crate::kv::AwKv;
 use crate::llm::LlmToolSchema;
 use crate::mcp_source::McpToolCatalog;
+use crate::sorla_source::SorlaToolCatalog;
 use crate::state::ToolCallRecord;
 use crate::tenant::TenantContext;
+
+/// Append an author `usage_note` to a resolved tool description. A `None` or
+/// whitespace-only note is a no-op (no trailing whitespace, no empty block).
+fn with_usage_note(description: String, note: &Option<String>) -> String {
+    match note {
+        Some(n) if !n.trim().is_empty() => format!("{description}\n\n{}", n.trim()),
+        _ => description,
+    }
+}
 
 /// Whether the agent may call this tool — exact (extension_id, tool_name) match.
 pub fn is_tool_allowed(call: &ToolCallRecord, allowed: &[ToolRef]) -> bool {
@@ -44,34 +57,68 @@ pub fn is_tool_allowed(call: &ToolCallRecord, allowed: &[ToolRef]) -> bool {
 /// Tools whose `extension_id` starts with `"mcp:"` are resolved from the
 /// per-tenant [`McpToolCatalog`] (`mcp`) instead of the extension runtime: the
 /// suffix after `"mcp:"` is the MCP `server_id`, and the catalog supplies the
-/// LLM-facing `description`/`parameters`. An mcp ref with no matching catalog
-/// entry (or no catalog at all) is logged and dropped, mirroring the
-/// extension-runtime "tool not found" path.
+/// LLM-facing `description`/`parameters`. When the catalog has no entry, the
+/// ref's own `description`/`input_schema` are used — the schema the pack's
+/// `AgentConfig` snapshotted at authoring time — so a deployed runner with no
+/// admin credentials still advertises the tool. The catalog WINS whenever it has
+/// an entry: it was probed from the live server this run. An mcp ref with
+/// neither is logged and dropped, mirroring the extension-runtime "tool not
+/// found" path.
 ///
 /// Tools whose `extension_id` starts with `"component:"` are resolved the same
 /// way from the per-tenant [`ComponentToolCatalog`] (`components`): the suffix
 /// is the `component_ref` and `tool_name` the operation, and the catalog
 /// supplies the operation's `description`/`parameters`. A `component:` ref with
 /// no matching catalog entry (or no catalog) is likewise logged and dropped.
+///
+/// Tools whose `extension_id` starts with `"sorla:"` are resolved the same way
+/// from the per-tenant [`SorlaToolCatalog`] (`sorla`): the suffix is the SoR
+/// `pack` and `tool_name` the action, and the catalog supplies the action's
+/// `description`/`parameters`. A `sorla:` ref with no matching catalog entry
+/// (or no catalog) is likewise logged and dropped.
+///
+/// Tools whose `extension_id` starts with `"flow:"` are resolved from the
+/// per-tenant [`FlowToolCatalog`] (`flows`): the suffix after `"flow:"` is the
+/// `flow_ref`, which is the sole key (no operation). The catalog supplies the
+/// LLM-facing `description`/`parameters`. A `flow:` ref with no matching catalog
+/// entry (or no catalog) is likewise logged and dropped.
 pub fn list_tools_for_llm(
     ext_runtime: &ExtensionRuntime,
     mcp: Option<&McpToolCatalog>,
     components: Option<&ComponentToolCatalog>,
+    flows: Option<&FlowToolCatalog>,
+    sorla: Option<&SorlaToolCatalog>,
     allowed: &[ToolRef],
 ) -> Vec<LlmToolSchema> {
     let mut out = Vec::with_capacity(allowed.len());
     for t in allowed {
         if let Some(server_id) = t.extension_id.strip_prefix("mcp:") {
-            match mcp.and_then(|c| c.tool_entry(server_id, &t.tool_name)) {
-                Some(entry) => out.push(LlmToolSchema {
+            let entry = mcp.and_then(|c| c.tool_entry(server_id, &t.tool_name));
+            // Catalog FIRST, the author contract second — deliberately the
+            // OPPOSITE order from the `flow:` branch below. A catalog entry was
+            // probed from the live server this run, whereas `ToolRef` carries a
+            // schema snapshotted into the pack at authoring time; preferring the
+            // pack would downgrade every deployment that does have a working
+            // admin source to a staler schema. The fallback exists so a deployed
+            // runner with NO admin credentials still advertises the tool at all
+            // instead of dropping it (spec §4.2).
+            let description = entry
+                .map(|e| e.description.clone())
+                .or_else(|| t.description.clone());
+            let parameters = entry
+                .map(|e| e.parameters.clone())
+                .or_else(|| t.input_schema.clone());
+            match (description, parameters) {
+                (Some(description), Some(parameters)) => out.push(LlmToolSchema {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    description: entry.description.clone(),
-                    parameters: entry.parameters.clone(),
+                    description: with_usage_note(description, &t.usage_note),
+                    parameters,
                 }),
-                None => tracing::warn!(
+                _ => tracing::warn!(
                     extension = %t.extension_id, tool = %t.tool_name,
-                    "mcp tool not found in catalog; dropping from LLM tool list"
+                    "mcp tool has neither a catalog entry nor an author contract; \
+                     dropping from LLM tool list"
                 ),
             }
             continue;
@@ -81,12 +128,51 @@ pub fn list_tools_for_llm(
                 Some(entry) => out.push(LlmToolSchema {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    description: entry.description.clone(),
+                    description: with_usage_note(entry.description.clone(), &t.usage_note),
                     parameters: entry.parameters.clone(),
                 }),
                 None => tracing::warn!(
                     extension = %t.extension_id, tool = %t.tool_name,
                     "component tool not found in catalog; dropping from LLM tool list"
+                ),
+            }
+            continue;
+        }
+        if let Some(pack) = t.extension_id.strip_prefix("sorla:") {
+            match sorla.and_then(|c| c.tool_entry(pack, &t.tool_name)) {
+                Some(entry) => out.push(LlmToolSchema {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    description: with_usage_note(entry.description.clone(), &t.usage_note),
+                    parameters: entry.parameters.clone(),
+                }),
+                None => tracing::warn!(
+                    extension = %t.extension_id, tool = %t.tool_name,
+                    "sorla tool not found in catalog; dropping from LLM tool list"
+                ),
+            }
+            continue;
+        }
+        if let Some(flow_ref) = t.extension_id.strip_prefix("flow:") {
+            let entry = flows.and_then(|c| c.tool_entry(flow_ref));
+            let description = t
+                .description
+                .clone()
+                .or_else(|| entry.map(|e| e.description.clone()));
+            let parameters = t
+                .input_schema
+                .clone()
+                .or_else(|| entry.map(|e| e.parameters.clone()));
+            match (description, parameters) {
+                (Some(description), Some(parameters)) => out.push(LlmToolSchema {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    description: with_usage_note(description, &t.usage_note),
+                    parameters,
+                }),
+                _ => tracing::warn!(
+                    extension = %t.extension_id, tool = %t.tool_name,
+                    "flow tool has neither an author contract nor a catalog entry; dropping from LLM tool list"
                 ),
             }
             continue;
@@ -101,7 +187,7 @@ pub fn list_tools_for_llm(
                     out.push(LlmToolSchema {
                         extension_id: t.extension_id.clone(),
                         tool_name: t.tool_name.clone(),
-                        description: def.description,
+                        description: with_usage_note(def.description, &t.usage_note),
                         parameters,
                     });
                 } else {
@@ -142,19 +228,29 @@ pub fn missing_tools(
     ext_runtime: &ExtensionRuntime,
     mcp: Option<&McpToolCatalog>,
     components: Option<&ComponentToolCatalog>,
+    flows: Option<&FlowToolCatalog>,
+    sorla: Option<&SorlaToolCatalog>,
     allowed: &[ToolRef],
 ) -> Vec<MissingTool> {
     let mut missing = Vec::new();
     for t in allowed {
         if let Some(server_id) = t.extension_id.strip_prefix("mcp:") {
-            if mcp
+            // Mirrors `list_tools_for_llm`'s mcp branch exactly: a catalog entry
+            // resolves the tool, and so does a complete author contract
+            // (description AND input schema) on the `ToolRef` itself. Without
+            // this second arm `preflight_warn_tools` would warn loudly about a
+            // pack-schema'd tool that now works.
+            let resolvable = mcp
                 .and_then(|c| c.tool_entry(server_id, &t.tool_name))
-                .is_none()
-            {
+                .is_some()
+                || (t.description.is_some() && t.input_schema.is_some());
+            if !resolvable {
                 missing.push(MissingTool {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    reason: "MCP tool not found in the tenant catalog".to_string(),
+                    reason: "MCP tool not found in the tenant catalog, and the agent config \
+                             carries no description + input schema for it"
+                        .to_string(),
                 });
             }
             continue;
@@ -168,6 +264,29 @@ pub fn missing_tools(
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
                     reason: "component tool not found in the catalog".to_string(),
+                });
+            }
+            continue;
+        }
+        if let Some(pack) = t.extension_id.strip_prefix("sorla:") {
+            if sorla
+                .and_then(|c| c.tool_entry(pack, &t.tool_name))
+                .is_none()
+            {
+                missing.push(MissingTool {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    reason: "sorla tool not found in the catalog".to_string(),
+                });
+            }
+            continue;
+        }
+        if let Some(flow_ref) = t.extension_id.strip_prefix("flow:") {
+            if flows.and_then(|c| c.tool_entry(flow_ref)).is_none() {
+                missing.push(MissingTool {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    reason: "flow tool not found in the catalog".to_string(),
                 });
             }
             continue;
@@ -194,30 +313,23 @@ pub fn missing_tools(
     missing
 }
 
-// NOTE: the research lane threads a `HostCallContext` (tenant + user_email)
-// into every tool call so an extension host can resolve the LLM provider
-// per-tenant. This lane's `greentic-ext-runtime` exposes only `invoke_tool`,
-// with no context parameter and no `HostCallContext` type, so tool calls here
-// carry no per-tenant routing hint. Restore the richer call once the host-port
-// surface lands on this lane.
+/// Build a [`HostCallContext`] from the per-step [`TenantContext`].
+///
+/// The extension host (e.g. the designer's `DesignerLlmBridge`) uses
+/// `ctx.tenant` to resolve the LLM provider per-tenant and `ctx.user_email`
+/// for optional per-user override (present only in interactive test-chat steps;
+/// `None` for autonomous workers).
+pub(crate) fn host_ctx_from_tenant(t: &TenantContext) -> HostCallContext {
+    HostCallContext {
+        tenant: if t.tenant_id.is_empty() {
+            None
+        } else {
+            Some(t.tenant_id.clone())
+        },
+        user_email: t.user_email.clone(),
+    }
+}
 
-/// Dispatch a single tool call. Wraps the blocking `invoke_tool` in
-/// `tokio::task::spawn_blocking` so the async executor thread is never
-/// stalled. Returns the tool result as a JSON Value.
-///
-/// Calls whose `extension_id` starts with `"mcp:"` route through the
-/// per-tenant [`McpToolCatalog`] (`mcp`) instead: the suffix is the MCP
-/// `server_id`, and dispatch goes over HTTP via
-/// [`crate::mcp_source::dispatch_route`]. An MCP call NEVER yields `Err` — a
-/// missing route or remote failure is surfaced as an `{"error": ...}` value so
-/// the LLM observes it as a normal tool result.
-///
-/// Calls whose `extension_id` starts with `"component:"` route through the
-/// per-tenant [`ComponentToolCatalog`] (`components`): the suffix is the
-/// `component_ref` and dispatch goes to the host component invoker via
-/// [`ComponentToolCatalog::dispatch`]. Like the mcp path it NEVER yields `Err`
-/// — an unknown operation or a missing catalog becomes an `{"error": ...}`
-/// value. Other ids keep the existing blocking WASM path.
 /// Reserved argument key carrying the session-established caller.
 ///
 /// Host-owned: [`stamp_caller`] OVERWRITES it on every dispatch, so an LLM that
@@ -265,29 +377,66 @@ fn stamp_caller(args: &mut serde_json::Value, caller: &crate::tenant::VerifiedCa
     );
 }
 
+/// Dispatch a single tool call. Wraps the blocking `invoke_tool_ctx` in
+/// `tokio::task::spawn_blocking` so the async executor thread is never
+/// stalled. Returns the tool result as a JSON Value.
+///
+/// Calls whose `extension_id` starts with `"mcp:"` route through the
+/// per-tenant [`McpToolCatalog`] (`mcp`) instead: the suffix is the MCP
+/// `server_id`, and dispatch goes over HTTP via
+/// [`crate::mcp_source::dispatch_route`]. An MCP call NEVER yields `Err` — a
+/// missing route or remote failure is surfaced as an `{"error": ...}` value so
+/// the LLM observes it as a normal tool result.
+///
+/// Calls whose `extension_id` starts with `"component:"` route through the
+/// per-tenant [`ComponentToolCatalog`] (`components`): the suffix is the
+/// `component_ref` and dispatch goes to the host component invoker via
+/// [`ComponentToolCatalog::dispatch`]. Like the mcp path it NEVER yields `Err`
+/// — an unknown operation or a missing catalog becomes an `{"error": ...}`
+/// value.
+///
+/// Calls whose `extension_id` starts with `"sorla:"` route through the
+/// per-tenant [`SorlaToolCatalog`] (`sorla`): the suffix is the SoR `pack`
+/// and dispatch goes to the host SoRX interact client via
+/// [`SorlaToolCatalog::dispatch`]. Like the mcp/component paths it NEVER
+/// yields `Err` — an unknown action or a missing catalog becomes an
+/// `{"error": ...}` value. Other ids keep the existing blocking WASM path.
 pub async fn dispatch_tool_call(
     ext_runtime: Arc<ExtensionRuntime>,
     mcp: Option<Arc<McpToolCatalog>>,
     components: Option<Arc<ComponentToolCatalog>>,
+    flows: Option<Arc<FlowToolCatalog>>,
+    sorla: Option<Arc<SorlaToolCatalog>>,
     call: ToolCallRecord,
-    // Read for the caller stamp. `invoke_tool` still takes no HostCallContext
-    // on this lane, so the tenant reaches the tool through the stamped
-    // argument rather than through a context parameter.
     tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
-    // Established once, applied to every LOCAL arm below. Not to the `mcp:`
-    // arm: that dispatches over HTTP to a server outside this deployment, and
-    // forwarding a caller's identity to a third party is a disclosure decision
-    // for whoever configures that server, not a plumbing detail of this one.
+    // Established once, applied to the extension and component arms below —
+    // the same arms #760 stamps on develop. Not to the `mcp:` arm: that
+    // dispatches over HTTP to a server outside this deployment, and forwarding
+    // a caller's identity to a third party is a disclosure decision for whoever
+    // configures that server, not a plumbing detail of this one. The `flow:`
+    // and `sorla:` arms (research-only) are left unstamped too: a flow's input
+    // is flow data, which is exactly the position a caller must not travel
+    // through, and SoRX is its own service boundary.
     let caller = tenant.caller_or_anonymous();
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
+        // `resolve_route` takes the catalog's exact `(server, tool)` entry when
+        // it has one and otherwise stamps the tool onto a pack-carried
+        // server-level route. An admin-built catalog registers no server-level
+        // routes, so its behaviour here is unchanged.
         let value = match mcp
             .as_deref()
-            .and_then(|c| c.route(server_id, &call.tool_name))
+            .and_then(|c| c.resolve_route(server_id, &call.tool_name))
         {
             Some(route) => {
                 let args = call.args.to_string();
-                crate::mcp_source::dispatch_route(route, &args).await
+                let scope = match mcp.as_deref().and_then(|c| c.secrets()) {
+                    Some(manager) => {
+                        crate::mcp_scope::McpCallScope::with_secrets(tenant.clone(), manager)
+                    }
+                    None => crate::mcp_scope::McpCallScope::new(tenant.clone()),
+                };
+                crate::mcp_source::dispatch_route(&route, &args, &scope).await
             }
             None => {
                 tracing::warn!(
@@ -295,8 +444,17 @@ pub async fn dispatch_tool_call(
                     tool = %call.tool_name,
                     "mcp call has no route in the tenant catalog; returning error value"
                 );
+                // A per-server diagnostic (only the pack path records one) names
+                // the real cause; without it a missing credential and an
+                // unregistered server are indistinguishable to the operator.
                 serde_json::json!({
-                    "error": format!("unknown mcp tool '{}/{}'", server_id, call.tool_name)
+                    "error": match mcp.as_deref().and_then(|c| c.server_error(server_id)) {
+                        Some(detail) => format!(
+                            "mcp tool '{}/{}' is unavailable: mcp server '{}' has {detail}",
+                            server_id, call.tool_name, server_id
+                        ),
+                        None => format!("unknown mcp tool '{}/{}'", server_id, call.tool_name),
+                    }
                 })
             }
         };
@@ -328,13 +486,42 @@ pub async fn dispatch_tool_call(
         return Ok(value);
     }
 
+    if let Some(pack) = call.extension_id.strip_prefix("sorla:") {
+        let value = match sorla.as_deref() {
+            Some(cat) => {
+                let args = call.args.to_string();
+                cat.dispatch(pack, &call.tool_name, &args).await
+            }
+            None => {
+                tracing::warn!(
+                    pack = %pack, tool = %call.tool_name,
+                    "sorla call has no catalog wired; returning error value"
+                );
+                serde_json::json!({ "error": format!("unknown sorla tool '{}/{}'", pack, call.tool_name) })
+            }
+        };
+        return Ok(value);
+    }
+
+    if let Some(flow_ref) = call.extension_id.strip_prefix("flow:") {
+        let value = match flows.as_deref() {
+            Some(cat) => cat.dispatch(flow_ref, &call.args.to_string()).await,
+            None => {
+                tracing::warn!(flow = %flow_ref, "flow call has no catalog wired; returning error value");
+                serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") })
+            }
+        };
+        return Ok(value);
+    }
+
     let mut args_value = call.args.clone();
     stamp_caller(&mut args_value, &caller);
     let args_json = args_value.to_string();
     let extension_id = call.extension_id.clone();
     let tool_name = call.tool_name.clone();
+    let ctx = host_ctx_from_tenant(tenant);
     let raw = tokio::task::spawn_blocking(move || {
-        ext_runtime.invoke_tool(&extension_id, &tool_name, &args_json)
+        ext_runtime.invoke_tool_ctx(&extension_id, &tool_name, &args_json, &ctx)
     })
     .await
     .map_err(|e| AgentError::ToolDispatch(format!("join: {e}")))?
@@ -523,16 +710,110 @@ impl ToolLedger for RedisToolLedger {
     }
 }
 
+const KV_LEDGER_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Tool-call idempotency ledger over [`AwKv`] (Redis-free). Same key format
+/// and 7-day TTL as [`RedisToolLedger`].
+pub struct KvToolLedger {
+    kv: Arc<dyn AwKv>,
+}
+
+impl KvToolLedger {
+    pub fn new(kv: Arc<dyn AwKv>) -> Self {
+        Self { kv }
+    }
+}
+
+impl ToolLedger for KvToolLedger {
+    fn get<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        call_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StateError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let key = ledger_key(tenant, session_id, call_id);
+            match self.kv.get(&key).await? {
+                Some(bytes) => {
+                    let entry: ToolLedgerEntry = serde_json::from_slice(&bytes)
+                        .map_err(|e| StateError::Decode(format!("ledger decode: {e}")))?;
+                    Ok(Some(entry.result))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn record<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        call_id: &'a str,
+        result: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = ledger_key(tenant, session_id, call_id);
+            let bytes = serde_json::to_vec(&ToolLedgerEntry { result })
+                .map_err(|e| StateError::Decode(format!("ledger encode: {e}")))?;
+            self.kv.set_ex(&key, bytes, KV_LEDGER_TTL).await
+        })
+    }
+}
+
+#[cfg(test)]
+mod ctx_tests {
+    use super::*;
+    use crate::tenant::TenantContext;
+
+    #[test]
+    fn host_ctx_carries_tenant_and_optional_user() {
+        let c1 = host_ctx_from_tenant(&TenantContext::new("acme", "prod"));
+        assert_eq!(c1.tenant.as_deref(), Some("acme"));
+        assert_eq!(c1.user_email, None);
+        let c2 = host_ctx_from_tenant(
+            &TenantContext::new("acme", "prod").with_user_email(Some("u@x.com".into())),
+        );
+        assert_eq!(c2.user_email.as_deref(), Some("u@x.com"));
+        let c3 = host_ctx_from_tenant(&TenantContext::new("", ""));
+        assert_eq!(
+            c3.tenant, None,
+            "empty tenant_id must map to None, not Some(\"\")"
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
+    fn with_usage_note_appends_when_present() {
+        let d = with_usage_note(
+            "Base description.".into(),
+            &Some("Use for VIP customers.".into()),
+        );
+        assert_eq!(d, "Base description.\n\nUse for VIP customers.");
+    }
+
+    #[test]
+    fn with_usage_note_noop_when_none_or_blank() {
+        assert_eq!(with_usage_note("Base.".into(), &None), "Base.");
+        assert_eq!(
+            with_usage_note("Base.".into(), &Some("   ".into())),
+            "Base."
+        );
+    }
+
+    #[test]
     fn is_tool_allowed_returns_true_for_exact_match() {
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -548,6 +829,9 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -569,12 +853,15 @@ mod tests {
     fn list_tools_for_llm_with_no_extensions_returns_empty() {
         // for_test runtime has no extensions loaded → list_tools errors
         // (NotFound) for every ext → all skipped → empty result.
-        let rt = crate::test_support::extension_runtime();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, &allowed);
         assert!(schemas.is_empty());
     }
 
@@ -583,12 +870,15 @@ mod tests {
         // No extensions loaded → the declared tool cannot resolve and is
         // reported as missing with a load-failure reason (instead of being
         // dropped silently, which is what causes hallucinated tool results).
-        let rt = crate::test_support::extension_runtime();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![ToolRef {
             extension_id: "greentic.hubspot".into(),
             tool_name: "hubspot_contacts".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         }];
-        let missing = missing_tools(&rt, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].extension_id, "greentic.hubspot");
         assert_eq!(missing[0].tool_name, "hubspot_contacts");
@@ -601,13 +891,16 @@ mod tests {
 
     #[test]
     fn missing_tools_reports_mcp_tool_absent_from_catalog() {
-        let rt = crate::test_support::extension_runtime();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![ToolRef {
             extension_id: "mcp:github".into(),
             tool_name: "create_issue".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         }];
         // No catalog provided → the mcp tool is unresolvable.
-        let missing = missing_tools(&rt, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
         assert!(
             missing[0].reason.contains("MCP tool not found"),
@@ -645,7 +938,7 @@ mod tests {
                 route_for_tests(server, tool, url),
             );
         }
-        McpToolCatalog::for_tests(tools, routes)
+        McpToolCatalog::from_parts(tools, routes, None)
     }
 
     /// Mount the minimal MCP JSON-RPC contract (initialize, initialized,
@@ -699,7 +992,7 @@ mod tests {
         // A catalog-backed mcp: ref is emitted as an LlmToolSchema with the
         // catalog's description/parameters; the ext_runtime is never consulted
         // for it (the for_test runtime has no extensions loaded).
-        let rt = crate::test_support::extension_runtime();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "id": { "type": "string" } }
@@ -710,21 +1003,157 @@ mod tests {
             ToolRef {
                 extension_id: "mcp:s1".into(),
                 tool_name: "get_issue".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             },
             // Absent from the catalog → dropped (warn), not panicked.
             ToolRef {
                 extension_id: "mcp:s1".into(),
                 tool_name: "missing".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "mcp:s1");
         assert_eq!(s.tool_name, "get_issue");
         assert_eq!(s.description, "Get an issue");
         assert_eq!(s.parameters, params);
+    }
+
+    /// The author contract a pack's `AgentConfig` carries for an `mcp:` binding.
+    fn mcp_ref_with_contract(server: &str, tool: &str) -> ToolRef {
+        ToolRef {
+            extension_id: format!("mcp:{server}"),
+            tool_name: tool.into(),
+            description: Some("Pack-carried description".into()),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "pack_arg": { "type": "string" } }
+            })),
+            usage_note: None,
+        }
+    }
+
+    #[test]
+    fn mcp_ref_listed_from_tool_ref_when_catalog_has_no_entry() {
+        // The deployed-runner case: no admin credentials, so no catalog at all.
+        // The schema the designer snapshotted into the pack's `AgentConfig` is
+        // what reaches the LLM. Before this, the tool was silently dropped.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
+
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, &allowed);
+        assert_eq!(schemas.len(), 1, "the author contract resolves the tool");
+        assert_eq!(schemas[0].extension_id, "mcp:s1");
+        assert_eq!(schemas[0].tool_name, "get_issue");
+        assert_eq!(schemas[0].description, "Pack-carried description");
+        assert_eq!(
+            schemas[0].parameters["properties"]["pack_arg"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn mcp_catalog_entry_wins_over_tool_ref_contract() {
+        // REGRESSION GUARD for every existing admin-backed deployment: when the
+        // catalog has an entry it was probed from the live server this run, and
+        // it must be emitted byte-for-byte even though the ref also carries a
+        // (possibly stale) snapshot. Flipping the precedence would silently
+        // downgrade every deployment that has a working admin source.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let live_params = serde_json::json!({
+            "type": "object",
+            "properties": { "live_arg": { "type": "number" } }
+        });
+        let catalog = catalog_with("s1", "get_issue", "Live description", live_params, None);
+        let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
+
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, &allowed);
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].description, "Live description");
+        assert_eq!(
+            schemas[0].parameters["properties"]["live_arg"]["type"], "number",
+            "the catalog's parameters must survive intact"
+        );
+        assert!(
+            schemas[0].parameters["properties"]
+                .get("pack_arg")
+                .is_none(),
+            "the pack snapshot must not leak into a catalog-resolved schema"
+        );
+    }
+
+    #[test]
+    fn mcp_ref_with_partial_contract_and_no_catalog_is_dropped() {
+        // Both halves are required, mirroring the `flow:` branch: a description
+        // with no schema cannot be offered to the LLM as a callable tool.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let mut description_only = mcp_ref_with_contract("s1", "get_issue");
+        description_only.input_schema = None;
+        let mut schema_only = mcp_ref_with_contract("s1", "list_issues");
+        schema_only.description = None;
+        let bare = ToolRef {
+            extension_id: "mcp:s1".into(),
+            tool_name: "nothing".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        };
+
+        let schemas = list_tools_for_llm(
+            &rt,
+            None,
+            None,
+            None,
+            None,
+            &[description_only, schema_only, bare],
+        );
+        assert!(schemas.is_empty(), "got: {schemas:?}");
+    }
+
+    #[test]
+    fn mcp_ref_contract_still_takes_the_usage_note() {
+        // The usage note is an author addendum to whichever description won; it
+        // must not be lost on the new fallback arm.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let mut t = mcp_ref_with_contract("s1", "get_issue");
+        t.usage_note = Some("Only for open issues.".into());
+
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, &[t]);
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(
+            schemas[0].description,
+            "Pack-carried description\n\nOnly for open issues."
+        );
+    }
+
+    #[test]
+    fn missing_tools_accepts_mcp_tool_resolved_by_its_author_contract() {
+        // `preflight_warn_tools` would otherwise warn loudly at startup about a
+        // tool that `list_tools_for_llm` now resolves and offers.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
+        assert!(missing_tools(&rt, None, None, None, None, &allowed).is_empty());
+    }
+
+    #[test]
+    fn missing_tools_still_reports_mcp_tool_with_no_contract_and_no_catalog() {
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let mut half = mcp_ref_with_contract("s1", "get_issue");
+        half.input_schema = None;
+        let missing = missing_tools(&rt, None, None, None, None, &[half]);
+        assert_eq!(missing.len(), 1);
+        assert!(
+            missing[0].reason.contains("MCP tool not found"),
+            "got: {}",
+            missing[0].reason
+        );
     }
 
     #[test]
@@ -738,7 +1167,7 @@ mod tests {
         // non-mcp extension id — if the mcp branch ever matched non-`mcp:`
         // ids and consulted the catalog, this entry would be emitted and the
         // empty assertion below would catch the regression.
-        let rt = crate::test_support::extension_runtime();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let catalog = catalog_with(
             "greentic.tavily",
             "search",
@@ -749,8 +1178,11 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "greentic.tavily".into(),
             tool_name: "search".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-mcp ref still goes through ext_runtime (unloaded → dropped)"
@@ -763,6 +1195,9 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "mcp:s1".into(),
             tool_name: "get_issue".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -796,7 +1231,7 @@ mod tests {
             serde_json::json!({}),
             Some(&uri),
         ));
-        let rt = Arc::new(crate::test_support::extension_runtime());
+        let rt = Arc::new(ExtensionRuntime::for_test().unwrap());
 
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -805,9 +1240,17 @@ mod tests {
             args: serde_json::json!({}),
         };
         let tc = TenantContext::new("t", "e");
-        let out = dispatch_tool_call(rt.clone(), Some(catalog.clone()), None, call, &tc)
-            .await
-            .expect("mcp dispatch never returns Err");
+        let out = dispatch_tool_call(
+            rt.clone(),
+            Some(catalog.clone()),
+            None,
+            None,
+            None,
+            call,
+            &tc,
+        )
+        .await
+        .expect("mcp dispatch never returns Err");
         assert_eq!(out, serde_json::json!({ "ok": 1 }), "got: {out}");
 
         // Route missing → shaped error value, still Ok.
@@ -817,7 +1260,7 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), Some(catalog), None, missing, &tc)
+        let out = dispatch_tool_call(rt.clone(), Some(catalog), None, None, None, missing, &tc)
             .await
             .expect("missing mcp route still returns Ok");
         assert_eq!(
@@ -833,7 +1276,7 @@ mod tests {
             tool_name: "nope".into(),
             args: serde_json::json!({}),
         };
-        let res = dispatch_tool_call(rt, None, None, non_mcp, &tc).await;
+        let res = dispatch_tool_call(rt, None, None, None, None, non_mcp, &tc).await;
         assert!(
             res.is_err(),
             "non-mcp dispatch against an unloaded extension must error"
@@ -842,12 +1285,175 @@ mod tests {
 
     use crate::component_source::ComponentToolCatalog;
     use crate::component_source::test_support::{FakeInvoker, one_tool};
+    use crate::flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog};
+    use crate::sorla_source::test_support::FakeInvoker as SorlaFakeInvoker;
+    use crate::sorla_source::{SorlaToolCatalog, SorlaToolEntry};
+
+    struct FakeFlowInvoker;
+    impl FlowInvoker for FakeFlowInvoker {
+        fn list_flows(&self) -> Vec<FlowOperation> {
+            vec![FlowOperation {
+                flow_ref: "lookup".into(),
+                description: "Look things up".into(),
+                parameters: serde_json::json!({ "type": "object", "properties": { "q": { "type": "integer" } } }),
+            }]
+        }
+        fn invoke<'a>(
+            &'a self,
+            flow_ref: &'a str,
+            args_json: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if flow_ref == "lookup" {
+                    Ok(serde_json::json!({ "echoed": args_json }))
+                } else {
+                    Err(format!("flow '{flow_ref}' not found"))
+                }
+            })
+        }
+    }
+
+    fn ext_runtime_stub() -> ExtensionRuntime {
+        ExtensionRuntime::for_test().unwrap()
+    }
+
+    fn test_flow_invoker() -> FakeFlowInvoker {
+        FakeFlowInvoker
+    }
+
+    #[test]
+    fn flow_tool_prefers_author_contract_over_catalog() {
+        // Catalog has flow "lookup" with its own description + parameters.
+        // ToolRef carries author overrides — these must win.
+        let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(test_flow_invoker())));
+        let allowed = vec![ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: Some("Author description".into()),
+            input_schema: Some(
+                serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+            ),
+            usage_note: None,
+        }];
+        let schemas = list_tools_for_llm(
+            &ext_runtime_stub(),
+            None,
+            None,
+            Some(&flows),
+            None,
+            &allowed,
+        );
+        let s = schemas
+            .iter()
+            .find(|s| s.extension_id == "flow:lookup")
+            .expect("flow tool listed");
+        assert_eq!(
+            s.description, "Author description",
+            "override description must win over catalog"
+        );
+        assert_eq!(
+            s.parameters["properties"]["q"]["type"], "string",
+            "override schema must win over catalog"
+        );
+    }
+
+    #[test]
+    fn flow_tool_falls_back_to_catalog_when_no_override() {
+        // ToolRef has no override — the catalog entry must be used.
+        let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(test_flow_invoker())));
+        let allowed = vec![ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        }];
+        let schemas = list_tools_for_llm(
+            &ext_runtime_stub(),
+            None,
+            None,
+            Some(&flows),
+            None,
+            &allowed,
+        );
+        assert!(
+            schemas.iter().any(|s| s.extension_id == "flow:lookup"),
+            "with no override the catalog entry must still be used to list the tool"
+        );
+    }
+
+    #[test]
+    fn list_tools_appends_usage_note_for_flow_tool() {
+        // Flow branch: ToolRef.description supplies the base description
+        // directly (no live runtime needed), so this proves the usage_note
+        // reaches the LLM-facing schema without an ExtensionRuntime fixture.
+        let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(test_flow_invoker())));
+        let allowed = vec![ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: Some("Base.".into()),
+            input_schema: Some(serde_json::json!({"type":"object","properties":{}})),
+            usage_note: Some("note-Z".into()),
+        }];
+        let schemas = list_tools_for_llm(
+            &ext_runtime_stub(),
+            None,
+            None,
+            Some(&flows),
+            None,
+            &allowed,
+        );
+        let s = schemas
+            .iter()
+            .find(|s| s.extension_id == "flow:lookup")
+            .expect("flow tool listed");
+        assert!(s.description.contains("Base."), "got: {}", s.description);
+        assert!(s.description.contains("note-Z"), "got: {}", s.description);
+    }
+
+    #[tokio::test]
+    async fn flow_prefixed_tool_is_listed_and_dispatched() {
+        let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(FakeFlowInvoker)));
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let allowed = vec![ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        }];
+        let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), None, &allowed);
+        assert!(
+            schemas
+                .iter()
+                .any(|s| s.extension_id == "flow:lookup" && s.tool_name == "look_up"),
+            "flow: tool must appear in listed schemas"
+        );
+
+        let call = ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            args: serde_json::json!({ "q": 1 }),
+        };
+        let rt_arc = Arc::new(ExtensionRuntime::for_test().unwrap());
+        let tc = TenantContext::new("t", "e");
+        let out = dispatch_tool_call(rt_arc, None, None, Some(flows), None, call, &tc)
+            .await
+            .expect("flow dispatch must not return Err");
+        assert!(
+            out.get("error").is_none(),
+            "known flow must dispatch, got {out}"
+        );
+    }
 
     #[test]
     fn component_ref_listed_from_catalog() {
         // A catalog-backed component: ref is emitted as an LlmToolSchema with
         // the catalog's description/parameters; ext_runtime is never consulted.
-        let rt = crate::test_support::extension_runtime();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "order_id": { "type": "string" } }
@@ -867,15 +1473,21 @@ mod tests {
             ToolRef {
                 extension_id: "component:greentic.refund".into(),
                 tool_name: "issue_refund".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             },
             // Absent from the catalog → dropped (warn), not panicked.
             ToolRef {
                 extension_id: "component:greentic.refund".into(),
                 tool_name: "missing".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), &allowed);
+        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "component:greentic.refund");
@@ -890,7 +1502,7 @@ mod tests {
         // component catalog is present. The decoy entry is keyed by the FULL
         // non-prefixed id — if the component branch ever matched it, this entry
         // would leak into the list and the empty assertion would catch it.
-        let rt = crate::test_support::extension_runtime();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let invoker = Arc::new(FakeInvoker::new(vec![], Ok(serde_json::json!({}))));
         let catalog = ComponentToolCatalog::for_tests(
             one_tool(
@@ -904,8 +1516,11 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "greentic.tavily".into(),
             tool_name: "search".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), &allowed);
+        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-component ref still goes through ext_runtime (unloaded → dropped)"
@@ -928,7 +1543,7 @@ mod tests {
             ),
             invoker,
         ));
-        let rt = Arc::new(crate::test_support::extension_runtime());
+        let rt = Arc::new(ExtensionRuntime::for_test().unwrap());
 
         let tc = TenantContext::new("t", "e");
         let call = ToolCallRecord {
@@ -937,9 +1552,17 @@ mod tests {
             tool_name: "issue_refund".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), None, Some(catalog.clone()), call, &tc)
-            .await
-            .expect("component dispatch never returns Err");
+        let out = dispatch_tool_call(
+            rt.clone(),
+            None,
+            Some(catalog.clone()),
+            None,
+            None,
+            call,
+            &tc,
+        )
+        .await
+        .expect("component dispatch never returns Err");
         assert_eq!(out, serde_json::json!({ "refund_id": "r-1" }), "got: {out}");
 
         // Unknown op → shaped error value, still Ok.
@@ -949,7 +1572,7 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), None, Some(catalog), missing, &tc)
+        let out = dispatch_tool_call(rt.clone(), None, Some(catalog), None, None, missing, &tc)
             .await
             .expect("missing component op still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");
@@ -962,9 +1585,108 @@ mod tests {
             tool_name: "issue_refund".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt, None, None, no_cat, &tc)
+        let out = dispatch_tool_call(rt, None, None, None, None, no_cat, &tc)
             .await
             .expect("component dispatch with no catalog still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");
+    }
+
+    #[test]
+    fn list_includes_sorla_ref() {
+        // A catalog-backed sorla: ref is emitted as an LlmToolSchema with the
+        // catalog's description/parameters; ext_runtime is never consulted.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": { "amount": { "type": "number" } }
+        });
+        let invoker = Arc::new(SorlaFakeInvoker::new(vec![], Ok(serde_json::json!({}))));
+        let mut tools = HashMap::new();
+        tools.insert(
+            ("landlord".to_string(), "record_rent_payment".to_string()),
+            SorlaToolEntry {
+                description: "Record a rent payment".to_string(),
+                parameters: params.clone(),
+            },
+        );
+        let catalog = SorlaToolCatalog::for_tests(tools, invoker);
+
+        let allowed = vec![
+            ToolRef {
+                extension_id: "sorla:landlord".into(),
+                tool_name: "record_rent_payment".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
+            },
+            // Absent from the catalog → dropped (warn), not panicked.
+            ToolRef {
+                extension_id: "sorla:landlord".into(),
+                tool_name: "missing".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
+            },
+        ];
+
+        let schemas = list_tools_for_llm(&rt, None, None, None, Some(&catalog), &allowed);
+        assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
+        let s = &schemas[0];
+        assert_eq!(s.extension_id, "sorla:landlord");
+        assert_eq!(s.tool_name, "record_rent_payment");
+        assert_eq!(s.description, "Record a rent payment");
+        assert_eq!(s.parameters, params);
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sorla_ref() {
+        // Catalog entry present → routes to the invoker and returns its value.
+        let invoker = Arc::new(SorlaFakeInvoker::new(
+            vec![],
+            Ok(serde_json::json!({"ok":true})),
+        ));
+        let mut tools = HashMap::new();
+        tools.insert(
+            ("landlord".to_string(), "record_rent_payment".to_string()),
+            SorlaToolEntry {
+                description: "Record a rent payment".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        );
+        let catalog = Arc::new(SorlaToolCatalog::for_tests(tools, invoker));
+        let rt = Arc::new(ExtensionRuntime::for_test().unwrap());
+
+        let tc = TenantContext::new("t", "e");
+        let call = ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "sorla:landlord".into(),
+            tool_name: "record_rent_payment".into(),
+            args: serde_json::json!({}),
+        };
+        let out = dispatch_tool_call(rt, None, None, None, Some(catalog), call, &tc)
+            .await
+            .expect("sorla dispatch never returns Err");
+        assert_eq!(out, serde_json::json!({"ok":true}), "got: {out}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod kv_ledger_tests {
+    use super::*;
+    use crate::kv::MemoryKv;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn record_then_get_replays_result() {
+        let ledger = KvToolLedger::new(Arc::new(MemoryKv::new()));
+        let t = TenantContext::new("acme", "prod");
+        assert!(ledger.get(&t, "sess", "call1").await.unwrap().is_none());
+        ledger
+            .record(&t, "sess", "call1", serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        let got = ledger.get(&t, "sess", "call1").await.unwrap();
+        assert_eq!(got, Some(serde_json::json!({"ok": true})));
     }
 }

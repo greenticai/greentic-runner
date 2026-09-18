@@ -144,6 +144,14 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
         let user_text = extract_user_text(&input);
         let session_id = resolve_session_id(&input, idempotency_key);
         let tenant_ctx = TenantContext::new(tenant, env);
+        // Forward-compatible: honour a `conversational` flag on the dispatch
+        // input if the caller (engine remote-dispatch) supplies it, so the
+        // out-of-process path can offer `end_conversation` for a conversational
+        // flow node too. Defaults false when absent.
+        let conversational = input
+            .get("conversational")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let output = self
             .runtime
@@ -151,7 +159,10 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
                 tenant_ctx,
                 &session_id,
                 target,
-                AgentInput { text: user_text },
+                AgentInput {
+                    text: user_text,
+                    conversational,
+                },
             )
             .await
             .with_context(|| format!("agentic step failed for agent '{target}'"))?;
@@ -286,6 +297,10 @@ pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
 /// LLM. `reply` is repeated so a session can take several steps.
 #[cfg(feature = "test-mock")]
 #[must_use]
+// A test-double builder returning `Arc<AgentRuntime>`: it has no error channel,
+// and its one fallible call cannot fail here (see the comment at the call site).
+// Matches how `mock.rs` and `dispatch_ledger.rs` treat the same situation.
+#[allow(clippy::expect_used)]
 pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime> {
     use crate::cost::MockTokenMeter;
     use crate::llm::LlmResponse;
@@ -327,6 +342,8 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         limits: AgentLimits::default(),
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
     };
     for (tenant, env) in [
         ("default", "default"),
@@ -344,9 +361,14 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
 
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger: Arc<dyn ToolLedger> = Arc::new(NoopToolLedger);
-    // `aw-serve` is the canned-reply harness, so it never dispatches to a real
-    // extension; the shared empty-catalog test runtime is exactly right.
-    let ext_runtime = Arc::new(crate::test_support::extension_runtime());
+    // ext-runtime v1.3.2 (SDK contract research.4 bump) made `for_test()`
+    // fallible. It only fails on real construction errors (e.g. a malformed
+    // extensions root); the trivial no-extensions test double built here
+    // cannot hit that path, so `expect` is safe.
+    let ext_runtime = Arc::new(
+        greentic_ext_runtime::ExtensionRuntime::for_test()
+            .expect("ExtensionRuntime::for_test() must construct a no-extensions test double"),
+    );
 
     Arc::new(AgentRuntime::new(
         config_provider,

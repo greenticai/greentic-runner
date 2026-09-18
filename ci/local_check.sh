@@ -105,6 +105,13 @@ run_host_smoke() {
 run_crate_tests() {
   echo "==> crate tests"
   cargo test -p greentic-runner
+  # The agentic-worker unit tests need `test-mock` (the mock LLM/billing/state
+  # doubles live behind it), so a bare `cargo test -p greentic-aw-runtime`
+  # silently reports 0 tests. `workspace_tests` covers them via --all-features,
+  # but that variant also pulls RocksDB and is routinely skipped, which would
+  # leave the credit-budget gate in `loop.rs` -- the only thing stopping an
+  # empty wallet from spending on LLM calls -- with no gate in any cheap step.
+  cargo test -p greentic-aw-runtime --features test-mock
 }
 
 run_workspace_tests() {

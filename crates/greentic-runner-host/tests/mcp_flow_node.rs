@@ -864,6 +864,100 @@ fn mcp_node_local_wasm_calls_echo_tool_in_process() -> Result<()> {
     );
     Ok(())
 }
+
+/// An embedding host can hand the engine an MCP source it built itself,
+/// instead of the engine deriving one from process-global `GREENTIC_AW_*`
+/// env vars.
+///
+/// This is what a host serving MANY tenants from ONE process needs: env can
+/// only name a single tenant, so a per-tenant host has no way to say which
+/// tenant its MCP catalog should come from. The designer's Run Demo is that
+/// host.
+///
+/// The env is cleared BEFORE the engine is built, so the env-derived source
+/// is `None`. If the injection did not take, the node would bind the
+/// "MCP is not configured" error instead of the tool's result — which is
+/// exactly the failure this test exists to catch.
+#[test]
+fn an_injected_mcp_source_is_used_when_the_env_is_unset() -> Result<()> {
+    let _guard = ENV_GUARD.lock().unwrap();
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("mcp-injected.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    let mcp = rt.block_on(fake_mcp_server(
+        json!({ "structuredContent": { "title": "Bug" } }),
+    ));
+    let admin = rt.block_on(fake_admin(&mcp.uri()));
+
+    build_mcp_pack(
+        &pack_path,
+        json!({
+            "server": "github",
+            "tool": "get_issue",
+            "arguments": { "id": "{{ entry.issue_id }}" },
+            "output": "issue"
+        }),
+    )?;
+
+    let config = Arc::new(host_config(&bindings_path));
+
+    // SAFETY: serialized by ENV_GUARD. Deliberately UNSET: the source under
+    // test must come from the injection, not from the environment.
+    unsafe {
+        std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+        std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+        std::env::remove_var("GREENTIC_AW_MCP");
+    }
+
+    let injected = Arc::new(greentic_aw_runtime::McpToolSource::new(
+        admin.uri(),
+        "gtc_live_test",
+    ));
+
+    let pack = Arc::new(rt.block_on(PackRuntime::load(
+        &pack_path,
+        Arc::clone(&config),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(greentic_runner_host::wasi::RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?);
+    let engine = rt
+        .block_on(FlowEngine::new(
+            vec![Arc::clone(&pack)],
+            Arc::clone(&config),
+        ))?
+        .with_mcp_source(Some(injected));
+
+    let ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let execution = rt
+        .block_on(engine.execute(ctx, json!({ "issue_id": "42" })))
+        .context("mcp flow run")?;
+
+    match execution.status {
+        FlowStatus::Completed => {}
+        FlowStatus::Waiting(wait) => anyhow::bail!("flow paused unexpectedly: {:?}", wait.reason),
+    }
+
+    let issue = find_key(&execution.output, "issue")
+        .with_context(|| format!("output key `issue` missing, got {:?}", execution.output))?;
+    assert_eq!(
+        issue,
+        &json!({ "title": "Bug" }),
+        "an injected source must be used even with no MCP env set; got {:?}",
+        execution.output
+    );
+    Ok(())
+}
+
 // ── pack-carried routes (no admin at all) ────────────────────────────────────
 //
 // The feature these cover: a deployed runner holds no admin credentials, so an

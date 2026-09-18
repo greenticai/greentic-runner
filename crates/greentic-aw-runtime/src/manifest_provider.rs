@@ -114,6 +114,9 @@ mod tests {
                 tools: vec![ToolRef {
                     extension_id: "yaml.ext".into(),
                     tool_name: "yaml_tool".into(),
+                    description: None,
+                    input_schema: None,
+                    usage_note: None,
                 }],
                 guardrails: vec![],
                 llm: LlmProviderRef {
@@ -124,6 +127,8 @@ mod tests {
                 limits: AgentLimits::default(),
                 memory: None,
                 knowledge: None,
+                conversational: false,
+                opening_message: None,
             },
         );
         p
@@ -179,12 +184,6 @@ mod tests {
         std::fs::write(dir.join(format!("{agent_id}.json")), body).unwrap();
     }
 
-    /// Requires `greentic_dw_manifest_tools`: without it this lane's
-    /// `DigitalWorkerManifest` carries no `extension_tools`, so the overlay is
-    /// always empty and there is nothing to overlay. The companion
-    /// `a_tool_declaring_manifest_is_ignored_on_this_lane` pins what happens
-    /// instead.
-    #[cfg(greentic_dw_manifest_tools)]
     #[tokio::test]
     async fn overlays_manifest_tools_over_base() {
         let tmp = tempfile::tempdir().unwrap();
@@ -206,42 +205,13 @@ mod tests {
             vec![ToolRef {
                 extension_id: "greentic.tavily".into(),
                 tool_name: "web_search".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             }]
         );
         assert_eq!(cfg.system_prompt, "yaml-prompt");
         assert_eq!(cfg.llm.model, "gpt-4o-mini");
-    }
-
-    /// The honest counterpart on this lane: a manifest that DOES declare
-    /// agentic-worker tools still leaves the base config untouched, because
-    /// `DigitalWorkerManifest` here has no `extension_tools` field to parse
-    /// them into. Silent by design — `ManifestToolOverlayProvider` is
-    /// fail-soft — so pin it rather than leave it to be discovered.
-    #[cfg(not(greentic_dw_manifest_tools))]
-    #[tokio::test]
-    async fn a_tool_declaring_manifest_is_ignored_on_this_lane() {
-        let tmp = tempfile::tempdir().unwrap();
-        let tenant = TenantContext::new("t", "e");
-        write_manifest(
-            tmp.path(),
-            "bot",
-            &manifest_json("bot", "greentic.tavily", "web_search"),
-        );
-
-        let provider = ManifestToolOverlayProvider::new(
-            base_provider("bot", &tenant),
-            tmp.path().to_path_buf(),
-        );
-        let cfg = provider.agent_config(&tenant, "bot").await.unwrap();
-
-        assert_eq!(
-            cfg.tools,
-            vec![ToolRef {
-                extension_id: "yaml.ext".into(),
-                tool_name: "yaml_tool".into(),
-            }],
-            "the manifest's greentic.tavily/web_search must NOT reach the config on this lane"
-        );
     }
 
     #[tokio::test]
@@ -258,6 +228,9 @@ mod tests {
             vec![ToolRef {
                 extension_id: "yaml.ext".into(),
                 tool_name: "yaml_tool".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             }]
         );
     }
@@ -308,6 +281,9 @@ mod tests {
             vec![ToolRef {
                 extension_id: "yaml.ext".into(),
                 tool_name: "yaml_tool".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             }]
         );
     }

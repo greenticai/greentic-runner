@@ -16,12 +16,12 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ targe
 pkg-fmt = "tgz"
 bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
 targets = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
 ]
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
@@ -31,6 +31,113 @@ pkg-fmt = "zip"
 [package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
 pkg-fmt = "zip"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+blake3.workspace = true
+clap.workspace = true
+# NOT `workspace = true`: Cargo/edition-2024 forbids a member from overriding
+# `default-features` on a workspace-inherited dependency unless the workspace
+# declaration itself already says `default-features = false` — and flipping it
+# there would cascade to every other workspace member that depends on these
+# crates (crates/tests, aw-event-bridge, telco-x-event-bridge), pulling their
+# `agentic-worker`/`state-disk` defaults out from under them too. Writing the
+# path+version out explicitly here (instead of inheriting) keeps the
+# `default-features = false` scoped to just this runner->host / runner->desktop
+# edge, so a lean `--no-default-features --features verify` build of
+# `greentic-runner` produces a coherent (agentic-worker-OFF) feature graph
+# without touching any other member's defaults. See the `agentic-worker`
+# feature below, which re-forwards it for the default build.
+greentic-runner-host = { path = "../greentic-runner-host", version = "=1.3.0-research.0", default-features = false }
+greentic-runner-desktop = { path = "../greentic-runner-desktop", version = "=1.3.0-research.0", default-features = false }
+greentic-interfaces.workspace = true
+greentic-interfaces-host.workspace = true
+greentic-interfaces-wasmtime.workspace = true
+greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
+greentic-config.workspace = true
+greentic-distributor-client.workspace = true
+greentic_pack.workspace = true
+wasmtime-environ.workspace = true
+humantime.workspace = true
+runner-core = { workspace = true }
+chrono.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+serde_json.workspace = true
+serde_cbor.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_yaml_bw.workspace = true
+serde.workspace = true
+sha2.workspace = true
+wasmparser.workspace = true
+url.workspace = true
+indexmap.workspace = true
+toml.workspace = true
+zip.workspace = true
+tempfile.workspace = true
+walkdir.workspace = true
+
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[features]
+# Passthrough feature flags so the `info` report can accurately partition host
+# capabilities into enabled/disabled. These stay disabled by default — enable
+# them on the host crate and mirror them here if you need them surfaced.
+default = ["verify", "agentic-worker"]
+verify = ["greentic-runner-host/verify"]
+telemetry = ["greentic-runner-host/telemetry"]
+session-redis = ["greentic-runner-host/session-redis"]
+component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
+fault-injection = ["greentic-runner-host/fault-injection"]
+legacy-gen-bindings = []
+# Operator-configured Chronicle document-RAG (knowledge tier). Off by default
+# (pulls cross-org git deps + a native RocksDB build); enable for a knowledge
+# build: `--features knowledge-chronicle`.
+knowledge-chronicle = ["greentic-runner-host/knowledge-chronicle"]
+# Long-term episodic memory tier (same Chronicle stack, separate capability).
+long-term-chronicle = ["greentic-runner-host/long-term-chronicle"]
+# No-infra agentic-worker state: process-global in-memory stores when
+# GREENTIC_AW_REDIS_URL is unset, so a single-process runner runs dw.agent turns
+# without Redis. For local/sidecar use (e.g. the designer's loopback test-chat
+# runner sidecar) — NOT production deploys (use the Redis-backed stores). Off by default.
+# Forwarded to the desktop crate as well as the host: `greentic-runner-desktop`'s
+# `build_host_config` carries its OWN `#[cfg(feature = "desktop-agent-ephemeral")]`
+# no-Redis branch, so forwarding only to the host leaves that copy dead (#739).
+desktop-agent-ephemeral = [
+    "greentic-runner-host/desktop-agent-ephemeral",
+    "greentic-runner-desktop/desktop-agent-ephemeral",
+]
+# Skips extension signature verification when GREENTIC_EXT_ALLOW_UNSIGNED=1.
+# LOCAL DEV ONLY — never in a build that serves production traffic. Split out of
+# desktop-agent-ephemeral so the bypass has to be asked for by name.
+dev-allow-unsigned = ["greentic-runner-host/dev-allow-unsigned"]
+# Gates DwAgent (agentic-worker) nodes and their unpublishable runtime deps.
+# Enabled by default for local workspace builds; excluded from published
+# defaults because greentic-aw-runtime is not on crates.io.
+agentic-worker = [
+    "greentic-runner-host/agentic-worker",
+    "greentic-runner-host/state-disk",
+    "greentic-runner-desktop/agentic-worker",
+]
+# Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…) via
+# greentic-llm. Passthrough to the host/desktop crates. Opt-in (pulls rig-core);
+# `gtc`/greentic-start must add this to its runner feature list to surface it.
+greentic-llm-backend = [
+    "greentic-runner-host/greentic-llm-backend",
+    "greentic-runner-desktop/greentic-llm-backend",
+]
+
+[dev-dependencies]
+greentic-flow.workspace = true
+greentic-config-types.workspace = true
+serial_test.workspace = true
+semver.workspace = true
+insta.workspace = true
+greentic-state.workspace = true
 
 [lib]
 name = "greentic_runner"
@@ -49,92 +156,3 @@ required-features = ["legacy-gen-bindings"]
 name = "greentic-runner-cli"
 path = "src/bin/greentic-runner-cli.rs"
 required-features = ["legacy-gen-bindings"]
-
-[features]
-# Passthrough feature flags so the `info` report can accurately partition host
-# capabilities into enabled/disabled. These stay disabled by default — enable
-# them on the host crate and mirror them here if you need them surfaced.
-default = ["verify", "agentic-worker"]
-verify = ["greentic-runner-host/verify"]
-telemetry = ["greentic-runner-host/telemetry"]
-session-redis = ["greentic-runner-host/session-redis"]
-component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
-fault-injection = ["greentic-runner-host/fault-injection"]
-legacy-gen-bindings = []
-# Re-declared now that the host carries the agentic worker again (it was
-# dropped from this lane in d43ae4dd as main-only wiring, leaving the source's
-# cfg gates permanently false). On by default to match the host, so `info`
-# reports the capability truthfully and `HostConfig`'s agent/graph fields are
-# initialised in the tests below.
-agentic-worker = ["greentic-runner-host/agentic-worker"]
-# Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…) via
-# greentic-llm. Passthrough to the host/desktop crates. Opt-in (pulls rig-core);
-# `gtc`/greentic-start must add this to its runner feature list to surface it.
-#
-# Restored on develop: without it every published `greentic-runner-dev` binary
-# routed EVERY agentic-worker LLM call to api.openai.com, ignoring the agent's
-# configured `llm.provider`, with no warning anywhere.
-greentic-llm-backend = [
-    "greentic-runner-host/greentic-llm-backend",
-    "greentic-runner-desktop/greentic-llm-backend",
-]
-# No-infra agentic-worker state: process-global in-memory stores when
-# GREENTIC_AW_REDIS_URL is unset, so a single-process runner runs dw.agent turns
-# without Redis. For local/sidecar use (e.g. the designer's loopback test-chat
-# runner sidecar) — NOT production deploys (use the Redis-backed stores).
-#
-# Forwarded to the desktop crate as well as the host, which main does not do:
-# `greentic-runner-desktop`'s `build_host_config` carries its OWN
-# `#[cfg(feature = "desktop-agent-ephemeral")]` no-Redis branch, so forwarding
-# only to the host leaves the desktop harness's copy of that branch dead.
-desktop-agent-ephemeral = [
-    "greentic-runner-host/desktop-agent-ephemeral",
-    "greentic-runner-desktop/desktop-agent-ephemeral",
-]
-
-[dependencies]
-anyhow.workspace = true
-base64.workspace = true
-blake3.workspace = true
-chrono.workspace = true
-clap.workspace = true
-greentic-config.workspace = true
-greentic-distributor-client.workspace = true
-greentic-interfaces.workspace = true
-greentic-interfaces-host.workspace = true
-greentic-interfaces-wasmtime.workspace = true
-greentic-runner-desktop = { workspace = true }
-greentic-runner-host = { workspace = true }
-greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
-greentic_pack.workspace = true
-humantime.workspace = true
-indexmap.workspace = true
-runner-core = { workspace = true }
-serde.workspace = true
-serde_cbor.workspace = true
-serde_json.workspace = true
-serde_yaml_bw.workspace = true
-sha2.workspace = true
-tempfile.workspace = true
-tokio.workspace = true
-toml.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-url.workspace = true
-walkdir.workspace = true
-wasmparser.workspace = true
-wasmtime.workspace = true
-wasmtime-environ.workspace = true
-wasmtime-wasi.workspace = true
-zip.workspace = true
-
-[build-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-
-[dev-dependencies]
-greentic-config-types.workspace = true
-greentic-flow.workspace = true
-greentic-state.workspace = true
-insta.workspace = true
-semver.workspace = true
-serial_test.workspace = true

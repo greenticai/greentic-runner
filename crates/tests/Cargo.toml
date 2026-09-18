@@ -9,16 +9,26 @@ anyhow.workspace = true
 async-trait.workspace = true
 greentic-config-types.workspace = true
 greentic-flow.workspace = true
-greentic-runner-host.workspace = true
 greentic-types.workspace = true
 jsonschema.workspace = true
 once_cell.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+# NOT `.workspace = true` (which inherits `default-features = true`): none of
+# this crate's tests construct a `HostConfig` literal, so it doesn't need
+# host's `agentic-worker`/`state-disk` defaults. An unconstrained edge here
+# would force host's `agentic-worker` on for the WHOLE workspace resolve
+# (feature unification), which then breaks every other crate's own correctly
+# `#[cfg(feature = "agentic-worker")]`-gated `HostConfig` literal (runner's,
+# desktop's) whenever this crate is built in the same `--workspace` invocation
+# with `agentic-worker` intentionally off (e.g. the lean clippy gate) — see the
+# matching comments in greentic-runner's and greentic-runner-desktop's
+# Cargo.tomls.
+greentic-runner-host = { path = "../greentic-runner-host", version = "=1.3.0-research.0", default-features = false }
 runner-core.workspace = true
 semver.workspace = true
-serde_json.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
 zip.workspace = true

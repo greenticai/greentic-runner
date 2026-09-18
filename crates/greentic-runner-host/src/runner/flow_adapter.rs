@@ -189,6 +189,9 @@ fn map_node(node_id: NodeId, node_ir: NodeIR) -> Result<Node> {
         err_map: None,
         routing,
         telemetry: TelemetryHints::default(),
+        // This adapter's NodeIR has no conversational flag; the SP3
+        // conversational chat-segment flag reaches the runtime through the
+        // greentic_flow parse path (types::Node.conversational).
         conversational: false,
     })
 }

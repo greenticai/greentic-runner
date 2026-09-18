@@ -9,16 +9,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use greentic_mcp_exec::{ExecConfig, ExecRequest, RuntimePolicy, ToolStore, VerifyPolicy, exec};
-// `ToolDef` + `list_tools` — component introspection returning name /
-// description / input-schema — exist only on the mcp-exec line this lane does
-// not carry. Its `ToolInfo` is a store entry (name / path / sha256), a
-// different thing, and `describe::describe_tool` returns a describe-v1
-// document that would need real adaptation. So local-wasm tool DISCOVERY is
-// gated; dispatch below still works, since `exec` is present.
-#[cfg(greentic_mcp_local_wasm)]
-use greentic_mcp_exec::{ToolDef, list_tools};
+use greentic_mcp_exec::{
+    ExecConfig, ExecRequest, RuntimePolicy, ToolDef, ToolStore, VerifyPolicy, exec, list_tools,
+};
 use serde_json::{Value, json};
+
+use crate::mcp_scope::McpCallScope;
 
 /// Directory holding cached local MCP `*.wasm` files.
 ///
@@ -61,7 +57,7 @@ pub fn cache_dir() -> PathBuf {
 /// execution-time hash check will catch the mismatch before the component is
 /// instantiated, and `local_call_tool` will return `{"error": ...}` without
 /// running the tampered code.
-pub(crate) fn exec_config_for(component_ref: &str) -> ExecConfig {
+pub(crate) fn exec_config_for(component_ref: &str, scope: Option<&McpCallScope>) -> ExecConfig {
     let pinned_digest = read_pinned_digest(component_ref);
     let security = if let Some(wasm_digest) = pinned_digest {
         let mut required_digests = HashMap::new();
@@ -87,7 +83,7 @@ pub(crate) fn exec_config_for(component_ref: &str) -> ExecConfig {
         // OpenAPI routers), so the component is granted outbound HTTP. "No HTTP
         // hop" refers to the host<->MCP transport, not the tool's own egress.
         http_enabled: true,
-        secrets_store: None,
+        secrets_store: scope.and_then(|s| s.exec_secrets_store()),
     }
 }
 
@@ -125,15 +121,14 @@ fn read_pinned_digest(component_ref: &str) -> Option<String> {
 }
 
 /// List a local component's tools. Returns an empty vec and emits a `warn` on any failure.
-#[cfg(greentic_mcp_local_wasm)]
+// pre-existing: the spawned closure returns `greentic_mcp_exec::ExecError`, a large
+// external error variant we neither own nor propagate (mapped to a warn here); boxing
+// it would touch `list_tools`'s public signature, so we scope-allow instead.
+#[allow(clippy::result_large_err)]
 pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
     let component = component_ref.to_string();
-    let config = exec_config_for(component_ref);
-    // Box the error: `ExecError` is ≥144 bytes, which trips `clippy::result_large_err`
-    // on the closure's return type. It is only ever read for its `Display` here.
-    let res =
-        tokio::task::spawn_blocking(move || list_tools(&component, &config).map_err(Box::new))
-            .await;
+    let config = exec_config_for(component_ref, None);
+    let res = tokio::task::spawn_blocking(move || list_tools(&component, &config)).await;
     match res {
         Ok(Ok(tools)) => tools,
         Ok(Err(e)) => {
@@ -155,20 +150,37 @@ pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
     }
 }
 
+/// Build the exec request for a local tool call. Pure, so the tenant wiring is
+/// testable without a wasm component: a `None` tenant here is precisely the
+/// defect that makes every `secret_get` fail with `missing-tenant-ctx`.
+pub(crate) fn exec_request_for(
+    component_ref: &str,
+    tool: &str,
+    args: &Value,
+    scope: &McpCallScope,
+) -> ExecRequest {
+    ExecRequest {
+        component: component_ref.to_string(),
+        action: tool.to_string(),
+        args: args.clone(),
+        tenant: scope.types_tenant(),
+    }
+}
+
 /// Call a local component's tool. Returns `{"error": ...}` on any failure; never panics.
-pub async fn local_call_tool(component_ref: &str, tool: &str, args: &Value) -> Value {
-    let component = component_ref.to_string();
-    let action = tool.to_string();
-    let cloned_args = args.clone();
-    let config = exec_config_for(component_ref);
-    let req = ExecRequest {
-        component,
-        action,
-        args: cloned_args,
-        tenant: None,
-    };
-    // Boxed for the same reason as in `local_list_tools` above.
-    let res = tokio::task::spawn_blocking(move || exec(req, &config).map_err(Box::new)).await;
+// pre-existing: the spawned closure returns `greentic_mcp_exec::ExecError`, a large
+// external error variant we neither own nor propagate (mapped to a JSON error here);
+// boxing it would touch `exec`'s public signature, so we scope-allow instead.
+#[allow(clippy::result_large_err)]
+pub async fn local_call_tool(
+    component_ref: &str,
+    tool: &str,
+    args: &Value,
+    scope: &McpCallScope,
+) -> Value {
+    let config = exec_config_for(component_ref, Some(scope));
+    let req = exec_request_for(component_ref, tool, args, scope);
+    let res = tokio::task::spawn_blocking(move || exec(req, &config)).await;
     match res {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => json!({ "error": format!("local mcp call failed: {e}") }),
@@ -204,8 +216,14 @@ mod tests {
         unsafe { std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", dir.path()) };
         std::fs::copy(&src, dir.path().join("router_echo.wasm")).unwrap();
 
-        let out =
-            local_call_tool("router_echo", "echo", &serde_json::json!({"message": "hi"})).await;
+        let scope = McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+        let out = local_call_tool(
+            "router_echo",
+            "echo",
+            &serde_json::json!({"message": "hi"}),
+            &scope,
+        )
+        .await;
         assert!(!out.to_string().contains("\"error\""), "got: {out}");
     }
 
@@ -214,7 +232,8 @@ mod tests {
     async fn local_call_tool_missing_component_returns_error_value() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", dir.path()) };
-        let out = local_call_tool("nope", "echo", &serde_json::json!({})).await;
+        let scope = McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+        let out = local_call_tool("nope", "echo", &serde_json::json!({}), &scope).await;
         assert!(out.to_string().contains("error"), "got: {out}");
     }
 
@@ -247,7 +266,7 @@ mod tests {
         // Write a sidecar digest file for "mycomp.wasm.sha256".
         let sidecar = dir.path().join("mycomp.wasm.sha256");
         std::fs::write(&sidecar, "abcdef1234567890").unwrap();
-        let config = exec_config_for("mycomp");
+        let config = exec_config_for("mycomp", None);
         assert!(
             !config.security.allow_unverified,
             "sidecar present → allow_unverified must be false"
@@ -264,12 +283,68 @@ mod tests {
     fn exec_config_unverified_without_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", dir.path()) };
-        let config = exec_config_for("nosidecar");
+        let config = exec_config_for("nosidecar", None);
         assert!(
             config.security.allow_unverified,
             "no sidecar → allow_unverified must be true"
         );
         assert!(config.security.required_digests.is_empty());
         unsafe { std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR") };
+    }
+
+    #[test]
+    fn exec_config_without_scope_has_no_secrets_store() {
+        let config = exec_config_for("nosecrets", None);
+        assert!(
+            config.secrets_store.is_none(),
+            "introspection must stay credential-free"
+        );
+    }
+
+    #[test]
+    fn exec_request_carries_tenant_from_scope() {
+        use crate::mcp_scope::McpCallScope;
+        use crate::tenant::TenantContext;
+        use serde_json::json;
+
+        let scope = McpCallScope::new(TenantContext::new("acme", "prod"));
+        let req = exec_request_for("petstore", "list_pets", &json!({}), &scope);
+        let tenant = req
+            .tenant
+            .expect("tenant must be populated; without it the host answers missing-tenant-ctx");
+        assert_eq!(tenant.tenant.as_str(), "acme");
+        assert_eq!(tenant.env.as_str(), "prod");
+        assert_eq!(req.component, "petstore");
+        assert_eq!(req.action, "list_pets");
+    }
+
+    #[test]
+    fn exec_config_with_scope_carrying_secrets_has_a_store() {
+        use crate::mcp_scope::McpCallScope;
+        use crate::tenant::TenantContext;
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct FakeSecrets;
+        #[async_trait]
+        impl greentic_secrets_lib::SecretsManager for FakeSecrets {
+            async fn read(&self, _: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                Ok(b"v".to_vec())
+            }
+            async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        let scope =
+            McpCallScope::with_secrets(TenantContext::new("acme", "prod"), Arc::new(FakeSecrets));
+        let config = exec_config_for("withsecrets", Some(&scope));
+        assert!(
+            config.secrets_store.is_some(),
+            "the call path must receive a secrets store"
+        );
     }
 }

@@ -84,6 +84,8 @@ mod tests {
             memory: None,
             knowledge: None,
             guardrails: vec![],
+            conversational: false,
+            opening_message: None,
         };
         if present {
             c.memory = Some(MemorySettings {

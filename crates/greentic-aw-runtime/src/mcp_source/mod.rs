@@ -40,8 +40,8 @@ mod tests;
 
 pub use source::{McpToolSource, dispatch_route};
 pub use types::{
-    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpRoute, McpToolCatalog, McpToolEntry,
-    Transport,
+    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpCallerIdentity, McpPackRoute, McpRoute,
+    McpToolCatalog, McpToolEntry, Transport,
 };
 
 #[cfg(test)]
