@@ -6612,6 +6612,43 @@ mod tests {
         );
     }
 
+    /// A sibling-less `approval.call` node (component id `approval.call`,
+    /// operation `None` — the shape greentic-flow now emits when the gate has
+    /// no sibling component) must dispatch as `NodeKind::ApprovalCall` with an
+    /// empty target, not fall through to `component.exec`/error.
+    ///
+    /// Reconciliation note #2 (`approval.call` shape change, Part B): adding
+    /// `approval.call` to the runtime-native call kinds changes a
+    /// sibling-less approval node's compiled shape. This pins the runner-host
+    /// side of that assumption at the engine level.
+    #[test]
+    fn approval_call_with_no_operation_dispatches_as_approval_call() {
+        let node = Node {
+            id: NodeId::from_str("gate").unwrap(),
+            component: FlowComponentRef {
+                id: "approval.call".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "await": true, "input": { "mode": "always" } }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+        let host_node = HostNode::from(node);
+        assert!(
+            matches!(&host_node.kind, NodeKind::ApprovalCall { target } if target.is_empty()),
+            "expected NodeKind::ApprovalCall with an empty target, got {:?}",
+            host_node.kind
+        );
+    }
+
     #[test]
     fn emits_end_event_for_successful_node() {
         let node_id = NodeId::from_str("emit").unwrap();
@@ -11697,10 +11734,57 @@ mod tests {
         }
     }
 
+    /// One recorded `OperalaNodeHandler::execute` call.
+    #[derive(Clone, Debug)]
+    struct OperalaCallRecord {
+        tenant: String,
+        env: String,
+        target: String,
+        operation: String,
+        session_id: String,
+        input: serde_json::Value,
+    }
+
+    #[derive(Default)]
+    struct RecordingOperalaHandler {
+        calls: std::sync::Mutex<Vec<OperalaCallRecord>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runner::operala_node::OperalaNodeHandler for RecordingOperalaHandler {
+        async fn execute(
+            &self,
+            tenant: &str,
+            env: &str,
+            target: &str,
+            operation: &str,
+            session_id: &str,
+            input: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.calls
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording handler lock poisoned"))?
+                .push(OperalaCallRecord {
+                    tenant: tenant.to_string(),
+                    env: env.to_string(),
+                    target: target.to_string(),
+                    operation: operation.to_string(),
+                    session_id: session_id.to_string(),
+                    input: input.clone(),
+                });
+            Ok(json!({ "ok": true, "reply": "recorded" }))
+        }
+    }
+
     /// Build a single-node flow: an `operala.call` node (given `target`) that
     /// ends the flow directly. Mirrors `conversational_dw_flow`'s shape for
     /// the (non-conversational) operala path.
     fn operala_flow(target: &str) -> HostFlow {
+        operala_flow_with_payload(target, json!({ "operation": "", "input": { "goal": "hi" } }))
+    }
+
+    /// Like [`operala_flow`] but with a caller-chosen node payload.
+    fn operala_flow_with_payload(target: &str, payload_expr: Value) -> HostFlow {
         let mut nodes = IndexMap::new();
         let node_id = NodeId::from_str("op").unwrap();
         nodes.insert(
@@ -11713,7 +11797,7 @@ mod tests {
                 component_id: "operala.call".to_string(),
                 operation_name: Some(target.to_string()),
                 operation_in_mapping: None,
-                payload_expr: json!({ "operation": "", "input": { "goal": "hi" } }),
+                payload_expr,
                 routing: Routing::End,
                 vars_out: None,
             },
@@ -11802,6 +11886,47 @@ mod tests {
             .expect("operala.call with an in-process handler must complete");
         assert!(matches!(execution.status, FlowStatus::Completed));
         assert_eq!(execution.output, json!({ "reply": "stub" }));
+    }
+
+    #[test]
+    fn operala_call_hands_the_handler_run_and_the_nodes_input() {
+        // greentic-dw-authoring stamps `operation: "invoke"`; the invoker only
+        // accepts "" | "run". The deep-worker settings (B2) ride in `input`.
+        let deep_worker = json!({ "iterationBudget": 3, "reflection": false, "delegation": false });
+        let recorder = std::sync::Arc::new(RecordingOperalaHandler::default());
+        let engine = operala_engine(
+            operala_flow_with_payload(
+                "w1",
+                json!({
+                    "operation": "invoke",
+                    "input": { "goal": "summarise the quarter", "deep_worker": deep_worker.clone() }
+                }),
+            ),
+            Some(recorder.clone()),
+        );
+        let execution = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(engine.execute(operala_ctx(), Value::Null))
+            .expect("operala.call with an in-process handler must complete");
+        assert!(matches!(execution.status, FlowStatus::Completed));
+
+        let calls = recorder.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one dispatch: {calls:?}");
+        let call = &calls[0];
+        assert_eq!(call.operation, "run", "invoke must be normalised to run");
+        assert_eq!(call.target, "w1");
+        assert_eq!(call.tenant, "demo");
+        assert_eq!(call.env, "local");
+        assert_eq!(call.session_id, "sess-op");
+        assert_eq!(call.input["goal"], json!("summarise the quarter"));
+        assert_eq!(
+            call.input["deep_worker"], deep_worker,
+            "settings must reach the invoker verbatim"
+        );
+        assert!(
+            call.input.get("operation").is_none(),
+            "the handler gets payload.input, not the envelope"
+        );
     }
 
     #[test]
