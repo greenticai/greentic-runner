@@ -1,6 +1,7 @@
 pub mod adapt_events_email;
 pub mod adapt_timer;
 pub mod agent_node;
+pub mod card_nav;
 #[cfg(feature = "agentic-worker")]
 pub(crate) mod aw_backends;
 pub mod component_invoker;

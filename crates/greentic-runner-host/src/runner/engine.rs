@@ -796,6 +796,54 @@ impl FlowEngine {
     }
 
     pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+        self.execute_with_entry(ctx, input, None).await
+    }
+
+    /// Execute a flow whose cursor starts at `entry_node` instead of the flow's
+    /// declared entrypoint.
+    ///
+    /// Card-driven messaging packs carry the id of the next node to run on the
+    /// inbound activity (the designer emits it as `nextCardId`). A host that can
+    /// only call [`FlowEngine::execute`] restarts such a flow at its entrypoint
+    /// on every turn, so the capture nodes chained between two cards never run.
+    ///
+    /// Unlike [`FlowEngine::resume`] this needs no persisted `FlowSnapshot`:
+    /// state starts fresh from `input`. That is what makes it usable for packs
+    /// whose pause points are rendered cards rather than `session.wait` nodes —
+    /// those never park, so they never leave a snapshot behind.
+    ///
+    /// An `entry_node` that is not a node of the flow is a hard error. Falling
+    /// back to the entrypoint would re-introduce the silent restart this exists
+    /// to remove.
+    pub async fn execute_from(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+        entry_node: &str,
+    ) -> Result<FlowExecution> {
+        self.execute_with_entry(ctx, input, Some(entry_node.to_string()))
+            .await
+    }
+
+    async fn execute_with_entry(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+        entry_node: Option<String>,
+    ) -> Result<FlowExecution> {
+        // Validate the caller's entry node BEFORE the retry loop below, whose
+        // session-flow arm converts a terminal error into an Ok envelope. A
+        // node id the flow does not have is a caller/pack defect, not a
+        // transient failure, and must surface as an error rather than as a
+        // rendered "something went wrong" card.
+        if let Some(node) = entry_node.as_deref() {
+            let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
+            let node_id = NodeId::from_str(node)
+                .with_context(|| format!("invalid entry node id `{node}`"))?;
+            if !flow_ir.nodes.contains_key(&node_id) {
+                bail!("flow {} has no node `{}`", ctx.flow_id, node);
+            }
+        }
         let span = self.flow_execute_span(&ctx);
         let retry_config = ctx.retry_config;
         let original_input = input;
@@ -819,7 +867,10 @@ impl FlowEngine {
                     maybe_fail(FaultPoint::Timeout, fault_ctx)
                         .map_err(|err| anyhow!(err.to_string()))?;
                 }
-                match self.execute_once(&ctx, original_input.clone()).await {
+                match self
+                    .execute_once(&ctx, original_input.clone(), entry_node.clone())
+                    .await
+                {
                     Ok(value) => return Ok(value),
                     Err(err) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
@@ -911,7 +962,12 @@ impl FlowEngine {
             .await
     }
 
-    async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+    async fn execute_once(
+        &self,
+        ctx: &FlowContext<'_>,
+        input: Value,
+        entry_node: Option<String>,
+    ) -> Result<FlowExecution> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
         let mut state = ExecutionState::new(input);
         let missing = seed_vars_and_collect_missing_required(
@@ -929,7 +985,7 @@ impl FlowEngine {
             );
             anyhow::bail!("{label}: {}", missing.join(", "));
         }
-        self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
+        self.drive_flow(ctx, flow_ir, state, entry_node, ctx.flow_id.to_string())
             .await
     }
 
@@ -1047,7 +1103,8 @@ impl FlowEngine {
                 }
             };
 
-            attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
+            let owned_the_submit =
+                attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
@@ -1094,6 +1151,18 @@ impl FlowEngine {
                             }
                         }
                     };
+
+                    // This node has now routed on the submit that was delivered
+                    // to it, so the action is spent. `response.*` is synthesised
+                    // from the run's entry envelope and is therefore run-scoped:
+                    // left in place it matches again at the NEXT card and the
+                    // run walks straight past it, advancing the journey by two
+                    // pages per submit. Clearing it here means every later node
+                    // sees a freshly rendered card with no pending action, falls
+                    // through its conditional routing, and parks for the user.
+                    if owned_the_submit {
+                        consume_routing_action(&mut state.entry);
+                    }
 
                     match decision {
                         NextDecision::Next(n) => current = n,
@@ -2854,6 +2923,32 @@ impl FlowEngine {
         &self.flows
     }
 
+    /// Node ids declared by a flow, for callers that must tell a flow node
+    /// apart from something else that shares the id space — a card asset, in
+    /// the case of [`crate::runner::card_nav`].
+    ///
+    /// Loads the flow if it is not cached yet; an unloadable flow yields an
+    /// empty list rather than an error, because the caller's question ("is
+    /// this a node?") has a sound negative answer either way.
+    pub async fn flow_node_ids(&self, pack_id: &str, flow_id: &str) -> Vec<String> {
+        match self.get_or_load_flow(pack_id, flow_id).await {
+            Ok(flow) => flow
+                .nodes
+                .keys()
+                .map(|id| id.as_str().to_string())
+                .collect(),
+            Err(error) => {
+                tracing::debug!(
+                    pack_id,
+                    flow_id,
+                    error = %error,
+                    "flow not loadable while listing node ids; treating as no nodes"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     pub fn flow_by_key(&self, pack_id: &str, flow_id: &str) -> Option<&FlowDescriptor> {
         self.flows
             .iter()
@@ -3487,6 +3582,22 @@ fn declared_answer_fields(payload_expr: &Value) -> DeclaredAnswerFields {
     }
 }
 
+/// Remove the routing `action` from a run's entry envelope.
+///
+/// Mirrors the two shapes [`build_routing_context`] reads it from: the
+/// greentic-start demo path wraps the activity (`entry.input.metadata`), the
+/// direct runner path does not (`entry.metadata`).
+fn consume_routing_action(entry: &mut Value) {
+    for pointer in ["/input/metadata", "/metadata"] {
+        if let Some(Value::Object(meta)) = entry.pointer_mut(pointer) {
+            meta.remove("action");
+        }
+    }
+}
+
+/// Returns true when the pending submit belonged to `node_id` and was consumed
+/// here — the caller clears the routing action once this node has routed on it.
+///
 /// Merge the pending submitted fields into `output` when it belongs to the node
 /// that parked for them, then CONSUME the pending entry.
 ///
@@ -3508,16 +3619,16 @@ fn attach_pending_card_answers(
     node_id: &str,
     node: &HostNode,
     output: &mut NodeOutput,
-) {
+) -> bool {
     let is_target = state
         .pending_card_answers
         .as_ref()
         .is_some_and(|pending| pending.node_id == node_id);
     if !is_target {
-        return;
+        return false;
     }
     let Some(pending) = state.pending_card_answers.take() else {
-        return;
+        return false;
     };
     // No `ok` check on purpose: the answers are real whether or not the
     // re-render succeeded, and dropping them would let a transient render error
@@ -3527,7 +3638,7 @@ fn attach_pending_card_answers(
             node_id = %node_id,
             "node output payload is not an object; submitted answers not attached"
         );
-        return;
+        return true;
     };
     if map.contains_key("answers") {
         tracing::warn!(
@@ -3560,6 +3671,7 @@ fn attach_pending_card_answers(
         DeclaredAnswerFields::Absent => pending.answers,
     };
     map.insert("answers".to_string(), Value::Object(answers));
+    true
 }
 
 /// Decide what to park for the node awaiting a submit, from the snapshot being

@@ -107,6 +107,21 @@ impl TenantContext {
 pub struct RunOptions {
     pub profile: Profile,
     pub entry_flow: Option<String>,
+    /// Start the run at this node instead of the flow's declared entrypoint.
+    ///
+    /// Card-driven messaging packs carry the id of the next node to run on the
+    /// inbound activity. Without this the host can only restart at the
+    /// entrypoint on every turn, so the nodes chained between two rendered
+    /// cards never execute.
+    ///
+    /// A persisted resume snapshot WINS over this: it means a card is parked
+    /// awaiting the user's submit, and only re-dispatching that card attaches
+    /// the submitted `answers` to its output for the nodes downstream to read.
+    /// So this drives the FIRST hop into a flow, and resume drives the rest.
+    ///
+    /// A node id the flow does not have is an error, never a silent fall back
+    /// to the entrypoint.
+    pub entry_node: Option<String>,
     pub input: Value,
     pub ctx: TenantContext,
     pub transcript: Option<TranscriptHook>,
@@ -150,6 +165,7 @@ impl fmt::Debug for RunOptions {
         f.debug_struct("RunOptions")
             .field("profile", &self.profile)
             .field("entry_flow", &self.entry_flow)
+            .field("entry_node", &self.entry_node)
             .field("input", &self.input)
             .field("ctx", &self.ctx)
             .field("transcript", &self.transcript.is_some())
@@ -277,6 +293,7 @@ pub fn desktop_defaults() -> RunOptions {
         secrets_manager: None,
         cross_pack_resolver: None,
         session_state_dir: None,
+        entry_node: None,
     }
 }
 
@@ -542,7 +559,19 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         .and_then(load_session_snapshot);
 
     let execution = if let Some(snapshot) = resume_snapshot {
+        // A parked snapshot OUTRANKS `entry_node`. A card parks awaiting the
+        // user's submit, and only re-dispatching THAT node on resume attaches
+        // the submitted `answers` to its output — which is what the nodes
+        // downstream read (`{{node.<card>.answers.<field>}}`). Jumping to an
+        // entry node instead skips the card, so the answers never exist and
+        // every downstream binding resolves empty.
         engine.resume(ctx, snapshot, opts.input.clone()).await
+    } else if let Some(entry_node) = opts.entry_node.as_deref() {
+        // No parked run to continue, so this is the caller's first hop into
+        // the flow: start at the node it named.
+        engine
+            .execute_from(ctx, opts.input.clone(), entry_node)
+            .await
     } else {
         engine.execute(ctx, opts.input.clone()).await
     };
