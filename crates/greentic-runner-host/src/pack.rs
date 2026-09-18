@@ -2452,6 +2452,69 @@ impl PackRuntime {
         })
     }
 
+    /// Fold a provider instance's configured answers into its invocation
+    /// payload, the same way [`Self::merge_component_config_into_input_json`]
+    /// does for a component.
+    ///
+    /// `ProviderBinding` has carried `config_json` since providers gained
+    /// instances, and `runner::operator` passes it whenever it reaches a
+    /// provider through `invoke_component`. This path — the one
+    /// `HostRuntime`'s webhook dispatch uses — took the payload and handed it
+    /// over untouched, so a provider invoked here saw `request.config` as an
+    /// empty object no matter what the operator had answered. Nothing failed:
+    /// every setup answer simply was not there, which a provider reports (if
+    /// at all) as its own feature being switched off.
+    ///
+    /// Two rules, and the second is why this is not just a call to the
+    /// component version:
+    ///
+    /// - **No config, no change.** A provider instance with no configured
+    ///   answers gets the byte-identical payload it gets today, so nothing
+    ///   about an unconfigured provider moves.
+    /// - **The payload must already be JSON.** A provider's input arrives as
+    ///   bytes from a webhook body, not as a flow node's value, so it may not
+    ///   be JSON at all. The component merge wraps a non-JSON input as a JSON
+    ///   string, which for a provider would replace a binary body with an
+    ///   envelope the component cannot read — trading a missing config for a
+    ///   corrupted request. Here a payload that does not parse is passed
+    ///   through untouched and the drop is logged with the provider named,
+    ///   because silence is what this whole function exists to end.
+    fn merge_provider_config_into_input(
+        config_json: Option<&str>,
+        input_json: Vec<u8>,
+        provider_type: &str,
+    ) -> Vec<u8> {
+        let Some(config_json) = config_json else {
+            return input_json;
+        };
+        let Ok(input_str) = std::str::from_utf8(&input_json) else {
+            tracing::warn!(
+                provider_type,
+                "provider payload is not UTF-8; invoking without its configured answers"
+            );
+            return input_json;
+        };
+        if serde_json::from_str::<Value>(input_str).is_err() {
+            tracing::warn!(
+                provider_type,
+                "provider payload is not JSON; invoking without its configured answers"
+            );
+            return input_json;
+        }
+        match Self::merge_component_config_into_input_json(Some(config_json), input_str) {
+            Ok(merged) => merged.into_bytes(),
+            Err(error) => {
+                tracing::warn!(
+                    provider_type,
+                    %error,
+                    "could not merge the provider's configured answers into its payload; \
+                     invoking without them"
+                );
+                input_json
+            }
+        }
+    }
+
     fn merge_component_config_into_input_json(
         config_json: Option<&str>,
         input_json: &str,
@@ -2520,7 +2583,11 @@ impl PackRuntime {
         let wasi_policy = Arc::clone(&self.wasi_policy);
         let pack_id = self.metadata().pack_id.clone();
         let allow_state_store = self.allows_state_store(&component_ref_owned);
-        let input_owned = input_json;
+        let input_owned = Self::merge_provider_config_into_input(
+            binding.config_json.as_deref(),
+            input_json,
+            &binding.provider_type,
+        );
         let op_owned = op.to_string();
         let ctx_owned = ctx;
         let world = binding.world.clone();
@@ -5509,6 +5576,49 @@ pub(crate) mod tests {
     use greentic_flow::model::{FlowDoc, NodeDoc};
     use indexmap::IndexMap;
     use serde_json::json;
+
+    /// The whole point: a configured provider used to be invoked with its
+    /// answers dropped, so `request.config` arrived empty.
+    #[test]
+    fn a_configured_provider_receives_its_answers() {
+        let merged = PackRuntime::merge_provider_config_into_input(
+            Some(r#"{"auto_start_on_open":false}"#),
+            br#"{"hello":"world"}"#.to_vec(),
+            "webchat-gui",
+        );
+        let value: Value = serde_json::from_slice(&merged).expect("merged payload is JSON");
+        assert_eq!(value["config"]["auto_start_on_open"], json!(false));
+        assert_eq!(value["input"]["hello"], json!("world"));
+    }
+
+    /// An unconfigured provider must get the bytes it gets today, unchanged —
+    /// so nothing about a provider nobody has answered for moves.
+    #[test]
+    fn an_unconfigured_provider_payload_is_untouched() {
+        let original = br#"{"hello":"world"}"#.to_vec();
+        let merged =
+            PackRuntime::merge_provider_config_into_input(None, original.clone(), "webchat-gui");
+        assert_eq!(merged, original);
+    }
+
+    /// A provider's input is a webhook body, not a flow value, so it may not be
+    /// JSON. The component merge would wrap it as a JSON string; doing that
+    /// here would swap a missing config for a corrupted request body.
+    #[test]
+    fn a_non_json_provider_payload_is_passed_through_rather_than_wrapped() {
+        let original = vec![0x89u8, 0x50, 0x4e, 0x47];
+        let merged = PackRuntime::merge_provider_config_into_input(
+            Some(r#"{"k":1}"#),
+            original.clone(),
+            "some-provider",
+        );
+        assert_eq!(merged, original, "binary payloads must survive verbatim");
+
+        let text = b"not json at all".to_vec();
+        let merged =
+            PackRuntime::merge_provider_config_into_input(Some(r#"{"k":1}"#), text.clone(), "p");
+        assert_eq!(merged, text);
+    }
 
     #[test]
     fn tags_indicate_entry_treats_internal_as_non_entry() {
