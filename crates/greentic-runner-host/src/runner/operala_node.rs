@@ -82,6 +82,26 @@ fn resolve_operala_provider_model(
     }
 }
 
+/// Env var choosing how `operala.call` nodes dispatch in a build compiled with
+/// `operala-in-process`. Mirrors `GREENTIC_AW_DISPATCH` for `dw.agent`.
+#[cfg(feature = "operala-in-process")]
+pub const OPERALA_DISPATCH_ENV: &str = "GREENTIC_OPERALA_DISPATCH";
+
+/// Whether `operala.call` should run in-process, given the raw value of
+/// [`OPERALA_DISPATCH_ENV`]. Only `nats` (any case, surrounding whitespace
+/// ignored) opts out and keeps the NATS `RemoteDispatchHandler` path; unset or
+/// any other value keeps the in-process default — the handler is then still
+/// wired only when an LLM key resolves.
+///
+/// Pure over its argument so it is unit-testable without mutating the process
+/// environment; cfg-gated like [`resolve_operala_provider_model`] so a lean
+/// build does not flag it dead.
+#[cfg(any(feature = "operala-in-process", test))]
+#[must_use]
+pub fn operala_dispatch_in_process(env_value: Option<&str>) -> bool {
+    !env_value.is_some_and(|value| value.trim().eq_ignore_ascii_case("nats"))
+}
+
 // ---------------------------------------------------------------------------
 // desktop-agent-ephemeral feature: DeepWorkerInvoker-backed handler
 // ---------------------------------------------------------------------------
@@ -233,5 +253,26 @@ mod tests {
             err.to_string().contains("worker LLM config missing"),
             "error must name the missing worker LLM config, got: {err}"
         );
+    }
+
+    #[test]
+    fn operala_dispatch_defaults_to_in_process_when_unset() {
+        assert!(operala_dispatch_in_process(None));
+    }
+
+    #[test]
+    fn operala_dispatch_nats_forces_nats_case_insensitively() {
+        assert!(!operala_dispatch_in_process(Some("nats")));
+        assert!(!operala_dispatch_in_process(Some(" NATS ")));
+        assert!(!operala_dispatch_in_process(Some("Nats")));
+    }
+
+    #[test]
+    fn operala_dispatch_any_other_value_stays_in_process() {
+        // Mirrors `dw_agent_dispatch_mode`: only `nats` opts out; a typo or an
+        // explicit `inprocess` keeps the default, never silently disables it.
+        assert!(operala_dispatch_in_process(Some("")));
+        assert!(operala_dispatch_in_process(Some("inprocess")));
+        assert!(operala_dispatch_in_process(Some("nat")));
     }
 }
