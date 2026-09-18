@@ -1,10 +1,3 @@
-// Exercises `ExtRuntimeGuardrailEvaluator`, which needs the
-// `greentic:extension-design@0.3.0` guardrail surface. This lane's
-// greentic-ext-runtime is on 0.2.0 and the evaluator is compiled out, so this
-// test is parked on the same gate as the code it covers. See the [features]
-// note in Cargo.toml.
-#![cfg(greentic_guardrail_ext)]
-
 //! End-to-end test: load the real `component-guardrail-pii` WASM extension,
 //! wire it through `AgentRuntime`, and assert masking + deny behaviour.
 //!

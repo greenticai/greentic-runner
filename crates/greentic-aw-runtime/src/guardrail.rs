@@ -110,36 +110,6 @@ impl GuardrailEvaluator for AcceptAllEvaluator {
     }
 }
 
-/// Evaluator for lanes whose `greentic-ext-runtime` cannot run guardrail
-/// extensions — it has no `evaluate_guardrail`, because the
-/// `greentic:extension-design@0.3.0` interface that declares `guardrail` is
-/// not part of its WIT surface.
-///
-/// It FAILS CLOSED. Returning [`GuardrailVerdict::Accept`] would be worse than
-/// useless: an agent that configured a guardrail would run completely
-/// unprotected while appearing to be guarded. An error is loud, and matches
-/// [`GuardrailPolicy`]'s stated contract that a caller which cannot determine
-/// the guardrail outcome must fail closed.
-///
-/// Agents that configure no guardrails never reach this evaluator, so the dev
-/// lane stays usable; only an agent that actually asked for a guardrail is
-/// stopped.
-pub struct UnavailableGuardrailEvaluator;
-
-impl GuardrailEvaluator for UnavailableGuardrailEvaluator {
-    fn evaluate(
-        &self,
-        extension_id: &str,
-        _input: &GuardrailInput,
-    ) -> Result<GuardrailVerdict, GuardrailInvokeError> {
-        Err(GuardrailInvokeError(format!(
-            "guardrail extension '{extension_id}' cannot run on this build: \
-             greentic-ext-runtime here does not expose the \
-             greentic:extension-design@0.3.0 guardrail interface"
-        )))
-    }
-}
-
 /// A [`GuardrailEvaluator`] that delegates evaluation to a real WASM extension
 /// loaded by [`greentic_ext_runtime::ExtensionRuntime`].
 ///
@@ -158,17 +128,10 @@ impl GuardrailEvaluator for UnavailableGuardrailEvaluator {
 /// Construction (Task 8) will pass the `Arc<ExtensionRuntime>` that the
 /// `AgentRuntime` already holds for tool dispatch. No additional WASM runtime
 /// is needed.
-///
-/// Gated on `guardrail-ext`: it needs `ExtensionRuntime::evaluate_guardrail`
-/// and `GuardrailVerdictWire`, which exist only where the runtime carries the
-/// `greentic:extension-design@0.3.0` WIT surface. Lanes without it get
-/// [`UnavailableGuardrailEvaluator`] instead, which fails closed.
-#[cfg(greentic_guardrail_ext)]
 pub struct ExtRuntimeGuardrailEvaluator {
     pub ext_runtime: std::sync::Arc<greentic_ext_runtime::ExtensionRuntime>,
 }
 
-#[cfg(greentic_guardrail_ext)]
 impl GuardrailEvaluator for ExtRuntimeGuardrailEvaluator {
     fn evaluate(
         &self,

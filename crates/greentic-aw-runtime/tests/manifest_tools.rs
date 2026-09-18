@@ -1,4 +1,3 @@
-#![cfg(greentic_dw_manifest_tools)]
 //! Integration tests for [`greentic_aw_runtime::manifest_tools::manifest_to_tool_refs`].
 //!
 //! Verifies the additive bridge from `DigitalWorkerManifest.extension_tools`

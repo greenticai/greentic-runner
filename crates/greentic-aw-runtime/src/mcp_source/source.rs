@@ -474,17 +474,7 @@ async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, Str
             crate::mcp_store_pull::ensure_cached(component, version, digest)
                 .await
                 .map_err(|e| format!("local-wasm store-pull failed for '{}': {e}", component))?;
-            // Discovery needs mcp-exec's component introspection, which this
-            // lane's mcp-exec does not expose. Remote (http) servers are
-            // unaffected — only local-wasm discovery is unavailable.
-            #[cfg(not(greentic_mcp_local_wasm))]
-            return Err(format!(
-                "local-wasm MCP tool discovery is not available on this build; \
-                 server '{component}' cannot be catalogued"
-            ));
-            #[cfg(greentic_mcp_local_wasm)]
             let tools = crate::mcp_local::local_list_tools(component).await;
-            #[cfg(greentic_mcp_local_wasm)]
             Ok(tools
                 .into_iter()
                 .map(|tool_def| McpToolDef {
