@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use greentic_pack::reader::open_pack;
+use greentic_pack::reader::{VerifyReport, open_pack};
 use greentic_runner_host::RunnerWasiPolicy;
 use greentic_runner_host::config::{
     FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
@@ -325,6 +325,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                     entry_flows: meta.entry_flows.clone(),
                     secret_requirements: Vec::new(),
                 });
+                note_verify_outcome(&recorder, VerifyOutcome::Loaded(&load.report));
                 if let Some(manifest) = load.gpack_manifest.as_ref() {
                     pack_http_flags = manifest
                         .components
@@ -343,17 +344,14 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             Err(err) => {
                 recorder.record_verify_event("error", &err.message)?;
                 if opts.signing == SigningPolicy::DevOk && is_signature_error(&err.message) {
-                    warn!(error = %err.message, "continuing despite signature error (dev policy)");
+                    note_verify_outcome(&recorder, VerifyOutcome::Downgraded(&err.message));
                 } else {
                     return Err(anyhow!("pack verification failed: {}", err.message));
                 }
             }
         }
     } else {
-        tracing::debug!(
-            path = %pack_path.display(),
-            "skipping pack verification for directory input"
-        );
+        note_verify_outcome(&recorder, VerifyOutcome::DirectorySkipped);
     }
 
     let kill_switch = desktop_http_kill_switch_active();
@@ -741,6 +739,63 @@ fn resolve_entry_flow(
 
 fn is_signature_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains("signature")
+}
+
+/// What a verification outcome is worth recording, if anything.
+///
+/// Kept separate from the call sites so the decision can be tested directly —
+/// the call sites live deep inside `run_pack_with_options`, which needs a real
+/// pack, a real profile and a temp directory to reach.
+enum VerifyOutcome<'a> {
+    /// A pack that loaded, carrying its verification report.
+    Loaded(&'a VerifyReport),
+    /// The input was a directory, so verification never ran at all.
+    DirectorySkipped,
+    /// An error was downgraded to a warning by `is_signature_error`.
+    Downgraded(&'a str),
+}
+
+/// `None` when there is nothing worth recording; otherwise the event status and
+/// its message.
+fn verify_event(outcome: VerifyOutcome<'_>) -> Option<(&'static str, String)> {
+    match outcome {
+        VerifyOutcome::Loaded(report) if report.signature_ok => None,
+        VerifyOutcome::Loaded(report) => {
+            // Fall back to a fixed sentence rather than an empty message: an
+            // empty event is as invisible as no event, which is the defect this
+            // exists to close.
+            let message = if report.warnings.is_empty() {
+                "pack signature did not verify; the loader reported no detail".to_string()
+            } else {
+                report.warnings.join("; ")
+            };
+            Some(("unverified", message))
+        }
+        VerifyOutcome::DirectorySkipped => Some((
+            "skipped",
+            "pack verification skipped: input is a directory, not a signed archive".to_string(),
+        )),
+        VerifyOutcome::Downgraded(err) => Some((
+            "downgraded",
+            format!("continuing despite error, matched as signature-related by substring: {err}"),
+        )),
+    }
+}
+
+/// Record a verification outcome, if there is one worth recording.
+///
+/// Deliberately swallows a recording failure. All three call sites fire on paths
+/// where the run continues, and observability added by this change must not be
+/// able to turn a run that works into a run that fails. The pre-existing call on
+/// the error path keeps its `?` — that run is already failing.
+fn note_verify_outcome(recorder: &RunRecorder, outcome: VerifyOutcome<'_>) {
+    let Some((status, message)) = verify_event(outcome) else {
+        return;
+    };
+    warn!(status, message = %message, "pack verification");
+    if let Err(err) = recorder.record_verify_event(status, &message) {
+        warn!(error = %err, "could not record the pack verification event");
+    }
 }
 
 fn to_reader_policy(policy: SigningPolicy) -> greentic_pack::reader::SigningPolicy {
@@ -1550,6 +1605,106 @@ mod tests {
         assert_eq!(event["session_id"], "session-1");
         assert_eq!(event["flow_id"], "flow.demo");
         assert_eq!(event["redactions"][0], "$.token");
+    }
+
+    fn report(signature_ok: bool, warnings: &[&str]) -> VerifyReport {
+        VerifyReport {
+            signature_ok,
+            sbom_ok: true,
+            warnings: warnings.iter().map(|w| (*w).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_verified_pack_has_nothing_to_report() {
+        // A report that verified is equally silent even if it carried unrelated
+        // warnings — this function speaks only about signature state.
+        assert!(verify_event(VerifyOutcome::Loaded(&report(true, &["noise"]))).is_none());
+    }
+
+    #[test]
+    fn an_unverified_pack_reports_the_crates_own_diagnosis() {
+        // greentic-pack already distinguishes missing / incomplete / invalid.
+        // Surfacing its wording rather than re-deriving one keeps the two in step.
+        let r = report(false, &["signature files missing; skipping verification"]);
+        let (status, message) = verify_event(VerifyOutcome::Loaded(&r)).expect("reports");
+        assert_eq!(status, "unverified");
+        assert!(
+            message.contains("signature files missing"),
+            "the crate's own warning must survive verbatim: {message}"
+        );
+    }
+
+    #[test]
+    fn several_warnings_are_all_kept() {
+        let r = report(false, &["first problem", "second problem"]);
+        let (_, message) = verify_event(VerifyOutcome::Loaded(&r)).expect("reports");
+        assert!(message.contains("first problem"), "{message}");
+        assert!(message.contains("second problem"), "{message}");
+    }
+
+    #[test]
+    fn an_unverified_pack_with_no_warnings_still_reports() {
+        // Silence here would recreate the very defect this work closes.
+        let r = report(false, &[]);
+        let (status, message) = verify_event(VerifyOutcome::Loaded(&r)).expect("reports");
+        assert_eq!(status, "unverified");
+        assert!(
+            !message.is_empty(),
+            "an empty message is as invisible as no event"
+        );
+    }
+
+    #[test]
+    fn a_directory_input_reports_that_it_was_skipped() {
+        let (status, message) = verify_event(VerifyOutcome::DirectorySkipped).expect("reports");
+        assert_eq!(status, "skipped");
+        assert!(message.contains("director"), "{message}");
+    }
+
+    #[test]
+    fn note_verify_outcome_writes_verification_events_to_transcript() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("artifacts");
+        let dirs = prepare_run_dirs(Some(root.clone())).expect("run dirs");
+        let profile = sample_profile();
+
+        let recorder = RunRecorder::new(
+            dirs,
+            &profile,
+            None,
+            PackMetadata::fallback(&PathBuf::from("test.gtpack")),
+            None,
+        )
+        .expect("recorder");
+
+        // Fire the event through the recorder-level helper, not just verify_event.
+        note_verify_outcome(&recorder, VerifyOutcome::DirectorySkipped);
+
+        // Read back and verify the event landed in the transcript with the expected shape.
+        let transcript_path = root.join("transcript.jsonl");
+        let transcript = std::fs::read_to_string(&transcript_path).expect("read transcript");
+
+        // The event should be a JSON line with component == "verify.pack" and status == "skipped".
+        let line = transcript
+            .lines()
+            .find(|line| line.contains("\"verify.pack\""))
+            .expect("verify.pack event found");
+
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("parse transcript event");
+        assert_eq!(parsed["component"], "verify.pack");
+        assert_eq!(parsed["status"], "skipped");
+    }
+
+    #[test]
+    fn a_downgraded_error_names_itself_and_how_it_was_matched() {
+        let (status, message) =
+            verify_event(VerifyOutcome::Downgraded("boom: bad signature")).expect("reports");
+        assert_eq!(status, "downgraded");
+        assert!(message.contains("boom: bad signature"), "{message}");
+        // The substring match is the reason this downgrade happened at all, and
+        // it is known to be an unreliable classifier — say so where it is seen.
+        assert!(message.contains("substring"), "{message}");
     }
 
     #[test]
