@@ -261,6 +261,45 @@ pub mod aw {
         tool: &str,
         arguments: &Value,
     ) -> Value {
+        let result = dispatch_for_node(
+            source,
+            pack_routes,
+            secrets,
+            tenant,
+            env,
+            team,
+            server_id,
+            tool,
+            arguments,
+        )
+        .await;
+        // Every failure is returned as a value, and a node with no error route
+        // still reports `ok: true` (see `mcp_node_output`), so without a log an
+        // operator sees a clean run whose MCP call silently did nothing (#703).
+        if let Some(error) = result.get("error") {
+            tracing::warn!(
+                tenant,
+                server_id,
+                tool,
+                error = %error,
+                "mcp node did not run successfully"
+            );
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_for_node(
+        source: Option<&Arc<McpToolSource>>,
+        pack_routes: Option<&PackMcpRoutes>,
+        secrets: Option<&crate::secrets::DynSecretsManager>,
+        tenant: &str,
+        env: &str,
+        team: Option<&str>,
+        server_id: &str,
+        tool: &str,
+        arguments: &Value,
+    ) -> Value {
         // `dispatch_route` takes the arguments as a JSON string and is itself
         // infallible (bad args / connect / timeout all become `{"error": ...}`).
         let args_str = arguments.to_string();
