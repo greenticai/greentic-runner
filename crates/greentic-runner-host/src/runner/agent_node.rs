@@ -1709,9 +1709,37 @@ mod aw {
         // mount above left in place and acts only on a worker whose knowledge
         // binding names `provider.knowledge.extension`.
         let base = crate::runner::knowledge_ext::attach(base, ext_runtime);
+
+        // Billing metering, identical to the `build_agent_runtime` serve path.
+        // Without this the in-process `dw.agent` node ran on the default
+        // `NoopBillingMeter`: its LLM spend was never metered AND the credit
+        // gate never fired, so an out-of-credit tenant kept running for free
+        // through this node while the out-of-process path stopped them.
+        //
+        // Ship-dark, same as the serve path: a no-op until an operator sets
+        // GREENTIC_BILLING_BASE_URL + GREENTIC_BILLING_SERVICE_SECRET.
+        let billing_enabled;
+        let base = match greentic_aw_runtime::billing::HttpBillingMeter::from_env() {
+            Some(http_meter) => {
+                billing_enabled = true;
+                base.with_billing_meter(Arc::new(http_meter))
+            }
+            None => {
+                billing_enabled = false;
+                base
+            }
+        };
         let runtime = Arc::new(base);
 
-        tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed");
+        // `billing_enabled` is logged rather than left implicit: this path
+        // silently metered nothing for its whole existence, and a boot line
+        // stating it either way is what makes that visible to an operator.
+        tracing::info!(
+            agent_count,
+            tenant = %tenant,
+            billing_enabled,
+            "AW runtime constructed"
+        );
         Some(runtime)
     }
 
@@ -2411,6 +2439,88 @@ mod aw {
                 seen,
                 vec![None],
                 "an unknown pack identity must stay absent — never fall back to the agent id"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Billing wiring on the in-process `dw.agent` path
+        // -------------------------------------------------------------------
+
+        /// The in-process `dw.agent` runtime must talk to the configured
+        /// billing service, exactly as the out-of-process serve path does.
+        ///
+        /// Asserted through observable behaviour rather than by inspecting the
+        /// runtime: the agent loop consults `BillingMeter::over_budget` before
+        /// it touches the LLM or the state store, and the HTTP sink implements
+        /// that as `GET /v1/tenants/{tenant}/wallet`. So a request arriving at
+        /// the billing server proves a real meter is installed; with the
+        /// default `NoopBillingMeter` nothing is ever sent.
+        #[tokio::test]
+        #[serial_test::serial]
+        // `set_var`/`remove_var` are process-global; `serial` keeps them from
+        // racing other env-reading tests.
+        #[allow(unsafe_code)]
+        async fn in_process_handler_consults_the_configured_billing_service() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v1/tenants/acme/wallet"))
+                // `available: 0` short-circuits the step at the credit gate, so
+                // the test never reaches the LLM backend or acquires a lock.
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"available": "0"})),
+                )
+                .mount(&server)
+                .await;
+
+            // Pin extension discovery at an empty dir: without this the runtime
+            // scans the developer's real `~/.greentic/extensions`, which makes
+            // the test depend on machine state and cost ~45s locally.
+            let empty_extensions = tempfile::tempdir().expect("tempdir");
+            unsafe {
+                std::env::set_var("GREENTIC_BILLING_BASE_URL", server.uri());
+                std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+                std::env::set_var("GREENTIC_EXTENSIONS_DIR", empty_extensions.path());
+            }
+
+            let mut agents = HashMap::new();
+            agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+            let handler = build_runtime_handler_with_stores(
+                agents,
+                "acme".to_string(),
+                crate::secrets::default_manager().expect("env secrets manager"),
+                vec![],
+                Arc::new(MockAgentStateStore::new()),
+                Arc::new(MockTokenMeter::new(0)),
+                Arc::new(NoopToolLedger),
+                None,
+                None,
+            )
+            .await
+            .expect("handler should build from mock stores");
+
+            let _ = handler
+                .execute("acme", "prod", "greeter", "s", &json!({"user_text": "hi"}))
+                .await;
+
+            unsafe {
+                std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+                std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+                std::env::remove_var("GREENTIC_EXTENSIONS_DIR");
+            }
+
+            let wallet_calls = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/tenants/acme/wallet")
+                .count();
+            assert!(
+                wallet_calls >= 1,
+                "in-process dw.agent must consult the billing service; got {wallet_calls} \
+                 wallet requests, which means it is still running on NoopBillingMeter \
+                 and its LLM spend is never metered"
             );
         }
 
