@@ -540,4 +540,26 @@ pub enum AgentStep {
     Reply {
         text: String,
     },
+    /// The worker's BUILT-IN knowledge base (`KnowledgeSettings`) was searched
+    /// for this turn and returned `chunks`, which were injected into the system
+    /// prompt before the first LLM call. Recorded once per step, ahead of every
+    /// `LlmCall`, and only when retrieval succeeded with at least one chunk — a
+    /// failed or empty retrieval injects nothing and so has nothing to cite.
+    ///
+    /// This is NOT a tool call: the model did not ask for it, the loop ran it.
+    /// Recording it as a synthetic `ToolCall` would inflate tool-call counts and
+    /// anything metering them. It exists so a trail consumer (greentic-start's
+    /// `agent_provenance`) can cite what a knowledge-grounded answer drew on.
+    ///
+    /// The chunks are recorded faithfully, text included: the trail is
+    /// server-side data. Whether a chunk's text may reach an end user's
+    /// browser is the CONSUMER's disclosure decision, not the runtime's.
+    ///
+    /// Adding a variant to this `#[serde(tag = "kind")]` enum is a contract
+    /// change: a strict `Vec<AgentStep>` deserialiser built against an older
+    /// runtime rejects `"kind": "knowledge_retrieval"`. Readers must skip kinds
+    /// they do not know.
+    KnowledgeRetrieval {
+        chunks: Vec<knowledge::RetrievedChunk>,
+    },
 }

@@ -583,4 +583,42 @@ mod tests {
             .unwrap();
         assert_eq!(hits[0].text, "retrieved for: refund policy");
     }
+
+    /// #770: the serialised shape of `AgentStep::KnowledgeRetrieval` is a
+    /// cross-repo contract — greentic-start's `agent_provenance` reads
+    /// `kind == "knowledge_retrieval"` and each chunk's `text`/`score`/
+    /// `doc_id`/`metadata`. Pin it, and pin that it round-trips.
+    #[test]
+    fn knowledge_retrieval_step_serialises_with_a_stable_shape() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("title".into(), serde_json::json!("Refund policy"));
+        let step = crate::AgentStep::KnowledgeRetrieval {
+            chunks: vec![RetrievedChunk {
+                text: "Refunds take 5 days.".into(),
+                score: 0.5,
+                doc_id: Some("doc-1".into()),
+                chunk_index: Some(2),
+                metadata,
+            }],
+        };
+        let value = serde_json::to_value(&step).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "knowledge_retrieval",
+                "chunks": [{
+                    "text": "Refunds take 5 days.",
+                    "score": 0.5,
+                    "doc_id": "doc-1",
+                    "chunk_index": 2,
+                    "metadata": {"title": "Refund policy"}
+                }]
+            })
+        );
+        let back: crate::AgentStep = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            back,
+            crate::AgentStep::KnowledgeRetrieval { ref chunks } if chunks.len() == 1
+        ));
+    }
 }
