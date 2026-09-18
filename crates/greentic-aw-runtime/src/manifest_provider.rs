@@ -114,6 +114,9 @@ mod tests {
                 tools: vec![ToolRef {
                     extension_id: "yaml.ext".into(),
                     tool_name: "yaml_tool".into(),
+                    description: None,
+                    input_schema: None,
+                    usage_note: None,
                 }],
                 guardrails: vec![],
                 llm: LlmProviderRef {
@@ -124,6 +127,8 @@ mod tests {
                 limits: AgentLimits::default(),
                 memory: None,
                 knowledge: None,
+                conversational: false,
+                opening_message: None,
             },
         );
         p
@@ -206,6 +211,9 @@ mod tests {
             vec![ToolRef {
                 extension_id: "greentic.tavily".into(),
                 tool_name: "web_search".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             }]
         );
         assert_eq!(cfg.system_prompt, "yaml-prompt");
@@ -258,6 +266,9 @@ mod tests {
             vec![ToolRef {
                 extension_id: "yaml.ext".into(),
                 tool_name: "yaml_tool".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             }]
         );
     }
@@ -308,6 +319,9 @@ mod tests {
             vec![ToolRef {
                 extension_id: "yaml.ext".into(),
                 tool_name: "yaml_tool".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
             }]
         );
     }

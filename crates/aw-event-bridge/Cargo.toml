@@ -4,10 +4,11 @@ version     = { workspace = true }
 edition     = { workspace = true }
 license     = { workspace = true }
 description = "NATS event bridge for the Greentic agentic-worker runtime: consumes greentic.agentic.request.v1 and dispatches to AgentDispatchInvoker."
+publish     = false
 
 [dependencies]
 anyhow         = { workspace = true }
-async-nats     = "0.49"
+async-nats     = "0.46"
 async-trait    = { workspace = true }
 futures-util   = "0.3"
 greentic-types = { workspace = true }

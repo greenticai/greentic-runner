@@ -4,16 +4,56 @@
 //! ([`McpToolCatalog`]). Transport and dispatch logic lives in `source.rs`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use greentic_secrets_lib::SecretsManager;
 use secrecy::SecretString;
 use serde::Deserialize;
 
 /// How long a built catalog is reused before a refetch is considered.
 pub(super) const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// Per-server budget for the full connect → initialize → list/call sequence.
-pub(super) const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-server budget for a catalog PROBE (connect → initialize → tools/list).
+///
+/// Deliberately short. A probe only asks "is this server reachable and what
+/// does it offer?", and it runs for every server on the catalog path, so a dead
+/// or hanging one must be skipped quickly rather than holding up the servers
+/// that do work.
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default budget for a tool CALL (connect → initialize → tools/call).
+///
+/// This is a different question from the probe budget and needs a different
+/// answer: the tool is doing real work. A desktop agent driving an application
+/// to produce a quote routinely takes tens of seconds, and sharing the probe's
+/// 5s made every such tool permanently uncallable — reported only as
+/// `tool call timed out after 5s`, which reads like a network fault rather than
+/// a budget that was never meant to cover work.
+pub(super) const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Operator override for [`DEFAULT_CALL_TIMEOUT`], in whole seconds.
+pub(super) const CALL_TIMEOUT_ENV: &str = "GREENTIC_AW_MCP_CALL_TIMEOUT_SECS";
+
+/// Resolve the tool-call budget from an already-read env value.
+///
+/// Pure so it can be tested without mutating the process environment. Anything
+/// unusable — absent, unparseable, or zero — falls back to the default rather
+/// than failing: a malformed knob must not make every MCP tool uncallable,
+/// which is the failure this whole budget split exists to remove. A zero would
+/// time out every call instantly, so it is treated as unusable rather than
+/// honoured as "no time at all".
+pub(super) fn call_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_CALL_TIMEOUT)
+}
+
+/// The tool-call budget for this process.
+pub(super) fn call_timeout() -> Duration {
+    call_timeout_from(std::env::var(CALL_TIMEOUT_ENV).ok().as_deref())
+}
 
 /// Role a server must carry to be exposed to agentic workers (the agent-loop
 /// MCP path).
@@ -24,6 +64,48 @@ pub const MCP_ROLE_AGENTIC_WORKER: &str = "agentic_worker";
 /// [`MCP_ROLE_AGENTIC_WORKER`] so the operator can authorize a server for one
 /// surface without the other.
 pub const MCP_ROLE_FLOW_EDITOR: &str = "flow_editor";
+
+/// Who an [`McpToolSource`] is asking the admin on behalf of.
+///
+/// The admin resolves RBAC from request headers, so a caller that sends only a
+/// bearer forces that bearer to imply the tenant — i.e. a tenant-scoped
+/// `gtc_live_*` token per tenant, captured once at construction. That works for
+/// a runner process dedicated to one tenant and does NOT work for an embedding
+/// host serving many tenants from one process (the designer): its Run Demo
+/// builds a host per tenant, but a process-global token can only name one of
+/// them, so every tenant would read the same tenant's servers.
+///
+/// Supplying an identity moves the tenant from the credential to the request,
+/// letting such a host present the service key it already holds and say per
+/// call who it is acting for.
+///
+/// [`McpToolSource`]: super::source::McpToolSource
+#[derive(Clone, Debug)]
+pub struct McpCallerIdentity {
+    pub tenant_slug: String,
+    pub user_email: String,
+    /// The caller's team. `None` for a caller that belongs to no team (an
+    /// operator session spans tenants), which sends no team header at all.
+    pub team_slug: Option<String>,
+}
+
+impl McpCallerIdentity {
+    pub fn new(tenant_slug: impl Into<String>, user_email: impl Into<String>) -> Self {
+        Self {
+            tenant_slug: tenant_slug.into(),
+            user_email: user_email.into(),
+            team_slug: None,
+        }
+    }
+
+    /// Name the team this caller is acting in. MCP servers are stored per-team
+    /// on the admin, so omitting a team the caller really has resolves a
+    /// different server set than that team's authoring UI listed.
+    pub fn with_team(mut self, team_slug: impl Into<String>) -> Self {
+        self.team_slug = Some(team_slug.into());
+        self
+    }
+}
 
 /// Which transport backs an MCP server row. `http` is the default (existing
 /// remote behavior); `local-wasm` runs a `wasix:mcp` component in-process.
@@ -179,13 +261,47 @@ impl std::fmt::Debug for McpRoute {
     }
 }
 
+/// Non-secret route material for one server, as carried by a `.gtpack`'s
+/// `assets/mcp-routes.json` sidecar.
+///
+/// The runner-host side owns the deserialization (`runner::mcp_pack_routes`);
+/// this is the shape it hands to [`super::McpToolSource::from_pack_routes`]. It
+/// carries no token — `auth_team` names the scope the token is SEALED at, not
+/// the token itself.
+#[derive(Clone, Debug, Default)]
+pub struct McpPackRoute {
+    pub server_id: String,
+    /// `"http"` or `"local-wasm"`.
+    pub transport: String,
+    pub transport_url: Option<String>,
+    pub auth_header_name: Option<String>,
+    /// Team slug the authoring session resolved this server's token under.
+    /// `None` means the tenant-default `_` scope.
+    pub auth_team: Option<String>,
+    pub component_ref: Option<String>,
+    pub component_version: Option<String>,
+    pub component_digest: Option<String>,
+}
+
 /// Immutable per-tenant view of the agentic-worker MCP tool surface.
 pub struct McpToolCatalog {
     /// `(server_id, raw_tool_name)` → LLM-facing tool schema.
     pub(super) tools: HashMap<(String, String), McpToolEntry>,
     /// `(server_id, raw_tool_name)` → dispatch route.
     pub(super) routes: HashMap<(String, String), McpRoute>,
+    /// `server_id` → dispatch route with no tool name bound yet. Populated only
+    /// on the pack-backed path, where the tool names a server offers are never
+    /// discovered (no probe); see [`McpToolCatalog::with_server_routes`].
+    pub(super) server_routes: HashMap<String, McpRoute>,
+    /// `server_id` → why this server has no usable route this run. Lets the
+    /// dispatch error name the real cause instead of "unknown mcp tool".
+    pub(super) server_errors: HashMap<String, String>,
     pub(super) fetched_at: Instant,
+    /// Tenant secrets manager carried over from the [`super::McpToolSource`]
+    /// that built this catalog, if any, so a `local-wasm` dispatch route
+    /// reached through this catalog can build a secrets-bearing
+    /// [`crate::mcp_scope::McpCallScope`].
+    pub(super) secrets: Option<Arc<dyn SecretsManager>>,
 }
 
 impl McpToolCatalog {
@@ -193,7 +309,10 @@ impl McpToolCatalog {
         Self {
             tools: HashMap::new(),
             routes: HashMap::new(),
+            server_routes: HashMap::new(),
+            server_errors: HashMap::new(),
             fetched_at: Instant::now(),
+            secrets: None,
         }
     }
 
@@ -218,24 +337,80 @@ impl McpToolCatalog {
         self.tools.get(&(server_id.to_string(), tool.to_string()))
     }
 
-    /// Dispatch route for one tool, if present.
+    /// Dispatch route for one tool, if the catalog holds an exact entry for it.
     pub fn route(&self, server_id: &str, tool: &str) -> Option<&McpRoute> {
         self.routes.get(&(server_id.to_string(), tool.to_string()))
     }
 
-    /// Build a catalog directly from tool/route maps, bypassing the admin +
-    /// MCP probe. Test-only: lets downstream crates (e.g. `tools.rs`) exercise
-    /// the list/dispatch seams without standing up a wiremock pair.
-    #[cfg(test)]
-    pub(crate) fn for_tests(
+    /// Dispatch route for one tool, falling back to the server-level route when
+    /// there is no exact entry.
+    ///
+    /// The exact entry always WINS: an admin-built catalog probed the server and
+    /// knows every `(server_id, raw_tool_name)` pair, and its route carries that
+    /// server's own `allowed_tools` filtering by construction. The fallback only
+    /// fires on the pack-backed path, which never probes and therefore only ever
+    /// knows the SERVER — the tool name arrives from the agent's own `ToolRef`
+    /// and is stamped on here.
+    pub fn resolve_route(&self, server_id: &str, tool: &str) -> Option<McpRoute> {
+        if let Some(route) = self.route(server_id, tool) {
+            return Some(route.clone());
+        }
+        self.server_routes
+            .get(server_id)
+            .map(|route| route.clone().with_tool(tool))
+    }
+
+    /// Why `server_id` has no usable route this run, when that is known.
+    /// `None` on any admin-built catalog, which records no such diagnostics.
+    pub fn server_error(&self, server_id: &str) -> Option<&str> {
+        self.server_errors.get(server_id).map(String::as_str)
+    }
+
+    /// Tenant secrets manager carried over from the source that built this
+    /// catalog, if any. `local-wasm` dispatch call sites use this to build a
+    /// secrets-bearing [`crate::mcp_scope::McpCallScope`].
+    pub fn secrets(&self) -> Option<Arc<dyn SecretsManager>> {
+        self.secrets.clone()
+    }
+
+    /// Build a catalog directly from tool/route maps, bypassing the admin fetch
+    /// and the MCP probe.
+    ///
+    /// Public for the same reason [`McpRoute::from_parts`] is: an embedding host
+    /// that resolves its MCP surface WITHOUT the admin — a deployed runner
+    /// reading `assets/mcp-routes.json` out of its own pack — otherwise has no
+    /// way to express a catalog at all, because the fields are `pub(super)` and
+    /// the only other constructor performs a network fetch plus a per-server
+    /// probe.
+    ///
+    /// Tests use it for the same reason, so there is exactly one constructor
+    /// rather than a test twin with the same body.
+    pub fn from_parts(
         tools: HashMap<(String, String), McpToolEntry>,
         routes: HashMap<(String, String), McpRoute>,
+        secrets: Option<Arc<dyn SecretsManager>>,
     ) -> Self {
         Self {
             tools,
             routes,
+            server_routes: HashMap::new(),
+            server_errors: HashMap::new(),
             fetched_at: Instant::now(),
+            secrets,
         }
+    }
+
+    /// Attach per-SERVER fallback routes and their per-server diagnostics.
+    /// Used by the pack-backed source; see [`McpToolCatalog::resolve_route`].
+    #[must_use]
+    pub fn with_server_routes(
+        mut self,
+        server_routes: HashMap<String, McpRoute>,
+        server_errors: HashMap<String, String>,
+    ) -> Self {
+        self.server_routes = server_routes;
+        self.server_errors = server_errors;
+        self
     }
 }
 
@@ -244,15 +419,15 @@ impl McpToolCatalog {
 /// code uses this to aim a route at a fake MCP server.
 #[cfg(test)]
 pub(crate) fn route_for_tests(server_id: &str, tool: &str, transport_url: &str) -> McpRoute {
-    McpRoute {
-        server_id: server_id.to_string(),
-        transport_url: transport_url.to_string(),
-        auth_header_name: None,
-        auth_token: None,
-        raw_tool_name: tool.to_string(),
-        transport: Transport::Http,
-        component_ref: None,
-        component_version: None,
-        component_digest: None,
-    }
+    McpRoute::from_parts(
+        server_id,
+        transport_url,
+        None,
+        None,
+        "http",
+        None,
+        None,
+        None,
+    )
+    .with_tool(tool)
 }

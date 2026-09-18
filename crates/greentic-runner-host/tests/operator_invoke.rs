@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Write, copy};
@@ -585,6 +586,12 @@ async fn setup_runtime_with_state(
         Arc::clone(&state_store),
         state_host,
         secrets,
+        #[cfg(feature = "agentic-worker")]
+        None,
+        #[cfg(feature = "agentic-worker")]
+        None,
+        #[cfg(feature = "agentic-worker")]
+        None,
     )
     .await?;
     Ok((runtime, state_store))
@@ -638,7 +645,6 @@ fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Res
     );
 
     let manifest = PackManifest {
-        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "operator.component".parse()?,
         name: Some("operator.component".into()),
@@ -664,6 +670,7 @@ fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Res
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: Some(extensions),
     };
 

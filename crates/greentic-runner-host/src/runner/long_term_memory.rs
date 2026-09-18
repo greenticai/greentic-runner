@@ -48,7 +48,20 @@ const ENV_SURREAL_PATH: &str = "GREENTIC_CHRONICLE_SURREAL_PATH";
 /// SurrealDB on disk — no external graph server required.
 const DEFAULT_BACKEND: &str = "surreal-embedded";
 /// Default on-disk location for the embedded SurrealDB store.
-const DEFAULT_SURREAL_PATH: &str = "/var/lib/greentic/chronicle";
+///
+/// Prefers the per-user `~/.greentic/chronicle` and only falls back to the system
+/// path — the same convention [`crate::runner::aw_backends`] uses for the agent
+/// state store. A bare `/var/lib/greentic` default is unwritable for any non-root
+/// process (e.g. the designer's Test-chat sidecar) and the mount failure is
+/// GRACEFUL, so the tier silently stays disabled. Root/systemd deployments have
+/// no `HOME` and keep the system path. Kept distinct from the knowledge tier's
+/// path — two embedded handles must never share one directory.
+fn default_surreal_path() -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => format!("{home}/.greentic/chronicle"),
+        _ => "/var/lib/greentic/chronicle".to_string(),
+    }
+}
 // LLM (entity/edge extraction) — any OpenAI-compatible endpoint.
 const ENV_LLM_BASE_URL: &str = "GREENTIC_CHRONICLE_LLM_BASE_URL";
 const ENV_LLM_API_KEY: &str = "GREENTIC_CHRONICLE_LLM_API_KEY";
@@ -156,8 +169,7 @@ fn select_backend() -> Option<ChronicleBackend> {
             Some(ChronicleBackend::Falkor { connection, graph })
         }
         "surreal-embedded" => {
-            let path = std::env::var(ENV_SURREAL_PATH)
-                .unwrap_or_else(|_| DEFAULT_SURREAL_PATH.to_string());
+            let path = std::env::var(ENV_SURREAL_PATH).unwrap_or_else(|_| default_surreal_path());
             Some(ChronicleBackend::surreal_embedded(path))
         }
         "surreal-memory" => {
@@ -274,7 +286,15 @@ mod tests {
         clear_backend_env();
         match select_backend() {
             Some(ChronicleBackend::SurrealEmbedded { path }) => {
-                assert_eq!(path, DEFAULT_SURREAL_PATH);
+                // Per-user by default (the sidecar runs as a normal user); only a
+                // HOME-less root/systemd process gets the system path.
+                assert_eq!(path, default_surreal_path());
+                match std::env::var("HOME") {
+                    Ok(home) if !home.is_empty() => {
+                        assert_eq!(path, format!("{home}/.greentic/chronicle"))
+                    }
+                    _ => assert_eq!(path, "/var/lib/greentic/chronicle"),
+                }
             }
             other => panic!("expected default SurrealEmbedded, got {other:?}"),
         }

@@ -29,6 +29,49 @@ async fn route_debug_redacts_token() {
     assert!(dbg.contains("[REDACTED]"), "got: {dbg}");
 }
 
+/// `from_parts` is a SECOND way to get a token into an `McpRoute` — a
+/// pack-carried route resolves one from the secrets backend instead of an
+/// admin row. A route built this way is logged on exactly the same paths, so
+/// the redaction has to cover it too; the struct-literal test above cannot
+/// catch a constructor that bypasses it.
+#[test]
+fn route_from_parts_redacts_its_token_in_debug() {
+    let route = McpRoute::from_parts(
+        "s1",
+        "https://mcp.example.com/",
+        Some("Authorization"),
+        Some("tok-secret"),
+        "http",
+        None,
+        None,
+        None,
+    )
+    .with_tool("get_issue");
+
+    let dbg = format!("{route:?}");
+    assert!(!dbg.contains("tok-secret"), "got: {dbg}");
+    assert!(dbg.contains("[REDACTED]"), "got: {dbg}");
+    assert!(matches!(route.transport, Transport::Http));
+}
+
+/// The transport discriminator is a string on the wire; `local-wasm` is the
+/// only value that is not HTTP, and getting it wrong would dial an empty URL.
+#[test]
+fn route_from_parts_maps_the_local_wasm_transport() {
+    let route = McpRoute::from_parts(
+        "s1",
+        "",
+        None,
+        None,
+        "local-wasm",
+        Some("router_echo"),
+        Some("1.0.0"),
+        Some("sha256:abc"),
+    );
+    assert!(matches!(route.transport, Transport::LocalWasm));
+    assert_eq!(route.component_digest.as_deref(), Some("sha256:abc"));
+}
+
 #[test]
 fn parse_rows_defaults_transport_to_http_and_reads_local_wasm() {
     let body = json!({"servers": [
@@ -147,7 +190,9 @@ async fn local_wasm_server_lists_and_dispatches_in_process() {
     let route = catalog
         .route("local", "echo")
         .expect("route for echo must exist");
-    let out = dispatch_route(route, "{\"message\":\"hi\"}").await;
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let out = dispatch_route(route, "{\"message\":\"hi\"}", &scope).await;
     assert!(
         !out.to_string().contains("\"error\""),
         "dispatch must succeed; got: {out}"
@@ -245,7 +290,9 @@ async fn lazy_pull_on_catalog_miss_and_dispatch() {
 
     // Dispatch must succeed (lazy pull no-ops on cache hit, sidecar pins digest).
     let route = catalog.route("local", "echo").expect("route for echo");
-    let out = dispatch_route(route, "{\"message\":\"world\"}").await;
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let out = dispatch_route(route, "{\"message\":\"world\"}", &scope).await;
     assert!(
         !out.to_string().contains("\"error\""),
         "dispatch must succeed after lazy pull; got: {out}"
@@ -374,7 +421,9 @@ async fn dispatch_route_local_wasm_wrong_digest_returns_error_not_panic() {
         component_digest: Some(wrong_digest),
     };
 
-    let result = dispatch_route(&route, r#"{"message":"degrade-test"}"#).await;
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let result = dispatch_route(&route, r#"{"message":"degrade-test"}"#, &scope).await;
 
     // Clean up before asserting (to avoid leaking env state on failure).
     unsafe {
@@ -393,4 +442,91 @@ async fn dispatch_route_local_wasm_wrong_digest_returns_error_not_panic() {
         !cache_dir.path().join("router_echo.wasm").exists(),
         "a digest mismatch during dispatch must leave the cache empty"
     );
+}
+
+/// A tool that takes longer than the catalog PROBE budget must still be allowed
+/// to finish.
+///
+/// One 5s constant used to govern both "is this server alive?" and "has this
+/// tool finished its work?". Those are different questions with different
+/// budgets: a liveness probe should fail fast so a dead server is skipped
+/// quickly, while real work — a desktop agent driving an application to produce
+/// a quote, say — routinely takes tens of seconds. Sharing the constant made
+/// every such tool permanently impossible to call, reported as
+/// `tool call timed out after 5s`.
+///
+/// The delay here is deliberately longer than the probe budget and far shorter
+/// than the call budget, so this fails if the two are ever collapsed back into
+/// one constant.
+#[tokio::test]
+async fn a_slow_tool_call_is_not_cut_off_by_the_probe_budget() {
+    use std::time::Duration;
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "method": "initialize" })))
+        .respond_with(super::catalog::initialize_ok())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({ "method": "notifications/initialized" }),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "method": "tools/call" })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(6))
+                .set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 3,
+                    "result": { "structuredContent": { "quote": "ok" } }
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let route = crate::mcp_source::route_for_tests("srv", "create_quote", &server.uri());
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let out = dispatch_route(&route, "{}", &scope).await;
+
+    assert!(
+        !out.to_string().contains("timed out"),
+        "a 6s tool call must not be cut off by the 5s probe budget; got: {out}"
+    );
+}
+
+/// The call-budget override is parsed defensively: anything unusable falls back
+/// to the default rather than being honoured.
+///
+/// A zero is the case worth stating. Honouring it literally would time out
+/// every tool call instantly — reintroducing, via a typo in a knob, exactly the
+/// "no MCP tool can ever run" failure this split exists to remove.
+#[test]
+fn an_unusable_call_timeout_override_falls_back_to_the_default() {
+    use crate::mcp_source::types::{DEFAULT_CALL_TIMEOUT, call_timeout_from};
+    use std::time::Duration;
+
+    assert_eq!(call_timeout_from(Some("300")), Duration::from_secs(300));
+    assert_eq!(call_timeout_from(Some("  300  ")), Duration::from_secs(300));
+
+    for unusable in [
+        None,
+        Some(""),
+        Some("abc"),
+        Some("-5"),
+        Some("0"),
+        Some("1.5"),
+    ] {
+        assert_eq!(
+            call_timeout_from(unusable),
+            DEFAULT_CALL_TIMEOUT,
+            "unusable override {unusable:?} must fall back to the default"
+        );
+    }
 }

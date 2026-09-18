@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::error::LlmError;
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse, LlmToolSchema, OnDelta};
 use crate::state::{ChatMessage, ToolCallRecord};
+use crate::tool_wire_name::{ToolNameCodec, wire_tool_name};
 
 /// Maximum time to wait between consecutive bytes from the streaming
 /// response before treating the connection as dead. reqwest's client
@@ -201,6 +202,9 @@ impl LlmBackend for OpenAiLlmBackend {
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
             let messages = build_messages(&req);
+            // Built from the list the model is about to be shown: a sanitised
+            // wire name cannot be split back apart by string surgery.
+            let codec = ToolNameCodec::for_tools(&req.tools);
             let tools: Option<Vec<OaTool<'_>>> = if req.tools.is_empty() {
                 None
             } else {
@@ -245,7 +249,9 @@ impl LlmBackend for OpenAiLlmBackend {
                 .tool_calls
                 .unwrap_or_default()
                 .into_iter()
-                .map(|c| build_tool_call_record(c.id, &c.function.name, &c.function.arguments))
+                .map(|c| {
+                    build_tool_call_record(&codec, c.id, &c.function.name, &c.function.arguments)
+                })
                 .collect();
             Ok(LlmResponse {
                 content: choice.message.content,
@@ -273,6 +279,9 @@ impl LlmBackend for OpenAiLlmBackend {
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
             let messages = build_messages(&req);
+            // Built from the list the model is about to be shown: a sanitised
+            // wire name cannot be split back apart by string surgery.
+            let codec = ToolNameCodec::for_tools(&req.tools);
             let tools: Option<Vec<OaTool<'_>>> = if req.tools.is_empty() {
                 None
             } else {
@@ -329,7 +338,7 @@ impl LlmBackend for OpenAiLlmBackend {
             {
                 on_delta(&text);
             }
-            Ok(acc.finish())
+            Ok(acc.finish(&codec))
         })
     }
 }
@@ -463,11 +472,11 @@ impl StreamAccumulator {
         Ok(emit)
     }
 
-    fn finish(self) -> LlmResponse {
+    fn finish(self, codec: &ToolNameCodec) -> LlmResponse {
         let tool_calls = self
             .tool_calls
             .into_values()
-            .map(|frag| build_tool_call_record(frag.id, &frag.name, &frag.arguments))
+            .map(|frag| build_tool_call_record(codec, frag.id, &frag.name, &frag.arguments))
             .collect();
         let content = if self.content.is_empty() {
             None
@@ -529,9 +538,14 @@ struct OaStreamToolFn {
 /// degrades to an empty object rather than failing the whole turn.
 ///
 /// [`complete`]: OpenAiLlmBackend::complete
-fn build_tool_call_record(call_id: String, name: &str, raw_args: &str) -> ToolCallRecord {
+fn build_tool_call_record(
+    codec: &ToolNameCodec,
+    call_id: String,
+    name: &str,
+    raw_args: &str,
+) -> ToolCallRecord {
     let args: serde_json::Value = serde_json::from_str(raw_args).unwrap_or(serde_json::json!({}));
-    let (extension_id, tool_name) = split_tool_name(name);
+    let (extension_id, tool_name) = codec.decode(name);
     ToolCallRecord {
         call_id,
         extension_id,
@@ -587,7 +601,7 @@ fn build_messages(req: &LlmRequest) -> Vec<OaMessage> {
                         id: tc.call_id.clone(),
                         typ: "function",
                         function: OaToolFn {
-                            name: encode_tool_name(&tc.extension_id, &tc.tool_name),
+                            name: wire_tool_name(&tc.extension_id, &tc.tool_name),
                             arguments: tc.args.to_string(),
                         },
                     })
@@ -612,7 +626,7 @@ fn build_tool(t: &LlmToolSchema) -> OaTool<'_> {
     OaTool {
         typ: "function",
         function: OaToolDef {
-            name: encode_tool_name(&t.extension_id, &t.tool_name),
+            name: wire_tool_name(&t.extension_id, &t.tool_name),
             description: &t.description,
             parameters: &t.parameters,
         },
@@ -793,7 +807,7 @@ mod tests {
                 deltas.push(text);
             }
         }
-        let resp = acc.finish();
+        let resp = acc.finish(&ToolNameCodec::default());
         assert_eq!(deltas, vec!["Hel".to_string(), "lo".to_string()]);
         assert_eq!(resp.content.as_deref(), Some("Hello"));
         assert_eq!(resp.tool_calls.len(), 1);

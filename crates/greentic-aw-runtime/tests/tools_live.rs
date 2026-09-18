@@ -23,18 +23,22 @@ use greentic_aw_runtime::config::ToolRef;
 use greentic_aw_runtime::state::ToolCallRecord;
 use greentic_aw_runtime::tenant::TenantContext;
 use greentic_aw_runtime::tools::{dispatch_tool_call, list_tools_for_llm};
+use greentic_ext_runtime::ExtensionRuntime;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unloaded_tool_is_invisible_to_llm_and_dispatch_fails_safe() {
-    let runtime = greentic_aw_runtime::test_support::extension_runtime();
+    let runtime = ExtensionRuntime::for_test().unwrap();
 
     let allowed = vec![ToolRef {
         extension_id: "greentic.absent".into(),
         tool_name: "nope".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
 
     // A tool whose extension isn't loaded never reaches the LLM's tool list.
-    let schemas = list_tools_for_llm(&runtime, None, None, &allowed);
+    let schemas = list_tools_for_llm(&runtime, None, None, None, None, &allowed);
     assert!(
         schemas.is_empty(),
         "an unloaded extension must yield no LLM-visible tools, got {schemas:?}"
@@ -50,7 +54,7 @@ async fn unloaded_tool_is_invisible_to_llm_and_dispatch_fails_safe() {
         args: serde_json::json!({}),
     };
     let tc = TenantContext::new("t", "e");
-    let result = dispatch_tool_call(Arc::new(runtime), None, None, call, &tc).await;
+    let result = dispatch_tool_call(Arc::new(runtime), None, None, None, None, call, &tc).await;
 
     let err = result.expect_err("dispatch against an unloaded extension must error");
     let message = err.to_string();

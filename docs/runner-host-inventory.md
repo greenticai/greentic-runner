@@ -122,7 +122,10 @@ secrets are wired today.
   - `/healthz` returns watcher status, telemetry init, and secrets backend state.
   - `/admin/packs/status` lists tenants, pack versions/digests, and last reload
     timestamp/errors. `/admin/packs/reload` triggers a reload (subject to admin
-    auth). Both live behind the `AdminGuard`.
+    auth). `/admin/capabilities` (feature `agentic-worker`) lists the
+    capabilities offered by extensions installed on this runner, for
+    `greentic-designer-admin`'s guardrail-policy preflight. All three live
+    behind the `AdminGuard`.
 
 ### `runner-core`
 
@@ -188,6 +191,7 @@ port, routing, and adapter secrets.
 | `TENANT_RESOLVER` | `RoutingConfig::from_env` | Chooses tenant routing strategy: `env`, `host`, `header`, or `jwt`. |
 | `DEFAULT_TENANT` | `RoutingConfig::from_env` | Fallback tenant when routing heuristics fail; default comes from greentic-config `dev.default_tenant` (`demo`). |
 | `GREENTIC_ENV` | `RunnerHost::handle_activity` and `FlowEngine` defaults | Marks the logical deployment environment inserted into `TenantCtx`. Defaults to `local`. |
+| `GREENTIC_HTTP_OUTBOUND_TIMEOUT_SECS` | `http_timeout_hooks::HttpTimeoutHooks` | Ceiling (seconds) on every `wasi:http` outbound request's connect / first-byte / between-bytes timeout phases, for every component. Defaults to 30. A component's own shorter, explicitly-set timeout is never raised — only an absent or longer one is lowered to this ceiling. |
 | `OTEL_*` (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_RESOURCE_ATTRIBUTES`, etc.) | `telemetry` feature | Standard OTLP exporter configuration for spans/metrics. |
 | Provider-specific secrets (`SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`, etc.) | Adapter modules | Enable signature verification, API credentials, and message sending for the corresponding adapters. |
 

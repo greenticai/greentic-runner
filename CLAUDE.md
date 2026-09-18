@@ -64,6 +64,7 @@ crates/
                              #   dispatches to TelcoXDispatchInvoker (telco-x.call side).
                              #   Phase 2 transport scaffold + EchoInvoker placeholder +
                              #   telco-x-serve bin (real ops = a TelcoXDispatchInvoker impl)
+  greentic-i18n/             # Compile-time i18n (embedded locale bundles)
   tests/                     # Integration test harness
 ```
 
@@ -91,12 +92,97 @@ i18n is handled inline in runner-host (`crates/greentic-runner-host/src/runner/i
 A flow node keyed `dw.agent.<agent_id>` (component `dw.agent`, operation = agent_id)
 dispatches to the agentic-worker runtime (`crates/greentic-aw-runtime`, Plan-Act-Observe
 loop). Gated behind the `agentic-worker` feature (default-on). Tools come from
-`.gtxpack` design-extensions loaded from `GREENTIC_EXTENSIONS_DIR/design/` at boot
-(`agent_node::build_ext_runtime` scans + registers them) and from per-tenant MCP servers;
-the OpenAI backend encodes tool function names as `<ext>_FN_<tool>` (OpenAI rejects dots).
-Needs `GREENTIC_AW_REDIS_URL` (state) + an LLM key (`GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY`).
+`.gtxpack` design-extensions and from per-tenant MCP servers; the OpenAI backend
+encodes tool function names as `<ext>_FN_<tool>` (OpenAI rejects dots).
+
+Design extensions load from **two** sources, in this order
+(`agent_node::build_ext_runtime`):
+
+1. `GREENTIC_EXTENSIONS_DIR/design/` on disk (`discovery::scan_kind_dir`).
+2. The loaded packs' own `extensions/*.gtxpack` entries
+   (`runner::pack_extensions::register_from_packs`).
+
+**Disk wins**; the pack is the fallback, same direction as
+`mcp_source_from_env().or_else(mcp_source_from_packs(..))`. The order of the two
+passes is what enforces it — `register_loaded_from_dir` inserts by
+`ExtensionId`, so running the pack pass first would overwrite an operator's
+installed copy with one frozen at pack-build time. See
+`pack_extensions::is_shadowed` for the reasoning and the cost.
+
+The pack source exists because nothing writes `GREENTIC_EXTENSIONS_DIR` inside a
+k8s or Cloud Run container: the directory scanned there is empty, so every
+extension tool an operator bound used to be dropped with a `warn` after the
+deploy reported success and after they had already supplied its credential.
+Pack-carried archives go through the SAME `register_loaded_from_dir` gate
+(signature + `manifest.json` ledger) — the pack is a delivery route, not a
+verification bypass. The in-pack layout is a cross-repo contract with
+greentic-pack and is recorded at the top of `runner::pack_extensions`.
+Needs a state backend — `memory` (default, ephemeral) / `disk` (redb) / `redis` (durable +
+multi-instance), selected via `GREENTIC_AW_STATE_BACKEND` — plus an LLM key
+(`GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY`). When nothing is set the runtime auto-selects an
+in-memory backend, so `dw.agent` runs with no Redis; multi-instance HA still requires `redis`
+(the `memory`/`disk` backends give single-process locking only).
 Worker config is an `AgentConfig` (`greentic-aw-runtime/src/config.rs`), supplied via pack
 manifest, `<agent_id>.json` in `GREENTIC_AGENT_MANIFESTS_DIR`, or the admin endpoint.
+
+An agent may be marked `conversational` (`AgentConfig.conversational`, default false).
+The host `end_conversation` tool is offered when EITHER that config opts in OR the
+invocation does — `AgentInput.conversational`, set from the flow node's `conversational`
+flag (SP3). So a flow node marked conversational makes the agent able to end the segment
+the engine park-loop maintains, even when the agent's own config default is false (the
+node, not just the agent config, can opt in; the two are OR-ed in the loop as `conv_active`).
+Conversational agents are offered a host built-in `end_conversation` tool (reserved `host`
+extension id) plus a system-prompt note; when the model calls it, the loop terminates the
+turn with `TerminationReason::ConversationEnded` and the closing message (`final_message`
+arg, else the accompanying reply) becomes the final reply — routed through the same
+outbound-guardrail/save path as a normal `FinalReply`. This is SP1 of the in-flow
+conversational chat-segment epic (`docs/superpowers/specs/2026-07-07-conversational-agent-chat-segment-epic-design.md`).
+**Tool-failure blocker guard:** if any tool the agent tried during the turn failed
+(dispatch error or allow-list block), an `end_conversation` request is downgraded to a
+normal `FinalReply` (the turn parks) instead of `ConversationEnded`. This keeps a
+conversational segment open — the closing message, which explains the failure, is shown
+and the flow does not silently advance past the blocker. The `end_conversation`
+system-prompt note also steers the model not to end on tool/backend failures.
+
+A conversational `dw.agent` node (`NodeKind::DwAgent.conversational`, default false) is a
+multi-turn segment: after each agent turn the engine parks and re-enters the same node
+(`NodeControl::LoopHere`) on the next inbound message, until the agent's output carries
+`terminated_by == "conversation_ended"`, at which point the flow advances to the node's
+successor (SP2). Non-conversational `dw.agent` is unchanged (one-shot). The flow-doc
+`conversational` flag wiring is SP3. A safety backstop caps the park-loop at
+`MAX_PARK_TURNS` (100) consecutive parked turns per node: an agent that never emits
+`conversation_ended` force-advances to the successor after the cap (per-node counter
+`ExecutionState.park_turns`, persisted in the park/resume snapshot; a plain constant,
+no env var / config knob).
+
+The out-of-process (`DwAgentDispatch::Nats`) dispatch path supports the same
+conversational park-loop, identical in outcome to the in-process path. A fresh user turn
+marks a pending-await marker (`ExecutionState.pending_agent_await`, serde-persisted) and
+dispatches to the `agentic` NATS runtime with `resume_at_self: true`, which parks via
+`NodeControl::AwaitHere` — a correlation-keyed wait that resumes at the node itself
+(not the routing successor) once the async response arrives. On resume, the agent's
+response is read from `state.entry.output` (the `{ok, output: {reply, trail,
+terminated_by}, events, error}` envelope the NATS response listener builds), not from the
+node's re-rendered request payload; `terminated_by == "conversation_ended"` completes the
+node (advances to the successor), otherwise it loops (`NodeControl::LoopHere`, session-keyed,
+awaiting the next user message) — with the same `MAX_PARK_TURNS` cap and force-advance
+behavior as the in-process path. Only a resume whose `state.entry` carries an `"ok"` key is
+treated as that response (an interleave guard — a user message arriving before the real
+response instead falls through and re-dispatches as a fresh turn), and an `{ok:false, ...}`
+error envelope surfaces `error.message` as the reply and re-parks (`LoopHere`) without
+bumping the `MAX_PARK_TURNS` cap.
+
+**Known limitation:** the await has no deadline. A lost/never-arriving `aw-serve` response
+currently wedges the segment indefinitely (the interleave guard above lets a *new* user
+message re-dispatch a fresh turn, but the original stuck wait is never cleaned up). A
+bounded deadline was tried and reverted: the naive version set a fixed-timeout watchdog on
+every fresh dispatch, but the NATS correlation id is deterministic per-conversation (no
+per-dispatch nonce), the watchdog is fire-and-forget with no cancellation, and
+`FlowResumeStore` overwrites the wait slot by `scope_hash` on every turn — so a watchdog from
+an earlier turn fires later and injects a spurious `{ok:false, error:{code:"timeout"}}`
+into whatever turn is parked at that moment, producing a bogus timeout reply mid-conversation.
+A correct bounded deadline needs a per-dispatch correlation nonce plus watchdog cancellation
+(likely shared with `sorla.call`); tracked as a follow-up, not yet implemented.
 
 ### Async runtime dispatch (`sorla.call` node)
 
@@ -153,7 +239,9 @@ gate is the pure `agent_node::should_serve_agentic_inproc`; the spawn is
 by `agent_node::load_process_agent_configs`) — pack-embedded and per-tenant
 `HostConfig.agents` are not visible at process startup. Skips with a warning (and
 the runner continues normally) when no agents are configured, or when the runtime
-cannot be built (no `GREENTIC_AW_REDIS_URL` / no LLM key).
+cannot be built (no usable state backend — e.g. `GREENTIC_AW_STATE_BACKEND=redis` with no
+`GREENTIC_AW_REDIS_URL`, or a Redis connect failure — or no LLM key). With no backend env set
+it defaults to the in-memory backend, so the runtime builds without Redis.
 
 ### WASM Component Model
 
@@ -298,7 +386,10 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables `sorla.call`/`operala.call`/`agentic.call`/`telco-x.call` dispatch + in-proc agentic serve. The runner registers response listeners for `sorla`/`operala`/`agentic`/`telco-x`; the `telco-x-event-bridge` crate serves `greentic.telco-x.request.v1` (Phase 2 transport scaffold). A credit-free `telco-x-serve` bin runs the bridge with the built-in `EchoInvoker` (`cargo run -p telco-x-event-bridge --bin telco-x-serve`); real Telco-X operations need a production `TelcoXDispatchInvoker` impl. Until then `telco-x.call` only echoes. See `docs/superpowers/specs/2026-06-21-telco-x-runtime-dispatch-design.md` in the workspace root |
 | `GREENTIC_AGENTIC_SERVE_INPROC` | Opt-in (default OFF): co-host the agentic-worker NATS service in-process; truthy (`1`/`true`/`yes`/`on`) + `GREENTIC_EVENTS_NATS_URL` set |
 | `GREENTIC_AGENT_MANIFESTS_DIR` | Dir of `<agent_id>.json` full `AgentConfig` files; process-level agent source for in-proc serve |
-| `GREENTIC_AW_REDIS_URL` | Agentic-worker state store (required for `dw.agent` + in-proc serve runtime) |
+| `GREENTIC_AW_PACK_EXTENSIONS` | Set to `0` to ignore design extensions carried inside a `.gtpack` (`extensions/*.gtxpack`) and keep the on-disk scan as the only source. Mirrors `GREENTIC_AW_MCP` / `GREENTIC_AW_COMPONENT_TOOLS` / `GREENTIC_AW_FLOW_TOOLS`. |
+| `GREENTIC_AW_STATE_BACKEND` | AW state backend selector: `redis` \| `memory` \| `disk`. Unset → `redis` if `GREENTIC_AW_REDIS_URL` is set, else `memory` (ephemeral, in-process). `memory`/`disk` give single-process locking only — multi-instance HA needs `redis`. |
+| `GREENTIC_AW_STATE_PATH` | On-disk (redb) file path when `GREENTIC_AW_STATE_BACKEND=disk` (default `~/.greentic/aw-state.redb`, falling back to `/var/lib/greentic/aw-state.redb`). |
+| `GREENTIC_AW_REDIS_URL` | Agentic-worker Redis state store. **Optional** — the worker defaults to an in-memory backend when unset; set this (or `GREENTIC_AW_STATE_BACKEND=disk`) for durable / multi-instance state. |
 
 Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
 

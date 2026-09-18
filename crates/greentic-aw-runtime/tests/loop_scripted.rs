@@ -40,6 +40,8 @@ fn cfg(max_iter: u32, timeout_ms: u64, tools: Vec<ToolRef>, cap: Option<u32>) ->
         },
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
     }
 }
 
@@ -80,7 +82,7 @@ fn build_runtime(
     let cp = Arc::new(cp);
     let token_meter = Arc::new(MockTokenMeter::new(token_used));
     let ledger = Arc::new(NoopToolLedger);
-    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
     let rt = AgentRuntime::new(
         cp,
         store,
@@ -104,6 +106,7 @@ async fn happy_path_one_iteration() {
             "a",
             AgentInput {
                 text: "hello".into(),
+                conversational: false,
             },
         )
         .await
@@ -124,7 +127,15 @@ async fn max_iterations_terminates_loop() {
     ];
     let (rt, tel, tc) = build_runtime(script, cfg(3, 60_000, vec![], None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::MaxIterations);
@@ -136,7 +147,15 @@ async fn timeout_terminates_loop() {
     // timeout=0ms → the iteration-start timeout check fires immediately.
     let (rt, tel, tc) = build_runtime(vec![Ok(final_reply("never"))], cfg(8, 0, vec![], None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "x".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "x".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::Timeout);
@@ -153,7 +172,15 @@ async fn tool_not_allowed_becomes_observation_then_reply() {
     ];
     let (rt, _tel, tc) = build_runtime(script, cfg(4, 60_000, vec![], None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::FinalReply);
@@ -173,6 +200,9 @@ async fn tool_dispatch_error_becomes_observation_then_reply() {
     let allowed = vec![ToolRef {
         extension_id: "http".into(),
         tool_name: "fetch".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let script = vec![
         Ok(tool_call("c1", "http", "fetch")),
@@ -180,7 +210,15 @@ async fn tool_dispatch_error_becomes_observation_then_reply() {
     ];
     let (rt, _tel, tc) = build_runtime(script, cfg(4, 60_000, allowed, None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::FinalReply);
@@ -194,6 +232,60 @@ async fn tool_dispatch_error_becomes_observation_then_reply() {
 }
 
 #[tokio::test]
+async fn tool_call_trail_carries_args_and_duration() {
+    // The trail records the model's tool arguments (input) and a wall-clock
+    // duration alongside each tool call, so a caller (e.g. the demo trace) can
+    // show WHAT was requested and how long it took — not just the tool name.
+    let allowed = vec![ToolRef {
+        extension_id: "http".into(),
+        tool_name: "fetch".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
+    }];
+    let sent_args = serde_json::json!({ "url": "https://example.com", "method": "GET" });
+    let script = vec![
+        Ok(tool_call_with_args(
+            "c1",
+            "http",
+            "fetch",
+            sent_args.clone(),
+        )),
+        Ok(final_reply("done")),
+    ];
+    let (rt, _tel, tc) = build_runtime(script, cfg(4, 60_000, allowed, None), 0);
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    let (args, _duration_ms) = out
+        .trail
+        .iter()
+        .find_map(|s| match s {
+            AgentStep::ToolCall {
+                call_id,
+                args,
+                duration_ms,
+                ..
+            } if call_id == "c1" => Some((args.clone(), *duration_ms)),
+            _ => None,
+        })
+        .expect("tool call c1 recorded in trail");
+    assert_eq!(
+        args, sent_args,
+        "trail carries the model's tool args verbatim"
+    );
+}
+
+#[tokio::test]
 async fn token_budget_exceeded_returns_error() {
     // Daily cap 10, already-used 100 → gate trips before any LLM call.
     let (rt, _tel, tc) = build_runtime(
@@ -202,7 +294,15 @@ async fn token_budget_exceeded_returns_error() {
         100,
     );
     let err = rt
-        .step(tc, "s", "a", AgentInput { text: "x".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "x".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, AgentError::TokenBudgetExceeded));
@@ -216,6 +316,9 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
     let allowed = vec![ToolRef {
         extension_id: "http".into(),
         tool_name: "fetch".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let mixed = LlmResponse {
         content: Some("internal reasoning".into()),
@@ -231,7 +334,15 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
     let script = vec![Ok(mixed), Ok(final_reply("the real answer"))];
     let (rt, _tel, tc) = build_runtime(script, cfg(4, 60_000, allowed, None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.reply, "the real answer");
@@ -262,11 +373,19 @@ async fn llm_provider_unavailable_after_retries_returns_error() {
     let cp = Arc::new(cp);
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger = Arc::new(NoopToolLedger);
-    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
     let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
 
     let err = rt
-        .step(tc, "s", "a", AgentInput { text: "x".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "x".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, AgentError::LlmProviderUnavailable));
@@ -307,7 +426,7 @@ fn build_lt_runtime(
     let cp = MockConfigProvider::new();
     let tc = TenantContext::new("acme", "prod");
     cp.insert(&tc, "a", cfg_inner);
-    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
     let rt = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
@@ -334,6 +453,7 @@ async fn long_term_facts_are_injected_into_system_prompt() {
         "a",
         AgentInput {
             text: "what do I like?".into(),
+            conversational: false,
         },
     )
     .await
@@ -352,9 +472,17 @@ async fn no_injection_when_long_term_disabled() {
         cfg(8, 60_000, vec![], None),
         mem,
     );
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let prompts = llm.seen_system_prompts.lock().unwrap();
     assert_eq!(prompts[0], "sys");
     assert!(!prompts[0].contains("<long_term_memory>"));
@@ -375,6 +503,7 @@ async fn turn_is_ingested_as_episode_in_background() {
             "a",
             AgentInput {
                 text: "what do I like?".into(),
+                conversational: false,
             },
         )
         .await
@@ -397,9 +526,17 @@ async fn no_ingest_when_long_term_disabled() {
         cfg(8, 60_000, vec![], None),
         mem.clone(),
     );
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     // Give any erroneously-spawned task a chance to run, then assert none did.
     tokio::task::yield_now().await;
     assert!(mem.ingested().is_empty());
@@ -409,9 +546,17 @@ async fn no_ingest_when_long_term_disabled() {
 async fn recall_memory_tool_advertised_when_active() {
     let mem = Arc::new(MockLongTermMemory::new(vec![]));
     let (rt, llm, tc) = build_lt_runtime(vec![Ok(final_reply("hi"))], cfg_with_long_term(8), mem);
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let tools = llm.seen_tool_names.lock().unwrap();
     assert!(tools[0].iter().any(|n| n == "recall_memory"));
 }
@@ -424,9 +569,17 @@ async fn recall_memory_tool_absent_when_disabled() {
         cfg(8, 60_000, vec![], None),
         mem,
     );
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let tools = llm.seen_tool_names.lock().unwrap();
     assert!(!tools[0].iter().any(|n| n == "recall_memory"));
 }
@@ -452,6 +605,7 @@ async fn recall_memory_call_is_handled_host_side() {
             "a",
             AgentInput {
                 text: "what do I like?".into(),
+                conversational: false,
             },
         )
         .await
@@ -520,7 +674,7 @@ fn build_st_runtime(
     let cp = MockConfigProvider::new();
     let tc = TenantContext::new("acme", "prod");
     cp.insert(&tc, "a", cfg_inner);
-    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
     let rt = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
@@ -542,9 +696,17 @@ async fn remember_and_recall_tools_advertised_when_active() {
     // Config has memory.short_term set and the provider is attached → the LLM
     // request must include both "remember" and "recall" tool names.
     let (rt, llm, tc) = build_st_runtime(vec![Ok(final_reply("hi"))], cfg_with_short_term(8));
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let tools = llm.seen_tool_names.lock().unwrap();
     assert!(
         tools[0].iter().any(|n| n == "remember"),
@@ -566,9 +728,17 @@ async fn short_term_tools_absent_when_disabled() {
         vec![Ok(final_reply("hi"))],
         cfg(8, 60_000, vec![], None), // no memory binding
     );
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let tools = llm.seen_tool_names.lock().unwrap();
     assert!(
         !tools[0].iter().any(|n| n == "remember"),
@@ -613,6 +783,7 @@ async fn remember_then_recall_roundtrips_via_tools() {
             "a",
             AgentInput {
                 text: "what is my fav color?".into(),
+                conversational: false,
             },
         )
         .await
@@ -657,6 +828,7 @@ async fn recall_missing_key_returns_null() {
             "a",
             AgentInput {
                 text: "do you know my name?".into(),
+                conversational: false,
             },
         )
         .await
@@ -674,4 +846,224 @@ async fn recall_missing_key_returns_null() {
         recall_result.get("value").is_some_and(|v| v.is_null()),
         "expected null value for missing key, got: {recall_result}"
     );
+}
+
+#[tokio::test]
+async fn conversational_agent_is_offered_end_conversation_tool() {
+    // conversational = true → the LLM request must carry the `end_conversation`
+    // tool and the system prompt must carry the accompanying note.
+    let llm = Arc::new(MockLlmBackend::new(vec![Ok(final_reply("hi"))]));
+    let mut c = cfg(4, 5_000, vec![], None);
+    c.conversational = true;
+    let cp = MockConfigProvider::new();
+    let tc = TenantContext::new("acme", "prod");
+    cp.insert(&tc, "a", c);
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+    let rt = AgentRuntime::new(
+        Arc::new(cp),
+        Arc::new(MockAgentStateStore::new()),
+        ext,
+        llm.clone(),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    );
+    let out = rt
+        .step(
+            tc,
+            "sess-conv",
+            "a",
+            AgentInput {
+                text: "hello".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::FinalReply); // no tool called here
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(
+        tools[0].iter().any(|t| t == "end_conversation"),
+        "expected 'end_conversation' in tool list: {:?}",
+        tools[0]
+    );
+    let prompts = llm.seen_system_prompts.lock().unwrap();
+    assert!(
+        prompts[0].contains("end_conversation"),
+        "expected system prompt to mention 'end_conversation': {:?}",
+        prompts[0]
+    );
+}
+
+#[tokio::test]
+async fn non_conversational_agent_has_no_end_conversation_tool() {
+    // conversational defaults to false → neither the tool nor the note appear.
+    let llm = Arc::new(MockLlmBackend::new(vec![Ok(final_reply("hi"))]));
+    let c = cfg(4, 5_000, vec![], None);
+    let cp = MockConfigProvider::new();
+    let tc = TenantContext::new("acme", "prod");
+    cp.insert(&tc, "a", c);
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+    let rt = AgentRuntime::new(
+        Arc::new(cp),
+        Arc::new(MockAgentStateStore::new()),
+        ext,
+        llm.clone(),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    );
+    let _ = rt
+        .step(
+            tc,
+            "sess-conv",
+            "a",
+            AgentInput {
+                text: "hello".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(
+        !tools[0].iter().any(|t| t == "end_conversation"),
+        "unexpected 'end_conversation' in tool list: {:?}",
+        tools[0]
+    );
+    let prompts = llm.seen_system_prompts.lock().unwrap();
+    assert!(
+        !prompts[0].contains("end_conversation"),
+        "unexpected 'end_conversation' note in system prompt: {:?}",
+        prompts[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `end_conversation` short-circuit termination (SP1, Task 5)
+// ---------------------------------------------------------------------------
+
+/// Build an `end_conversation` tool-call `LlmResponse`, mirroring `tool_call(...)`.
+/// `final_message` becomes the tool's `args.final_message` (omitted when `None`);
+/// `content` is the accompanying assistant text (the fallback source when
+/// `final_message` is absent/empty).
+fn end_conversation_call(
+    call_id: &str,
+    final_message: Option<&str>,
+    content: Option<&str>,
+) -> LlmResponse {
+    let args = match final_message {
+        Some(m) => serde_json::json!({ "final_message": m }),
+        None => serde_json::json!({}),
+    };
+    LlmResponse {
+        content: content.map(str::to_string),
+        tool_calls: vec![ToolCallRecord {
+            call_id: call_id.into(),
+            extension_id: "host".into(),
+            tool_name: "end_conversation".into(),
+            args,
+        }],
+        tokens_in: 5,
+        tokens_out: 5,
+    }
+}
+
+#[tokio::test]
+async fn end_conversation_terminates_with_final_message() {
+    let mut c = cfg(4, 5_000, vec![], None);
+    c.conversational = true;
+    let (rt, _tel, tc) = build_runtime(
+        vec![Ok(end_conversation_call("c1", Some("Goodbye!"), None))],
+        c,
+        0,
+    );
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "bye".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+    assert_eq!(out.reply, "Goodbye!");
+}
+
+#[tokio::test]
+async fn end_conversation_falls_back_to_accompanying_content() {
+    let mut c = cfg(4, 5_000, vec![], None);
+    c.conversational = true;
+    let (rt, _tel, tc) = build_runtime(
+        vec![Ok(end_conversation_call("c1", None, Some("Take care.")))],
+        c,
+        0,
+    );
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "bye".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+    assert_eq!(out.reply, "Take care.");
+}
+
+#[tokio::test]
+async fn end_conversation_empty_reply_when_neither_present() {
+    let mut c = cfg(4, 5_000, vec![], None);
+    c.conversational = true;
+    let (rt, _tel, tc) = build_runtime(vec![Ok(end_conversation_call("c1", None, None))], c, 0);
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "bye".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+    assert_eq!(out.reply, "");
+}
+
+#[tokio::test]
+async fn end_conversation_ignored_when_not_conversational() {
+    // Non-conversational agent: the tool is not intercepted. The model's call
+    // is not in the (empty) allow-list, so it is blocked (not terminated); the
+    // second scripted response is the real final reply.
+    let script = vec![
+        Ok(end_conversation_call("c1", Some("nope"), None)),
+        Ok(final_reply("real reply")),
+    ];
+    let (rt, _tel, tc) = build_runtime(script, cfg(4, 5_000, vec![], None), 0); // conversational = false
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "hi".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::FinalReply);
+    assert_eq!(out.reply, "real reply");
 }

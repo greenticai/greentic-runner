@@ -21,8 +21,8 @@ use greentic_llm::{
 
 use crate::error::LlmError;
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
-use crate::llm_openai::{encode_tool_name, split_tool_name};
 use crate::state::{ChatMessage, ToolCallRecord};
+use crate::tool_wire_name::{ToolNameCodec, wire_tool_name};
 
 /// AW LLM backend backed by greentic-llm's multi-provider `RigBackend`.
 ///
@@ -93,6 +93,9 @@ impl LlmBackend for GreenticLlmBackend {
             let provider =
                 self.provider_for(&request.provider.provider, &request.provider.model)?;
             let chat_request = build_chat_request(&request);
+            // Built from the list the model is shown: a sanitised wire name
+            // cannot be split back apart by string surgery.
+            let codec = ToolNameCodec::for_tools(&request.tools);
             let response = provider
                 .chat(chat_request)
                 .await
@@ -100,7 +103,7 @@ impl LlmBackend for GreenticLlmBackend {
                 // BadRequest so `RetryingLlmBackend` does not loop on a
                 // deterministic failure.
                 .map_err(|e| LlmError::BadRequest(e.to_string()))?;
-            Ok(map_response(response))
+            Ok(map_response(response, &codec))
         })
     }
 }
@@ -116,7 +119,7 @@ fn build_chat_request(req: &LlmRequest) -> GChatRequest {
         .tools
         .iter()
         .map(|t| GToolDef {
-            name: encode_tool_name(&t.extension_id, &t.tool_name),
+            name: wire_tool_name(&t.extension_id, &t.tool_name),
             description: t.description.clone(),
             schema: t.parameters.clone(),
         })
@@ -156,7 +159,7 @@ fn map_message(msg: &ChatMessage) -> GChatMessage {
                 .iter()
                 .map(|tc| GToolCall {
                     id: tc.call_id.clone(),
-                    name: encode_tool_name(&tc.extension_id, &tc.tool_name),
+                    name: wire_tool_name(&tc.extension_id, &tc.tool_name),
                     arguments: tc.args.clone(),
                 })
                 .collect(),
@@ -173,13 +176,13 @@ fn map_message(msg: &ChatMessage) -> GChatMessage {
 }
 
 /// greentic-llm [`ChatResponse`](greentic_llm::ChatResponse) → AW [`LlmResponse`].
-fn map_response(resp: GChatResponse) -> LlmResponse {
+fn map_response(resp: GChatResponse, codec: &ToolNameCodec) -> LlmResponse {
     let content = (!resp.content.trim().is_empty()).then_some(resp.content);
     let tool_calls = resp
         .tool_calls
         .into_iter()
         .map(|tc| {
-            let (extension_id, tool_name) = split_tool_name(&tc.name);
+            let (extension_id, tool_name) = codec.decode(&tc.name);
             ToolCallRecord {
                 call_id: tc.id,
                 extension_id,
@@ -188,12 +191,17 @@ fn map_response(resp: GChatResponse) -> LlmResponse {
             }
         })
         .collect();
-    // greentic-llm's ChatResponse does not surface token counts.
+    // greentic-llm surfaces token usage on its ChatResponse (since 1.1.0), so
+    // carry it through — this is what makes real per-turn token counts show up
+    // in a caller's trace (e.g. the designer Run Demo) instead of zeros.
+    let (tokens_in, tokens_out) = resp
+        .usage
+        .map_or((0, 0), |u| (u.input_tokens as u32, u.output_tokens as u32));
     LlmResponse {
         content,
         tool_calls,
-        tokens_in: 0,
-        tokens_out: 0,
+        tokens_in,
+        tokens_out,
     }
 }
 
@@ -316,21 +324,41 @@ mod tests {
 
     #[test]
     fn map_response_splits_tool_name_and_blanks_empty_content() {
-        let resp = map_response(GChatResponse {
-            content: "  ".into(),
-            tool_calls: vec![GToolCall {
-                id: "c1".into(),
-                name: "greentic_DOT_tavily_FN_tavily_search".into(),
-                arguments: json!({"q": "rust"}),
-            }],
-            finish_reason: greentic_llm::FinishReason::ToolCalls,
-            // This test covers content/tool-call mapping only; usage is
-            // asserted by the metering tests.
-            usage: None,
-        });
+        let resp = map_response(
+            GChatResponse {
+                content: "  ".into(),
+                tool_calls: vec![GToolCall {
+                    id: "c1".into(),
+                    name: "greentic_DOT_tavily_FN_tavily_search".into(),
+                    arguments: json!({"q": "rust"}),
+                }],
+                finish_reason: greentic_llm::FinishReason::ToolCalls,
+                usage: None,
+            },
+            &ToolNameCodec::default(),
+        );
         assert!(resp.content.is_none(), "whitespace-only content → None");
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].extension_id, "greentic.tavily");
         assert_eq!(resp.tool_calls[0].tool_name, "tavily_search");
+    }
+
+    #[test]
+    fn map_response_carries_token_usage() {
+        let resp = map_response(
+            GChatResponse {
+                content: "hi".into(),
+                tool_calls: vec![],
+                finish_reason: greentic_llm::FinishReason::Stop,
+                usage: Some(greentic_llm::Usage {
+                    input_tokens: 42,
+                    output_tokens: 17,
+                    ..Default::default()
+                }),
+            },
+            &ToolNameCodec::default(),
+        );
+        assert_eq!(resp.tokens_in, 42);
+        assert_eq!(resp.tokens_out, 17);
     }
 }

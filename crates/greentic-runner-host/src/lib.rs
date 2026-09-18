@@ -65,13 +65,14 @@ pub mod watcher;
 
 mod activity;
 mod host;
+mod http_timeout_hooks;
 pub mod oauth;
 
 pub use activity::{Activity, ActivityKind, WelcomeFlowHint};
 pub use config::HostConfig;
 pub use gtbind::{PackBinding, TenantBindings};
 pub use host::TelemetryCfg;
-pub use host::{HostBuilder, RunnerHost, TenantHandle};
+pub use host::{HostBuilder, RunnerHost, TenantHandle, TurnTrace};
 pub use wasi::{PreopenSpec, RunnerWasiPolicy};
 
 pub use greentic_types::{EnvId, FlowId, PackId, TenantCtx, TenantId};
@@ -141,6 +142,12 @@ timers: []
             Arc::clone(&state_store),
             state_host,
             secrets,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
         )
         .await?;
         Ok((workspace, runtime))

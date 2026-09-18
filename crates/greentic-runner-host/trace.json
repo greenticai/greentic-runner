@@ -1,6 +1,6 @@
 {
   "trace_version": 1,
-  "runner_version": "1.1.6",
+  "runner_version": "1.3.0-research.0",
   "pack": {
     "pack_ref": "runner.components",
     "resolved_digest": "sha256:a3195ff0a9befb0192ef4fa7f5aa7fea944c9a9fa58aa25a4e80e9e80b5c36c1"

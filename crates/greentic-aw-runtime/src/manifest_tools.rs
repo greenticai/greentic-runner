@@ -17,6 +17,10 @@
 use crate::config::ToolRef;
 use greentic_dw_manifest::DigitalWorkerManifest;
 
+/// Capability literal a tool must declare to be usable by an agentic worker.
+/// The manifest's own validation requires every `ExtensionTool` to carry this.
+const AGENTIC_WORKER_CAPABILITY: &str = "agentic_worker";
+
 /// Convert a manifest's `extension_tools` into AW runtime [`ToolRef`]s.
 ///
 /// Only tools whose `capabilities` declare [`AGENTIC_WORKER_CAPABILITY`] are
@@ -42,51 +46,35 @@ use greentic_dw_manifest::DigitalWorkerManifest;
 /// # }
 /// ```
 pub fn manifest_to_tool_refs(manifest: &DigitalWorkerManifest) -> Vec<ToolRef> {
-    // `DigitalWorkerManifest` on this lane's greentic-dw-manifest carries no
-    // `extension_tools` field, so a manifest here can never declare extension
-    // tools and the overlay is empty. That is the honest answer rather than a
-    // failure: `ManifestToolOverlayProvider` is fail-soft by contract, and an
-    // empty overlay leaves the base config's tools untouched.
-    #[cfg(not(greentic_dw_manifest_tools))]
-    {
-        let _ = manifest;
-        Vec::new()
-    }
+    let mut seen_pairs: Vec<(String, String)> = Vec::new();
+    let mut tool_refs: Vec<ToolRef> = Vec::new();
 
-    #[cfg(greentic_dw_manifest_tools)]
-    {
-        /// Capability literal a tool must declare to be usable by an agentic
-        /// worker. The manifest's own validation requires every
-        /// `ExtensionTool` to carry this.
-        const AGENTIC_WORKER_CAPABILITY: &str = "agentic_worker";
-
-        let mut seen_pairs: Vec<(String, String)> = Vec::new();
-        let mut tool_refs: Vec<ToolRef> = Vec::new();
-
-        for extension_tool in &manifest.extension_tools {
-            let supports_agentic_worker = extension_tool
-                .capabilities
-                .iter()
-                .any(|capability| capability == AGENTIC_WORKER_CAPABILITY);
-            if !supports_agentic_worker {
-                continue;
-            }
-
-            let pair = (
-                extension_tool.extension_id.clone(),
-                extension_tool.tool_name.clone(),
-            );
-            if seen_pairs.contains(&pair) {
-                continue;
-            }
-
-            seen_pairs.push(pair);
-            tool_refs.push(ToolRef {
-                extension_id: extension_tool.extension_id.clone(),
-                tool_name: extension_tool.tool_name.clone(),
-            });
+    for extension_tool in &manifest.extension_tools {
+        let supports_agentic_worker = extension_tool
+            .capabilities
+            .iter()
+            .any(|capability| capability == AGENTIC_WORKER_CAPABILITY);
+        if !supports_agentic_worker {
+            continue;
         }
 
-        tool_refs
+        let pair = (
+            extension_tool.extension_id.clone(),
+            extension_tool.tool_name.clone(),
+        );
+        if seen_pairs.contains(&pair) {
+            continue;
+        }
+
+        seen_pairs.push(pair);
+        tool_refs.push(ToolRef {
+            extension_id: extension_tool.extension_id.clone(),
+            tool_name: extension_tool.tool_name.clone(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        });
     }
+
+    tool_refs
 }

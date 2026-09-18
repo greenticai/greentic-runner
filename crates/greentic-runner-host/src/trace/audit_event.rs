@@ -156,6 +156,89 @@ pub fn build_agent_audit_event(
     )
 }
 
+/// Builds the metering subject for one agentic-worker run completion:
+/// `audit.<tenant>.metering.agent_run`.
+pub fn metering_subject(tenant: &str) -> String {
+    format!("audit.{tenant}.metering.agent_run")
+}
+
+/// Constructs the metering `EventEnvelope` for one completed agentic-worker
+/// run.
+///
+/// `type` is always `greentic.runner.metering.agent_run`; `source` is always
+/// `"runner"`; `subject` is `agent:<agent_id>`; the payload is the billing
+/// unit record: `{"unit":"agent_run","quantity":1,"agent_id":<agent_id>,
+/// "steps":<steps>}`. Emitted once per successful `dw.agent` run, alongside
+/// (not instead of) the per-step agent-audit events from
+/// [`build_agent_audit_event`].
+pub fn build_agent_run_metering_event(
+    tenant: &TenantCtx,
+    agent_id: &str,
+    steps: usize,
+    now: DateTime<Utc>,
+    id: String,
+) -> EventEnvelope {
+    let payload = json!({
+        "unit": "agent_run",
+        "quantity": 1,
+        "agent_id": agent_id,
+        "steps": steps,
+    });
+
+    base_event(
+        tenant,
+        "greentic.runner.metering.agent_run",
+        "runner",
+        format!("agent:{agent_id}"),
+        None,
+        payload,
+        now,
+        id,
+    )
+}
+
+/// Subject for one guardrail denial: `audit.<tenant>.guardrail.violation`.
+pub fn violation_subject(tenant: &str) -> String {
+    format!("audit.{tenant}.guardrail.violation")
+}
+
+/// Best-effort record of one guardrail denial — blocked (Enforce) or recorded
+/// only (Monitor). Emitted alongside, never instead of, the other audit
+/// events (the metering event and the per-step agent-audit events).
+///
+/// This is TELEMETRY, not an audit log: `AuditSink` drops events when its
+/// channel saturates and the NATS publish is fire-and-forget. The payload
+/// carries `code` (a stable, non-sensitive classifier), never `message`
+/// (free text that may echo user content) or the guarded content itself.
+pub fn build_guardrail_violation_event(
+    tenant: &TenantCtx,
+    agent_id: &str,
+    session_id: Option<&str>,
+    obs: &greentic_aw_runtime::guardrail::GuardrailObservation,
+    now: DateTime<Utc>,
+    id: String,
+) -> EventEnvelope {
+    let payload = json!({
+        "cap_id": obs.cap_id,
+        "extension_id": obs.extension_id,
+        "direction": obs.direction.as_str(),
+        "code": obs.code,
+        "action": obs.action,
+        "agent_id": agent_id,
+    });
+
+    base_event(
+        tenant,
+        "greentic.runner.guardrail.violation",
+        "runner",
+        format!("agent:{agent_id}"),
+        session_id.map(str::to_string),
+        payload,
+        now,
+        id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +287,30 @@ mod tests {
             EnvId::try_from("prod").expect("valid env id"),
             TenantId::try_from("t1").expect("valid tenant id"),
         )
+    }
+
+    fn tenant_ctx_named(tenant: &str, env: &str) -> TenantCtx {
+        TenantCtx::new(
+            EnvId::try_from(env).expect("valid env id"),
+            TenantId::try_from(tenant).expect("valid tenant id"),
+        )
+    }
+
+    fn obs_blocked() -> greentic_aw_runtime::guardrail::GuardrailObservation {
+        greentic_aw_runtime::guardrail::GuardrailObservation {
+            cap_id: "greentic:guardrail/pii".to_string(),
+            extension_id: "ext-pii".to_string(),
+            direction: greentic_aw_runtime::guardrail::GuardrailDirection::Inbound,
+            code: "pii".to_string(),
+            action: greentic_aw_runtime::guardrail::GuardrailAction::Blocked,
+        }
+    }
+
+    fn obs_monitored() -> greentic_aw_runtime::guardrail::GuardrailObservation {
+        greentic_aw_runtime::guardrail::GuardrailObservation {
+            action: greentic_aw_runtime::guardrail::GuardrailAction::Monitored,
+            ..obs_blocked()
+        }
     }
 
     #[test]
@@ -304,6 +411,49 @@ mod tests {
     }
 
     #[test]
+    fn metering_subject_is_well_formed() {
+        assert_eq!(metering_subject("t1"), "audit.t1.metering.agent_run");
+    }
+
+    #[test]
+    fn agent_run_metering_event_has_expected_type_subject_and_payload() {
+        let tenant = tenant_ctx();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let env = build_agent_run_metering_event(&tenant, "agent1", 3, now, "id1".to_string());
+        let body = serde_json::to_value(&env).unwrap();
+
+        assert_eq!(
+            body.get("type").and_then(Value::as_str),
+            Some("greentic.runner.metering.agent_run")
+        );
+        assert_eq!(body.get("source").and_then(Value::as_str), Some("runner"));
+        assert_eq!(
+            body.get("subject").and_then(Value::as_str),
+            Some("agent:agent1")
+        );
+        assert_eq!(
+            body.get("tenant")
+                .and_then(|t| t.get("tenant"))
+                .and_then(Value::as_str),
+            Some("t1")
+        );
+
+        let payload = body.get("payload").unwrap();
+        assert_eq!(
+            payload.get("unit").and_then(Value::as_str),
+            Some("agent_run")
+        );
+        assert_eq!(payload.get("quantity").and_then(Value::as_u64), Some(1));
+        assert_eq!(payload.get("steps").and_then(Value::as_u64), Some(3));
+        assert_eq!(
+            payload.get("agent_id").and_then(Value::as_str),
+            Some("agent1")
+        );
+    }
+
+    #[test]
     fn agent_event_decodes_under_admin_contract() {
         let tenant = tenant_ctx();
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
@@ -333,5 +483,49 @@ mod tests {
                 .and_then(Value::as_str),
             Some("http")
         );
+    }
+
+    #[test]
+    fn guardrail_violation_event_has_the_expected_shape() {
+        let tenant = tenant_ctx_named("acme", "production");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ev = build_guardrail_violation_event(
+            &tenant,
+            "a1",
+            Some("s1"),
+            &obs_blocked(),
+            now,
+            "evt-1".to_string(),
+        );
+        assert_eq!(ev.r#type, "greentic.runner.guardrail.violation");
+        assert_eq!(ev.source, "runner");
+        assert_eq!(ev.payload["cap_id"], "greentic:guardrail/pii");
+        assert_eq!(ev.payload["direction"], "inbound");
+        assert_eq!(ev.payload["code"], "pii");
+        assert_eq!(ev.payload["action"], "blocked");
+        assert_eq!(ev.payload["agent_id"], "a1");
+        // Privacy: the payload must never carry the free-text `message`.
+        assert!(ev.payload.get("message").is_none());
+    }
+
+    #[test]
+    fn guardrail_violation_subject_is_tenant_scoped() {
+        assert_eq!(violation_subject("acme"), "audit.acme.guardrail.violation");
+    }
+
+    #[test]
+    fn monitored_violation_is_tagged_monitored() {
+        let tenant = tenant_ctx_named("acme", "production");
+        let ev = build_guardrail_violation_event(
+            &tenant,
+            "a1",
+            None,
+            &obs_monitored(),
+            Utc::now(),
+            "e".to_string(),
+        );
+        assert_eq!(ev.payload["action"], "monitored");
     }
 }

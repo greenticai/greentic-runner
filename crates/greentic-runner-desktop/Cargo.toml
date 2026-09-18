@@ -8,26 +8,30 @@ homepage = "https://github.com/greentic-ai/greentic-runner"
 repository = "https://github.com/greentic-ai/greentic-runner"
 
 [features]
-# `build_host_config` already gates `HostConfig`'s `agents`/`graphs` on this
-# flag, but the flag itself was never declared — so while the host's
-# `agentic-worker` was a stub the cfg was permanently false and nothing
-# noticed. Now that the host carries the feature by default, declare it here
-# and forward it, keeping the two crates' views of `HostConfig` in step.
 default = ["agentic-worker"]
-agentic-worker = ["greentic-runner-host/agentic-worker"]
+# Propagates the agentic-worker feature to the host shim.
+# Keep out of published defaults when greentic-aw-runtime is not on crates.io.
+agentic-worker = ["greentic-runner-host/agentic-worker", "greentic-runner-host/state-disk"]
 # Multi-provider in-process LLM backend (DeepSeek/Anthropic/…) via greentic-llm.
-# Off by default; restored on develop alongside the host's own declaration.
 greentic-llm-backend = ["agentic-worker", "greentic-runner-host/greentic-llm-backend"]
 # Enables the ephemeral (in-memory) agent state store for desktop/local runs.
 # Activates test-mock types from greentic-aw-runtime; must NOT be in `default`
-# so the server build (agentic-worker only) never compiles the mocks. Gates the
-# no-Redis branch in `build_host_config` — without it a desktop run with
-# GREENTIC_AW_REDIS_URL unset logs "dw.agent nodes disabled" and serves none.
+# so the server build (agentic-worker only) never compiles the mocks.
 desktop-agent-ephemeral = ["agentic-worker", "greentic-runner-host/desktop-agent-ephemeral"]
+# See greentic-runner-host. LOCAL DEV ONLY.
+dev-allow-unsigned = ["agentic-worker", "greentic-runner-host/dev-allow-unsigned"]
 
 [dependencies]
 anyhow.workspace = true
-greentic-runner-host = { workspace = true }
+# NOT `workspace = true`: see the matching comment in
+# crates/greentic-runner/Cargo.toml. This crate's own `build_host_config`
+# (src/lib.rs) cfg-gates `HostConfig.agents`/`.graphs` on ITS OWN
+# `agentic-worker` feature, so that feature must be the sole thing turning
+# host's `agentic-worker` on for this crate too — otherwise a standalone
+# `--no-default-features` build of this crate (e.g. the workspace-wide lean
+# clippy gate) pulls host's `agentic-worker` default back on while this
+# crate's own gate stays off, reproducing the same E0063 incoherence.
+greentic-runner-host = { path = "../greentic-runner-host", version = "=1.3.0-research.0", default-features = false, features = ["telemetry"] }
 greentic_pack.workspace = true
 parking_lot.workspace = true
 runner-core.workspace = true

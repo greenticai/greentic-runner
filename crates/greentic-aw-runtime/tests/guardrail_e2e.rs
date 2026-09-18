@@ -60,7 +60,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use greentic_aw_runtime::config::{AgentConfig, AgentLimits, GuardrailRef, LlmProviderRef};
+use greentic_aw_runtime::config::{
+    AgentConfig, AgentLimits, GuardrailMode, GuardrailRef, LlmProviderRef,
+};
 use greentic_aw_runtime::cost::MockTokenMeter;
 use greentic_aw_runtime::error::AgentError;
 use greentic_aw_runtime::guardrail::{ExtRuntimeGuardrailEvaluator, StaticGuardrailPolicy};
@@ -224,8 +226,15 @@ async fn pii_extension_registers_and_capability_appears_in_registry() {
     write_signed_extension_dir(&wasm_src, &ext_dir);
 
     let paths = DiscoveryPaths::new(tmp.path().to_path_buf());
-    let mut ext_runtime =
-        ExtensionRuntime::new(RuntimeConfig::from_paths(paths)).expect("ExtensionRuntime::new");
+    // Root the trust store at the tempdir. Unset, it resolves to the real
+    // `$GREENTIC_HOME`/`~/.greentic` — the same store `gtdx install` writes —
+    // so this test would pin its throwaway fixture key against the real
+    // `greentic.guardrail-pii` id, and the next run (a fresh random key for
+    // the same id) would fail `PublisherKeyChanged`. Green once, red forever.
+    let mut ext_runtime = ExtensionRuntime::new(
+        RuntimeConfig::from_paths(paths).with_trust_root(tmp.path().to_path_buf()),
+    )
+    .expect("ExtensionRuntime::new");
 
     ext_runtime
         .register_loaded_from_dir(&ext_dir)
@@ -271,7 +280,13 @@ async fn pii_guardrail_masks_inbound_email() {
     std::fs::create_dir_all(&ext_dir).expect("create ext subdir");
     write_signed_extension_dir(&wasm_src, &ext_dir);
 
-    let (runtime, tc) = build_full_runtime(&wasm_src, &tmp, &ext_dir, serde_json::Value::Null);
+    let (runtime, tc) = build_full_runtime(
+        &wasm_src,
+        &tmp,
+        &ext_dir,
+        serde_json::Value::Null,
+        GuardrailMode::Enforce,
+    );
 
     let output = runtime
         .step(
@@ -280,6 +295,7 @@ async fn pii_guardrail_masks_inbound_email() {
             "pii-agent",
             AgentInput {
                 text: "email me at x@y.com please".into(),
+                conversational: false,
             },
         )
         .await
@@ -312,7 +328,13 @@ async fn pii_guardrail_denies_blocklist_match() {
     write_signed_extension_dir(&wasm_src, &ext_dir);
 
     let blocklist_config = serde_json::json!({ "blocklist": ["forbidden"] });
-    let (runtime, tc) = build_full_runtime(&wasm_src, &tmp, &ext_dir, blocklist_config);
+    let (runtime, tc) = build_full_runtime(
+        &wasm_src,
+        &tmp,
+        &ext_dir,
+        blocklist_config,
+        GuardrailMode::Enforce,
+    );
 
     let result = runtime
         .step(
@@ -321,6 +343,7 @@ async fn pii_guardrail_denies_blocklist_match() {
             "pii-agent",
             AgentInput {
                 text: "this message contains forbidden content".into(),
+                conversational: false,
             },
         )
         .await;
@@ -347,6 +370,144 @@ async fn pii_guardrail_denies_blocklist_match() {
     }
 }
 
+// ─── Observer wiring: real `run_step` → `StepObserver::on_guardrail` ────────
+//
+// The two `guardrail_notify_pattern_reports_a_*_denial` unit tests in
+// `crates/greentic-aw-runtime/src/loop.rs` pin the notify *pattern* only
+// (they call a test-local re-implementation of the notify logic, not
+// `run_step`). These two tests close that gap: they drive the REAL
+// `AgentRuntime::step_with_observer` → `run_step` → `observer.on_guardrail`
+// path, through the same signed WASM guardrail extension the rest of this
+// file uses, for both Enforce (blocked) and Monitor (recorded, not blocked)
+// modes.
+
+#[derive(Default)]
+struct RecordingObserver {
+    guardrails: std::sync::Mutex<Vec<greentic_aw_runtime::guardrail::GuardrailObservation>>,
+}
+
+impl greentic_aw_runtime::StepObserver for RecordingObserver {
+    fn on_guardrail(&self, obs: &greentic_aw_runtime::guardrail::GuardrailObservation) {
+        self.guardrails.lock().unwrap().push(obs.clone());
+    }
+}
+
+/// Proves the real `run_step` wiring notifies a `StepObserver` for an
+/// Enforce-mode blocklist denial (the turn is blocked AND observed).
+#[tokio::test]
+async fn pii_guardrail_enforce_denial_notifies_real_observer() {
+    let Some(wasm_src) = pii_wasm_src() else {
+        eprintln!("SKIP: component-guardrail-pii WASM not found");
+        return;
+    };
+
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let ext_dir = tmp.path().join("greentic.guardrail-pii");
+    std::fs::create_dir_all(&ext_dir).expect("create ext subdir");
+    write_signed_extension_dir(&wasm_src, &ext_dir);
+
+    let blocklist_config = serde_json::json!({ "blocklist": ["forbidden"] });
+    let (runtime, tc) = build_full_runtime(
+        &wasm_src,
+        &tmp,
+        &ext_dir,
+        blocklist_config,
+        GuardrailMode::Enforce,
+    );
+
+    let observer = std::sync::Arc::new(RecordingObserver::default());
+    let result = runtime
+        .step_with_observer(
+            tc,
+            "session-e2e-deny-observed",
+            "pii-agent",
+            AgentInput {
+                text: "this message contains forbidden content".into(),
+                conversational: false,
+            },
+            observer.clone(),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(AgentError::GuardrailDenied { .. })),
+        "expected GuardrailDenied, got: {result:?}"
+    );
+    let seen = observer.guardrails.lock().unwrap();
+    assert_eq!(seen.len(), 1, "a blocked denial must reach the observer");
+    assert_eq!(
+        seen[0].action,
+        greentic_aw_runtime::guardrail::GuardrailAction::Blocked
+    );
+}
+
+/// Proves the real `run_step` wiring notifies a `StepObserver` for a
+/// Monitor-mode blocklist denial (the turn passes through AND is observed).
+#[tokio::test]
+async fn pii_guardrail_monitor_denial_notifies_real_observer_without_blocking() {
+    let Some(wasm_src) = pii_wasm_src() else {
+        eprintln!("SKIP: component-guardrail-pii WASM not found");
+        return;
+    };
+
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let ext_dir = tmp.path().join("greentic.guardrail-pii");
+    std::fs::create_dir_all(&ext_dir).expect("create ext subdir");
+    write_signed_extension_dir(&wasm_src, &ext_dir);
+
+    let blocklist_config = serde_json::json!({ "blocklist": ["forbidden"] });
+    let (runtime, tc) = build_full_runtime(
+        &wasm_src,
+        &tmp,
+        &ext_dir,
+        blocklist_config,
+        GuardrailMode::Monitor,
+    );
+
+    let observer = std::sync::Arc::new(RecordingObserver::default());
+    let result = runtime
+        .step_with_observer(
+            tc,
+            "session-e2e-monitor-observed",
+            "pii-agent",
+            AgentInput {
+                text: "this message contains forbidden content".into(),
+                conversational: false,
+            },
+            observer.clone(),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "monitor mode must not block the turn: {result:?}"
+    );
+    let seen = observer.guardrails.lock().unwrap();
+    // Monitor mode passes the ORIGINAL content through unchanged (per the
+    // mode semantics, untouched by this fix pass), so the echoing LLM's
+    // reply still contains "forbidden" — the outbound guardrail hook fires
+    // too. Both the inbound and outbound denials must reach the observer.
+    assert_eq!(
+        seen.len(),
+        2,
+        "both the inbound and outbound monitored denials must reach the observer"
+    );
+    assert!(
+        seen.iter()
+            .all(|obs| obs.action == greentic_aw_runtime::guardrail::GuardrailAction::Monitored),
+        "monitor mode must never block: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|obs| obs.direction == greentic_aw_runtime::guardrail::GuardrailDirection::Inbound)
+    );
+    assert!(
+        seen.iter().any(
+            |obs| obs.direction == greentic_aw_runtime::guardrail::GuardrailDirection::Outbound
+        )
+    );
+}
+
 // ─── Helper: build a full AgentRuntime with PII guardrail ───────────────────
 
 fn build_full_runtime(
@@ -354,10 +515,17 @@ fn build_full_runtime(
     tmp: &tempfile::TempDir,
     ext_dir: &std::path::Path,
     guardrail_config: serde_json::Value,
+    mode: GuardrailMode,
 ) -> (AgentRuntime, TenantContext) {
     let paths = DiscoveryPaths::new(tmp.path().to_path_buf());
-    let mut ext_runtime =
-        ExtensionRuntime::new(RuntimeConfig::from_paths(paths)).expect("ExtensionRuntime::new");
+    // Root the trust store at the tempdir — see the note on the direct
+    // construction above. Every caller of this helper registers a freshly
+    // signed fixture under a real extension id, so an unrooted store would
+    // pin throwaway keys into `~/.greentic` and self-poison the next run.
+    let mut ext_runtime = ExtensionRuntime::new(
+        RuntimeConfig::from_paths(paths).with_trust_root(tmp.path().to_path_buf()),
+    )
+    .expect("ExtensionRuntime::new");
     ext_runtime
         .register_loaded_from_dir(ext_dir)
         .expect("register_loaded_from_dir");
@@ -371,6 +539,7 @@ fn build_full_runtime(
         cap_id: "greentic:guardrail/pii".into(),
         offer_id: None,
         config: guardrail_config,
+        mode,
     }]));
 
     let tc = TenantContext::new("test-tenant", "test");
@@ -391,6 +560,8 @@ fn build_full_runtime(
         },
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
     };
 
     let cp = MockConfigProvider::new();

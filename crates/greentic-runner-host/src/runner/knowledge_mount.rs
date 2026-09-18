@@ -14,11 +14,14 @@
 //! distinct path. The graph store is operator-selectable via
 //! `GREENTIC_KNOWLEDGE_BACKEND`, defaulting to embedded SurrealDB so document RAG
 //! works with no external graph server. The embedding endpoint
-//! (`GREENTIC_KNOWLEDGE_EMBED_*`, any OpenAI-compatible API) is the opt-in signal:
-//! absent it — or on a config / connection failure — the knowledge tier simply
-//! stays disabled; it never fails runtime construction.
+//! (`GREENTIC_KNOWLEDGE_EMBED_*`, any OpenAI-compatible API) is the opt-in signal —
+//! specifically its **key + model**; the base URL is optional and defaults to the
+//! embeddings client's provider default (a plain OpenAI provider has no explicit
+//! endpoint). Absent the signal — or on a config / connection failure — the
+//! knowledge tier simply stays disabled; it never fails runtime construction.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chronicle_core::driver::GraphDriver;
 use chronicle_driver_falkor::FalkorDriver;
@@ -46,7 +49,20 @@ const ENV_SURREAL_PATH: &str = "GREENTIC_KNOWLEDGE_SURREAL_PATH";
 const DEFAULT_BACKEND: &str = "surreal-embedded";
 /// Default on-disk location for the embedded SurrealDB knowledge store. Distinct
 /// from the long-term-memory default so the two tiers never open the same store.
-const DEFAULT_SURREAL_PATH: &str = "/var/lib/greentic/knowledge";
+///
+/// Prefers the per-user `~/.greentic/knowledge` and only falls back to the
+/// system path — the same convention [`crate::runner::aw_backends`] uses for the
+/// agent state store. A bare `/var/lib/greentic` default is unwritable for any
+/// non-root process (e.g. the designer's Test-chat sidecar), and the mount
+/// failure is GRACEFUL ("knowledge disabled"), so vector retrieval silently
+/// yields nothing instead of erroring. Root/systemd deployments have no `HOME`
+/// and keep the system path.
+fn default_surreal_path() -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => format!("{home}/.greentic/knowledge"),
+        _ => "/var/lib/greentic/knowledge".to_string(),
+    }
+}
 // Neo4j (backend=neo4j) — may point at the same server long-term memory uses; the
 // `knowledge:<tenant>` group_id keeps corpora isolated from memory graph entities.
 const ENV_NEO4J_URI: &str = "GREENTIC_KNOWLEDGE_NEO4J_URI";
@@ -98,23 +114,45 @@ pub async fn attach(runtime: AgentRuntime) -> AgentRuntime {
     }
 }
 
-/// Build the knowledge embedding config from the environment. The embedding
-/// endpoint (base URL + key + model) is mandatory — its absence is how an operator
-/// opts out — so a missing value returns `None` and leaves knowledge disabled.
+/// Build the knowledge embedding config from the environment. The **key + model**
+/// are mandatory — their absence is how an operator opts out — so a missing value
+/// returns `None` and leaves knowledge disabled.
+///
+/// The base URL is OPTIONAL: `KnowledgeConfig::openai_base_url` is an `Option`
+/// whose `None` means "the embeddings client's provider default". Requiring it
+/// here contradicted that and disabled knowledge for the most common setup — a
+/// plain OpenAI embedding provider, which legitimately has no explicit endpoint.
 fn build_config() -> Option<KnowledgeConfig> {
-    let base_url = std::env::var(ENV_EMBED_BASE_URL).ok()?;
     let api_key = std::env::var(ENV_EMBED_API_KEY).ok()?;
     let model = std::env::var(ENV_EMBED_MODEL).ok()?;
+    let base_url = std::env::var(ENV_EMBED_BASE_URL)
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let embedding_dim = std::env::var(ENV_EMBED_DIM)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_EMBEDDING_DIM);
 
     let mut config = KnowledgeConfig::new(embedding_dim);
-    config.openai_base_url = Some(base_url);
+    config.openai_base_url = base_url;
     config.openai_api_key = Some(api_key);
     config.embedding_model = Some(model);
     Some(config)
+}
+
+/// The model + dimension the configured embedder will produce, for validating
+/// pack-supplied precomputed vectors before they reach ingest. `None` when no
+/// embedder is configured — the caller skips ingest entirely in that case.
+///
+/// Goes through [`build_config`] rather than reading the env vars directly, so
+/// the expectation applies the same defaulting the embedder does — notably
+/// `DEFAULT_EMBEDDING_DIM` when `GREENTIC_KNOWLEDGE_EMBED_DIM` is unset or
+/// unparseable. This is a SEPARATE `build_config` call from the one
+/// [`ingest_corpus`] makes, not a shared value; they agree because nothing
+/// mutates the environment between them, not because the types enforce it.
+pub(crate) fn embedding_expectation() -> Option<(String, usize)> {
+    let config = build_config()?;
+    Some((config.embedding_model.clone()?, config.embedding_dim))
 }
 
 /// The graph-store backend resolved from the environment, before any connection
@@ -147,8 +185,7 @@ fn resolve_backend() -> Option<BackendChoice> {
     let kind = std::env::var(ENV_BACKEND).unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
     match kind.as_str() {
         "surreal-embedded" => {
-            let path = std::env::var(ENV_SURREAL_PATH)
-                .unwrap_or_else(|_| DEFAULT_SURREAL_PATH.to_string());
+            let path = std::env::var(ENV_SURREAL_PATH).unwrap_or_else(|_| default_surreal_path());
             Some(BackendChoice::SurrealEmbedded { path })
         }
         "surreal-memory" => Some(BackendChoice::SurrealMemory),
@@ -202,13 +239,7 @@ fn resolve_backend() -> Option<BackendChoice> {
 async fn build_driver(embedding_dim: usize) -> Option<Arc<dyn GraphDriver>> {
     match resolve_backend()? {
         BackendChoice::SurrealEmbedded { path } => {
-            match SurrealDriver::connect_embedded(&path, embedding_dim).await {
-                Ok(driver) => Some(Arc::new(driver)),
-                Err(err) => {
-                    tracing::warn!(error = %err, path = %path, "knowledge: embedded SurrealDB connect failed; knowledge disabled");
-                    None
-                }
-            }
+            connect_embedded_retrying(&path, embedding_dim).await
         }
         BackendChoice::SurrealMemory => {
             tracing::warn!(
@@ -245,6 +276,63 @@ async fn build_driver(embedding_dim: usize) -> Option<Arc<dyn GraphDriver>> {
             }
         }
     }
+}
+
+/// Whether a connect error is the embedded store's directory-lock contention,
+/// as opposed to a permanent failure (bad path, dim mismatch). RocksDB reports
+/// it as `No locks available` / `lock hold by current process`; matched
+/// case-insensitively so a wording change across versions still degrades to the
+/// old fail-open behaviour rather than a false retry.
+fn is_lock_contention(err_msg: &str) -> bool {
+    let lower = err_msg.to_ascii_lowercase();
+    lower.contains("no locks available") || lower.contains("lock hold")
+}
+
+/// Connect to the embedded store, retrying briefly while its directory lock is
+/// still held by a just-closed handle.
+///
+/// `ingest_corpus` opens this same store, writes the corpus, and drops its
+/// handle immediately before the serving mount ([`attach`]) opens its own — but
+/// embedded SurrealDB (RocksDB) releases the directory lock *asynchronously* as
+/// the previous handle finishes closing. So `attach`'s open can lose a short
+/// race with the ingest handle's teardown and see `No locks available`, which
+/// silently disabled the whole knowledge tier (RAG present in the store, but the
+/// serving mount never came up). The window is brief and self-clears once the
+/// close completes, so a bounded backoff turns that silent miss into a wait of a
+/// few hundred milliseconds at worst.
+///
+/// Only lock contention is retried; a permanent error returns on the first
+/// attempt so a genuine misconfiguration still fails fast into the same
+/// knowledge-disabled fallback.
+async fn connect_embedded_retrying(
+    path: &str,
+    embedding_dim: usize,
+) -> Option<Arc<dyn GraphDriver>> {
+    const MAX_ATTEMPTS: u32 = 8;
+    const MAX_DELAY: Duration = Duration::from_millis(400);
+    let mut delay = Duration::from_millis(25);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let err = match SurrealDriver::connect_embedded(path, embedding_dim).await {
+            Ok(driver) => return Some(Arc::new(driver)),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        if !is_lock_contention(&msg) || attempt == MAX_ATTEMPTS {
+            tracing::warn!(
+                error = %err, path = %path, attempt,
+                "knowledge: embedded SurrealDB connect failed; knowledge disabled"
+            );
+            return None;
+        }
+        tracing::debug!(
+            path = %path, attempt,
+            "knowledge: embedded store lock still held by the closing ingest handle; retrying"
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(MAX_DELAY);
+    }
+    None
 }
 
 /// Adapts the provider-stack [`KnowledgeChronicle`] (which implements the
@@ -310,6 +398,7 @@ fn to_dw_chunk(c: AwChunk) -> DwChunk {
         chunk_index: c.chunk_index,
         text: c.text,
         metadata: c.metadata,
+        embedding: c.embedding,
     }
 }
 
@@ -358,14 +447,81 @@ pub(crate) async fn ingest_corpus(tenant: &TenantCtx, chunks: Vec<AwChunk>) {
         ),
         Err(err) => tracing::warn!(error = %err, "knowledge: baked-corpus ingest failed"),
     }
-    // `knowledge` (and its embedded-store handle) drops here, before the serving
-    // mount opens its own connection.
+    // `knowledge` (and its embedded-store handle) drops here. The directory lock
+    // is released asynchronously as that handle finishes closing, so the serving
+    // mount's open can briefly race this teardown — `connect_embedded_retrying`
+    // absorbs that window.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn is_lock_contention_matches_rocksdb_flock_messages() {
+        // The verbatim RocksDB LOG line observed when the ingest handle had not
+        // finished releasing the directory lock.
+        assert!(is_lock_contention(
+            "IO error: lock hold by current process, acquire time 1784187876 \
+             acquiring thread 1908306: /home/u/.greentic/knowledge/LOCK: No locks available"
+        ));
+        assert!(is_lock_contention("No Locks Available")); // case-insensitive
+    }
+
+    #[test]
+    fn is_lock_contention_ignores_permanent_errors() {
+        // A misconfiguration must NOT be retried — it would only delay the
+        // fail-open into the knowledge-disabled fallback.
+        assert!(!is_lock_contention("No such file or directory"));
+        assert!(!is_lock_contention(
+            "embedding dimension mismatch: 1536 vs 1024"
+        ));
+        assert!(!is_lock_contention(""));
+    }
+
+    /// The real fix, against a real embedded store: while one handle holds the
+    /// directory lock (the ingest handle mid-teardown), `connect_embedded_retrying`
+    /// must keep trying and win once that handle drops — where a single open would
+    /// have returned `No locks available` and disabled knowledge.
+    ///
+    /// Two embedded opens on one directory in the same process genuinely collide
+    /// (RocksDB reports "lock hold by current process"), which is exactly the boot
+    /// race this reproduces. Timing margin is wide (release at 100ms vs a ~1.5s
+    /// retry budget) so it is not flaky.
+    #[tokio::test]
+    async fn embedded_connect_retries_past_a_lingering_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().into_owned();
+
+        // A single second open, with the first still held, loses on lock
+        // contention — the failure this fix absorbs.
+        let first = SurrealDriver::connect_embedded(&path, 8)
+            .await
+            .expect("first open");
+        let contended = SurrealDriver::connect_embedded(&path, 8)
+            .await
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            contended.as_deref().is_some_and(is_lock_contention),
+            "a plain second open must fail on lock contention; got {contended:?}"
+        );
+
+        // Release the holder shortly after the retry loop starts.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(first);
+        });
+
+        let driver = connect_embedded_retrying(&path, 8).await;
+        releaser.await.expect("releaser");
+
+        assert!(
+            driver.is_some(),
+            "retry must win once the prior handle releases the lock"
+        );
+    }
 
     // `std::env::set_var`/`remove_var` are `unsafe` under edition 2024; confined to
     // tests, which run under `#[serial]` so no other thread observes the env mid-mutation.
@@ -414,13 +570,44 @@ mod tests {
     }
 
     #[test]
+    fn to_dw_chunk_carries_precomputed_embedding() {
+        let vec = vec![0.1_f32, 0.2, 0.3];
+        let aw = AwChunk {
+            doc_id: "faq".into(),
+            chunk_index: 2,
+            text: "Refunds within 5 days.".into(),
+            metadata: serde_json::Map::new(),
+            embedding: Some(vec.clone()),
+        };
+        let dw = to_dw_chunk(aw);
+        assert_eq!(dw.doc_id, "faq");
+        assert_eq!(dw.chunk_index, 2);
+        assert_eq!(dw.text, "Refunds within 5 days.");
+        // The pre-computed vector must survive the AW→DW mapping unchanged so the
+        // Chronicle backend can skip re-embedding.
+        assert_eq!(dw.embedding, Some(vec));
+    }
+
+    #[test]
+    fn to_dw_chunk_preserves_absent_embedding() {
+        let aw = AwChunk {
+            doc_id: "faq".into(),
+            chunk_index: 0,
+            text: "No vector here.".into(),
+            metadata: serde_json::Map::new(),
+            embedding: None,
+        };
+        assert_eq!(to_dw_chunk(aw).embedding, None);
+    }
+
+    #[test]
     #[serial]
     fn resolve_backend_defaults_to_embedded_surreal() {
         clear_backend_env();
         assert_eq!(
             resolve_backend(),
             Some(BackendChoice::SurrealEmbedded {
-                path: DEFAULT_SURREAL_PATH.to_string()
+                path: default_surreal_path()
             })
         );
         clear_backend_env();
@@ -555,6 +742,30 @@ mod tests {
         set(ENV_EMBED_BASE_URL, "https://api.example/v1");
         set(ENV_EMBED_API_KEY, "sk-test");
         assert!(build_config().is_none());
+        clear_embed_env();
+    }
+
+    #[test]
+    #[serial]
+    fn build_config_enabled_without_base_url() {
+        // The common setup — a plain OpenAI embedding provider — carries no
+        // explicit endpoint. `openai_base_url: None` means "provider default", so
+        // key + model alone must ENABLE knowledge; requiring a base URL here
+        // silently disabled the whole tier (and the caller had already skipped the
+        // static KB injection, losing the documents entirely).
+        clear_embed_env();
+        set(ENV_EMBED_API_KEY, "sk-test");
+        set(ENV_EMBED_MODEL, "text-embedding-3-small");
+        let config = build_config().expect("key + model alone must enable knowledge");
+        assert!(
+            config.openai_base_url.is_none(),
+            "absent base URL must stay None (provider default), not be invented"
+        );
+        assert_eq!(config.openai_api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            config.embedding_model.as_deref(),
+            Some("text-embedding-3-small")
+        );
         clear_embed_env();
     }
 }

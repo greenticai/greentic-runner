@@ -77,6 +77,14 @@ pub struct FlowEngine {
     /// Bridges `sorla.call` flow nodes into a separate runtime over pub/sub.
     /// Not feature-gated: `sorla.call` is a core runtime-dispatch node.
     remote_dispatch_handler: Option<Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>>,
+    /// Bridges `operala.call` flow nodes into an in-process deep-worker
+    /// runtime (see `runner::operala_node`). Not feature-gated (like
+    /// `remote_dispatch_handler`): `operala.call` is a core runtime-dispatch
+    /// node and the trait itself has no feature-gated dependencies — only the
+    /// concrete production impl (built under `desktop-agent-ephemeral` in
+    /// `runtime.rs`) does. `None` falls back to the existing NATS
+    /// `RemoteDispatchHandler` path (`execute_remote_dispatch`).
+    operala_node_handler: Option<Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
     /// Controls whether `dw.agent` nodes run in-process (default) or are
     /// rerouted over the durable agentic NATS path (`GREENTIC_AW_DISPATCH=nats`).
     #[cfg(feature = "agentic-worker")]
@@ -91,6 +99,15 @@ pub struct FlowEngine {
     /// in which case MCP nodes fail gracefully with a clear node error.
     #[cfg(feature = "agentic-worker")]
     mcp_tool_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+    /// The secrets manager the HOST injected, used to resolve an `mcp` node's
+    /// credential. `None` for a standalone runner, which then falls back to the
+    /// env-derived manager exactly as before.
+    ///
+    /// Separate from the engine's other state because it is not the engine's
+    /// own: `TenantRuntime` owns it and hands it over, the same way it hands
+    /// over `mcp_tool_source`.
+    #[cfg(feature = "agentic-worker")]
+    mcp_secrets: Option<crate::secrets::DynSecretsManager>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -133,6 +150,10 @@ pub enum FlowStatus {
 pub struct FlowExecution {
     pub output: Value,
     pub status: FlowStatus,
+    /// Per-node outputs for this turn (`node_id → node_output_view(payload)`),
+    /// captured from the flow's `ExecutionState` before it is finalised.
+    /// Observability only — never affects `output`/egress.
+    pub node_outputs: JsonMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,10 +161,18 @@ struct HostFlow {
     id: String,
     start: Option<NodeId>,
     nodes: IndexMap<NodeId, HostNode>,
+    vars_init: JsonMap<String, Value>,
+    /// Names of `vars_init` declarations whose decl has `"required": true`.
+    /// Parsed from `metadata.extra.vars_init`; order follows the map iteration.
+    /// Not yet read by production dispatch code — this is Task 1 of the
+    /// "required flow-var fail-fast" plan; a later task consumes it to reject
+    /// flow execution when a required var has no value at start. Exercised by
+    /// `from_flow_collects_required_vars` in the meantime.
+    #[allow(dead_code)]
+    required_vars: Vec<String>,
     /// Flow-level slot definitions extracted from `metadata.extra["greentic.slot_schema"]`.
     /// Injected into slot-extractor component invocations at dispatch time (Phase D).
     slot_schema: Option<Value>,
-    vars_init: JsonMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +268,9 @@ enum NodeKind {
     Wait,
     DwAgent {
         agent_id: String,
+        /// SP2: opt into multi-turn conversation-segment park-loop behaviour.
+        /// SP3 will populate this from the flow doc; the loader defaults it false.
+        conversational: bool,
     },
     DwAgentGraph {
         graph_id: String,
@@ -314,19 +346,103 @@ struct ComponentCall {
 }
 
 impl FlowExecution {
-    fn completed(output: Value) -> Self {
+    fn completed(output: Value, node_outputs: JsonMap<String, Value>) -> Self {
         Self {
             output,
             status: FlowStatus::Completed,
+            node_outputs,
         }
     }
 
-    fn waiting(output: Value, wait: FlowWait) -> Self {
+    fn waiting(output: Value, wait: FlowWait, node_outputs: JsonMap<String, Value>) -> Self {
         Self {
             output,
             status: FlowStatus::Waiting(Box::new(wait)),
+            node_outputs,
         }
     }
+}
+
+/// i18n key for what a chat user is told when a flow fails terminally.
+/// Resolved by [`user_facing_flow_failure_text`].
+///
+/// Deliberately generic. The engine's own error text stays in
+/// `metadata.error_message` for logs, the conformance harness and richer
+/// clients — putting it in `text` is what the surrounding code exists to
+/// prevent ("instead of leaking raw engine text to the chat").
+///
+/// It is NOT optional, and that is the point. A terminal failure on a session
+/// flow used to be reported as an `Ok` whose payload carried metadata ONLY, and
+/// every messaging provider refuses a payload with no `text`/card:
+/// `messaging-provider-telegram` returns `"text required"`, slack/teams/whatsapp
+/// /email/webex behave the same, and even `messaging-provider-webchat` — the one
+/// provider with an `extract_error_envelope` error-card path — rejects it at its
+/// `"text, adaptive_card, attachments, or extensions required"` guard BEFORE
+/// that path is reached. So a failing flow was silent on every channel: no
+/// reply, no error, nothing. The worst case is an `approval.call` gate with
+/// `mode: always`, which must reach a human and instead failed invisibly.
+///
+/// webchat still renders its styled card rather than this string: it checks the
+/// envelope first and only falls back to `text`. This message is what the other
+/// twelve providers send.
+///
+/// Localized at the **deployment** level, not per conversation. See
+/// [`user_facing_flow_failure_text`] for what that does and does not buy.
+const USER_FACING_FLOW_FAILURE_KEY: &str = "runner.flow.execution_failed";
+
+/// Resolve the failure text for an explicitly supplied locale.
+///
+/// Split out from [`user_facing_flow_failure_text`] so tests can exercise every
+/// entry in the table without mutating the process environment (which is
+/// `unsafe` in Rust 2024) — the same shape as
+/// `HostConfig::oauth_broker_config_with_env`.
+///
+/// Unknown, empty and untranslated locales resolve to the English wording, and
+/// the result is **never empty**: a blank `text` is the silent-on-every-channel
+/// bug this whole path exists to prevent, so a blank table entry is corrected
+/// here rather than shipped to a user.
+fn user_facing_flow_failure_text_for(locale: &str) -> String {
+    let text = crate::runner::i18n::resolve_message(
+        USER_FACING_FLOW_FAILURE_KEY,
+        crate::runner::i18n::FLOW_EXECUTION_FAILED_EN,
+        locale,
+    );
+    if text.trim().is_empty() {
+        return crate::runner::i18n::FLOW_EXECUTION_FAILED_EN.to_string();
+    }
+    text
+}
+
+/// What a chat user is told when a flow fails terminally, in their language
+/// where we know it.
+///
+/// Two sources, in order:
+///
+/// 1. **The conversation**, via [`activity_locale`] on the inbound activity
+///    payload — the same `metadata.locale` the card path already honours. This
+///    is what makes one process able to answer two users in two languages.
+/// 2. **The deployment**, via `i18n::select_locale(None)`: `--locale`, then
+///    `GREENTIC_LOCALE`, then the system `LANG`/`LC_ALL`/`LC_MESSAGES`. The
+///    existing operator knob, and the same resolver `runner::operator` uses, so
+///    an operator serving one language sets it once for every channel.
+///
+/// Then English, for an unknown or untranslated locale.
+///
+/// **What is honestly still missing.** Source 1 depends on the *producer*
+/// stamping `metadata.locale` into the payload: `FlowContext` has no locale
+/// field, `IngressEnvelope` has no typed one (and `host.rs` sends its
+/// free-form `metadata` as `None`), and although `greentic_types::TenantCtx`
+/// carries an `i18n_id` slot meant for exactly this, every construction site on
+/// the flow path sets it `None` — only `greentic_x_provider` populates it, from
+/// a greentic-x `input_locale`. So a channel that stamps nothing falls to the
+/// deployment locale, and a deployment serving mixed languages answers them all
+/// in one. Closing that needs a typed locale on the envelope threaded onto
+/// `FlowContext`; it is not something this function can do from here.
+fn user_facing_flow_failure_text(entry: &Value) -> String {
+    let locale = activity_locale(entry)
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::runner::i18n::select_locale(None));
+    user_facing_flow_failure_text_for(&locale)
 }
 
 impl FlowEngine {
@@ -457,8 +573,9 @@ impl FlowEngine {
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
-            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: None,
+            rollout_ids: RolloutIds::default(),
+            operala_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
@@ -467,6 +584,8 @@ impl FlowEngine {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: crate::runner::mcp_node::source_from_env(),
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
         })
     }
 
@@ -487,6 +606,57 @@ impl FlowEngine {
         &self.rollout_ids
     }
 
+    /// Use an MCP tool source the embedding host built, in place of the one
+    /// [`FlowEngine::new`] derives from the process-global `GREENTIC_AW_*`
+    /// environment.
+    ///
+    /// Env can only ever name ONE tenant, so a host that serves many tenants
+    /// from one process cannot express its per-tenant catalog that way. Such a
+    /// host builds a source per tenant (see
+    /// `greentic_aw_runtime::McpCallerIdentity`) and injects it here.
+    ///
+    /// `None` LEAVES THE ENV-DERIVED SOURCE IN PLACE rather than clearing it —
+    /// callers thread this straight through from a host that may not have one,
+    /// and the standalone runner must keep working off its environment. Use
+    /// `GREENTIC_AW_MCP=0` to disable MCP outright.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_mcp_source(
+        mut self,
+        source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+    ) -> Self {
+        if let Some(source) = source {
+            self.mcp_tool_source = Some(source);
+        }
+        self
+    }
+
+    /// Bind the host's secrets manager for MCP credential resolution.
+    ///
+    /// Same shape and same reason as [`with_mcp_source`](Self::with_mcp_source):
+    /// `None` leaves the env-derived behaviour alone, so a standalone runner is
+    /// unaffected.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_mcp_secrets(mut self, secrets: Option<crate::secrets::DynSecretsManager>) -> Self {
+        if let Some(secrets) = secrets {
+            self.mcp_secrets = Some(secrets);
+        }
+        self
+    }
+
+    /// The manager an `mcp` node dispatches with, per
+    /// [`crate::runner::mcp_node::aw::choose_mcp_secrets`] — an explicit
+    /// `SECRETS_BACKEND` first, then the host-injected manager, then the
+    /// env-derived default.
+    #[cfg(feature = "agentic-worker")]
+    fn mcp_secrets_for_dispatch(&self) -> Option<crate::secrets::DynSecretsManager> {
+        let requested = std::env::var("SECRETS_BACKEND").ok();
+        crate::runner::mcp_node::aw::choose_mcp_secrets(
+            requested.as_deref(),
+            crate::runner::mcp_node::aw::secrets_from_env(),
+            self.mcp_secrets.as_ref(),
+        )
+    }
+
     /// Set an optional cross-pack resolver for `provider.invoke` nodes that
     /// reference providers in other packs (resolved via capability registry).
     pub fn set_cross_pack_resolver(&mut self, resolver: Arc<dyn CrossPackResolver>) {
@@ -501,6 +671,19 @@ impl FlowEngine {
         handler: Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
     ) {
         self.remote_dispatch_handler = Some(handler);
+    }
+
+    /// Set the handler that bridges `operala.call` flow nodes into an
+    /// in-process deep-worker runtime. Constructed by the runner binary
+    /// (`runtime.rs`, `desktop-agent-ephemeral` feature) so `operala.call`
+    /// nodes run with no NATS in that build. Mirrors [`set_agent_node_handler`].
+    ///
+    /// [`set_agent_node_handler`]: FlowEngine::set_agent_node_handler
+    pub fn set_operala_node_handler(
+        &mut self,
+        handler: Arc<dyn crate::runner::operala_node::OperalaNodeHandler>,
+    ) {
+        self.operala_node_handler = Some(handler);
     }
 
     /// Set the handler that bridges `DwAgent` flow nodes into the agentic-worker
@@ -613,54 +796,6 @@ impl FlowEngine {
     }
 
     pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
-        self.execute_with_entry(ctx, input, None).await
-    }
-
-    /// Execute a flow whose cursor starts at `entry_node` instead of the flow's
-    /// declared entrypoint.
-    ///
-    /// Card-driven messaging packs carry the id of the next node to run on the
-    /// inbound activity (the designer emits it as `nextCardId`). A host that can
-    /// only call [`FlowEngine::execute`] restarts such a flow at its entrypoint
-    /// on every turn, so the capture nodes chained between two cards never run.
-    ///
-    /// Unlike [`FlowEngine::resume`] this needs no persisted `FlowSnapshot`:
-    /// state starts fresh from `input`. That is what makes it usable for packs
-    /// whose pause points are rendered cards rather than `session.wait` nodes —
-    /// those never park, so they never leave a snapshot behind.
-    ///
-    /// An `entry_node` that is not a node of the flow is a hard error. Falling
-    /// back to the entrypoint would re-introduce the silent restart this exists
-    /// to remove.
-    pub async fn execute_from(
-        &self,
-        ctx: FlowContext<'_>,
-        input: Value,
-        entry_node: &str,
-    ) -> Result<FlowExecution> {
-        self.execute_with_entry(ctx, input, Some(entry_node.to_string()))
-            .await
-    }
-
-    async fn execute_with_entry(
-        &self,
-        ctx: FlowContext<'_>,
-        input: Value,
-        entry_node: Option<String>,
-    ) -> Result<FlowExecution> {
-        // Validate the caller's entry node BEFORE the retry loop below, whose
-        // session-flow arm converts a terminal error into an Ok envelope. A
-        // node id the flow does not have is a caller/pack defect, not a
-        // transient failure, and must surface as an error rather than as a
-        // rendered "something went wrong" card.
-        if let Some(node) = entry_node.as_deref() {
-            let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
-            let node_id = NodeId::from_str(node)
-                .with_context(|| format!("invalid entry node id `{node}`"))?;
-            if !flow_ir.nodes.contains_key(&node_id) {
-                bail!("flow {} has no node `{}`", ctx.flow_id, node);
-            }
-        }
         let span = self.flow_execute_span(&ctx);
         let retry_config = ctx.retry_config;
         let original_input = input;
@@ -684,10 +819,7 @@ impl FlowEngine {
                     maybe_fail(FaultPoint::Timeout, fault_ctx)
                         .map_err(|err| anyhow!(err.to_string()))?;
                 }
-                match self
-                    .execute_once(&ctx, original_input.clone(), entry_node.clone())
-                    .await
-                {
+                match self.execute_once(&ctx, original_input.clone()).await {
                     Ok(value) => return Ok(value),
                     Err(err) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
@@ -696,13 +828,20 @@ impl FlowEngine {
                             // messaging provider renders it instead of leaking
                             // raw engine text to the chat.
                             if ctx.session_id.is_some() {
-                                return Ok(FlowExecution::completed(json!({
-                                    "metadata": {
-                                        "error_kind": "flow_execution_failed",
-                                        "error_message": err.to_string(),
-                                        "flow_id": ctx.flow_id,
-                                    }
-                                })));
+                                return Ok(FlowExecution::completed(
+                                    json!({
+                                        "text": user_facing_flow_failure_text(&original_input),
+                                        // Generic, user-safe, and REQUIRED for the
+                                        // failure to reach anyone. See
+                                        // `USER_FACING_FLOW_FAILURE_KEY`.
+                                        "metadata": {
+                                            "error_kind": "flow_execution_failed",
+                                            "error_message": err.to_string(),
+                                            "flow_id": ctx.flow_id,
+                                        }
+                                    }),
+                                    Default::default(),
+                                ));
                             }
                             return Err(err);
                         }
@@ -772,21 +911,25 @@ impl FlowEngine {
             .await
     }
 
-    async fn execute_once(
-        &self,
-        ctx: &FlowContext<'_>,
-        input: Value,
-        entry_node: Option<String>,
-    ) -> Result<FlowExecution> {
+    async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
         let mut state = ExecutionState::new(input);
-        for (name, default) in flow_ir.vars_init.iter() {
-            state
-                .vars
-                .entry(name.clone())
-                .or_insert_with(|| default.clone());
+        let missing = seed_vars_and_collect_missing_required(
+            &flow_ir.vars_init,
+            &flow_ir.required_vars,
+            &mut state.vars,
+        );
+        if !missing.is_empty() {
+            // Non-retryable by design: the message avoids should_retry's trigger
+            // words (transient/unavailable/internal/timeout).
+            let label = crate::runner::i18n::resolve_message(
+                "runner.flow.required_var_missing",
+                "required flow variable not provided",
+                "en",
+            );
+            anyhow::bail!("{label}: {}", missing.join(", "));
         }
-        self.drive_flow(ctx, flow_ir, state, entry_node, ctx.flow_id.to_string())
+        self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
             .await
     }
 
@@ -904,8 +1047,7 @@ impl FlowEngine {
                 }
             };
 
-            let owned_the_submit =
-                attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
+            attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
@@ -953,27 +1095,16 @@ impl FlowEngine {
                         }
                     };
 
-                    // This node has now routed on the submit that was delivered
-                    // to it, so the action is spent. `response.*` is synthesised
-                    // from the run's entry envelope and is therefore run-scoped:
-                    // left in place it matches again at the NEXT card and the
-                    // run walks straight past it, advancing the journey by two
-                    // pages per submit. Clearing it here means every later node
-                    // sees a freshly rendered card with no pending action, falls
-                    // through its conditional routing, and parks for the user.
-                    if owned_the_submit {
-                        consume_routing_action(&mut state.entry);
-                    }
-
                     match decision {
                         NextDecision::Next(n) => current = n,
                         NextDecision::End => {
+                            let node_outputs = state.outputs_map();
                             let nodes_snapshot = state.nodes.clone();
                             let final_output = state.finalize_with(Some(output.payload.clone()));
-                            return Ok(FlowExecution::completed(lift_first_node_error_from_nodes(
-                                final_output,
-                                &nodes_snapshot,
-                            )));
+                            return Ok(FlowExecution::completed(
+                                lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
+                                node_outputs,
+                            ));
                         }
                         NextDecision::Wait => {
                             // Conditional routing fell through. Pause at the
@@ -991,6 +1122,7 @@ impl FlowEngine {
                                 awaiting_submit: true,
                                 state: snapshot_state,
                             };
+                            let node_outputs = state.outputs_map();
                             let output_value = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::waiting(
                                 output_value,
@@ -1001,6 +1133,7 @@ impl FlowEngine {
                                     )),
                                     snapshot,
                                 },
+                                node_outputs,
                             ));
                         }
                     }
@@ -1039,10 +1172,77 @@ impl FlowEngine {
                         awaiting_submit: false,
                         state: snapshot_state,
                     };
+                    let node_outputs = state.outputs_map();
                     let output_value = state.clone().finalize_with(None);
                     return Ok(FlowExecution::waiting(
                         output_value,
                         FlowWait { reason, snapshot },
+                        node_outputs,
+                    ));
+                }
+                NodeControl::LoopHere { reason } => {
+                    // Conversational dw.agent: park and re-enter THIS node so the
+                    // next user message drives the next turn. Render the reply
+                    // (finalize_with Some) — unlike NodeControl::Wait, which
+                    // resumes at the successor and finalizes with None.
+                    let mut snapshot_state = state.clone();
+                    snapshot_state.clear_egress();
+                    let snapshot = FlowSnapshot {
+                        pack_id: step_ctx.pack_id.to_string(),
+                        flow_id: step_ctx.flow_id.to_string(),
+                        next_flow: (current_flow_id != step_ctx.flow_id)
+                            .then_some(current_flow_id.clone()),
+                        next_node: node_id.as_str().to_string(),
+                        awaiting_submit: false,
+                        state: snapshot_state,
+                    };
+                    let node_outputs = state.outputs_map();
+                    let output_value = state.finalize_with(Some(output.payload.clone()));
+                    return Ok(FlowExecution::waiting(
+                        output_value,
+                        FlowWait { reason, snapshot },
+                        node_outputs,
+                    ));
+                }
+                NodeControl::AwaitHere {
+                    reason,
+                    correlation_id: _,
+                } => {
+                    // Await the async agent response, but resume at THIS node so
+                    // the conversational branch evaluates `terminated_by`. Mirror the
+                    // remote-await Wait snapshot construction EXCEPT next_node = self.
+                    //
+                    // Keying note: the resume snapshot is stored under the SAME
+                    // `(session_hint, scope_hash)` store key as every other wait kind
+                    // (`build_store_ctx` strips the correlation from the key). The
+                    // correlation id is NOT part of the key — it only drives how the
+                    // NATS response reconstructs the hint/scope (RuntimeSessionResumer)
+                    // so it recomputes that same key. So an AwaitHere park and a later
+                    // LoopHere park for the same conversation occupy the same single
+                    // slot; they never coexist because each park overwrites it. Safety
+                    // rests on sequential single-slot resume, not key separation — an
+                    // inbound arriving mid-await resolves to this slot (a known
+                    // interleaving limitation, tracked as a follow-up).
+                    let mut snapshot_state = state.clone();
+                    snapshot_state.clear_egress();
+                    let snapshot = FlowSnapshot {
+                        pack_id: step_ctx.pack_id.to_string(),
+                        flow_id: step_ctx.flow_id.to_string(),
+                        next_flow: (current_flow_id != step_ctx.flow_id)
+                            .then_some(current_flow_id.clone()),
+                        next_node: node_id.as_str().to_string(), // SELF, not successor
+                        awaiting_submit: false,
+                        state: snapshot_state,
+                    };
+                    let node_outputs = state.outputs_map();
+                    // Finalize with None (render nothing here — the reply, if any,
+                    // was already surfaced before the dispatch): match the
+                    // remote-await Wait finalize semantics confirmed in Task 1.
+                    let output_value = state.clone().finalize_with(None);
+                    return Ok(FlowExecution::waiting(
+                        output_value,
+                        FlowWait { reason, snapshot },
+                        node_outputs,
                     ));
                 }
                 NodeControl::Jump(jump) => {
@@ -1062,12 +1262,13 @@ impl FlowEngine {
                         "needs_user": needs_user,
                     });
                     state.push_egress(response);
+                    let node_outputs = state.outputs_map();
                     let nodes_snapshot = state.nodes.clone();
                     let final_output = state.finalize_with(None);
-                    return Ok(FlowExecution::completed(lift_first_node_error_from_nodes(
-                        final_output,
-                        &nodes_snapshot,
-                    )));
+                    return Ok(FlowExecution::completed(
+                        lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
+                        node_outputs,
+                    ));
                 }
             }
         }
@@ -1159,27 +1360,203 @@ impl FlowEngine {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
-            NodeKind::DwAgent { agent_id } => {
+            NodeKind::DwAgent {
+                agent_id,
+                conversational,
+            } => {
                 #[cfg(feature = "agentic-worker")]
                 match self.dw_agent_dispatch {
                     crate::runner::agent_node::DwAgentDispatch::Nats => {
-                        // Reroute to the durable out-of-process agentic path.
-                        // Wrap the raw node payload as the dispatch `input` (the
-                        // serve invoker reads `input.user_text`); `await=true` →
-                        // pause+resume, identical to `agentic.call`.
-                        let remote_payload = serde_json::json!({ "await": true, "input": payload });
-                        self.execute_remote_dispatch(ctx, "agentic", agent_id, remote_payload)
+                        if *conversational {
+                            // Interleave guard (#1): the pending-await marker alone
+                            // does not prove this resume carries the agent's NATS
+                            // response — a user message can arrive before it (e.g.
+                            // the user types again while the agent is still
+                            // thinking) and land in `state.entry` too. The NATS
+                            // response envelope is always `{ok, output, events,
+                            // error}`; a user-message resume has no `"ok"` key. Only
+                            // treat this as the response path when BOTH the marker
+                            // is set AND `state.entry` looks like that envelope.
+                            // `&&` short-circuits, so `take_agent_await` (which
+                            // clears the marker) is not called when the shape check
+                            // fails — the marker survives for the real response,
+                            // and the stray user message falls through to the
+                            // fresh-dispatch branch below (re-dispatches as a new
+                            // turn instead of being misread as a null agent reply).
+                            let is_agent_response = state.entry.get("ok").is_some();
+                            if is_agent_response && state.take_agent_await(node_id) {
+                                // Resuming with the agent's NATS response. SPIKE §Q2:
+                                // the response is NOT in the `payload` argument (that
+                                // is a freshly re-rendered request-mapping template) —
+                                // it landed in `state.entry` as the envelope
+                                // `{ok, output, events, error}`, so the agent output is
+                                // `state.entry.output` (= `{reply, trail, terminated_by}`)
+                                // and `terminated_by` is nested one level under `.output`.
+                                // `state.entry` is readable here (same module; precedent
+                                // `inject_card_locale(&mut payload, &state.entry)` above).
+                                let ok = state
+                                    .entry
+                                    .get("ok")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if !ok {
+                                    // Error envelope (Fix B): a transport/agent error
+                                    // must not be silently swallowed as a null reply,
+                                    // and must NOT bump the park-loop cap — a flapping
+                                    // backend should not burn the segment's turn budget
+                                    // or force-advance past it. Surface the error
+                                    // message as the reply and re-park (fail-safe:
+                                    // await the next user message). There is currently
+                                    // no self-inflicted await deadline (see the
+                                    // fresh-dispatch branch below), but this also
+                                    // handles a `{ok:false}` envelope from any other
+                                    // source (e.g. a flow-authored deadline) the same way.
+                                    let message = state
+                                        .entry
+                                        .get("error")
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("the agent could not respond");
+                                    tracing::warn!(
+                                        agent_id = %agent_id,
+                                        error = %message,
+                                        "conversational dw.agent (nats) response was an error/timeout envelope; surfacing and re-parking without bumping the park-loop cap"
+                                    );
+                                    let output =
+                                        NodeOutput::new(serde_json::json!({ "reply": message }));
+                                    Ok(DispatchOutcome::with_control(
+                                        output,
+                                        NodeControl::LoopHere {
+                                            reason: Some(format!(
+                                                "conversational dw.agent `{agent_id}` (nats) awaiting next user message after error response"
+                                            )),
+                                        },
+                                    ))
+                                } else {
+                                    let agent_out =
+                                        state.entry.get("output").cloned().unwrap_or(Value::Null);
+                                    let output = NodeOutput::new(agent_out.clone());
+                                    let ended = agent_out
+                                        .get("terminated_by")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("conversation_ended");
+                                    if ended {
+                                        state.reset_park_turns(node_id);
+                                        Ok(DispatchOutcome::complete(output))
+                                    } else {
+                                        let turns = state.bump_park_turns(node_id);
+                                        if turns >= MAX_PARK_TURNS {
+                                            tracing::warn!(
+                                                agent_id = %agent_id,
+                                                turns,
+                                                "conversational dw.agent (nats) hit park-loop cap ({MAX_PARK_TURNS}); force-advancing to successor"
+                                            );
+                                            // Reset on force-advance too, so a graph that
+                                            // re-enters this node later starts with a fresh
+                                            // budget (mirrors the `conversation_ended` path —
+                                            // the counter is cleared on every exit past the node).
+                                            state.reset_park_turns(node_id);
+                                            Ok(DispatchOutcome::complete(output))
+                                        } else {
+                                            Ok(DispatchOutcome::with_control(
+                                                output,
+                                                NodeControl::LoopHere {
+                                                    reason: Some(format!(
+                                                        "conversational dw.agent `{agent_id}` (nats) awaiting next user message"
+                                                    )),
+                                                },
+                                            ))
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Fresh user turn: dispatch to NATS, park awaiting the
+                                // response and re-enter THIS node on resume (not the
+                                // routing successor) so the conversational decision
+                                // above can evaluate the agent's response. No await
+                                // deadline: a bounded wait needs a per-dispatch
+                                // correlation nonce + watchdog cancellation (the
+                                // correlation id is deterministic per-conversation and
+                                // the resume-store slot is overwritten every turn, so a
+                                // naive deadline's fire-and-forget watchdog can inject a
+                                // spurious timeout into a later, healthy turn) — tracked
+                                // as a follow-up.
+                                state.mark_agent_await(node_id);
+                                let remote_payload =
+                                    serde_json::json!({ "await": true, "input": payload });
+                                self.execute_remote_dispatch(
+                                    ctx,
+                                    "agentic",
+                                    agent_id,
+                                    remote_payload,
+                                    true,
+                                )
+                                .await
+                            }
+                        } else {
+                            // Non-conversational: unchanged single await → resumes at
+                            // the routing successor, exactly as before.
+                            let remote_payload =
+                                serde_json::json!({ "await": true, "input": payload });
+                            self.execute_remote_dispatch(
+                                ctx,
+                                "agentic",
+                                agent_id,
+                                remote_payload,
+                                false,
+                            )
                             .await
+                        }
                     }
-                    crate::runner::agent_node::DwAgentDispatch::InProcess => self
-                        .execute_dw_agent(ctx, agent_id, payload)
-                        .await
-                        .map(DispatchOutcome::complete),
+                    crate::runner::agent_node::DwAgentDispatch::InProcess => {
+                        let output = self
+                            .execute_dw_agent(ctx, agent_id, payload, *conversational)
+                            .await?;
+                        if *conversational {
+                            let ended = output
+                                .payload
+                                .get("terminated_by")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("conversation_ended");
+                            if ended {
+                                state.reset_park_turns(node_id);
+                                Ok(DispatchOutcome::complete(output))
+                            } else {
+                                let turns = state.bump_park_turns(node_id);
+                                if turns >= MAX_PARK_TURNS {
+                                    tracing::warn!(
+                                        agent_id = %agent_id,
+                                        turns,
+                                        "conversational dw.agent hit park-loop cap ({MAX_PARK_TURNS}); force-advancing to successor"
+                                    );
+                                    // Reset on force-advance too, so a graph that
+                                    // re-enters this node later starts with a fresh
+                                    // budget (mirrors the `conversation_ended` path —
+                                    // the counter is cleared on every exit past the node).
+                                    state.reset_park_turns(node_id);
+                                    Ok(DispatchOutcome::complete(output))
+                                } else {
+                                    Ok(DispatchOutcome::with_control(
+                                        output,
+                                        NodeControl::LoopHere {
+                                            reason: Some(format!(
+                                                "conversational dw.agent `{agent_id}` awaiting next user message"
+                                            )),
+                                        },
+                                    ))
+                                }
+                            }
+                        } else {
+                            Ok(DispatchOutcome::complete(output))
+                        }
+                    }
                 }
                 #[cfg(not(feature = "agentic-worker"))]
-                self.execute_dw_agent(ctx, agent_id, payload)
-                    .await
-                    .map(DispatchOutcome::complete)
+                {
+                    self.execute_dw_agent(ctx, agent_id, payload, *conversational)
+                        .await
+                        .map(DispatchOutcome::complete)
+                }
             }
             NodeKind::DwAgentGraph { graph_id } => self
                 .execute_dw_agent_graph(ctx, graph_id, payload)
@@ -1196,10 +1573,17 @@ impl FlowEngine {
                 self.execute_telco_x_call(ctx, target, payload).await
             }
             NodeKind::ApprovalCall { target } => {
-                self.execute_approval_call(ctx, target, payload).await
+                self.execute_approval_call(ctx, node_id, target, payload, state)
+                    .await
             }
             NodeKind::Mcp { server_id, tool } => self
-                .execute_mcp(ctx, server_id, tool, payload)
+                .execute_mcp(
+                    ctx,
+                    server_id,
+                    tool,
+                    payload,
+                    node_has_error_route(&node.routing),
+                )
                 .await
                 .map(DispatchOutcome::complete),
         }
@@ -1211,27 +1595,36 @@ impl FlowEngine {
         ctx: &FlowContext<'_>,
         agent_id: &str,
         payload: Value,
+        conversational: bool,
     ) -> Result<NodeOutput> {
-        let handler = self.agent_node_handler.as_ref().context(
-            "DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine: \
-             agentic-worker state is unavailable, so dw.agent nodes are disabled — set \
-             GREENTIC_AW_REDIS_URL, or run a runner built with \
-             --features desktop-agent-ephemeral for in-memory state (local single-process \
-             use only)",
-        )?;
+        let handler = self
+            .agent_node_handler
+            .as_ref()
+            .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")?;
         let session_id = ctx.session_id.unwrap_or("");
-        let result = handler
+        let started = std::time::Instant::now();
+        let mut result = handler
             .execute(
                 ctx.tenant,
                 &self.default_env,
                 agent_id,
                 session_id,
                 &payload,
+                conversational,
                 // From the context, NOT from `payload`: the node's payload is
                 // whatever the flow mapped, and a flow's mapping is authorable.
                 ctx.caller,
             )
             .await?;
+        // Per-node timing: record this agent step's own execution time on its
+        // output (`duration_ms`), so a trace can show per-node — not just
+        // per-turn — latency. Injected only when the output is a JSON object.
+        if let Value::Object(map) = &mut result {
+            map.insert(
+                "duration_ms".into(),
+                Value::from(started.elapsed().as_millis() as u64),
+            );
+        }
         Ok(NodeOutput::new(result))
     }
 
@@ -1241,6 +1634,7 @@ impl FlowEngine {
         _ctx: &FlowContext<'_>,
         agent_id: &str,
         _payload: Value,
+        _conversational: bool,
     ) -> Result<NodeOutput> {
         anyhow::bail!(
             "DwAgent node '{agent_id}' cannot run: this build was compiled without the \
@@ -1274,19 +1668,55 @@ impl FlowEngine {
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        self.execute_remote_dispatch(ctx, "sorla", target, payload)
+        self.execute_remote_dispatch(ctx, "sorla", target, payload, false)
             .await
     }
 
-    /// Dispatch an `operala.call` flow node via the shared remote-dispatch seam.
-    /// Identical to [`execute_sorla_call`] except the runtime name is `"operala"`.
+    /// Dispatch an `operala.call` flow node.
+    ///
+    /// When an in-process [`OperalaNodeHandler`] is wired (`desktop-agent-
+    /// ephemeral`, e.g. the designer's offline Test-chat sidecar), the node
+    /// runs the deep-worker runtime directly — no NATS, no
+    /// `RemoteDispatchHandler` — and completes inline. Otherwise falls back to
+    /// the shared remote-dispatch seam, identical to [`execute_sorla_call`]
+    /// except the runtime name is `"operala"`.
+    ///
+    /// [`OperalaNodeHandler`]: crate::runner::operala_node::OperalaNodeHandler
     async fn execute_operala_call(
         &self,
         ctx: &FlowContext<'_>,
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        self.execute_remote_dispatch(ctx, "operala", target, payload)
+        if let Some(handler) = self.operala_node_handler.as_ref() {
+            // `greentic-dw-authoring` stamps `operation: "invoke"` on the
+            // `operala.call` node, but the deep-worker invoker's contract
+            // accepts only `"" | "run"`. Normalize so an authored `deep_worker`
+            // actually runs in-process instead of failing operation validation.
+            let raw_operation = payload
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let operation = if raw_operation.eq_ignore_ascii_case("invoke") {
+                "run"
+            } else {
+                raw_operation
+            };
+            let inner_input = payload.get("input").cloned().unwrap_or(Value::Null);
+            let session_id = ctx.session_id.unwrap_or("");
+            let result = handler
+                .execute(
+                    ctx.tenant,
+                    &self.default_env,
+                    target,
+                    operation,
+                    session_id,
+                    &inner_input,
+                )
+                .await?;
+            return Ok(DispatchOutcome::complete(NodeOutput::new(result)));
+        }
+        self.execute_remote_dispatch(ctx, "operala", target, payload, false)
             .await
     }
 
@@ -1300,7 +1730,7 @@ impl FlowEngine {
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        self.execute_remote_dispatch(ctx, "agentic", target, payload)
+        self.execute_remote_dispatch(ctx, "agentic", target, payload, false)
             .await
     }
 
@@ -1313,35 +1743,75 @@ impl FlowEngine {
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        self.execute_remote_dispatch(ctx, "telco-x", target, payload)
+        self.execute_remote_dispatch(ctx, "telco-x", target, payload, false)
             .await
     }
 
-    /// Dispatch an `approval.call` flow node. Applies the autonomy gate first:
-    /// when the gate says a human is NOT required, complete immediately on the
-    /// `approved` branch WITHOUT creating a pending approval; otherwise dispatch
-    /// to the `"approval"` runtime over the shared remote-dispatch seam (which
-    /// durably pauses the flow until the human resolves it).
+    /// Human-in-the-loop approval gate.
+    ///
+    /// Sets `meta["outcome"]` to `approved` / `denied` / `timeout` on every path,
+    /// so routing conditions (`event == "approved"`) work identically whether a
+    /// human decided or the gate auto-approved. `ok` cannot serve as the
+    /// discriminator: greentic-admin publishes `ok: true` for approve AND deny.
+    ///
+    /// Uses `resume_at_self = true` so the response re-enters THIS node and its
+    /// own routing sees the decision. `pending_approval_await` distinguishes the
+    /// first entry from the resume, and stops a stray inbound (which lands in the
+    /// same wait slot — see the keying note on `NodeControl::AwaitHere`) from
+    /// re-dispatching a duplicate approval request.
     async fn execute_approval_call(
         &self,
         ctx: &FlowContext<'_>,
+        node_id: &str,
         target: &str,
         payload: Value,
+        state: &mut ExecutionState,
     ) -> Result<DispatchOutcome> {
+        if state.take_approval_await(node_id) {
+            if entry_is_approval_response(&state.entry) {
+                let outcome = approval_outcome_from_entry(&state.entry);
+                let output = NodeOutput::with_meta(
+                    state.entry.clone(),
+                    serde_json::json!({ "outcome": outcome }),
+                );
+                return Ok(DispatchOutcome::complete(output));
+            }
+            // A user activity arrived while we were parked. Re-park without
+            // re-dispatching; the correlation id is discarded by the AwaitHere
+            // handler, so re-parking needs nothing from the original dispatch.
+            state.mark_approval_await(node_id);
+            return Ok(DispatchOutcome::await_here(
+                NodeOutput::new(serde_json::json!({ "pending": true })),
+                Some("awaiting approval decision".to_string()),
+                String::new(),
+            ));
+        }
+
         let input = payload.get("input").cloned().unwrap_or(Value::Null);
         if !approval_requires_human(&input) {
-            // Match the shape the resume path injects ({ok, output, error})
-            // so downstream conditions read the decision at the same
-            // relative path regardless of whether a human was involved.
-            let output = NodeOutput::new(serde_json::json!({
-                "ok": true,
-                "output": { "decision": "approved", "auto": true },
-                "error": serde_json::Value::Null,
-            }));
+            let output = NodeOutput::with_meta(
+                serde_json::json!({
+                    "ok": true,
+                    "output": { "decision": "approved", "auto": true },
+                    "error": serde_json::Value::Null,
+                }),
+                serde_json::json!({ "outcome": "approved" }),
+            );
             return Ok(DispatchOutcome::complete(output));
         }
-        self.execute_remote_dispatch(ctx, "approval", target, payload)
-            .await
+
+        // Mark only once the dispatch actually parked. A fire-and-forget
+        // (`await: false`) dispatch completes without parking, and an early `?`
+        // error never parks either — marking before the call would leave the
+        // node believing it is awaiting a decision it never requested, and every
+        // later inbound would re-park forever.
+        let outcome = self
+            .execute_remote_dispatch(ctx, "approval", target, payload, true)
+            .await?;
+        if matches!(outcome.control, NodeControl::AwaitHere { .. }) {
+            state.mark_approval_await(node_id);
+        }
+        Ok(outcome)
     }
 
     /// Execute a `component == "mcp"` flow node (LOCKED ENCODING v2).
@@ -1368,6 +1838,7 @@ impl FlowEngine {
         server_id: &str,
         tool: &str,
         payload: Value,
+        has_error_route: bool,
     ) -> Result<NodeOutput> {
         // Payload is the source of truth: prefer the rendered `server`/`tool`
         // from config, falling back to the values resolved at flow-load time
@@ -1383,33 +1854,35 @@ impl FlowEngine {
             .cloned()
             .unwrap_or_else(|| Value::Object(JsonMap::new()));
 
-        // A route the pack carries itself, so a deployed runner with no admin
-        // credentials can dispatch at all; `None` (a pack predating the
-        // sidecar) falls back to the catalog exactly as before.
-        let pack = self
+        // Route material the running pack carries. Preferred over the admin
+        // catalog, so a deployed runner with no admin credentials can dispatch
+        // at all; `None` (a pack predating the sidecar) falls back to the
+        // catalog exactly as before.
+        let pack_routes = self
             .packs
             .iter()
-            .find(|pack| pack.metadata().pack_id == ctx.pack_id);
-        let pack_routes = pack.and_then(|pack| pack.mcp_routes());
+            .find(|pack| pack.metadata().pack_id == ctx.pack_id)
+            .and_then(|pack| pack.mcp_routes());
 
         // The team the AUTHORING session resolved this server's token under, as
         // recorded in the sidecar. `FlowContext` carries no team and a deployed
         // workload has no principled source for one, so this is the only place
-        // the value can come from. Absent yields `None`, and the credential
-        // read then tries the tenant-default `_` scope exactly as before.
+        // the value can come from. Absent (a pack predating the field) yields
+        // `None`, and the credential read then tries the tenant-default `_`
+        // scope exactly as it did before.
         let auth_team = pack_routes
             .and_then(|routes| routes.get(server_id))
             .and_then(|route| route.auth_team.as_deref());
 
-        // The HOST's secrets manager, not one derived from `SECRETS_BACKEND`.
-        // That env only names `env` and `broker`; an operator booting a bundle
-        // runs on greentic-start's dev store, which the runner has no variant
-        // for — so a manager built from the environment can never read the
-        // credential, and the node would dispatch without one.
-        let result = crate::runner::mcp_node::invoke_with_secrets(
+        // The manager the HOST injected, not one built from `SECRETS_BACKEND`:
+        // no Cloud Run or Kubernetes deployment sets that variable, so the
+        // env-derived fallback resolved a `secrets://` URI as a literal
+        // variable name and every credential lookup missed.
+        let secrets = self.mcp_secrets_for_dispatch();
+        let result = crate::runner::mcp_node::aw::invoke_with_secrets(
             self.mcp_tool_source.as_ref(),
             pack_routes,
-            pack.map(|p| p.secrets()),
+            secrets.as_ref(),
             ctx.tenant,
             &self.default_env,
             auth_team,
@@ -1426,7 +1899,7 @@ impl FlowEngine {
             Some(key) if !key.is_empty() => json!({ key: result.clone() }),
             _ => result.clone(),
         };
-        Ok(mcp_output(bound, &result))
+        Ok(mcp_node_output(bound, &result, has_error_route))
     }
 
     /// Compile-time stub for the MCP flow node when the agentic-worker feature
@@ -1439,6 +1912,7 @@ impl FlowEngine {
         server_id: &str,
         tool: &str,
         _payload: Value,
+        _has_error_route: bool,
     ) -> Result<NodeOutput> {
         Ok(NodeOutput::new(json!({
             "error": format!(
@@ -1463,6 +1937,15 @@ impl FlowEngine {
     /// - `await=false` -> publish + complete immediately with
     ///   `{ "dispatched": true, "correlation_id": <marked hint> }`.
     ///
+    /// `resume_at_self`: when the runtime enters `AwaitingResponse`, controls
+    /// whether the flow resumes at the routing successor
+    /// ([`DispatchOutcome::wait`], `resume_at_self = false` — the behavior for
+    /// every non-conversational caller) or re-enters THIS node
+    /// ([`DispatchOutcome::await_here`], `resume_at_self = true` — the
+    /// conversational out-of-process `dw.agent` caller) once the async
+    /// response arrives. Only affects the `AwaitingResponse` branch; the
+    /// `Dispatched` (fire-and-forget) branch is unaffected either way.
+    ///
     /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
     async fn execute_remote_dispatch(
         &self,
@@ -1470,6 +1953,7 @@ impl FlowEngine {
         runtime: &str,
         target: &str,
         payload: Value,
+        resume_at_self: bool,
     ) -> Result<DispatchOutcome> {
         let handler = self.remote_dispatch_handler.as_ref().with_context(|| {
             format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
@@ -1546,9 +2030,17 @@ impl FlowEngine {
                 let reason = format!("await-runtime:{correlation_id}");
                 let output = NodeOutput::new(serde_json::json!({
                     "pending": true,
-                    "correlation_id": correlation_id,
+                    "correlation_id": correlation_id.clone(),
                 }));
-                Ok(DispatchOutcome::wait(output, Some(reason)))
+                if resume_at_self {
+                    Ok(DispatchOutcome::await_here(
+                        output,
+                        Some(reason),
+                        correlation_id,
+                    ))
+                } else {
+                    Ok(DispatchOutcome::wait(output, Some(reason)))
+                }
             }
             crate::runner::remote_dispatch::RemoteDispatchAction::Dispatched => {
                 let output = NodeOutput::new(serde_json::json!({
@@ -2045,7 +2537,27 @@ impl FlowEngine {
         // value with the WIT envelope still ok=true (because the wasm guest
         // returned normally). Treat them the same as a component_error so the
         // engine error-envelope lift path surfaces the failure to the user.
+        //
+        // This mirrors the `component_error` branch above: the asymmetry (this
+        // branch bailing unconditionally while `component_error` checked
+        // `has_error_route` first) was chronological, not deliberate — the
+        // unconditional bail predates `has_error_route`/`NodeOutput::errored`
+        // entirely, and nothing about the MCP wire shape makes it exempt from
+        // node_io error routing.
         if let Some((code, message)) = mcp_tool_error(&value) {
+            if call.has_error_route {
+                // Normalize into the same `{ok:false, error:{code,message}}` shape
+                // `component_error` recognises, rather than teaching `to_node_output`
+                // a second "what does a failed node's error look like" branch. This
+                // makes `to_node_output` (the `{errors}` envelope) and `meta.error`
+                // (read by `lift_first_node_error_from_nodes`) agree with each other
+                // AND with the `bail!` message below on the code/message pair —
+                // there is exactly one place, `mcp_tool_error`, that decides what
+                // an MCP tool error's code/message are.
+                return Ok(NodeOutput::errored(normalize_mcp_tool_error(
+                    &value, &code, &message,
+                )));
+            }
             bail!(
                 "component {} returned tool error: {}: {}",
                 call.component_ref,
@@ -2342,32 +2854,6 @@ impl FlowEngine {
         &self.flows
     }
 
-    /// Node ids declared by a flow, for callers that must tell a flow node
-    /// apart from something else that shares the id space — a card asset, in
-    /// the case of [`crate::runner::card_nav`].
-    ///
-    /// Loads the flow if it is not cached yet; an unloadable flow yields an
-    /// empty list rather than an error, because the caller's question ("is
-    /// this a node?") has a sound negative answer either way.
-    pub async fn flow_node_ids(&self, pack_id: &str, flow_id: &str) -> Vec<String> {
-        match self.get_or_load_flow(pack_id, flow_id).await {
-            Ok(flow) => flow
-                .nodes
-                .keys()
-                .map(|id| id.as_str().to_string())
-                .collect(),
-            Err(error) => {
-                tracing::debug!(
-                    pack_id,
-                    flow_id,
-                    error = %error,
-                    "flow not loadable while listing node ids; treating as no nodes"
-                );
-                Vec::new()
-            }
-        }
-    }
-
     pub fn flow_by_key(&self, pack_id: &str, flow_id: &str) -> Option<&FlowDescriptor> {
         self.flows
             .iter()
@@ -2455,12 +2941,14 @@ pub struct NodeEvent<'a> {
 /// agent's last output. Deliberately a plain constant: no env var, no
 /// per-agent config knob.
 ///
-/// On this lane nothing in the engine reads it: `dispatch_node` has no
-/// conversational `DwAgent` branch to enforce the cap. Its only referent is
-/// the port-pending `conversational_dw_agent` test harness, so it carries that
-/// harness's cfg — otherwise `-D warnings` flags it dead in any build that
-/// turns `agentic-worker` on.
-#[cfg(conversational_dw_agent_port)]
+/// Only referenced from the conversational `DwAgent` branch of
+/// `dispatch_node` and from the (already `#[cfg(feature = "agentic-worker")]`
+/// -gated) park-loop-cap unit tests below; cfg-gate it the same way so it
+/// isn't flagged dead when that feature is off (e.g. a lean
+/// `--no-default-features --features verify` build). Unlike
+/// `bump_park_turns`/etc. below, no plain (ungated) test references this
+/// constant directly, so no `test` alternative is needed here.
+#[cfg(feature = "agentic-worker")]
 const MAX_PARK_TURNS: u32 = 100;
 
 /// Submitted fields waiting to be attached to the output of the node that
@@ -2559,6 +3047,8 @@ impl ExecutionState {
             "input": self.input.clone(),
             "nodes": nodes,
             "redirect_count": self.redirect_count,
+            "park_turns": self.park_turns.clone(),
+            "pending_agent_await": self.pending_agent_await.keys().cloned().collect::<Vec<_>>(),
         })
     }
 
@@ -2587,6 +3077,53 @@ impl ExecutionState {
 
     fn increment_redirect_count(&mut self) {
         self.redirect_count = self.redirect_count.saturating_add(1);
+    }
+
+    /// Bump the park-loop turn counter for `node_id` and return the NEW count.
+    ///
+    /// Like `MAX_PARK_TURNS`, only called from the conversational `DwAgent`
+    /// branch of `dispatch_node` (`agentic-worker`-gated) plus the unit tests
+    /// below.
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn bump_park_turns(&mut self, node_id: &str) -> u32 {
+        let entry = self.park_turns.entry(node_id.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+
+    /// Clear the park-loop turn counter for `node_id` (e.g. once the
+    /// conversational segment ends), so a later re-entry starts fresh.
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn reset_park_turns(&mut self, node_id: &str) {
+        self.park_turns.remove(node_id);
+    }
+
+    /// Mark `node_id` as awaiting an async `dw.agent` NATS dispatch response.
+    /// Called from the conversational `DwAgentDispatch::Nats` branch in
+    /// `dispatch_node` before dispatching a fresh user turn.
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn mark_agent_await(&mut self, node_id: &str) {
+        self.pending_agent_await.insert(node_id.to_string(), ());
+    }
+
+    /// Check-and-clear: returns whether `node_id` was awaiting an agent response.
+    /// Called from the conversational `DwAgentDispatch::Nats` branch in
+    /// `dispatch_node` on resume, to distinguish "resuming with the agent's
+    /// response" from "a fresh user turn".
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn take_agent_await(&mut self, node_id: &str) -> bool {
+        self.pending_agent_await.remove(node_id).is_some()
+    }
+
+    /// Mark `node_id` as parked awaiting an approval decision.
+    fn mark_approval_await(&mut self, node_id: &str) {
+        self.pending_approval_await.insert(node_id.to_string(), ());
+    }
+
+    /// Check-and-clear: returns whether `node_id` dispatched an approval and is
+    /// awaiting the decision.
+    fn take_approval_await(&mut self, node_id: &str) -> bool {
+        self.pending_approval_await.remove(node_id).is_some()
     }
 
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
@@ -2668,6 +3205,16 @@ impl DispatchOutcome {
         }
     }
 
+    fn await_here(output: NodeOutput, reason: Option<String>, correlation_id: String) -> Self {
+        Self {
+            output,
+            control: NodeControl::AwaitHere {
+                reason,
+                correlation_id,
+            },
+        }
+    }
+
     fn with_control(output: NodeOutput, control: NodeControl) -> Self {
         Self { output, control }
     }
@@ -2678,6 +3225,37 @@ enum NodeControl {
     Continue,
     Wait {
         reason: Option<String>,
+    },
+    /// Park the flow and RE-ENTER this same node on the next inbound activity
+    /// (conversational `dw.agent` loop), rendering the node output first.
+    /// Unlike `Wait` (which resumes at the routing successor and renders
+    /// nothing), `LoopHere` sets the resume target to the current node and
+    /// renders the reply.
+    ///
+    /// Only constructed from the conversational `DwAgent` branch of
+    /// `dispatch_node`, which is `#[cfg(feature = "agentic-worker")]` —
+    /// `#[allow(dead_code)]` rather than cfg-gating the variant itself so the
+    /// (unconditionally-compiled) match arm handling it in `run_flow`'s
+    /// dispatch loop doesn't need a matching cfg attribute.
+    #[allow(dead_code)]
+    LoopHere {
+        reason: Option<String>,
+    },
+    /// Park the flow and await a correlation-keyed async runtime response
+    /// (out-of-process conversational `dw.agent`), but RE-ENTER this same
+    /// node when the response arrives — like `LoopHere` it resumes at THIS
+    /// node (not the routing successor) so the conversational decision can
+    /// evaluate the response, unlike `Wait` which resumes at the routing
+    /// successor. Resumed via the dispatch listener + `RuntimeSessionResumer`.
+    AwaitHere {
+        reason: Option<String>,
+        // Audit-carried, not read: per the spike's keying model (§Q3), the
+        // actual resume lookup is keyed by `(session_hint, ReplyScope.scope_hash)`
+        // via `build_store_ctx`/`FlowResumeStore`, not by this field — the
+        // `drive_flow` handler destructures it as `correlation_id: _`. Kept on
+        // the variant for debugging/observability only.
+        #[allow(dead_code)]
+        correlation_id: String,
     },
     Jump(JumpControl),
     Respond {
@@ -2716,11 +3294,33 @@ impl NodeOutput {
     /// A failure output (`ok == false`). `build_routing_context` derives the
     /// `error_event` from this, so a node with an `on_error`-family route lands
     /// on its failure branch; `node_output_view` exposes the `{errors}` envelope.
+    ///
+    /// `meta` is built by MERGING two things a failure payload can carry, not
+    /// by replacing one with the other: `outcome` (read by
+    /// `build_routing_context` so a component-distinguished failure like
+    /// `on_timeout` routes to its own branch instead of the generic error
+    /// branch — mirrors the success path's `outcome_meta`) and `error` (read
+    /// by `lift_first_node_error_from_nodes`, the same carrier
+    /// `NodeOutput::with_error` populates). A component can emit both at once
+    /// (`{"ok":false,"outcome":"on_timeout","error":{...}}`), and neither must
+    /// clobber the other.
     fn errored(payload: Value) -> Self {
+        let mut meta = JsonMap::new();
+        if let Some(outcome) = payload.get("outcome").and_then(Value::as_str) {
+            meta.insert("outcome".to_string(), Value::String(outcome.to_string()));
+        }
+        if let Some(error) = payload.get("error") {
+            meta.insert("error".to_string(), error.clone());
+        }
+        let meta = if meta.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(meta)
+        };
         Self {
             ok: false,
             payload,
-            meta: Value::Null,
+            meta,
         }
     }
 }
@@ -2903,36 +3503,21 @@ fn declared_answer_fields(payload_expr: &Value) -> DeclaredAnswerFields {
 ///
 /// Called immediately before `state.nodes.insert`, and that position is
 /// load-bearing — see `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`.
-/// Remove the routing `action` from a run's entry envelope.
-///
-/// Mirrors the two shapes [`build_routing_context`] reads it from: the
-/// greentic-start demo path wraps the activity (`entry.input.metadata`), the
-/// direct runner path does not (`entry.metadata`).
-fn consume_routing_action(entry: &mut Value) {
-    for pointer in ["/input/metadata", "/metadata"] {
-        if let Some(Value::Object(meta)) = entry.pointer_mut(pointer) {
-            meta.remove("action");
-        }
-    }
-}
-
-/// Returns true when the pending submit belonged to `node_id` and was consumed
-/// here — the caller clears the routing action once this node has routed on it.
 fn attach_pending_card_answers(
     state: &mut ExecutionState,
     node_id: &str,
     node: &HostNode,
     output: &mut NodeOutput,
-) -> bool {
+) {
     let is_target = state
         .pending_card_answers
         .as_ref()
         .is_some_and(|pending| pending.node_id == node_id);
     if !is_target {
-        return false;
+        return;
     }
     let Some(pending) = state.pending_card_answers.take() else {
-        return false;
+        return;
     };
     // No `ok` check on purpose: the answers are real whether or not the
     // re-render succeeded, and dropping them would let a transient render error
@@ -2942,7 +3527,7 @@ fn attach_pending_card_answers(
             node_id = %node_id,
             "node output payload is not an object; submitted answers not attached"
         );
-        return true;
+        return;
     };
     if map.contains_key("answers") {
         tracing::warn!(
@@ -2975,7 +3560,6 @@ fn attach_pending_card_answers(
         DeclaredAnswerFields::Absent => pending.answers,
     };
     map.insert("answers".to_string(), Value::Object(answers));
-    true
 }
 
 /// Decide what to park for the node awaiting a submit, from the snapshot being
@@ -3045,6 +3629,99 @@ fn mcp_tool_error(value: &Value) -> Option<(String, String)> {
         None => raw_message.to_string(),
     };
     Some((code.to_string(), message))
+}
+
+/// Reshape an MCP-shaped tool-error payload (`{ "error": { "code", "message",
+/// "status" } }`, no `ok`/`result` key) into the `{ok:false, error:{code,message}}`
+/// shape `component_error` already recognises. `code`/`message` are the pair
+/// `mcp_tool_error` already computed (so `message` is the status-qualified string,
+/// identical to what the `bail!` branch would have said) and simply replace the
+/// raw `error.code`/`error.message` fields; any other field on `error` (e.g.
+/// `status`) and any other top-level field on the payload survive untouched.
+///
+/// This is the single normalization point: once a payload is in this shape,
+/// `to_node_output` (the `{{node.<id>.errors}}` template envelope) and
+/// `NodeOutput::errored`'s `meta.error` (read by
+/// `lift_first_node_error_from_nodes`) both read it exactly as they already read
+/// a genuine `component_error` failure — no second "what does a failed node's
+/// error look like" branch needed anywhere downstream.
+fn normalize_mcp_tool_error(value: &Value, code: &str, message: &str) -> Value {
+    let mut obj = value.as_object().cloned().unwrap_or_default();
+    obj.insert("ok".to_string(), Value::Bool(false));
+    let mut error = obj
+        .get("error")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    error.insert("code".to_string(), Value::String(code.to_string()));
+    error.insert("message".to_string(), Value::String(message.to_string()));
+    obj.insert("error".to_string(), Value::Object(error));
+    Value::Object(obj)
+}
+
+/// Build an MCP node's output, marking it failed when the tool did not run —
+/// but only for a node that has somewhere to route the failure.
+///
+/// `mcp_node::invoke_with_secrets` is infallible by contract: a runner
+/// without MCP credentials, a tool missing from the tenant catalog, a dead
+/// endpoint, and bad arguments all arrive as `{"error": "..."}` inside
+/// `result`, with the WIT-level call itself having returned normally. Always
+/// reporting `ok: true` left the flow with nothing to route on: a Digital
+/// Worker run showed 33/33 green nodes and rendered its quote card with
+/// every field blank.
+///
+/// **`has_error_route` gates the whole thing.** `Routing::Next` and a
+/// `Routing::Custom` array with only success-family routes have nowhere to
+/// send a failure: `evaluate_custom_routing`'s fall-through for a routing
+/// array that has conditions but matched none of them is
+/// `CustomRoutingDecision::Wait`, which PARKS the run — a worse outcome for
+/// an operator who never wired up error handling than the pre-existing
+/// silent wrong answer (a parked run needs manual intervention to ever
+/// resolve; a silent wrong answer at least lets the flow finish). So a node
+/// with no error route keeps reporting `ok: true`, byte-for-byte the pre-R3
+/// behaviour — this mirrors the `has_error_route` gate
+/// `execute_component_call` already uses for the same reason (there:
+/// `bail!` vs `NodeOutput::errored`; here: `ok: true` vs `NodeOutput::errored`),
+/// keeping the change purely additive.
+///
+/// When the node DOES have an error route, the failure is normalized into
+/// the exact `{ok:false, error:{code,message}}` shape `component_error`
+/// already recognises, via `normalize_mcp_tool_error` — reusing Phase 2's
+/// single definition of what a failed node's `{errors}` output looks like,
+/// rather than inventing a second one for this code path. `bound` (the tool
+/// result, optionally wrapped under the node's `output:` binding key) is
+/// passed as the base object, so any field already on it — most importantly
+/// the `output:` binding key — survives alongside the new top-level
+/// `ok`/`error` fields: `node.<id>.<binding-key>` keeps resolving exactly as
+/// before, while `node.<id>.errors[0].message` now resolves too.
+fn mcp_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeOutput {
+    if !has_error_route {
+        return NodeOutput::new(bound);
+    }
+    let Some(error) = result.get("error") else {
+        return NodeOutput::new(bound);
+    };
+    // `error` is not always a plain string: greentic-mcp-generator's
+    // `tool_error_with_status` shape (`{"error":{"code","message","status"}}`,
+    // the same shape `mcp_tool_error` already parses for the component-error
+    // path around `execute_component_call`) puts an object there. Try that
+    // detector FIRST so this shape gets the real `tool_error` code and the
+    // status-qualified message it already computes, instead of falling
+    // through to the plain-string handling below — which would stuff the
+    // whole serialized error object into `message` and hardcode a generic
+    // `mcp_call_failed` code, discarding both.
+    if let Some((code, message)) = mcp_tool_error(result) {
+        return NodeOutput::errored(normalize_mcp_tool_error(&bound, &code, &message));
+    }
+    let message = error
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    NodeOutput::errored(normalize_mcp_tool_error(
+        &bound,
+        "mcp_call_failed",
+        &message,
+    ))
 }
 
 fn extract_wait_reason(payload: &Value) -> Option<String> {
@@ -3295,6 +3972,28 @@ fn template_context(state: &ExecutionState, prev: Value) -> Value {
     Value::Object(ctx)
 }
 
+/// Seed declared flow variables into `target` (entry-or-insert; never
+/// overwrites an already-present key), then return the `required` names that
+/// remain absent from `target`. A required var is satisfied by either a
+/// declared default (seeded here) or a value already placed in `target`
+/// (e.g. an operator-provided demo value).
+fn seed_vars_and_collect_missing_required(
+    vars_init: &JsonMap<String, Value>,
+    required: &[String],
+    target: &mut JsonMap<String, Value>,
+) -> Vec<String> {
+    for (name, default) in vars_init.iter() {
+        target
+            .entry(name.clone())
+            .or_insert_with(|| default.clone());
+    }
+    required
+        .iter()
+        .filter(|name| !target.contains_key(name.as_str()))
+        .cloned()
+        .collect()
+}
+
 impl From<Flow> for HostFlow {
     fn from(value: Flow) -> Self {
         let mut nodes = IndexMap::new();
@@ -3307,15 +4006,6 @@ impl From<Flow> for HostFlow {
             .and_then(Value::as_str)
             .and_then(|id| NodeId::from_str(id).ok())
             .or_else(|| nodes.keys().next().cloned());
-        // Extract flow-level slot_schema from metadata.extra (Phase D).
-        // The producer side (greentic-flow compile_flow) stores it under
-        // "greentic.slot_schema" when the FlowDoc has a `slot_schema` field.
-        let slot_schema = value
-            .metadata
-            .extra
-            .get(SLOT_SCHEMA_METADATA_KEY)
-            .filter(|v| !v.is_null())
-            .cloned();
         let vars_init = value
             .metadata
             .extra
@@ -3330,12 +4020,35 @@ impl From<Flow> for HostFlow {
                     .collect::<JsonMap<String, Value>>()
             })
             .unwrap_or_default();
+        let required_vars = value
+            .metadata
+            .extra
+            .get("vars_init")
+            .and_then(|v| v.as_object())
+            .map(|decls| {
+                decls
+                    .iter()
+                    .filter(|(_, decl)| decl.get("required") == Some(&Value::Bool(true)))
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        // Extract flow-level slot_schema from metadata.extra (Phase D).
+        // The producer side (greentic-flow compile_flow) stores it under
+        // "greentic.slot_schema" when the FlowDoc has a `slot_schema` field.
+        let slot_schema = value
+            .metadata
+            .extra
+            .get(SLOT_SCHEMA_METADATA_KEY)
+            .filter(|v| !v.is_null())
+            .cloned();
         Self {
             id: value.id.as_str().to_string(),
             start,
             nodes,
-            slot_schema,
             vars_init,
+            required_vars,
+            slot_schema,
         }
     }
 }
@@ -3361,10 +4074,23 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("sorla.")
             || full_ref.starts_with("operala.")
             || full_ref.starts_with("agentic.")
+            // Same dispatch family as sorla./operala./agentic. above, and listed in
+            // NATIVE_OP_KEYS like them. Without it an `approval.call` node — which
+            // packc emits with `operation: None` because the id is already complete
+            // — gets split into component "approval" + operation "call", and
+            // "approval" is by construction absent from the pack's component map.
+            // The gate then fails with `component 'approval' not found in pack` on a
+            // pack that is perfectly well-formed, so rebuilding never helps.
+            || full_ref.starts_with("approval.")
             || full_ref.starts_with("var.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
             || full_ref.starts_with("mcp:");
+        // packc emits `operation: None` to mean "the id is already complete" and
+        // carries the operation in input.mapping instead. Splitting such an id would
+        // produce a prefix that is never a key in the pack's component map (the map is
+        // keyed verbatim by `node.component.id`), so only split when the mapping does
+        // not tell us the operation.
         let (component_ref, raw_operation) =
             if node.component.operation.is_some() || is_builtin || operation_in_mapping.is_some() {
                 (full_ref, node.component.operation.clone())
@@ -3436,6 +4162,9 @@ impl From<Node> for HostNode {
                 }
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
+                    // SP3: honour the flow-doc `conversational` flag (greentic-flow
+                    // parses it into `greentic_types::Node.conversational`).
+                    conversational: node.conversational,
                 },
                 "dw.agent_graph" => NodeKind::DwAgentGraph {
                     graph_id: raw_operation.clone().unwrap_or_default(),
@@ -3787,6 +4516,24 @@ fn card_defaults_source<'a>(
     None
 }
 
+/// The conversation's locale as carried by the inbound activity payload.
+///
+/// `/input/metadata/locale`, then `/metadata/locale` — the shape
+/// `inject_card_locale` has always read for card invocations. Factored out so
+/// the card path and the flow-failure path resolve a conversation's language
+/// from the *same* pointers; two copies would silently drift into disagreeing
+/// about what language a user is speaking.
+///
+/// A blank value is treated as absent, so a producer that stamps an empty
+/// string does not out-rank the deployment locale.
+fn activity_locale(entry: &Value) -> Option<&str> {
+    entry
+        .pointer("/input/metadata/locale")
+        .or_else(|| entry.pointer("/metadata/locale"))
+        .and_then(Value::as_str)
+        .filter(|locale| !locale.trim().is_empty())
+}
+
 fn inject_card_locale(payload: &mut Value, entry: &Value) {
     if !is_card_invocation(payload) {
         return;
@@ -3795,11 +4542,7 @@ fn inject_card_locale(payload: &mut Value, entry: &Value) {
     if map.contains_key("locale") {
         return;
     }
-    let locale = entry
-        .pointer("/input/metadata/locale")
-        .or_else(|| entry.pointer("/metadata/locale"))
-        .and_then(Value::as_str);
-    if let Some(locale) = locale {
+    if let Some(locale) = activity_locale(entry) {
         map.insert("locale".into(), Value::String(locale.to_string()));
     }
 }
@@ -4100,12 +4843,14 @@ fn evaluate_custom_routing(
     );
 
     let mut has_condition = false;
+    let mut unmatched_conditions: Vec<&str> = Vec::new();
     for route in routes {
         let condition = route.get("condition").and_then(|v| v.as_str());
         let to = route.get("to").and_then(|v| v.as_str());
 
         if let Some(cond) = condition {
             has_condition = true;
+            unmatched_conditions.push(cond);
             if evaluate_simple_condition(cond, &ctx)
                 && let Some(target) = to
                 && let Ok(nid) = NodeId::new(target)
@@ -4139,9 +4884,10 @@ fn evaluate_custom_routing(
     // Routing arrays with no conditions at all (pure unconditional `out`
     // terminators) remain true ends.
     if has_condition {
-        tracing::debug!(
+        tracing::warn!(
             flow_id = %flow_ir.id,
             node_id = %node_id,
+            conditions = ?unmatched_conditions,
             "no conditional route matched; pausing run at current node for resume"
         );
         CustomRoutingDecision::Wait
@@ -4239,23 +4985,6 @@ fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
     }
 }
 
-/// Build a context object for routing condition evaluation.
-///
-/// The context merges the node output with the flow entry so that conditions
-/// can reference both component results and incoming message data.
-///
-/// Layout:
-/// ```text
-/// {
-///   ...output.payload...,     // top-level fields from component output
-///   "entry": <flow entry>,
-///   "in":    <flow entry>,    // alias
-///   "response": {             // synthesised from envelope metadata
-///     <key>: <value>,         // e.g. "action": "about"
-///     ...
-///   }
-/// }
-/// ```
 /// Success-family outcome ports, in the priority order used to pick the default
 /// success `event` for a node that succeeded without emitting an explicit
 /// `outcome`. `on_success` is first so components whose success name is the
@@ -4447,12 +5176,18 @@ fn build_routing_context(
     ctx.insert("entry".into(), entry.clone());
     ctx.insert("in".into(), entry.clone());
 
+    // Every prior node's output, keyed by id — the SAME projection
+    // `template_context` exposes for `{{node.<id>.<field>}}`, so a routing
+    // condition resolves `node.<id>.<field>` exactly as a param template does.
+    // Without this a guard could only read the current node's payload (spread
+    // at the top level, above), so a condition naming any other node resolved
+    // to nothing and silently took the false branch on every input.
+    ctx.insert("node".into(), Value::Object(state.outputs_map()));
+
     // Synthesise "response" from the envelope metadata.
     // greentic-start demo path: entry.input.metadata.*
     // greentic-runner direct path: entry.metadata.*
-    let metadata = entry
-        .pointer("/input/metadata")
-        .or_else(|| entry.pointer("/metadata"));
+    let metadata = resolve_entry_metadata(&entry);
 
     let mut response = JsonMap::new();
     if let Some(Value::Object(meta)) = metadata {
@@ -4541,9 +5276,45 @@ fn approval_requires_human(input: &Value) -> bool {
     }
 }
 
+/// True when `entry` is a runtime-dispatch response envelope rather than a user
+/// activity. The dispatch response always carries a top-level `ok`
+/// (`{ok, output, events, error}`); an inbound activity never does. Mirrors the
+/// conversational `dw.agent` discriminator (`state.entry.get("ok").is_some()`).
+fn entry_is_approval_response(entry: &Value) -> bool {
+    entry.get("ok").is_some()
+}
+
+/// Map an approval response envelope to the routing outcome that becomes
+/// `event` via `NodeOutput.meta["outcome"]`.
+///
+/// A watchdog timeout arrives as `{ok: false, output: null, error: {code: "timeout"}}`
+/// and wins over any decision. Otherwise the discriminator is `output.decision`
+/// — NOT `ok`, which greentic-admin sets to `true` for approve *and* deny.
+///
+/// Fails closed: an unrecognised or absent decision is `denied`, mirroring
+/// `approval_requires_human`'s own `_ => true` fail-safe. A corrupt payload must
+/// never become a pass.
+fn approval_outcome_from_entry(entry: &Value) -> &'static str {
+    let timed_out = entry
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .is_some_and(|code| code.eq_ignore_ascii_case("timeout"));
+    if timed_out {
+        return "timeout";
+    }
+    // Fail closed: a failed envelope is never a pass, whatever `output` says.
+    if entry.get("ok").and_then(Value::as_bool) == Some(false) {
+        return "denied";
+    }
+    match entry.pointer("/output/decision").and_then(Value::as_str) {
+        Some(decision) if decision.eq_ignore_ascii_case("approved") => "approved",
+        _ => "denied",
+    }
+}
+
 #[cfg(test)]
 mod approval_gate_tests {
-    use super::approval_requires_human;
+    use super::{approval_outcome_from_entry, approval_requires_human, entry_is_approval_response};
     use serde_json::json;
 
     #[test]
@@ -4570,6 +5341,92 @@ mod approval_gate_tests {
         assert!(approval_requires_human(&json!({ "mode": "always" })));
         assert!(approval_requires_human(&json!({})));
     }
+
+    #[test]
+    fn entry_is_a_response_only_when_the_envelope_has_ok() {
+        // The dispatch response envelope always carries a top-level `ok`.
+        assert!(entry_is_approval_response(
+            &json!({ "ok": true, "output": { "decision": "approved" } })
+        ));
+        assert!(entry_is_approval_response(
+            &json!({ "ok": false, "error": { "code": "timeout" } })
+        ));
+        // A user activity arriving mid-await has no top-level `ok`.
+        assert!(!entry_is_approval_response(
+            &json!({ "text": "hi", "metadata": { "action": "go" } })
+        ));
+        assert!(!entry_is_approval_response(&json!({})));
+    }
+
+    #[test]
+    fn outcome_reads_the_decision() {
+        assert_eq!(
+            approval_outcome_from_entry(
+                &json!({ "ok": true, "output": { "decision": "approved" } })
+            ),
+            "approved"
+        );
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": true, "output": { "decision": "denied" } })),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn timeout_wins_over_the_decision() {
+        // The watchdog envelope has output: null and error.code == "timeout".
+        assert_eq!(
+            approval_outcome_from_entry(
+                &json!({ "ok": false, "output": null, "error": { "code": "timeout" } })
+            ),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn unknown_or_missing_decision_fails_closed_to_denied() {
+        // Fail closed: a corrupt payload must never become a pass.
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": true, "output": { "decision": "maybe" } })),
+            "denied"
+        );
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": true, "output": {} })),
+            "denied"
+        );
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": true })),
+            "denied"
+        );
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": false, "error": { "code": "nats_down" } })),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn a_failed_envelope_is_denied_even_if_it_carries_an_approval() {
+        // Fail closed: `ok: false` with a non-timeout error must not pass,
+        // regardless of a stale/forged decision field.
+        assert_eq!(
+            approval_outcome_from_entry(&json!({
+                "ok": false,
+                "error": { "code": "nats_down" },
+                "output": { "decision": "approved" }
+            })),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn decision_match_is_case_insensitive() {
+        assert_eq!(
+            approval_outcome_from_entry(
+                &json!({ "ok": true, "output": { "decision": "Approved" } })
+            ),
+            "approved"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4582,7 +5439,7 @@ mod tests {
     /// verbatim instead of wrapping in a `component.exec` node; the match in
     /// `component_label` above is what the ENGINE dispatches. Its doc says to
     /// keep the two in lockstep, and nothing enforced it — so `flow.goto`
-    /// arrived with an engine arm the loader never routed a node to, which is
+    /// shipped with an engine arm the loader never routed a node to, which is
     /// silent: the node builds, loads as a generic component, and simply is not
     /// a goto any more.
     ///
@@ -4591,8 +5448,6 @@ mod tests {
     /// somebody says whether the loader must preserve it — which is the whole
     /// point; a test listing strings alone would have gone stale the same way
     /// the doc comment did.
-    ///
-    /// Ported from #686 on `research`, `var.set` arm included.
     fn native_op_key_for(kind: &NodeKind) -> Option<&'static str> {
         match kind {
             // Not op-keys: these ARE the generic component paths.
@@ -4691,7 +5546,74 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         }
+    }
+
+    /// A distinguishable no-op manager. The tests below assert WHICH manager
+    /// an `mcp` node would dispatch with, via `Arc::ptr_eq`.
+    #[cfg(feature = "agentic-worker")]
+    struct StubSecrets;
+
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl greentic_secrets_lib::SecretsManager for StubSecrets {
+        async fn read(&self, _path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn write(&self, _path: &str, _bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `execute_mcp` reads `mcp_secrets_for_dispatch`; before this it read a
+    /// process-global built from `SECRETS_BACKEND`, which no Cloud Run or
+    /// Kubernetes deployment sets — so a `secrets://` URI resolved as a literal
+    /// variable name and every credential lookup missed.
+    ///
+    /// `#[serial]` because `mcp_secrets_for_dispatch` reads `SECRETS_BACKEND`,
+    /// which the env-mutating tests in `mcp_node` set and restore.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    #[serial_test::serial]
+    fn an_injected_manager_is_what_an_mcp_node_dispatches_with() {
+        let injected: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+        let engine = minimal_engine().with_mcp_secrets(Some(injected.clone()));
+        let chosen = engine
+            .mcp_secrets_for_dispatch()
+            .expect("an injected manager is always a choice");
+        assert!(std::sync::Arc::ptr_eq(&chosen, &injected));
+    }
+
+    /// A standalone runner must be unaffected: with nothing injected the engine
+    /// still falls back to the env-derived manager exactly as before.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn no_injection_leaves_the_env_derived_behaviour_alone() {
+        let engine = minimal_engine();
+        assert!(engine.mcp_secrets.is_none());
+    }
+
+    /// `None` must LEAVE an already-bound manager in place, mirroring
+    /// `with_mcp_source`: callers thread this straight through from a host that
+    /// may not have one.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    #[serial_test::serial]
+    fn binding_no_manager_does_not_clear_one_already_bound() {
+        let injected: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+        let engine = minimal_engine()
+            .with_mcp_secrets(Some(injected.clone()))
+            .with_mcp_secrets(None);
+        let chosen = engine
+            .mcp_secrets_for_dispatch()
+            .expect("the bound manager must survive");
+        assert!(std::sync::Arc::ptr_eq(&chosen, &injected));
     }
 
     fn flow_desc(id: &str, pack_id: &str, flow_type: &str, entry: bool) -> FlowDescriptor {
@@ -5535,6 +6457,49 @@ mod tests {
         fn on_node_error(&self, _event: &NodeEvent<'_>, _error: &dyn StdError) {}
     }
 
+    /// `approval.call` must survive lowering intact.
+    ///
+    /// packc emits the gate with `operation: None` because the id is already
+    /// complete. Before `approval.` joined the `is_builtin` allowlist, lowering
+    /// dot-split it into component `"approval"` + operation `"call"` — and
+    /// `"approval"` is by construction absent from the pack's component map,
+    /// which is keyed verbatim by `node.component.id`. Every human-approval gate
+    /// then failed at dispatch with `component 'approval' not found in pack` on a
+    /// perfectly well-formed pack, so rebuilding never helped.
+    #[test]
+    fn approval_call_component_id_is_not_dot_split() {
+        let node = Node {
+            id: NodeId::from_str("gate").unwrap(),
+            component: FlowComponentRef {
+                id: "approval.call".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "await": true, "input": { "mode": "always" } }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+        let host_node = HostNode::from(node);
+        assert_eq!(
+            host_node.component_id(),
+            "approval.call",
+            "approval.call must stay intact; splitting it yields 'approval', which \
+             is never a key in the pack's component map"
+        );
+        assert_eq!(
+            host_node.operation_name(),
+            None,
+            "the id is already complete — lowering must not invent an operation"
+        );
+    }
+
     #[test]
     fn emits_end_event_for_successful_node() {
         let node_id = NodeId::from_str("emit").unwrap();
@@ -5598,6 +6563,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -5624,6 +6592,22 @@ mod tests {
         let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
         assert!(matches!(result.status, FlowStatus::Completed));
 
+        // The completed FlowExecution exposes its per-node outputs (captured
+        // from ExecutionState.nodes before finalize_with drops them). This is
+        // the map the demo reads to surface a mid-flow dw.agent's output.
+        assert!(
+            !result.node_outputs.is_empty(),
+            "completed flow must expose its per-node outputs"
+        );
+        assert!(
+            result
+                .node_outputs
+                .values()
+                .any(|v| v.to_string().contains("logged")),
+            "node_outputs must carry the executed node's payload: {:?}",
+            result.node_outputs
+        );
+
         let starts = observer.starts.lock().unwrap();
         let ends = observer.ends.lock().unwrap();
         assert_eq!(starts.len(), 1);
@@ -5639,6 +6623,7 @@ mod tests {
         // found in pack"); the structured mapping operation makes the id a
         // complete reference.
         let node = Node {
+            conversational: false,
             id: NodeId::from_str("render").unwrap(),
             component: FlowComponentRef {
                 id: "ai.greentic.component-templates".parse().unwrap(),
@@ -5654,7 +6639,6 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
-            conversational: false,
         };
         let host = HostNode::from(node);
         assert!(
@@ -5672,6 +6656,7 @@ mod tests {
         // `<component>.<operation>` and absent from the mapping. The last-dot
         // split must still recover it.
         let node = Node {
+            conversational: false,
             id: NodeId::from_str("render").unwrap(),
             component: FlowComponentRef {
                 id: "templating.handlebars".parse().unwrap(),
@@ -5687,7 +6672,6 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
-            conversational: false,
         };
         let host = HostNode::from(node);
         assert!(
@@ -5724,6 +6708,7 @@ mod tests {
                 _agent_id: &str,
                 _session_id: &str,
                 _flow_input: &Value,
+                _conversational: bool,
                 caller: Option<&Value>,
             ) -> anyhow::Result<Value> {
                 *self.0.lock().unwrap() = caller.cloned();
@@ -5798,6 +6783,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
 
         let trusted = json!({ "user_verified": true, "sub": "u-1@acme" });
@@ -5877,12 +6865,14 @@ mod tests {
                 limits: AgentLimits::default(),
                 memory: None,
                 knowledge: None,
+                conversational: false,
+                opening_message: None,
             },
         );
         let config_provider = Arc::new(config_provider);
         let token_meter = Arc::new(MockTokenMeter::new(0));
         let ledger = Arc::new(NoopToolLedger);
-        let ext_runtime = Arc::new(crate::runner::agent_node::test_extension_runtime());
+        let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let runtime = Arc::new(AgentRuntime::new(
             config_provider,
             store,
@@ -5894,7 +6884,7 @@ mod tests {
             None,
         ));
         let handler: Arc<dyn AgentNodeHandler> =
-            Arc::new(RuntimeAgentNodeHandler::new(runtime, None, None));
+            Arc::new(RuntimeAgentNodeHandler::new(runtime, None, None, None));
 
         // --- flow with a single dw.agent node (operation = agent_id) ---
         let node_id = NodeId::from_str("agent").unwrap();
@@ -5958,6 +6948,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -6102,6 +7095,9 @@ mod tests {
             graph_node_handler: Some(handler_dyn),
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -6277,6 +7273,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
 
         let ctx = FlowContext {
@@ -6398,6 +7397,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         }
     }
 
@@ -6639,6 +7641,132 @@ mod tests {
         assert_eq!(err.to_string(), "redirect_limit");
     }
 
+    #[test]
+    fn park_turns_bump_and_reset() {
+        let mut state = ExecutionState::new(Value::Null);
+        assert_eq!(state.bump_park_turns("a"), 1);
+        assert_eq!(state.bump_park_turns("a"), 2);
+        // A different node's counter is independent.
+        assert_eq!(state.bump_park_turns("b"), 1);
+        assert_eq!(state.bump_park_turns("a"), 3);
+
+        state.reset_park_turns("a");
+        assert_eq!(
+            state.bump_park_turns("a"),
+            1,
+            "reset must restart from zero"
+        );
+        assert_eq!(
+            state.bump_park_turns("b"),
+            2,
+            "resetting `a` must not disturb `b`'s counter"
+        );
+    }
+
+    #[test]
+    fn park_turns_survives_snapshot_roundtrip() {
+        // park_turns must persist across a park/resume, which is a serde
+        // round-trip of ExecutionState (same contract as redirect_count /
+        // vars — see execution_state_vars_survive_serde_round_trip).
+        let mut state = ExecutionState::new(json!({}));
+        state.bump_park_turns("agent-1");
+        state.bump_park_turns("agent-1");
+
+        let encoded = serde_json::to_string(&state).expect("serialize");
+        let decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.park_turns.get("agent-1"), Some(&2));
+
+        // A legacy snapshot serialized before `park_turns` existed (no
+        // `park_turns` key) must still load, defaulting to an empty map.
+        let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0}"#;
+        let decoded_legacy: ExecutionState = serde_json::from_str(legacy).expect("legacy loads");
+        assert!(decoded_legacy.park_turns.is_empty());
+    }
+
+    #[test]
+    fn pending_agent_await_mark_and_take() {
+        let mut st = ExecutionState::new(serde_json::json!({}));
+        assert!(!st.take_agent_await("agent"), "unmarked node takes false");
+        st.mark_agent_await("agent");
+        assert!(st.take_agent_await("agent"), "marked node takes true");
+        assert!(!st.take_agent_await("agent"), "take clears the marker");
+        // Independent per node.
+        st.mark_agent_await("a");
+        st.mark_agent_await("b");
+        assert!(st.take_agent_await("a"));
+        assert!(st.take_agent_await("b"));
+    }
+
+    #[test]
+    fn pending_agent_await_survives_snapshot_roundtrip() {
+        let mut st = ExecutionState::new(serde_json::json!({}));
+        st.mark_agent_await("agent");
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: ExecutionState = serde_json::from_str(&json).expect("deserialize");
+        let mut back = back;
+        assert!(
+            back.take_agent_await("agent"),
+            "marker survives serde round-trip"
+        );
+        // Legacy snapshot without the key decodes to empty (serde default).
+        let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0,"vars":{},"park_turns":{}}"#;
+        let mut legacy: ExecutionState = serde_json::from_str(legacy).expect("legacy decode");
+        assert!(!legacy.take_agent_await("agent"), "absent key → empty");
+    }
+
+    #[test]
+    fn approval_await_mark_and_take() {
+        let mut st = ExecutionState::new(json!({}));
+        assert!(!st.take_approval_await("gate"), "unmarked node takes false");
+        st.mark_approval_await("gate");
+        assert!(st.take_approval_await("gate"), "marked node takes true");
+        assert!(!st.take_approval_await("gate"), "take clears the mark");
+    }
+
+    #[test]
+    fn approval_await_survives_snapshot_roundtrip() {
+        let mut st = ExecutionState::new(json!({}));
+        st.mark_approval_await("gate");
+        let encoded = serde_json::to_string(&st).expect("serialize");
+        let mut decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
+        assert!(
+            decoded.take_approval_await("gate"),
+            "the marker must survive a park/resume snapshot"
+        );
+    }
+
+    #[test]
+    fn approval_await_defaults_empty_for_old_snapshots() {
+        // Snapshots persisted before this field exists must still decode.
+        let mut decoded: ExecutionState =
+            serde_json::from_str(r#"{"entry":{},"input":{}}"#).expect("old snapshot decodes");
+        assert!(!decoded.take_approval_await("gate"));
+    }
+
+    #[test]
+    fn dispatch_outcome_await_here_stores_variant() {
+        // DispatchOutcome::await_here must store NodeControl::AwaitHere with
+        // both the reason and the correlation_id carried through unchanged
+        // (Task 4/5 build on this; the drive-loop handler resumes at self —
+        // see the behavioral coverage in Task 6).
+        let output = NodeOutput::new(json!({"ok": true}));
+        let outcome = DispatchOutcome::await_here(
+            output,
+            Some("awaiting agent response".to_string()),
+            "corr-123".to_string(),
+        );
+        match outcome.control {
+            NodeControl::AwaitHere {
+                reason,
+                correlation_id,
+            } => {
+                assert_eq!(reason.as_deref(), Some("awaiting agent response"));
+                assert_eq!(correlation_id, "corr-123");
+            }
+            other => panic!("expected NodeControl::AwaitHere, got {other:?}"),
+        }
+    }
+
     /// Regression: a `Routing::Custom` array containing at least one
     /// conditional entry must pause (return `Wait`) when no condition
     /// matches, instead of terminating. Concrete bug it guards against:
@@ -6655,8 +7783,9 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
-            slot_schema: None,
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
         };
         let current_node = NodeId::from_str("current").unwrap();
         let output = NodeOutput::new(Value::Null);
@@ -6694,51 +7823,6 @@ mod tests {
         assert_eq!(
             out.meta["error"]["message"],
             "weatherapi returned 401 Unauthorized"
-        );
-    }
-
-    /// A failed MCP call must mark the node not-ok so the already-wired
-    /// `lift_first_node_error_from_nodes` has something to find.
-    ///
-    /// `mcp_node::invoke` is infallible — every failure arrives as
-    /// `{"error": ...}` in the result — so the node used to report `ok: true`
-    /// and the flow completed clean. That is what made a Digital Worker run
-    /// show 33/33 green nodes with a blank quote.
-    #[test]
-    fn a_failed_mcp_call_marks_the_node_not_ok() {
-        let result = json!({ "error": "MCP is not configured on this runner" });
-        let bound = json!({ "quote_result_data": result.clone() });
-
-        let out = mcp_output(bound.clone(), &result);
-
-        assert!(!out.ok, "a failed MCP call must not report ok");
-        assert_eq!(
-            out.meta.pointer("/error/message").and_then(Value::as_str),
-            Some("MCP is not configured on this runner"),
-            "the message must reach meta.error where the lift reads it, got {:?}",
-            out.meta
-        );
-        assert_eq!(
-            out.payload, bound,
-            "the bound payload must be untouched — routing and any flow \
-             reading the bound value must behave exactly as before"
-        );
-    }
-
-    /// The success path must stay exactly as it was.
-    #[test]
-    fn a_successful_mcp_call_stays_ok() {
-        let result = json!({ "annual_premium": 1234 });
-        let bound = json!({ "quote_result_data": result.clone() });
-
-        let out = mcp_output(bound.clone(), &result);
-
-        assert!(out.ok, "a successful MCP call must report ok");
-        assert_eq!(out.payload, bound);
-        assert!(
-            out.meta.get("error").is_none(),
-            "a successful call must not stash an error, got {:?}",
-            out.meta
         );
     }
 
@@ -6788,16 +7872,12 @@ mod tests {
         assert_eq!(lifted, output);
     }
 
-    #[tokio::test]
-    async fn execute_user_facing_flow_failure_returns_completed_with_error_envelope() {
-        // Flow whose start node is missing — drive_flow will return Err on
-        // node lookup. With session_id present, execute() must convert that
-        // to a Completed FlowExecution carrying error_kind/error_message in
-        // output.metadata so the chat user sees the error card.
-        let flow_id_str = "broken.flow";
-        let pack_id_str = "test-pack";
+    /// An engine holding one flow whose start node is missing, so `drive_flow`
+    /// returns `Err` on node lookup. Shared by the terminal-failure tests below.
+    fn broken_flow_engine(pack_id_str: &str, flow_id_str: &str) -> FlowEngine {
         let host_flow = host_flow_for_test(flow_id_str, &["only-node"], Some("does-not-exist"));
-        let engine = FlowEngine {
+        FlowEngine {
+            operala_node_handler: None,
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
@@ -6824,8 +7904,14 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
-        };
-        let ctx = FlowContext {
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+        }
+    }
+
+    /// A single-attempt, session-bound context for `broken_flow_engine`.
+    fn terminal_failure_ctx<'a>(pack_id_str: &'a str, flow_id_str: &'a str) -> FlowContext<'a> {
+        FlowContext {
             tenant: "demo",
             pack_id: pack_id_str,
             flow_id: flow_id_str,
@@ -6843,7 +7929,18 @@ mod tests {
             observer: None,
             mocks: None,
             caller: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_user_facing_flow_failure_returns_completed_with_error_envelope() {
+        // With session_id present, execute() must convert the terminal Err to a
+        // Completed FlowExecution carrying error_kind/error_message in
+        // output.metadata plus user-safe text.
+        let flow_id_str = "broken.flow";
+        let pack_id_str = "test-pack";
+        let engine = broken_flow_engine(pack_id_str, flow_id_str);
+        let ctx = terminal_failure_ctx(pack_id_str, flow_id_str);
         let result = engine
             .execute(ctx, Value::Null)
             .await
@@ -6858,6 +7955,174 @@ mod tests {
             .unwrap_or("");
         assert!(!msg.is_empty(), "error_message must be populated");
         assert_eq!(result.output["metadata"]["flow_id"], "broken.flow");
+        // Without a `text`, this envelope reaches nobody: every messaging
+        // provider refuses a payload with no text/card, webchat included (its
+        // required-content guard runs BEFORE its error-card path). The comment
+        // above once claimed the user "sees the error card"; that only held for
+        // the `lift_first_node_error_from_nodes` envelope, which enriches an
+        // output that already carries text.
+        assert_eq!(
+            result.output["text"],
+            user_facing_flow_failure_text(&Value::Null),
+            "a terminal session-flow failure must carry the resolved user-facing message"
+        );
+        // Localisation must not be able to reintroduce the silence: whatever
+        // locale this process resolved to, `text` has to be a non-empty string.
+        let shown = result.output["text"].as_str().unwrap_or_default();
+        assert!(
+            !shown.trim().is_empty(),
+            "an empty `text` is silent on every channel"
+        );
+        // And the engine's own wording must NOT be what the user is shown.
+        assert!(
+            !shown.contains("does-not-exist"),
+            "raw engine text must stay in metadata.error_message"
+        );
+    }
+
+    /// The conversation's own locale — not the deployment's — decides the
+    /// language a failing flow apologises in.
+    ///
+    /// Drives the real `execute` failure path, so it also pins that
+    /// `original_input` (and not something else) is what gets consulted.
+    #[tokio::test]
+    async fn execute_user_facing_flow_failure_answers_in_the_conversation_locale() {
+        let flow_id_str = "broken.flow";
+        let pack_id_str = "test-pack";
+        let engine = broken_flow_engine(pack_id_str, flow_id_str);
+
+        // Same `metadata.locale` shape the card path already honours.
+        let result = engine
+            .execute(
+                terminal_failure_ctx(pack_id_str, flow_id_str),
+                json!({ "metadata": { "locale": "id-ID" } }),
+            )
+            .await
+            .expect("must not propagate Err");
+        let shown = result.output["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            shown,
+            user_facing_flow_failure_text_for("id"),
+            "an Indonesian conversation must be answered in Indonesian"
+        );
+        assert_ne!(
+            shown,
+            crate::runner::i18n::FLOW_EXECUTION_FAILED_EN,
+            "the conversation locale was ignored"
+        );
+
+        // The nested shape is honoured too, and the raw engine error still must
+        // not leak into a localized `text`.
+        let nested = engine
+            .execute(
+                terminal_failure_ctx(pack_id_str, flow_id_str),
+                json!({ "input": { "metadata": { "locale": "ja" } } }),
+            )
+            .await
+            .expect("must not propagate Err");
+        let nested_text = nested.output["text"].as_str().unwrap_or_default();
+        assert_eq!(nested_text, user_facing_flow_failure_text_for("ja"));
+        assert!(!nested_text.trim().is_empty());
+        assert!(
+            !nested_text.contains("does-not-exist"),
+            "raw engine text must stay in metadata.error_message in every locale"
+        );
+
+        // A locale nobody translated still gets a reply, in English.
+        let unknown = engine
+            .execute(
+                terminal_failure_ctx(pack_id_str, flow_id_str),
+                json!({ "metadata": { "locale": "kl-GL" } }),
+            )
+            .await
+            .expect("must not propagate Err");
+        assert_eq!(
+            unknown.output["text"],
+            crate::runner::i18n::FLOW_EXECUTION_FAILED_EN
+        );
+    }
+
+    #[test]
+    fn activity_locale_reads_both_shapes_and_treats_blank_as_absent() {
+        assert_eq!(
+            activity_locale(&json!({ "metadata": { "locale": "nl-NL" } })),
+            Some("nl-NL")
+        );
+        assert_eq!(
+            activity_locale(&json!({ "input": { "metadata": { "locale": "en-GB" } } })),
+            Some("en-GB")
+        );
+        // The nested shape wins, matching inject_card_locale's ordering.
+        assert_eq!(
+            activity_locale(&json!({
+                "input": { "metadata": { "locale": "ja" } },
+                "metadata": { "locale": "id" },
+            })),
+            Some("ja")
+        );
+        // A blank stamp must not out-rank the deployment locale.
+        assert_eq!(
+            activity_locale(&json!({ "metadata": { "locale": "  " } })),
+            None
+        );
+        assert_eq!(
+            activity_locale(&json!({ "metadata": { "locale": "" } })),
+            None
+        );
+        assert_eq!(
+            activity_locale(&json!({ "metadata": { "locale": 7 } })),
+            None
+        );
+        assert_eq!(activity_locale(&Value::Null), None);
+        assert_eq!(activity_locale(&json!({})), None);
+    }
+
+    /// The locale table must localize, and must never be able to reintroduce
+    /// the silent-on-every-channel bug.
+    ///
+    /// Drives `user_facing_flow_failure_text_for` directly rather than the env,
+    /// so every entry is covered without an `unsafe` `set_var`.
+    #[test]
+    fn user_facing_flow_failure_text_is_localized_and_never_empty() {
+        let english = user_facing_flow_failure_text_for("en");
+        assert_eq!(english, crate::runner::i18n::FLOW_EXECUTION_FAILED_EN);
+
+        // Every shipped translation must differ from English — otherwise the
+        // table is present but not wired up, which is the bug this replaces.
+        for locale in ["id", "es", "ja", "zh"] {
+            let translated = user_facing_flow_failure_text_for(locale);
+            assert_ne!(
+                translated, english,
+                "`{locale}` must resolve to its own wording, not English"
+            );
+        }
+
+        // Region subtags and separators normalize to the primary subtag.
+        assert_eq!(user_facing_flow_failure_text_for("id-ID"), {
+            user_facing_flow_failure_text_for("id")
+        });
+        assert_eq!(user_facing_flow_failure_text_for("zh_TW"), {
+            user_facing_flow_failure_text_for("zh")
+        });
+
+        // Unknown, absent and container-default locales fall back to English
+        // rather than to nothing.
+        for locale in ["", "xx", "klingon", "C", "C.UTF-8", "POSIX"] {
+            assert_eq!(
+                user_facing_flow_failure_text_for(locale),
+                english,
+                "`{locale}` must fall back to English"
+            );
+        }
+
+        // The invariant that matters on every channel, across the whole table.
+        for locale in ["en", "id", "es", "ja", "zh", "", "xx", "C.UTF-8"] {
+            let text = user_facing_flow_failure_text_for(locale);
+            assert!(
+                !text.trim().is_empty(),
+                "`{locale}` resolved to empty text, which is silent on every channel"
+            );
+        }
     }
 
     #[test]
@@ -6892,6 +8157,276 @@ mod tests {
         assert!(mcp_tool_error(&json!({"error": "oops"})).is_none());
     }
 
+    /// `normalize_mcp_tool_error` must produce exactly the shape
+    /// `component_error` recognises, carrying the already status-qualified
+    /// message (not the raw one), and must not drop unrelated fields (e.g.
+    /// `error.status`).
+    #[test]
+    fn normalize_mcp_tool_error_matches_component_error_shape() {
+        let value = json!({
+            "error": { "code": "tool_error", "message": "boom", "status": 502 }
+        });
+        let normalized = normalize_mcp_tool_error(&value, "tool_error", "boom (status 502)");
+        assert_eq!(
+            component_error(&normalized),
+            Some(("tool_error".to_string(), "boom (status 502)".to_string())),
+            "the normalized payload must be recognised by component_error verbatim"
+        );
+        // `status` on the original error object survives the reshape.
+        assert_eq!(normalized["error"]["status"], json!(502));
+    }
+
+    /// `mcp_node::invoke_with_secrets` is infallible: every failure (no route,
+    /// missing credential, dead endpoint, bad args) comes back as
+    /// `{"error": "<string>"}` in `result`. `execute_mcp` used to report
+    /// `ok: true` regardless, so a Digital Worker run showed 33/33 green
+    /// nodes and rendered its quote card with every field blank.
+    ///
+    /// A node WITH an `on_error`-family route must now see `ok: false`, and
+    /// the failure must be normalized into `component_error`'s
+    /// `{ok:false, error:{code,message}}` shape (via `normalize_mcp_tool_error`)
+    /// so `to_node_output`/`node_output_view` populate `{errors}` exactly like
+    /// a failed component call does — one definition of what a failed node's
+    /// errors look like, not a second one for this code path.
+    ///
+    /// `bound` here has no `output:` binding key, so it degrades to the bare
+    /// tool result (`{"error": "..."}`); `mcp_node_output_preserves_the_output_binding_key`
+    /// below covers the wrapped case.
+    #[test]
+    fn mcp_node_output_reports_failure_when_the_node_has_an_error_route() {
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let bound = result.clone();
+
+        let out = mcp_node_output(bound, &result, true);
+
+        assert!(
+            !out.ok,
+            "a failed MCP call with an error route must not report ok"
+        );
+        assert_eq!(
+            component_error(&out.payload),
+            Some((
+                "mcp_call_failed".to_string(),
+                "MCP is not configured on this runner".to_string()
+            )),
+            "the payload must be recognised by component_error verbatim, got {:?}",
+            out.payload
+        );
+        assert_eq!(
+            out.meta.pointer("/error/message").and_then(Value::as_str),
+            Some("MCP is not configured on this runner"),
+            "the message must reach meta.error where lift_first_node_error_from_nodes reads it"
+        );
+
+        let view = node_output_view(&out.payload);
+        let errors = view["errors"].as_array().expect("errors must be an array");
+        assert_eq!(errors.len(), 1, "errors must be populated, got {view:?}");
+        assert_eq!(
+            errors[0]["message"], "MCP is not configured on this runner",
+            "{{{{node.<id>.errors[0].message}}}} must surface the real message"
+        );
+    }
+
+    /// The failure shape is not always a plain string: greentic-mcp-generator's
+    /// `tool_error_with_status` emits `{"error":{"code","message","status"}}`
+    /// (Phase 2's weatherapi-401 case, `mcp_tool_error_recognises_generator_error_shape`).
+    /// `mcp_node_output` must reuse `mcp_tool_error` for this shape rather than
+    /// falling into the plain-string arm, which would stuff the whole
+    /// serialized error object into `message` and discard the real
+    /// `tool_error` code for a hardcoded `mcp_call_failed`.
+    ///
+    /// Compared against calling `mcp_tool_error` directly on the same value —
+    /// not a hand-typed string — so this test cannot drift from the detector
+    /// it is supposed to match.
+    #[test]
+    fn mcp_node_output_uses_mcp_tool_error_for_the_object_shaped_error() {
+        let result = json!({
+            "error": {
+                "code": "tool_error",
+                "message": "API request returned status 401",
+                "status": 401
+            }
+        });
+        let bound = result.clone();
+
+        let (expected_code, expected_message) =
+            mcp_tool_error(&result).expect("the detector must recognise this shape");
+
+        let out = mcp_node_output(bound, &result, true);
+
+        assert!(
+            !out.ok,
+            "an object-shaped MCP tool error with an error route must not report ok"
+        );
+        assert_eq!(
+            component_error(&out.payload),
+            Some((expected_code.clone(), expected_message.clone())),
+            "the code/message must be exactly what mcp_tool_error derives, got {:?}",
+            out.payload
+        );
+        // Pin the values themselves too, so a future change to mcp_tool_error's
+        // formatting is visible here as well as in its own test.
+        assert_eq!(expected_code, "tool_error");
+        assert!(expected_message.contains("API request returned status 401"));
+        assert!(expected_message.contains("(status 401)"));
+
+        let view = node_output_view(&out.payload);
+        let errors = view["errors"].as_array().expect("errors must be an array");
+        assert_eq!(errors.len(), 1, "errors must be populated, got {view:?}");
+        assert_eq!(errors[0]["message"], expected_message);
+    }
+
+    /// The `output:` binding key wraps the tool result under a named field
+    /// (e.g. `quote_result_data`). Requirement 1 (keep the bound payload
+    /// untouched) and requirement 2 (populate `{errors}`) both hold at once:
+    /// `normalize_mcp_tool_error` is handed `bound` itself, so the wrapped
+    /// field survives verbatim alongside the new top-level `ok`/`error`
+    /// fields the errors envelope needs. `node.<id>.quote_result_data` and
+    /// `node.<id>.errors[0].message` must both resolve from the same output.
+    #[test]
+    fn mcp_node_output_preserves_the_output_binding_key_alongside_the_error_envelope() {
+        let result = json!({ "error": "connection refused" });
+        let bound = json!({ "quote_result_data": result.clone() });
+
+        let out = mcp_node_output(bound.clone(), &result, true);
+
+        assert!(!out.ok);
+        assert_eq!(
+            out.payload["quote_result_data"], result,
+            "the output-key binding must survive untouched, got {:?}",
+            out.payload
+        );
+        assert_eq!(out.payload["ok"], json!(false));
+        assert_eq!(out.payload["error"]["code"], "mcp_call_failed");
+        assert_eq!(out.payload["error"]["message"], "connection refused");
+
+        let view = node_output_view(&out.payload);
+        assert_eq!(
+            view["quote_result_data"], result,
+            "{{{{node.<id>.quote_result_data}}}} must still resolve, got {view:?}"
+        );
+        let errors = view["errors"].as_array().expect("errors must be an array");
+        assert_eq!(errors[0]["message"], "connection refused");
+    }
+
+    /// R3's answer to the third routing shape: a node whose `Routing::Custom`
+    /// carries only success-family routes (or `Routing::Next`, which never
+    /// has an error route by construction — see
+    /// `node_has_error_route_detects_error_family_ports`) has nowhere to
+    /// route a failure. `evaluate_custom_routing`'s fall-through for a
+    /// routing array with conditions but no match is `CustomRoutingDecision::
+    /// Wait`, which PARKS the run — worse than the pre-R3 silent wrong
+    /// answer for an operator who never wired up error handling. So the
+    /// failure is surfaced only when `has_error_route` is true; a node
+    /// without one keeps reporting `ok: true`, byte-for-byte the pre-R3
+    /// behaviour.
+    #[test]
+    fn mcp_node_output_ignores_failure_when_the_node_has_no_error_route() {
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let bound = json!({ "quote_result_data": result.clone() });
+
+        let out = mcp_node_output(bound.clone(), &result, false);
+
+        assert!(
+            out.ok,
+            "a node with no error route must keep reporting ok, unchanged from pre-R3"
+        );
+        assert_eq!(
+            out.payload, bound,
+            "the payload must be exactly the bound value, no envelope reshaping"
+        );
+        assert_eq!(out.meta, Value::Null);
+    }
+
+    /// The success path must stay exactly as it was, regardless of
+    /// `has_error_route`: a node that opted into error routing but whose
+    /// call succeeded must not be affected.
+    #[test]
+    fn mcp_node_output_stays_ok_on_success_regardless_of_error_route() {
+        let result = json!({ "annual_premium": 1234 });
+        let bound = json!({ "quote_result_data": result.clone() });
+
+        for has_error_route in [true, false] {
+            let out = mcp_node_output(bound.clone(), &result, has_error_route);
+            assert!(out.ok, "a successful MCP call must report ok");
+            assert_eq!(out.payload, bound);
+            assert_eq!(out.meta, Value::Null);
+        }
+    }
+
+    /// Case 2 of the third-routing-shape analysis: a node WITH an `on_error`
+    /// route takes it — this is the point of R3.
+    #[test]
+    fn mcp_failure_with_on_error_route_routes_to_the_error_branch() {
+        let raw_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok_node" },
+            { "condition": "event == \"on_error\"", "to": "err_node" }
+        ]);
+        let routing = Routing::Custom(raw_routing.clone());
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let has_error_route = node_has_error_route(&routing);
+        assert!(has_error_route);
+        let out = mcp_node_output(result.clone(), &result, has_error_route);
+
+        match evaluate_custom_routing(&raw_routing, &out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err_node"),
+            other => panic!("expected the on_error route, got {other:?}"),
+        }
+    }
+
+    /// Case 3 of the third-routing-shape analysis, pinned end to end through
+    /// `evaluate_custom_routing`: a node whose `Routing::Custom` array has
+    /// only success-family routes never flips to `ok: false`, so it stays on
+    /// the success path — never `CustomRoutingDecision::Wait` (parked).
+    #[test]
+    fn mcp_failure_with_success_only_routing_never_parks() {
+        let raw_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok_node" }
+        ]);
+        let routing = Routing::Custom(raw_routing.clone());
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let has_error_route = node_has_error_route(&routing);
+        assert!(
+            !has_error_route,
+            "a success-only Custom routing has no error branch"
+        );
+        let out = mcp_node_output(result.clone(), &result, has_error_route);
+        assert!(out.ok, "no error route means the failure is not surfaced");
+
+        match evaluate_custom_routing(&raw_routing, &out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(
+                nid.as_str(),
+                "ok_node",
+                "the flow must continue on the success path, not park"
+            ),
+            other => panic!(
+                "a node with no error route must never park on an MCP failure, got {other:?}"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn execute_non_user_facing_flow_failure_still_propagates() {
         // No session_id => internal job. Errors still propagate as Err so
@@ -6900,6 +8435,7 @@ mod tests {
         let pack_id_str = "test-pack";
         let host_flow = host_flow_for_test(flow_id_str, &["only-node"], Some("does-not-exist"));
         let engine = FlowEngine {
+            operala_node_handler: None,
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
@@ -6926,6 +8462,8 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -7148,6 +8686,12 @@ mod tests {
         );
     }
 
+    /// A node with 2+ outgoing edges compiles (in the designer) to
+    /// `event == "<outcome>"` conditions. The runner must inject `event` into
+    /// the routing context — from the node's emitted outcome, else a default
+    /// derived from `ok` — so those conditions resolve instead of falling
+    /// through to `Wait`. Without the injection, multi-edge nodes silently
+    /// pause at runtime.
     #[test]
     fn multi_edge_node_routes_on_injected_event() {
         let raw_routing = json!([
@@ -7158,8 +8702,9 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
-            slot_schema: None,
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -7179,6 +8724,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn approval_outcomes_route_three_ways() {
+        // The contract this feature exists for: an approval node's decision
+        // selects the branch. `meta["outcome"]` wins over the ok-derived
+        // default, so `ok: true` still routes to "denied" when denied.
+        let raw_routing = json!([
+            { "condition": "event == \"approved\"", "to": "do_it" },
+            { "condition": "event == \"denied\"", "to": "reject" },
+            { "condition": "event == \"timeout\"", "to": "escalate" }
+        ]);
+        let flow_ir = HostFlow {
+            slot_schema: None,
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+        };
+        let current = NodeId::from_str("gate").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        for (outcome, expected) in [
+            ("approved", "do_it"),
+            ("denied", "reject"),
+            ("timeout", "escalate"),
+        ] {
+            let out = NodeOutput::with_meta(json!({}), json!({ "outcome": outcome }));
+            match evaluate_custom_routing(&raw_routing, &out, &state, &flow_ir, &current) {
+                CustomRoutingDecision::Next(nid) => assert_eq!(
+                    nid.as_str(),
+                    expected,
+                    "outcome {outcome} must route to {expected}"
+                ),
+                other => panic!("outcome {outcome}: expected Next({expected}), got {other:?}"),
+            }
+        }
+    }
+
     /// A node whose component reports a failure (`{ok:false, error}`) and which
     /// has an `on_error`-family route must surface a node_io `Errors` output
     /// (`ok == false`) and route to that branch instead of aborting the flow.
@@ -7192,8 +8775,9 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
-            slot_schema: None,
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -7204,6 +8788,98 @@ mod tests {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err_node"),
             other => panic!("expected on_error route, got {other:?}"),
         }
+    }
+
+    /// A failure payload carrying its own `outcome` (e.g. a component that
+    /// distinguishes `on_timeout` from a generic `on_error`) must route to
+    /// THAT branch, not to the default error branch. `NodeOutput::errored`
+    /// must therefore surface `outcome` in `meta` exactly like the success
+    /// path's `outcome_meta` already does.
+    #[test]
+    fn errored_output_with_outcome_routes_to_that_branch() {
+        let raw_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok_node" },
+            { "condition": "event == \"on_timeout\"", "to": "timeout_node" },
+            { "condition": "event == \"on_error\"", "to": "err_node" }
+        ]);
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        let errored = NodeOutput::errored(json!({
+            "ok": false,
+            "outcome": "on_timeout",
+            "error": { "code": "E", "message": "m" }
+        }));
+        match evaluate_custom_routing(&raw_routing, &errored, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "timeout_node"),
+            other => panic!("expected on_timeout route, got {other:?}"),
+        }
+    }
+
+    /// `meta.error` and `meta.outcome` are competing uses of the same `meta`
+    /// field (see `NodeOutput::with_error` vs the success path's
+    /// `outcome_meta`). `NodeOutput::errored` must merge them rather than let
+    /// one clobber the other: an outcome-carrying failure payload that ALSO
+    /// carries its own `error` object must still let
+    /// `lift_first_node_error_from_nodes` read a real error message from it,
+    /// not just fall back to the generic "flow node failed" default.
+    #[test]
+    fn errored_output_preserves_meta_error_alongside_outcome() {
+        let errored = NodeOutput::errored(json!({
+            "ok": false,
+            "outcome": "on_timeout",
+            "error": { "code": "E1", "message": "boom" }
+        }));
+        assert_eq!(
+            errored.meta.get("outcome").and_then(Value::as_str),
+            Some("on_timeout"),
+            "outcome must survive so routing can pick the on_timeout branch"
+        );
+        assert_eq!(
+            errored.meta["error"]["message"], "boom",
+            "error must survive alongside outcome, not be clobbered by it"
+        );
+
+        let mut nodes: HashMap<String, NodeOutput> = HashMap::new();
+        nodes.insert("run".to_string(), errored);
+        let lifted = lift_first_node_error_from_nodes(json!({}), &nodes);
+        assert_eq!(
+            lifted["metadata"]["error_message"], "boom",
+            "lift_first_node_error_from_nodes must read the real message, not the generic fallback"
+        );
+        assert_eq!(lifted["metadata"]["node_id"], "run");
+    }
+
+    /// The plain, common `component_error` shape — `{ok:false, error:{code,message}}`,
+    /// no `outcome` — is exactly what `execute_component_call`'s `component_error`
+    /// branch actually hands to `NodeOutput::errored`. Before R2, `errored` hardcoded
+    /// `meta = Value::Null`, so this exact routed failure always surfaced the generic
+    /// "flow node failed" default here regardless of what the component said.
+    /// `errored_output_preserves_meta_error_alongside_outcome` above only covers the
+    /// outcome+error combination; this covers the far more common outcome-less one.
+    #[test]
+    fn component_error_routed_failure_surfaces_real_message_via_lift() {
+        let errored = NodeOutput::errored(json!({
+            "ok": false,
+            "error": { "code": "E1", "message": "disk full" }
+        }));
+        let mut nodes: HashMap<String, NodeOutput> = HashMap::new();
+        nodes.insert("run".to_string(), errored);
+        let lifted = lift_first_node_error_from_nodes(json!({}), &nodes);
+        assert_eq!(
+            lifted["metadata"]["error_message"], "disk full",
+            "a component_error-routed failure must surface its real message, \
+             not the generic \"flow node failed\" default"
+        );
+        assert_eq!(lifted["metadata"]["node_id"], "run");
     }
 
     #[test]
@@ -7248,8 +8924,9 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
-            slot_schema: None,
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -7288,40 +8965,106 @@ mod tests {
         }
     }
 
-    /// `evaluate_simple_condition` backs the user-authored `conditional_branch`
-    /// expressions the catalog documents (e.g. `register.q_age >= 18`,
-    /// `submit.status == "ok"`). Beyond `==`/`!=` it must handle numeric
-    /// ordering (`>=` `<=` `>` `<`) and `contains` (case-insensitive substring);
-    /// otherwise those conditions silently evaluate to false and route wrong.
+    /// `evaluate_simple_condition` is a pure expression-parser test: it checks
+    /// operator parsing over an arbitrary, hand-built JSON context. This
+    /// context is **not** the shape `build_routing_context` produces at
+    /// runtime — it is not node-keyed, and the keys below (`a`/`b`/`c`) are
+    /// deliberately arbitrary so they cannot be mistaken for node ids. For
+    /// coverage of the real routing context (prior node outputs exposed
+    /// under `node.<id>`), see
+    /// `routing_context_exposes_prior_node_outputs_under_node`.
+    ///
+    /// What this test does pin (PR #486): beyond `==`/`!=`, the parser must
+    /// handle numeric ordering (`>=` `<=` `>` `<`) and `contains`
+    /// (case-insensitive substring); otherwise those conditions silently
+    /// evaluate to false and route wrong.
     #[test]
     fn condition_evaluator_supports_comparisons_and_contains() {
         let ctx = json!({
-            "register": { "q_age": 18 },
-            "submit": { "status": "ok" },
-            "msg": { "text": "Hello World" }
+            "a": { "age": 18 },
+            "b": { "status": "ok" },
+            "c": { "text": "Hello World" }
         });
 
         // Numeric ordering (operands parsed as numbers).
-        assert!(evaluate_simple_condition("register.q_age >= 18", &ctx));
-        assert!(!evaluate_simple_condition("register.q_age > 18", &ctx));
-        assert!(evaluate_simple_condition("register.q_age <= 18", &ctx));
-        assert!(!evaluate_simple_condition("register.q_age < 18", &ctx));
+        assert!(evaluate_simple_condition("a.age >= 18", &ctx));
+        assert!(!evaluate_simple_condition("a.age > 18", &ctx));
+        assert!(evaluate_simple_condition("a.age <= 18", &ctx));
+        assert!(!evaluate_simple_condition("a.age < 18", &ctx));
 
         // contains: case-insensitive substring over the resolved string.
-        assert!(evaluate_simple_condition(
-            "msg.text contains \"world\"",
-            &ctx
-        ));
-        assert!(!evaluate_simple_condition(
-            "msg.text contains \"bye\"",
-            &ctx
-        ));
+        assert!(evaluate_simple_condition("c.text contains \"world\"", &ctx));
+        assert!(!evaluate_simple_condition("c.text contains \"bye\"", &ctx));
 
         // Existing equality semantics unchanged (regression guard).
-        assert!(evaluate_simple_condition("submit.status == \"ok\"", &ctx));
-        assert!(!evaluate_simple_condition("submit.status != \"ok\"", &ctx));
+        assert!(evaluate_simple_condition("b.status == \"ok\"", &ctx));
+        assert!(!evaluate_simple_condition("b.status != \"ok\"", &ctx));
         // A non-numeric operand on an ordering op is false, not a panic.
-        assert!(!evaluate_simple_condition("submit.status >= 1", &ctx));
+        assert!(!evaluate_simple_condition("b.status >= 1", &ctx));
+    }
+
+    /// A routing condition must be able to read ANY prior node's output, not
+    /// just the immediate predecessor's payload. `state.nodes` has always held
+    /// them; the routing context simply never exposed them, so
+    /// `node.<id>.<field>` resolved to nothing and the guard silently took the
+    /// false branch on every input.
+    ///
+    /// This drives the REAL `build_routing_context` — see
+    /// `condition_evaluator_supports_comparisons_and_contains` for why a
+    /// hand-built context proves nothing here.
+    #[test]
+    fn routing_context_exposes_prior_node_outputs_under_node() {
+        let mut state = ExecutionState::new(json!({}));
+        state
+            .nodes
+            .insert("register".into(), NodeOutput::new(json!({ "q_age": 21 })));
+
+        let current = NodeOutput::new(json!({ "status": "ok" }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        // The cross-node form, matching `{{node.<id>.<field>}}` in params.
+        assert!(
+            evaluate_simple_condition("node.register.q_age >= 18", &ctx),
+            "a prior node's output must be readable via node.<id>.<field>: {ctx:?}"
+        );
+        // The node_io envelope resolves too — same projection as params.
+        assert!(
+            evaluate_simple_condition("node.register.data.q_age >= 18", &ctx),
+            "the data envelope must resolve like it does in params: {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn routing_context_keeps_the_predecessor_shorthand() {
+        // Negative-ish: the existing form must not regress. The current node's
+        // payload stays spread at the top level, which is what PR #665's
+        // source-node prefix strip relies on.
+        let mut state = ExecutionState::new(json!({}));
+        state
+            .nodes
+            .insert("register".into(), NodeOutput::new(json!({ "q_age": 21 })));
+
+        let current = NodeOutput::new(json!({ "q_age": 30 }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        assert!(
+            evaluate_simple_condition("q_age >= 30", &ctx),
+            "the bare form must still resolve against the current payload: {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn routing_context_does_not_resolve_a_missing_node() {
+        // Negative: a ref to a node with no output must NOT resolve — it must
+        // stay false, not accidentally match something.
+        let state = ExecutionState::new(json!({}));
+        let current = NodeOutput::new(json!({ "status": "ok" }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        assert!(
+            !evaluate_simple_condition("node.ghost.x == \"y\"", &ctx),
+            "a missing node must not resolve: {ctx:?}"
+        );
     }
 
     /// Symmetric to the success default: when a node FAILS (`ok == false`)
@@ -7335,8 +9078,9 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
-            slot_schema: None,
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -7612,7 +9356,6 @@ mod tests {
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
             messaging_provider_pack_ids: std::collections::HashSet::new(),
-            rollout_ids: RolloutIds::default(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: "e2e-pack".to_string(),
@@ -7625,6 +9368,7 @@ mod tests {
                 mode: crate::validate::ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: Some(
                 nats_engine_dispatcher
                     as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
@@ -7633,6 +9377,8 @@ mod tests {
             agent_node_handler: None,
             graph_node_handler: None,
             mcp_tool_source: None,
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
 
         let ctx = FlowContext {
@@ -7882,6 +9628,51 @@ mod tests {
     }
 
     #[test]
+    fn seed_vars_seeds_defaults_and_reports_missing_required() {
+        use serde_json::json;
+        let mut vars_init = JsonMap::new();
+        vars_init.insert("region".into(), json!("us-east-1"));
+
+        // "name" is required but has no default; "region" required WITH a default.
+        let required = vec!["name".to_string(), "region".to_string()];
+        let mut target = JsonMap::new();
+
+        let missing = seed_vars_and_collect_missing_required(&vars_init, &required, &mut target);
+
+        assert_eq!(
+            target.get("region"),
+            Some(&json!("us-east-1")),
+            "default seeded"
+        );
+        assert_eq!(
+            missing,
+            vec!["name".to_string()],
+            "only the defaultless required var is missing"
+        );
+    }
+
+    #[test]
+    fn seed_vars_respects_preexisting_value_for_required() {
+        use serde_json::json;
+        let vars_init = JsonMap::new(); // no defaults declared
+        let required = vec!["name".to_string()];
+        let mut target = JsonMap::new();
+        target.insert("name".into(), json!("Budi")); // operator-provided value already present
+
+        let missing = seed_vars_and_collect_missing_required(&vars_init, &required, &mut target);
+
+        assert!(
+            missing.is_empty(),
+            "a required var with a provided value is not missing"
+        );
+        assert_eq!(
+            target.get("name"),
+            Some(&json!("Budi")),
+            "provided value not overwritten"
+        );
+    }
+
+    #[test]
     fn from_flow_extracts_vars_init() {
         let flow = flow_with_extra(serde_json::json!({
             "vars_init": {
@@ -7902,6 +9693,133 @@ mod tests {
         let flow = flow_with_extra(serde_json::json!({}));
         let host: HostFlow = HostFlow::from(flow);
         assert!(host.vars_init.is_empty());
+    }
+
+    #[test]
+    fn from_flow_collects_required_vars() {
+        let flow = flow_with_extra(serde_json::json!({
+            "vars_init": {
+                "name":   { "type": "string", "required": true },
+                "region": { "type": "string", "default": "us-east-1" },
+                "note":   { "type": "string", "required": false }
+            }
+        }));
+        let host: HostFlow = HostFlow::from(flow);
+        assert_eq!(host.required_vars, vec!["name".to_string()]);
+    }
+
+    #[test]
+    fn execute_once_fails_on_missing_required_var() {
+        let node_id = NodeId::from_str("n1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "{{vars.region}}" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("vars.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({
+                    "vars_init": {
+                        "region": { "type": "string", "required": true }
+                    }
+                }),
+            },
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "vars.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
+        };
+
+        let observer = CountingObserver::new();
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "vars.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer),
+            mocks: None,
+            caller: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let err = rt
+            .block_on(engine.execute(ctx, Value::Null))
+            .expect_err("a required var with no default and no value must fail the run");
+        let msg = err.to_string();
+        assert!(msg.contains("region"), "error names the missing var: {msg}");
+        assert!(
+            !should_retry(&err),
+            "missing-required-var is deterministic and must not be retried"
+        );
+        assert!(
+            observer.ends.lock().unwrap().is_empty(),
+            "flow aborted before the node ran"
+        );
     }
 
     #[test]
@@ -7954,11 +9872,11 @@ mod tests {
         let host_flow = HostFlow::from(flow);
 
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
-            messaging_provider_pack_ids: std::collections::HashSet::new(),
-            rollout_ids: RolloutIds::default(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -7980,6 +9898,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
 
         let observer = CountingObserver::new();
@@ -8099,11 +10020,11 @@ mod tests {
     fn run_var_set_flow(flow: Flow) -> (FlowStatus, Vec<Value>) {
         let host_flow = HostFlow::from(flow);
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
-            messaging_provider_pack_ids: std::collections::HashSet::new(),
-            rollout_ids: RolloutIds::default(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -8125,6 +10046,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -8429,6 +10353,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vars_out_is_stripped_from_component_node_payload() {
+        // A component (non-emit) node whose input.mapping contains both a
+        // real field ("message") and the internal "vars_out" meta-key must NOT
+        // forward "vars_out" as part of its payload_expr. This prevents the key
+        // from leaking into wasm components with strict additionalProperties schemas.
+        //
+        // We use a PackComponent-style node (component ref = "my.component") so
+        // the non-emit arm of `impl From<Node> for HostNode` is exercised.
+        let node_id = NodeId::from_str("comp1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "my.component".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({
+                    "message": "hello",
+                    "vars_out": { "lastReply": "{{prev.message}}" }
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let host_node = HostNode::from(node);
+
+        // The vars_out binding must be preserved on the HostNode itself.
+        assert!(
+            host_node.vars_out.is_some(),
+            "vars_out binding must be carried on the HostNode"
+        );
+        assert!(
+            host_node
+                .vars_out
+                .as_ref()
+                .unwrap()
+                .contains_key("lastReply"),
+            "vars_out must contain the declared binding"
+        );
+
+        // The payload_expr must NOT contain the "vars_out" key.
+        assert!(
+            host_node.payload_expr.get("vars_out").is_none(),
+            "vars_out must not appear in payload_expr (would leak to wasm component input)"
+        );
+
+        // The real input field must still be present in the payload_expr.
+        assert_eq!(
+            host_node
+                .payload_expr
+                .get("message")
+                .and_then(Value::as_str),
+            Some("hello"),
+            "real input fields must remain in payload_expr"
+        );
+    }
+
+    #[test]
+    fn dotted_component_id_is_not_split_when_mapping_carries_operation() {
+        // packc sets `node.component.operation = None` to mean "the id is already
+        // complete" (normalize_legacy_component_exec_ids), and puts the operation in
+        // input.mapping. Lowering must therefore keep the reverse-DNS id intact and
+        // take the operation from the mapping. Splitting on the last dot yields a
+        // component_ref that is by construction absent from the pack's component map,
+        // so the node fails with "component '<truncated>' not found in pack".
+        let node_id = NodeId::from_str("present_koncar").unwrap();
+        let node = Node {
+            id: node_id,
+            component: FlowComponentRef {
+                id: "ai.greentic.koncar.component-present".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({
+                    "component": "ai.greentic.koncar.component-present",
+                    "operation": "present",
+                    "query": "hello"
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let host_node = HostNode::from(node);
+
+        assert_eq!(
+            host_node.component_id(),
+            "ai.greentic.koncar.component-present",
+            "dotted component id must survive lowering intact"
+        );
+        match &host_node.kind {
+            NodeKind::PackComponent { component_ref } => assert_eq!(
+                component_ref, "ai.greentic.koncar.component-present",
+                "PackComponent must look up the full id, not a dot-split prefix"
+            ),
+            other => panic!("expected NodeKind::PackComponent, got {other:?}"),
+        }
+        assert_eq!(
+            host_node.operation_in_mapping(),
+            Some("present"),
+            "the operation must still be readable from the mapping"
+        );
+    }
+
     /// Build a three-node flow: var_set → session.wait → emit.log.
     /// `vars_init` seeds `counter = 1`; `var_set` writes `greeting = "hello"`.
     /// The wait parks the flow; resume runs emit.log which reads both vars.
@@ -8537,11 +10579,11 @@ mod tests {
         let flow_id = "vars.survive.flow";
         let pack_id = "test-pack";
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
-            messaging_provider_pack_ids: std::collections::HashSet::new(),
-            rollout_ids: RolloutIds::default(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: pack_id.to_string(),
@@ -8563,6 +10605,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
 
@@ -8646,185 +10691,188 @@ mod tests {
         );
     }
 
-    // ── Conversational `dw.agent` park-and-loop harness — PORT PENDING ─────
-    //
-    // These tests encode the RESEARCH lane's behaviour: a conversational
-    // `dw.agent` node parks after every reply and re-enters itself until the
-    // agent emits `conversation_ended`, with `MAX_PARK_TURNS` as the safety
-    // backstop. This lane's engine carries none of it — `NodeKind::DwAgent`
-    // has no `conversational` flag, `dispatch_node` has no conversational
-    // branch, and `NodeControl` has no `LoopHere`/`AwaitHere` variants for
-    // such a branch to return. `FlowState::park_turns` survives only as
-    // snapshot-compatibility ballast; no lib code ever bumps it.
-    //
-    // While `agentic-worker` was a stub these tests were invisible: nothing
-    // here compiled, so the gap read as covered. Turning the feature back on
-    // exposed that. They are kept verbatim behind their own off-by-default
-    // feature so the debt is explicit and the spec survives for whoever ports
-    // the park-loop. It is a bare cfg rather than a cargo feature because CI
-    // builds `--all-features`, which would switch a feature on; build it with
-    // `RUSTFLAGS="--cfg conversational_dw_agent_port"`, and expect it NOT to
-    // compile until the port lands — that is the point.
-    #[cfg(conversational_dw_agent_port)]
-    mod conversational_dw_agent {
-        use super::*;
-
-        #[cfg(feature = "agentic-worker")]
-        struct StubAgentHandler {
-            payload: serde_json::Value,
+    #[cfg(feature = "agentic-worker")]
+    struct StubAgentHandler {
+        payload: serde_json::Value,
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for StubAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+            _conversational: bool,
+            _caller: Option<&serde_json::Value>,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self.payload.clone())
         }
-        #[cfg(feature = "agentic-worker")]
-        #[async_trait::async_trait]
-        impl crate::runner::agent_node::AgentNodeHandler for StubAgentHandler {
-            async fn execute(
-                &self,
-                _tenant_id: &str,
-                _env_id: &str,
-                _agent_id: &str,
-                _session_id: &str,
-                _flow_input: &serde_json::Value,
-                _conversational: bool,
-            ) -> anyhow::Result<serde_json::Value> {
-                Ok(self.payload.clone())
-            }
-        }
+    }
 
-        /// Build a 2-node flow: a `dw.agent` node (id "agent", conversational as
-        /// given) routing to an emit "thanks" node that ends the flow.
-        #[cfg(feature = "agentic-worker")]
-        fn conversational_dw_flow(conversational: bool) -> HostFlow {
-            let mut nodes = IndexMap::new();
-            let agent_id = NodeId::from_str("agent").unwrap();
-            let thanks_id = NodeId::from_str("thanks").unwrap();
-            nodes.insert(
-                agent_id.clone(),
-                HostNode {
-                    kind: NodeKind::DwAgent {
-                        agent_id: "a".to_string(),
-                        conversational,
-                    },
-                    component: "dw.agent".to_string(),
-                    component_id: "dw.agent".to_string(),
-                    operation_name: Some("a".to_string()),
-                    operation_in_mapping: None,
-                    payload_expr: json!({ "user_text": "hi" }),
-                    routing: Routing::Next {
-                        node_id: thanks_id.clone(),
-                    },
-                    vars_out: None,
+    /// Build a 2-node flow: a `dw.agent` node (id "agent", conversational as
+    /// given) routing to an emit "thanks" node that ends the flow.
+    #[cfg(feature = "agentic-worker")]
+    fn conversational_dw_flow(conversational: bool) -> HostFlow {
+        let mut nodes = IndexMap::new();
+        let agent_id = NodeId::from_str("agent").unwrap();
+        let thanks_id = NodeId::from_str("thanks").unwrap();
+        nodes.insert(
+            agent_id.clone(),
+            HostNode {
+                kind: NodeKind::DwAgent {
+                    agent_id: "a".to_string(),
+                    conversational,
                 },
-            );
-            nodes.insert(
-                thanks_id.clone(),
-                HostNode {
-                    kind: NodeKind::BuiltinEmit {
-                        kind: EmitKind::Response,
-                    },
-                    component: "emit.response".to_string(),
-                    component_id: "emit.response".to_string(),
-                    operation_name: None,
-                    operation_in_mapping: None,
-                    payload_expr: json!({ "text": "thanks" }),
-                    routing: Routing::End,
-                    vars_out: None,
+                component: "dw.agent".to_string(),
+                component_id: "dw.agent".to_string(),
+                operation_name: Some("a".to_string()),
+                operation_in_mapping: None,
+                payload_expr: json!({ "user_text": "hi" }),
+                routing: Routing::Next {
+                    node_id: thanks_id.clone(),
                 },
-            );
-            HostFlow {
-                slot_schema: None,
-                id: "conv.flow".to_string(),
-                start: Some(agent_id),
-                nodes,
-                vars_init: JsonMap::new(),
-                required_vars: Vec::new(),
-            }
-        }
-
-        /// Build an engine holding `flow` with a stub agent handler returning `payload`.
-        /// Mirrors the FlowEngine literal in `vars_survive_park_and_resume_end_to_end`.
-        #[cfg(feature = "agentic-worker")]
-        fn conv_engine(flow: HostFlow, payload: serde_json::Value) -> FlowEngine {
-            FlowEngine {
-                rollout_ids: RolloutIds::default(),
-                packs: Vec::new(),
-                flows: Vec::new(),
-                flow_sources: StdHashMap::new(),
-                flow_cache: RwLock::new(StdHashMap::from([(
-                    FlowKey {
-                        pack_id: "test-pack".to_string(),
-                        flow_id: "conv.flow".to_string(),
-                    },
-                    flow,
-                )])),
-                default_env: "local".to_string(),
-                validation: ValidationConfig {
-                    mode: ValidationMode::Off,
+                vars_out: None,
+            },
+        );
+        nodes.insert(
+            thanks_id.clone(),
+            HostNode {
+                kind: NodeKind::BuiltinEmit {
+                    kind: EmitKind::Response,
                 },
-                cross_pack_resolver: None,
-                remote_dispatch_handler: None,
-                dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
-                agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
-                graph_node_handler: None,
-                mcp_tool_source: None,
-            }
+                component: "emit.response".to_string(),
+                component_id: "emit.response".to_string(),
+                operation_name: None,
+                operation_in_mapping: None,
+                payload_expr: json!({ "text": "thanks" }),
+                routing: Routing::End,
+                vars_out: None,
+            },
+        );
+        HostFlow {
+            slot_schema: None,
+            id: "conv.flow".to_string(),
+            start: Some(agent_id),
+            nodes,
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
         }
+    }
 
-        #[cfg(feature = "agentic-worker")]
-        fn conv_ctx<'a>() -> FlowContext<'a> {
-            FlowContext {
-                tenant: "demo",
-                pack_id: "test-pack",
-                flow_id: "conv.flow",
-                node_id: None,
-                tool: None,
-                action: None,
-                session_id: Some("sess-conv"),
-                provider_id: None,
-                reply_scope: None,
-                retry_config: RetryConfig {
-                    max_attempts: 1,
-                    base_delay_ms: 1,
+    /// Build an engine holding `flow` with a stub agent handler returning `payload`.
+    /// Mirrors the FlowEngine literal in `vars_survive_park_and_resume_end_to_end`.
+    #[cfg(feature = "agentic-worker")]
+    fn conv_engine(flow: HostFlow, payload: serde_json::Value) -> FlowEngine {
+        FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
                 },
-                attempt: 1,
-                observer: None,
-                mocks: None,
-            }
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
+            graph_node_handler: None,
+            mcp_tool_source: None,
+            mcp_secrets: None,
+            operala_node_handler: None,
         }
+    }
 
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_parks_and_loops_on_normal_reply() {
+    #[cfg(feature = "agentic-worker")]
+    fn conv_ctx<'a>() -> FlowContext<'a> {
+        FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "conv.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-conv"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+            caller: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_parks_and_loops_on_normal_reply() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
+        );
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (park-loop), got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "must re-enter the dw.agent node itself"
+        );
+        // The reply is rendered in the parked output.
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("hello there"),
+            "the agent reply must be rendered before parking: {:?}",
+            result.output
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_advances_on_conversation_ended() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
+        );
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "conversation_ended must advance to the successor and complete, got {:?}",
+            result.status
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn non_conversational_dw_agent_never_loops() {
+        // Even with terminated_by == conversation_ended, a non-conversational
+        // node just routes onward (today's one-shot behaviour) — never parks.
+        for tb in ["final_reply", "conversation_ended"] {
             let engine = conv_engine(
-                conversational_dw_flow(true),
-                json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
-            );
-            let rt = Runtime::new().unwrap();
-            let result = rt
-                .block_on(engine.execute(conv_ctx(), Value::Null))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("expected Waiting (park-loop), got {other:?}"),
-            };
-            assert_eq!(
-                snapshot.next_node, "agent",
-                "must re-enter the dw.agent node itself"
-            );
-            // The reply is rendered in the parked output.
-            assert!(
-                serde_json::to_string(&result.output)
-                    .unwrap()
-                    .contains("hello there"),
-                "the agent reply must be rendered before parking: {:?}",
-                result.output
-            );
-        }
-
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_advances_on_conversation_ended() {
-            let engine = conv_engine(
-                conversational_dw_flow(true),
-                json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
+                conversational_dw_flow(false),
+                json!({ "reply": "x", "trail": [], "terminated_by": tb }),
             );
             let rt = Runtime::new().unwrap();
             let result = rt
@@ -8832,352 +10880,300 @@ mod tests {
                 .unwrap();
             assert!(
                 matches!(result.status, FlowStatus::Completed),
-                "conversation_ended must advance to the successor and complete, got {:?}",
+                "non-conversational must complete (route onward) for terminated_by={tb}, got {:?}",
                 result.status
             );
         }
+    }
 
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn non_conversational_dw_agent_never_loops() {
-            // Even with terminated_by == conversation_ended, a non-conversational
-            // node just routes onward (today's one-shot behaviour) — never parks.
-            for tb in ["final_reply", "conversation_ended"] {
-                let engine = conv_engine(
-                    conversational_dw_flow(false),
-                    json!({ "reply": "x", "trail": [], "terminated_by": tb }),
-                );
-                let rt = Runtime::new().unwrap();
-                let result = rt
-                    .block_on(engine.execute(conv_ctx(), Value::Null))
-                    .unwrap();
-                assert!(
-                    matches!(result.status, FlowStatus::Completed),
-                    "non-conversational must complete (route onward) for terminated_by={tb}, got {:?}",
-                    result.status
-                );
-            }
-        }
+    /// Safety-backstop behavioral test: a conversational `dw.agent` that
+    /// never emits `conversation_ended` must keep parking up to
+    /// `MAX_PARK_TURNS` turns, then force-advance to the successor instead
+    /// of trapping the flow forever.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_force_advances_after_park_loop_cap() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "still thinking", "trail": [], "terminated_by": "final_reply" }),
+        );
+        let rt = Runtime::new().unwrap();
 
-        /// Safety-backstop behavioral test: a conversational `dw.agent` that
-        /// never emits `conversation_ended` must keep parking up to
-        /// `MAX_PARK_TURNS` turns, then force-advance to the successor instead
-        /// of trapping the flow forever.
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_force_advances_after_park_loop_cap() {
-            let engine = conv_engine(
-                conversational_dw_flow(true),
-                json!({ "reply": "still thinking", "trail": [], "terminated_by": "final_reply" }),
-            );
-            let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let mut snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1, got {other:?}"),
+        };
 
-            let result = rt
-                .block_on(engine.execute(conv_ctx(), Value::Null))
-                .unwrap();
-            let mut snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("expected Waiting after turn 1, got {other:?}"),
-            };
-
-            // Turns 2..MAX_PARK_TURNS (exclusive) must keep parking.
-            for turn in 2..MAX_PARK_TURNS {
-                let result = rt
-                    .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
-                    .unwrap();
-                snapshot = match result.status {
-                    FlowStatus::Waiting(w) => w.snapshot,
-                    other => panic!("expected Waiting at turn {turn}, got {other:?}"),
-                };
-            }
-
-            // The MAX_PARK_TURNS-th turn must force-advance instead of parking again.
+        // Turns 2..MAX_PARK_TURNS (exclusive) must keep parking.
+        for turn in 2..MAX_PARK_TURNS {
             let result = rt
                 .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
                 .unwrap();
-            assert!(
-                matches!(result.status, FlowStatus::Completed),
-                "park-loop cap must force-advance to the successor at turn {MAX_PARK_TURNS}, got {:?}",
-                result.status
-            );
+            snapshot = match result.status {
+                FlowStatus::Waiting(w) => w.snapshot,
+                other => panic!("expected Waiting at turn {turn}, got {other:?}"),
+            };
         }
 
-        // ── NATS conversational `dw.agent` park-loop (Task 6) ──────────────────
-        //
-        // These tests drive the SAME `conversational_dw_flow`/`conv_ctx` harness as
-        // the in-process tests above, but with `DwAgentDispatch::Nats` and a stub
-        // `RemoteDispatchHandler` that never touches a live NATS server — it just
-        // records the dispatch and immediately returns `AwaitingResponse`, exactly
-        // like `dw_agent_nats_mode_dispatches_remote` above. The "NATS response
-        // arriving" half of the round trip is simulated by calling `engine.resume`
-        // directly with a hand-built envelope `{ok, output, events, error}` — the
-        // exact shape `dispatch_listener::decode_response` builds and that lands in
-        // `state.entry` on a real resume (spike finding §Q2). No live NATS server is
-        // needed or used.
+        // The MAX_PARK_TURNS-th turn must force-advance instead of parking again.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "park-loop cap must force-advance to the successor at turn {MAX_PARK_TURNS}, got {:?}",
+            result.status
+        );
+    }
 
-        /// Records every dispatch and immediately returns `AwaitingResponse`, so the
-        /// engine parks without a live NATS server. Mirrors `RecordingDispatcher` in
-        /// `dw_agent_nats_mode_dispatches_remote`, kept separate (and named for
-        /// re-use across the tests below) since three tests share it.
-        #[cfg(feature = "agentic-worker")]
-        struct ScriptedNatsDispatcher {
-            calls: Mutex<Vec<crate::runner::remote_dispatch::RemoteDispatch>>,
-        }
+    // ── NATS conversational `dw.agent` park-loop (Task 6) ──────────────────
+    //
+    // These tests drive the SAME `conversational_dw_flow`/`conv_ctx` harness as
+    // the in-process tests above, but with `DwAgentDispatch::Nats` and a stub
+    // `RemoteDispatchHandler` that never touches a live NATS server — it just
+    // records the dispatch and immediately returns `AwaitingResponse`, exactly
+    // like `dw_agent_nats_mode_dispatches_remote` above. The "NATS response
+    // arriving" half of the round trip is simulated by calling `engine.resume`
+    // directly with a hand-built envelope `{ok, output, events, error}` — the
+    // exact shape `dispatch_listener::decode_response` builds and that lands in
+    // `state.entry` on a real resume (spike finding §Q2). No live NATS server is
+    // needed or used.
 
-        #[cfg(feature = "agentic-worker")]
-        #[async_trait::async_trait]
-        impl crate::runner::remote_dispatch::RemoteDispatchHandler for ScriptedNatsDispatcher {
-            async fn dispatch(
-                &self,
-                request: crate::runner::remote_dispatch::RemoteDispatch,
-            ) -> anyhow::Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
-                let correlation_id = request.correlation_id.clone();
-                self.calls.lock().unwrap().push(request);
-                Ok(
-                    crate::runner::remote_dispatch::RemoteDispatchAction::AwaitingResponse {
-                        correlation_id,
-                    },
-                )
-            }
-        }
+    /// Records every dispatch and immediately returns `AwaitingResponse`, so the
+    /// engine parks without a live NATS server. Mirrors `RecordingDispatcher` in
+    /// `dw_agent_nats_mode_dispatches_remote`, kept separate (and named for
+    /// re-use across the tests below) since three tests share it.
+    #[cfg(feature = "agentic-worker")]
+    struct ScriptedNatsDispatcher {
+        calls: Mutex<Vec<crate::runner::remote_dispatch::RemoteDispatch>>,
+    }
 
-        /// Build an engine holding `flow` in `DwAgentDispatch::Nats` mode, wired to
-        /// `dispatcher`. Mirrors `conv_engine` (the in-process counterpart) so the
-        /// two harnesses are structurally comparable.
-        #[cfg(feature = "agentic-worker")]
-        fn nats_conv_engine(
-            flow: HostFlow,
-            dispatcher: std::sync::Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
-        ) -> FlowEngine {
-            FlowEngine {
-                rollout_ids: RolloutIds::default(),
-                packs: Vec::new(),
-                flows: Vec::new(),
-                flow_sources: StdHashMap::new(),
-                flow_cache: RwLock::new(StdHashMap::from([(
-                    FlowKey {
-                        pack_id: "test-pack".to_string(),
-                        flow_id: "conv.flow".to_string(),
-                    },
-                    flow,
-                )])),
-                default_env: "local".to_string(),
-                validation: ValidationConfig {
-                    mode: ValidationMode::Off,
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::remote_dispatch::RemoteDispatchHandler for ScriptedNatsDispatcher {
+        async fn dispatch(
+            &self,
+            request: crate::runner::remote_dispatch::RemoteDispatch,
+        ) -> anyhow::Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+            let correlation_id = request.correlation_id.clone();
+            self.calls.lock().unwrap().push(request);
+            Ok(
+                crate::runner::remote_dispatch::RemoteDispatchAction::AwaitingResponse {
+                    correlation_id,
                 },
-                cross_pack_resolver: None,
-                remote_dispatch_handler: Some(dispatcher),
-                dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::Nats,
-                agent_node_handler: None,
-                graph_node_handler: None,
-                mcp_tool_source: None,
-            }
+            )
         }
+    }
 
-        /// Build the envelope a real NATS response resume lands in `state.entry`,
-        /// per spike finding §Q2: `{ok, output: {reply, trail, terminated_by},
-        /// events, error}` (mirrors `dispatch_listener::decode_response`).
-        #[cfg(feature = "agentic-worker")]
-        fn agent_response_envelope(reply: &str, terminated_by: &str) -> Value {
-            json!({
-                "ok": true,
-                "output": { "reply": reply, "trail": [], "terminated_by": terminated_by },
-                "events": [],
-                "error": Value::Null,
-            })
+    /// Build an engine holding `flow` in `DwAgentDispatch::Nats` mode, wired to
+    /// `dispatcher`. Mirrors `conv_engine` (the in-process counterpart) so the
+    /// two harnesses are structurally comparable.
+    #[cfg(feature = "agentic-worker")]
+    fn nats_conv_engine(
+        flow: HostFlow,
+        dispatcher: std::sync::Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
+    ) -> FlowEngine {
+        FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: Some(dispatcher),
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::Nats,
+            agent_node_handler: None,
+            graph_node_handler: None,
+            mcp_tool_source: None,
+            mcp_secrets: None,
+            operala_node_handler: None,
         }
+    }
 
-        /// Turn 1 (fresh, no prior await marker): the conversational Nats arm must
-        /// mark the pending await, dispatch to NATS exactly once, and park via
-        /// `NodeControl::AwaitHere` — resuming at the node itself (not the routing
-        /// successor) with no reply surfaced yet (the response hasn't arrived).
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_nats_turn1_parks_via_await_here() {
-            let dispatcher = Arc::new(ScriptedNatsDispatcher {
-                calls: Mutex::new(vec![]),
-            });
-            let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
-            let rt = Runtime::new().unwrap();
+    /// Build the envelope a real NATS response resume lands in `state.entry`,
+    /// per spike finding §Q2: `{ok, output: {reply, trail, terminated_by},
+    /// events, error}` (mirrors `dispatch_listener::decode_response`).
+    #[cfg(feature = "agentic-worker")]
+    fn agent_response_envelope(reply: &str, terminated_by: &str) -> Value {
+        json!({
+            "ok": true,
+            "output": { "reply": reply, "trail": [], "terminated_by": terminated_by },
+            "events": [],
+            "error": Value::Null,
+        })
+    }
 
-            let result = rt
-                .block_on(engine.execute(conv_ctx(), Value::Null))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("expected Waiting after fresh dispatch, got {other:?}"),
-            };
-            assert_eq!(
-                snapshot.next_node, "agent",
-                "AwaitHere must resume at self, not the routing successor"
-            );
-            assert_eq!(
-                dispatcher.calls.lock().unwrap().len(),
-                1,
-                "a fresh user turn must dispatch to NATS exactly once"
-            );
-            assert_eq!(
-                result.output,
-                Value::Null,
-                "no reply is known yet on the initial dispatch — the async response hasn't arrived"
-            );
-        }
+    /// Turn 1 (fresh, no prior await marker): the conversational Nats arm must
+    /// mark the pending await, dispatch to NATS exactly once, and park via
+    /// `NodeControl::AwaitHere` — resuming at the node itself (not the routing
+    /// successor) with no reply surfaced yet (the response hasn't arrived).
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_turn1_parks_via_await_here() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
 
-        /// Full turn cycle, behavioral: fresh dispatch → AwaitHere park; simulated
-        /// "not ended" NATS response resume → LoopHere park (reply surfaced,
-        /// session-keyed park awaiting the next user message); a user-reply resume
-        /// dispatches to NATS again; a `conversation_ended` response resume →
-        /// Completed (advanced to the successor). This is the exact turn-by-turn
-        /// script called for in Task 6's brief.
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_nats_park_loop_full_turn_cycle() {
-            let dispatcher = Arc::new(ScriptedNatsDispatcher {
-                calls: Mutex::new(vec![]),
-            });
-            let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
-            let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after fresh dispatch, got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "AwaitHere must resume at self, not the routing successor"
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1,
+            "a fresh user turn must dispatch to NATS exactly once"
+        );
+        assert_eq!(
+            result.output,
+            Value::Null,
+            "no reply is known yet on the initial dispatch — the async response hasn't arrived"
+        );
+    }
 
-            // Turn 1: fresh user turn → dispatch to NATS → AwaitHere (self, park).
-            let result = rt
-                .block_on(engine.execute(conv_ctx(), Value::Null))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => {
-                    panic!("expected Waiting (AwaitHere) after turn 1 dispatch, got {other:?}")
-                }
-            };
-            assert_eq!(snapshot.next_node, "agent");
-            assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
+    /// Full turn cycle, behavioral: fresh dispatch → AwaitHere park; simulated
+    /// "not ended" NATS response resume → LoopHere park (reply surfaced,
+    /// session-keyed park awaiting the next user message); a user-reply resume
+    /// dispatches to NATS again; a `conversation_ended` response resume →
+    /// Completed (advanced to the successor). This is the exact turn-by-turn
+    /// script called for in Task 6's brief.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_park_loop_full_turn_cycle() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
 
-            // Simulated NATS response resume, "not ended": LoopHere (session-keyed
-            // park awaiting the next user message), reply surfaced.
-            let result = rt
-                .block_on(engine.resume(
-                    conv_ctx(),
-                    snapshot,
-                    agent_response_envelope("hello there", "final_reply"),
-                ))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => {
-                    panic!("expected Waiting (LoopHere) after not-ended response, got {other:?}")
-                }
-            };
-            assert_eq!(
-                snapshot.next_node, "agent",
-                "LoopHere also re-enters the node itself"
-            );
-            assert!(
-                serde_json::to_string(&result.output)
-                    .unwrap()
-                    .contains("hello there"),
-                "the agent's reply must be surfaced once the response resume lands: {:?}",
-                result.output
-            );
-            assert_eq!(
-                dispatcher.calls.lock().unwrap().len(),
-                1,
-                "the response landing must not itself trigger another NATS dispatch"
-            );
+        // Turn 1: fresh user turn → dispatch to NATS → AwaitHere (self, park).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after turn 1 dispatch, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "agent");
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
 
-            // User-reply resume: a fresh user turn dispatches to NATS again.
-            let result = rt
-                .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "user says more" })))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => {
-                    panic!("expected Waiting (AwaitHere) after turn 2 dispatch, got {other:?}")
-                }
-            };
-            assert_eq!(snapshot.next_node, "agent");
-            assert_eq!(
-                dispatcher.calls.lock().unwrap().len(),
-                2,
-                "a second fresh user turn must dispatch to NATS again"
-            );
+        // Simulated NATS response resume, "not ended": LoopHere (session-keyed
+        // park awaiting the next user message), reply surfaced.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("hello there", "final_reply"),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (LoopHere) after not-ended response, got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "LoopHere also re-enters the node itself"
+        );
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("hello there"),
+            "the agent's reply must be surfaced once the response resume lands: {:?}",
+            result.output
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1,
+            "the response landing must not itself trigger another NATS dispatch"
+        );
 
-            // Simulated NATS response resume, `conversation_ended`: advance to the
-            // successor and complete.
-            let result = rt
-                .block_on(engine.resume(
-                    conv_ctx(),
-                    snapshot,
-                    agent_response_envelope("bye", "conversation_ended"),
-                ))
-                .unwrap();
-            assert!(
-                matches!(result.status, FlowStatus::Completed),
-                "conversation_ended response must advance to the successor and complete, got {:?}",
-                result.status
-            );
-            assert_eq!(
-                dispatcher.calls.lock().unwrap().len(),
-                2,
-                "conversation end must not trigger another NATS dispatch"
-            );
-        }
+        // User-reply resume: a fresh user turn dispatches to NATS again.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "user says more" })))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after turn 2 dispatch, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "agent");
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "a second fresh user turn must dispatch to NATS again"
+        );
 
-        /// Safety-backstop parity with the in-process cap test: a NATS
-        /// conversational `dw.agent` whose response never carries
-        /// `conversation_ended` must keep parking (dispatch → AwaitHere →
-        /// response-resume → LoopHere) up to `MAX_PARK_TURNS` "not ended" responses,
-        /// then force-advance to the successor instead of trapping the flow.
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_nats_force_advances_after_park_loop_cap() {
-            let dispatcher = Arc::new(ScriptedNatsDispatcher {
-                calls: Mutex::new(vec![]),
-            });
-            let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
-            let rt = Runtime::new().unwrap();
+        // Simulated NATS response resume, `conversation_ended`: advance to the
+        // successor and complete.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("bye", "conversation_ended"),
+            ))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "conversation_ended response must advance to the successor and complete, got {:?}",
+            result.status
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "conversation end must not trigger another NATS dispatch"
+        );
+    }
 
-            // Turn 1: fresh dispatch (does not itself count toward the park cap —
-            // the cap is bumped only on a "not ended" response, matching the
-            // in-process semantics).
-            let result = rt
-                .block_on(engine.execute(conv_ctx(), Value::Null))
-                .unwrap();
-            let mut snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
-            };
+    /// Safety-backstop parity with the in-process cap test: a NATS
+    /// conversational `dw.agent` whose response never carries
+    /// `conversation_ended` must keep parking (dispatch → AwaitHere →
+    /// response-resume → LoopHere) up to `MAX_PARK_TURNS` "not ended" responses,
+    /// then force-advance to the successor instead of trapping the flow.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_force_advances_after_park_loop_cap() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
 
-            // Responses 1..MAX_PARK_TURNS (exclusive) must keep looping: a "not
-            // ended" response resume (LoopHere), then a user-message resume that
-            // re-dispatches to NATS (AwaitHere) for the next response.
-            for turn in 1..MAX_PARK_TURNS {
-                let result = rt
-                    .block_on(engine.resume(
-                        conv_ctx(),
-                        snapshot,
-                        agent_response_envelope("still thinking", "final_reply"),
-                    ))
-                    .unwrap();
-                snapshot = match result.status {
-                    FlowStatus::Waiting(w) => w.snapshot,
-                    other => {
-                        panic!("expected Waiting (LoopHere) at response #{turn}, got {other:?}")
-                    }
-                };
-                let result = rt
-                    .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
-                    .unwrap();
-                snapshot = match result.status {
-                    FlowStatus::Waiting(w) => w.snapshot,
-                    other => {
-                        panic!(
-                            "expected Waiting (AwaitHere) after user turn #{turn}, got {other:?}"
-                        )
-                    }
-                };
-            }
+        // Turn 1: fresh dispatch (does not itself count toward the park cap —
+        // the cap is bumped only on a "not ended" response, matching the
+        // in-process semantics).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let mut snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
 
-            // The MAX_PARK_TURNS-th "not ended" response must force-advance instead
-            // of parking again.
+        // Responses 1..MAX_PARK_TURNS (exclusive) must keep looping: a "not
+        // ended" response resume (LoopHere), then a user-message resume that
+        // re-dispatches to NATS (AwaitHere) for the next response.
+        for turn in 1..MAX_PARK_TURNS {
             let result = rt
                 .block_on(engine.resume(
                     conv_ctx(),
@@ -9185,363 +11181,538 @@ mod tests {
                     agent_response_envelope("still thinking", "final_reply"),
                 ))
                 .unwrap();
-            assert!(
-                matches!(result.status, FlowStatus::Completed),
-                "park-loop cap must force-advance to the successor at response {MAX_PARK_TURNS}, got {:?}",
-                result.status
-            );
-            assert_eq!(
-                dispatcher.calls.lock().unwrap().len(),
-                1 + (MAX_PARK_TURNS as usize - 1),
-                "exactly one NATS dispatch per user turn across the whole park-loop"
-            );
-        }
-
-        /// Parity: for the same scripted two-turn conversation (turn 1 replies
-        /// "hello there", not ended; turn 2 replies "bye", `conversation_ended`),
-        /// the NATS and in-process dispatch paths must be *observationally*
-        /// identical — same sequence of user-visible statuses, and the same
-        /// surfaced reply text on the parked turn.
-        ///
-        /// Caveat (documented, not hidden): the NATS path has one extra *internal*
-        /// resume between user turns — the async response landing (AwaitHere →
-        /// LoopHere) — that the in-process path does synchronously inside a single
-        /// `execute`/`resume` call. That extra step is invisible to the flow's
-        /// outward status/reply, which is exactly what this test asserts; it does
-        /// NOT assert the two paths take the same number of `resume` calls.
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_nats_and_inprocess_transcripts_match_for_same_script() {
-            let rt = Runtime::new().unwrap();
-
-            // ── In-process transcript ──
-            let inproc_handler = Arc::new(ScriptedAgentHandler {
-                script: Mutex::new(std::collections::VecDeque::from(vec![
-                    json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
-                    json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
-                ])),
-            });
-            let inproc_engine = conv_engine_scripted(conversational_dw_flow(true), inproc_handler);
-            let r1 = rt
-                .block_on(inproc_engine.execute(conv_ctx(), Value::Null))
-                .unwrap();
-            let inproc_snapshot = match r1.status {
-                FlowStatus::Waiting(ref w) => w.snapshot.clone(),
-                ref other => panic!("in-process turn 1: expected Waiting, got {other:?}"),
-            };
-            let r2 = rt
-                .block_on(inproc_engine.resume(
-                    conv_ctx(),
-                    inproc_snapshot,
-                    json!({ "text": "more" }),
-                ))
-                .unwrap();
-
-            // ── NATS transcript, same script ──
-            let dispatcher = Arc::new(ScriptedNatsDispatcher {
-                calls: Mutex::new(vec![]),
-            });
-            let nats_engine = nats_conv_engine(conversational_dw_flow(true), dispatcher);
-            let n1 = rt
-                .block_on(nats_engine.execute(conv_ctx(), Value::Null))
-                .unwrap();
-            let n1_snapshot = match n1.status {
+            snapshot = match result.status {
                 FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("nats turn 1 dispatch: expected Waiting, got {other:?}"),
+                other => panic!("expected Waiting (LoopHere) at response #{turn}, got {other:?}"),
             };
-            let n1r = rt
-                .block_on(nats_engine.resume(
-                    conv_ctx(),
-                    n1_snapshot,
-                    agent_response_envelope("hello there", "final_reply"),
-                ))
-                .unwrap();
-            let n1r_snapshot = match n1r.status {
-                FlowStatus::Waiting(ref w) => w.snapshot.clone(),
-                ref other => panic!("nats turn 1 response resume: expected Waiting, got {other:?}"),
-            };
-            let n2 = rt
-                .block_on(nats_engine.resume(conv_ctx(), n1r_snapshot, json!({ "text": "more" })))
-                .unwrap();
-            let n2_snapshot = match n2.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("nats turn 2 dispatch: expected Waiting, got {other:?}"),
-            };
-            let n2r = rt
-                .block_on(nats_engine.resume(
-                    conv_ctx(),
-                    n2_snapshot,
-                    agent_response_envelope("bye", "conversation_ended"),
-                ))
-                .unwrap();
-
-            // Same user-visible status per turn.
-            assert!(matches!(r1.status, FlowStatus::Waiting(_)));
-            assert!(
-                matches!(n1r.status, FlowStatus::Waiting(_)),
-                "nats turn 1's user-visible status must also be Waiting"
-            );
-            assert!(matches!(r2.status, FlowStatus::Completed));
-            assert!(
-                matches!(n2r.status, FlowStatus::Completed),
-                "nats turn 2 must also complete, matching the in-process transcript"
-            );
-
-            // Same surfaced reply text on the parked turn.
-            assert!(
-                serde_json::to_string(&r1.output)
-                    .unwrap()
-                    .contains("hello there"),
-                "in-process turn 1 must surface the reply: {:?}",
-                r1.output
-            );
-            assert!(
-                serde_json::to_string(&n1r.output)
-                    .unwrap()
-                    .contains("hello there"),
-                "nats turn 1 must surface the identical reply once the response resume lands: {:?}",
-                n1r.output
-            );
-        }
-
-        /// Build the error envelope shape a NATS response resume can also land in
-        /// `state.entry`: `{ok:false, output:null, events:[], error:{code,
-        /// message}}` (mirrors `agent_response_envelope`, but for the failure
-        /// path — a genuine agent/transport error. This code sets no deadline of
-        /// its own, but the same `{ok:false}` shape is also what a flow-authored
-        /// timeout, or any other error source, would arrive as — Fix B handles it
-        /// identically either way.
-        #[cfg(feature = "agentic-worker")]
-        fn agent_error_envelope(message: &str, code: Option<&str>) -> Value {
-            json!({
-                "ok": false,
-                "output": Value::Null,
-                "events": [],
-                "error": { "code": code, "message": message },
-            })
-        }
-
-        /// Fix A (interleave guard): a user message arriving before the agent's
-        /// NATS response must NOT be misread as that response. With the
-        /// pending-await marker set (turn 1's fresh dispatch), a resume whose
-        /// `state.entry` is a plain user-message shape (no `"ok"` key) must fall
-        /// through to the fresh-dispatch branch — re-dispatching to NATS as a new
-        /// turn and parking via `AwaitHere` again — instead of being consumed as
-        /// a (null) agent reply. The marker must also survive: it was NOT
-        /// consumed by the misrouted resume, only by the eventual real response.
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_nats_interleaved_user_message_is_not_misread_as_response() {
-            let dispatcher = Arc::new(ScriptedNatsDispatcher {
-                calls: Mutex::new(vec![]),
-            });
-            let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
-            let rt = Runtime::new().unwrap();
-
-            // Turn 1: fresh dispatch marks the pending-await and parks (AwaitHere).
             let result = rt
-                .block_on(engine.execute(conv_ctx(), Value::Null))
+                .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
                 .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
-            };
-            assert!(
-                snapshot.state.pending_agent_await.contains_key("agent"),
-                "turn 1 dispatch must mark the pending await"
-            );
-            assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
-
-            // A stray user message arrives BEFORE the agent's NATS response —
-            // same shape a real inbound activity would resume with, no `"ok"` key.
-            let result = rt
-                .block_on(engine.resume(
-                    conv_ctx(),
-                    snapshot,
-                    json!({ "text": "are you still there?" }),
-                ))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!(
-                    "a stray user message must re-dispatch as a fresh turn (Waiting/AwaitHere), got {other:?}"
-                ),
-            };
-            assert_eq!(
-                snapshot.next_node, "agent",
-                "the fresh re-dispatch still awaits at self"
-            );
-            assert_eq!(
-                dispatcher.calls.lock().unwrap().len(),
-                2,
-                "the stray user message must trigger its OWN fresh NATS dispatch, not be swallowed"
-            );
-            assert!(
-                snapshot.state.pending_agent_await.contains_key("agent"),
-                "the marker must still be set for the real response to land against"
-            );
-            assert_eq!(
-                result.output,
-                Value::Null,
-                "no reply is surfaced — this was not a misread null agent turn"
-            );
-            assert!(
-                !snapshot.state.park_turns.contains_key("agent"),
-                "a stray user message must not touch the park-loop cap"
-            );
-        }
-
-        /// Fix B (error envelope handling): a `{ok:false, ...}` response — any
-        /// agent/transport error, or a timeout-shaped envelope from any source
-        /// (this code no longer sets its own deadline) — must surface the error
-        /// message as the reply, re-park via `LoopHere` (fail-safe: await the
-        /// next user message, do not force-advance), and must NOT bump the
-        /// park-loop turn counter. Exercises two full error cycles (error →
-        /// user turn → error) to confirm the cap counter never advances even
-        /// after repeated failures.
-        #[cfg(feature = "agentic-worker")]
-        #[test]
-        fn conversational_dw_agent_nats_error_envelope_surfaces_and_reparks_without_cap_bump() {
-            let dispatcher = Arc::new(ScriptedNatsDispatcher {
-                calls: Mutex::new(vec![]),
-            });
-            let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
-            let rt = Runtime::new().unwrap();
-
-            // Turn 1: fresh dispatch → AwaitHere.
-            let result = rt
-                .block_on(engine.execute(conv_ctx(), Value::Null))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
-            };
-
-            // A plain agent/transport error resumes the flow.
-            let result = rt
-                .block_on(engine.resume(conv_ctx(), snapshot, agent_error_envelope("boom", None)))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("an error envelope must re-park (Waiting/LoopHere), got {other:?}"),
-            };
-            assert_eq!(
-                snapshot.next_node, "agent",
-                "LoopHere re-enters the node itself"
-            );
-            assert!(
-                serde_json::to_string(&result.output)
-                    .unwrap()
-                    .contains("boom"),
-                "the error message must be surfaced as the reply: {:?}",
-                result.output
-            );
-            assert!(
-                !snapshot.state.park_turns.contains_key("agent"),
-                "an error response must NOT bump the park-loop cap counter"
-            );
-
-            // A user turn in between re-dispatches (as usual).
-            let result = rt
-                .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "hello?" })))
-                .unwrap();
-            let snapshot = match result.status {
-                FlowStatus::Waiting(w) => w.snapshot,
-                other => panic!("expected Waiting (AwaitHere) after user turn, got {other:?}"),
-            };
-            assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
-
-            // A timeout-coded envelope (this code sets no deadline of its own —
-            // this shape would only arrive from a flow-authored deadline or some
-            // other upstream source) behaves identically to a plain error.
-            let result = rt
-                .block_on(engine.resume(
-                    conv_ctx(),
-                    snapshot,
-                    agent_error_envelope("timeout waiting for agent response", Some("timeout")),
-                ))
-                .unwrap();
-            let snapshot = match result.status {
+            snapshot = match result.status {
                 FlowStatus::Waiting(w) => w.snapshot,
                 other => {
-                    panic!("a timeout envelope must also re-park (Waiting/LoopHere), got {other:?}")
+                    panic!("expected Waiting (AwaitHere) after user turn #{turn}, got {other:?}")
                 }
             };
-            assert!(
-                serde_json::to_string(&result.output)
-                    .unwrap()
-                    .contains("timeout waiting for agent response"),
-                "the timeout message must be surfaced as the reply: {:?}",
-                result.output
-            );
-            assert!(
-                !snapshot.state.park_turns.contains_key("agent"),
-                "two error/timeout responses in a row (with an intervening user turn) must still \
-                 not have bumped the park-loop cap counter"
-            );
         }
 
-        /// Scriptable `AgentNodeHandler` stub: returns the next queued payload on
-        /// each call, so a single in-process engine can simulate a multi-turn
-        /// conversation with a different agent output per turn (unlike
-        /// `StubAgentHandler`, which always returns the same fixed payload).
-        #[cfg(feature = "agentic-worker")]
-        struct ScriptedAgentHandler {
-            script: Mutex<std::collections::VecDeque<serde_json::Value>>,
-        }
-        #[cfg(feature = "agentic-worker")]
-        #[async_trait::async_trait]
-        impl crate::runner::agent_node::AgentNodeHandler for ScriptedAgentHandler {
-            async fn execute(
-                &self,
-                _tenant_id: &str,
-                _env_id: &str,
-                _agent_id: &str,
-                _session_id: &str,
-                _flow_input: &serde_json::Value,
-                _conversational: bool,
-            ) -> anyhow::Result<serde_json::Value> {
-                Ok(self
-                    .script
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("ScriptedAgentHandler: script exhausted"))
+        // The MAX_PARK_TURNS-th "not ended" response must force-advance instead
+        // of parking again.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("still thinking", "final_reply"),
+            ))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "park-loop cap must force-advance to the successor at response {MAX_PARK_TURNS}, got {:?}",
+            result.status
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1 + (MAX_PARK_TURNS as usize - 1),
+            "exactly one NATS dispatch per user turn across the whole park-loop"
+        );
+    }
+
+    /// Parity: for the same scripted two-turn conversation (turn 1 replies
+    /// "hello there", not ended; turn 2 replies "bye", `conversation_ended`),
+    /// the NATS and in-process dispatch paths must be *observationally*
+    /// identical — same sequence of user-visible statuses, and the same
+    /// surfaced reply text on the parked turn.
+    ///
+    /// Caveat (documented, not hidden): the NATS path has one extra *internal*
+    /// resume between user turns — the async response landing (AwaitHere →
+    /// LoopHere) — that the in-process path does synchronously inside a single
+    /// `execute`/`resume` call. That extra step is invisible to the flow's
+    /// outward status/reply, which is exactly what this test asserts; it does
+    /// NOT assert the two paths take the same number of `resume` calls.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_and_inprocess_transcripts_match_for_same_script() {
+        let rt = Runtime::new().unwrap();
+
+        // ── In-process transcript ──
+        let inproc_handler = Arc::new(ScriptedAgentHandler {
+            script: Mutex::new(std::collections::VecDeque::from(vec![
+                json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
+                json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
+            ])),
+        });
+        let inproc_engine = conv_engine_scripted(conversational_dw_flow(true), inproc_handler);
+        let r1 = rt
+            .block_on(inproc_engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let inproc_snapshot = match r1.status {
+            FlowStatus::Waiting(ref w) => w.snapshot.clone(),
+            ref other => panic!("in-process turn 1: expected Waiting, got {other:?}"),
+        };
+        let r2 = rt
+            .block_on(inproc_engine.resume(conv_ctx(), inproc_snapshot, json!({ "text": "more" })))
+            .unwrap();
+
+        // ── NATS transcript, same script ──
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let nats_engine = nats_conv_engine(conversational_dw_flow(true), dispatcher);
+        let n1 = rt
+            .block_on(nats_engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let n1_snapshot = match n1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("nats turn 1 dispatch: expected Waiting, got {other:?}"),
+        };
+        let n1r = rt
+            .block_on(nats_engine.resume(
+                conv_ctx(),
+                n1_snapshot,
+                agent_response_envelope("hello there", "final_reply"),
+            ))
+            .unwrap();
+        let n1r_snapshot = match n1r.status {
+            FlowStatus::Waiting(ref w) => w.snapshot.clone(),
+            ref other => panic!("nats turn 1 response resume: expected Waiting, got {other:?}"),
+        };
+        let n2 = rt
+            .block_on(nats_engine.resume(conv_ctx(), n1r_snapshot, json!({ "text": "more" })))
+            .unwrap();
+        let n2_snapshot = match n2.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("nats turn 2 dispatch: expected Waiting, got {other:?}"),
+        };
+        let n2r = rt
+            .block_on(nats_engine.resume(
+                conv_ctx(),
+                n2_snapshot,
+                agent_response_envelope("bye", "conversation_ended"),
+            ))
+            .unwrap();
+
+        // Same user-visible status per turn.
+        assert!(matches!(r1.status, FlowStatus::Waiting(_)));
+        assert!(
+            matches!(n1r.status, FlowStatus::Waiting(_)),
+            "nats turn 1's user-visible status must also be Waiting"
+        );
+        assert!(matches!(r2.status, FlowStatus::Completed));
+        assert!(
+            matches!(n2r.status, FlowStatus::Completed),
+            "nats turn 2 must also complete, matching the in-process transcript"
+        );
+
+        // Same surfaced reply text on the parked turn.
+        assert!(
+            serde_json::to_string(&r1.output)
+                .unwrap()
+                .contains("hello there"),
+            "in-process turn 1 must surface the reply: {:?}",
+            r1.output
+        );
+        assert!(
+            serde_json::to_string(&n1r.output)
+                .unwrap()
+                .contains("hello there"),
+            "nats turn 1 must surface the identical reply once the response resume lands: {:?}",
+            n1r.output
+        );
+    }
+
+    /// Build the error envelope shape a NATS response resume can also land in
+    /// `state.entry`: `{ok:false, output:null, events:[], error:{code,
+    /// message}}` (mirrors `agent_response_envelope`, but for the failure
+    /// path — a genuine agent/transport error. This code sets no deadline of
+    /// its own, but the same `{ok:false}` shape is also what a flow-authored
+    /// timeout, or any other error source, would arrive as — Fix B handles it
+    /// identically either way.
+    #[cfg(feature = "agentic-worker")]
+    fn agent_error_envelope(message: &str, code: Option<&str>) -> Value {
+        json!({
+            "ok": false,
+            "output": Value::Null,
+            "events": [],
+            "error": { "code": code, "message": message },
+        })
+    }
+
+    /// Fix A (interleave guard): a user message arriving before the agent's
+    /// NATS response must NOT be misread as that response. With the
+    /// pending-await marker set (turn 1's fresh dispatch), a resume whose
+    /// `state.entry` is a plain user-message shape (no `"ok"` key) must fall
+    /// through to the fresh-dispatch branch — re-dispatching to NATS as a new
+    /// turn and parking via `AwaitHere` again — instead of being consumed as
+    /// a (null) agent reply. The marker must also survive: it was NOT
+    /// consumed by the misrouted resume, only by the eventual real response.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_interleaved_user_message_is_not_misread_as_response() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch marks the pending-await and parks (AwaitHere).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+        assert!(
+            snapshot.state.pending_agent_await.contains_key("agent"),
+            "turn 1 dispatch must mark the pending await"
+        );
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
+
+        // A stray user message arrives BEFORE the agent's NATS response —
+        // same shape a real inbound activity would resume with, no `"ok"` key.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                json!({ "text": "are you still there?" }),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!(
+                "a stray user message must re-dispatch as a fresh turn (Waiting/AwaitHere), got {other:?}"
+            ),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "the fresh re-dispatch still awaits at self"
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "the stray user message must trigger its OWN fresh NATS dispatch, not be swallowed"
+        );
+        assert!(
+            snapshot.state.pending_agent_await.contains_key("agent"),
+            "the marker must still be set for the real response to land against"
+        );
+        assert_eq!(
+            result.output,
+            Value::Null,
+            "no reply is surfaced — this was not a misread null agent turn"
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "a stray user message must not touch the park-loop cap"
+        );
+    }
+
+    /// Fix B (error envelope handling): a `{ok:false, ...}` response — any
+    /// agent/transport error, or a timeout-shaped envelope from any source
+    /// (this code no longer sets its own deadline) — must surface the error
+    /// message as the reply, re-park via `LoopHere` (fail-safe: await the
+    /// next user message, do not force-advance), and must NOT bump the
+    /// park-loop turn counter. Exercises two full error cycles (error →
+    /// user turn → error) to confirm the cap counter never advances even
+    /// after repeated failures.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_error_envelope_surfaces_and_reparks_without_cap_bump() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch → AwaitHere.
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+
+        // A plain agent/transport error resumes the flow.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, agent_error_envelope("boom", None)))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("an error envelope must re-park (Waiting/LoopHere), got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "LoopHere re-enters the node itself"
+        );
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("boom"),
+            "the error message must be surfaced as the reply: {:?}",
+            result.output
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "an error response must NOT bump the park-loop cap counter"
+        );
+
+        // A user turn in between re-dispatches (as usual).
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "hello?" })))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after user turn, got {other:?}"),
+        };
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
+
+        // A timeout-coded envelope (this code sets no deadline of its own —
+        // this shape would only arrive from a flow-authored deadline or some
+        // other upstream source) behaves identically to a plain error.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_error_envelope("timeout waiting for agent response", Some("timeout")),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => {
+                panic!("a timeout envelope must also re-park (Waiting/LoopHere), got {other:?}")
             }
-        }
+        };
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("timeout waiting for agent response"),
+            "the timeout message must be surfaced as the reply: {:?}",
+            result.output
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "two error/timeout responses in a row (with an intervening user turn) must still \
+             not have bumped the park-loop cap counter"
+        );
+    }
 
-        /// Build an in-process engine holding `flow`, wired to a `ScriptedAgentHandler`
-        /// so each agent turn can return a different payload. Mirrors `conv_engine`
-        /// (which uses a fixed payload for every call).
-        #[cfg(feature = "agentic-worker")]
-        fn conv_engine_scripted(
-            flow: HostFlow,
-            handler: std::sync::Arc<ScriptedAgentHandler>,
-        ) -> FlowEngine {
-            FlowEngine {
-                rollout_ids: RolloutIds::default(),
-                packs: Vec::new(),
-                flows: Vec::new(),
-                flow_sources: StdHashMap::new(),
-                flow_cache: RwLock::new(StdHashMap::from([(
-                    FlowKey {
-                        pack_id: "test-pack".to_string(),
-                        flow_id: "conv.flow".to_string(),
-                    },
-                    flow,
-                )])),
-                default_env: "local".to_string(),
-                validation: ValidationConfig {
-                    mode: ValidationMode::Off,
+    /// Scriptable `AgentNodeHandler` stub: returns the next queued payload on
+    /// each call, so a single in-process engine can simulate a multi-turn
+    /// conversation with a different agent output per turn (unlike
+    /// `StubAgentHandler`, which always returns the same fixed payload).
+    #[cfg(feature = "agentic-worker")]
+    struct ScriptedAgentHandler {
+        script: Mutex<std::collections::VecDeque<serde_json::Value>>,
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for ScriptedAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+            _conversational: bool,
+            _caller: Option<&serde_json::Value>,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("ScriptedAgentHandler: script exhausted"))
+        }
+    }
+
+    /// Build an in-process engine holding `flow`, wired to a `ScriptedAgentHandler`
+    /// so each agent turn can return a different payload. Mirrors `conv_engine`
+    /// (which uses a fixed payload for every call).
+    #[cfg(feature = "agentic-worker")]
+    fn conv_engine_scripted(
+        flow: HostFlow,
+        handler: std::sync::Arc<ScriptedAgentHandler>,
+    ) -> FlowEngine {
+        FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
                 },
-                cross_pack_resolver: None,
-                remote_dispatch_handler: None,
-                dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
-                agent_node_handler: Some(handler),
-                graph_node_handler: None,
-                mcp_tool_source: None,
-            }
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            agent_node_handler: Some(handler),
+            graph_node_handler: None,
+            mcp_tool_source: None,
+            mcp_secrets: None,
+            operala_node_handler: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // operala.call in-process handler wiring
+    // -----------------------------------------------------------------------
+
+    struct StubOperalaHandler {
+        payload: serde_json::Value,
+    }
+    #[async_trait::async_trait]
+    impl crate::runner::operala_node::OperalaNodeHandler for StubOperalaHandler {
+        async fn execute(
+            &self,
+            _tenant: &str,
+            _env: &str,
+            _target: &str,
+            _operation: &str,
+            _session_id: &str,
+            _input: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self.payload.clone())
+        }
+    }
+
+    /// Build a single-node flow: an `operala.call` node (given `target`) that
+    /// ends the flow directly. Mirrors `conversational_dw_flow`'s shape for
+    /// the (non-conversational) operala path.
+    fn operala_flow(target: &str) -> HostFlow {
+        let mut nodes = IndexMap::new();
+        let node_id = NodeId::from_str("op").unwrap();
+        nodes.insert(
+            node_id.clone(),
+            HostNode {
+                kind: NodeKind::OperalaCall {
+                    target: target.to_string(),
+                },
+                component: "operala.call".to_string(),
+                component_id: "operala.call".to_string(),
+                operation_name: Some(target.to_string()),
+                operation_in_mapping: None,
+                payload_expr: json!({ "operation": "", "input": { "goal": "hi" } }),
+                routing: Routing::End,
+                vars_out: None,
+            },
+        );
+        HostFlow {
+            slot_schema: None,
+            id: "operala.flow".to_string(),
+            start: Some(node_id),
+            nodes,
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+        }
+    }
+
+    /// Build an engine holding `flow` with the given optional in-process
+    /// operala handler and no NATS `RemoteDispatchHandler` — a `None` handler
+    /// exercises the existing NATS-fallback error path.
+    fn operala_engine(
+        flow: HostFlow,
+        handler: Option<std::sync::Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
+    ) -> FlowEngine {
+        FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "operala.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: handler,
+        }
+    }
+
+    fn operala_ctx<'a>() -> FlowContext<'a> {
+        FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "operala.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-op"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+            caller: None,
+        }
+    }
+
+    #[test]
+    fn operala_call_with_in_process_handler_completes_inline() {
+        let handler = std::sync::Arc::new(StubOperalaHandler {
+            payload: json!({ "reply": "stub" }),
+        });
+        let engine = operala_engine(operala_flow("deep_worker"), Some(handler));
+        let execution = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(engine.execute(operala_ctx(), Value::Null))
+            .expect("operala.call with an in-process handler must complete");
+        assert!(matches!(execution.status, FlowStatus::Completed));
+        assert_eq!(execution.output, json!({ "reply": "stub" }));
+    }
+
+    #[test]
+    fn operala_call_without_handler_or_nats_fails() {
+        let engine = operala_engine(operala_flow("deep_worker"), None);
+        let execution = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(engine.execute(operala_ctx(), Value::Null))
+            .expect("session flow returns a completed error envelope, not an Err");
+        // `operala_ctx` carries a `session_id`, so main's retry-exhaustion policy
+        // wraps the execution error into a `Completed` flow carrying the
+        // `flow_execution_failed` envelope (graceful degradation for session
+        // flows) rather than propagating an `Err`. The operala misconfiguration
+        // is still surfaced loudly — in the error payload.
+        assert!(matches!(execution.status, FlowStatus::Completed));
+        let msg = execution.output["metadata"]["error_message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            msg.contains("operala.call node dispatched but no RemoteDispatchHandler configured"),
+            "unexpected output: {:?}",
+            execution.output
+        );
     }
 
     #[test]
@@ -10017,149 +12188,6 @@ mod tests {
     /// `{{node.card.answers.email}}`). `card`'s first pass has no
     /// `response.action`, so its conditional routing falls through and it
     /// parks with `awaiting_submit: true`.
-    /// Two chained cards that route on the SAME action, then a terminal node.
-    ///
-    /// This is the shape every designer card journey has: each page's Continue
-    /// button submits `action = "continue"`, and each page's routing tests for
-    /// it.
-    fn two_card_chain_flow() -> Flow {
-        let card_node = |id: &str, to: Option<&str>| Node {
-            id: NodeId::from_str(id).unwrap(),
-            component: FlowComponentRef {
-                id: "emit.log".parse().unwrap(),
-                pack_alias: None,
-                operation: None,
-            },
-            input: InputMapping {
-                mapping: json!({ "card": id }),
-            },
-            output: OutputMapping {
-                mapping: Value::Null,
-            },
-            err_map: None,
-            routing: match to {
-                Some(target) => Routing::Custom(json!([
-                    { "condition": "response.action == \"submit\"", "to": target }
-                ])),
-                None => Routing::End,
-            },
-            telemetry: TelemetryHints::default(),
-            conversational: false,
-        };
-
-        let mut nodes = indexmap::IndexMap::default();
-        for (id, to) in [
-            ("card1", Some("card2")),
-            ("card2", Some("card3")),
-            ("card3", None),
-        ] {
-            nodes.insert(NodeId::from_str(id).unwrap(), card_node(id, to));
-        }
-
-        Flow {
-            schema_version: "1.0".into(),
-            id: FlowId::from_str("two.card.flow").unwrap(),
-            kind: FlowKind::Messaging,
-            entrypoints: BTreeMap::from([(
-                "default".to_string(),
-                Value::String("card1".to_string()),
-            )]),
-            nodes,
-            metadata: FlowMetadata {
-                title: None,
-                description: None,
-                tags: Default::default(),
-                extra: json!({}),
-            },
-        }
-    }
-
-    /// One submit must advance the journey by exactly ONE card.
-    ///
-    /// `response.*` is synthesised from the run's entry envelope, so it is
-    /// run-scoped: without consuming it, the action that moved `card1` matches
-    /// again at `card2` and the run walks straight past it. Measured on the
-    /// meridian quote journey: page 1's Continue landed the user on page 3.
-    ///
-    /// The submit belongs to the node it was delivered to. Once that node has
-    /// routed on it, later nodes in the same run must see a fresh card with no
-    /// pending action, park, and wait for the user.
-    #[test]
-    fn one_submit_advances_exactly_one_card() {
-        let host_flow = HostFlow::from(two_card_chain_flow());
-        let (flow_id, pack_id) = ("two.card.flow", "test-pack");
-        let engine = FlowEngine {
-            rollout_ids: RolloutIds::default(),
-            packs: Vec::new(),
-            flows: Vec::new(),
-            flow_sources: StdHashMap::new(),
-            messaging_provider_pack_ids: std::collections::HashSet::new(),
-            flow_cache: RwLock::new(StdHashMap::from([(
-                FlowKey {
-                    pack_id: pack_id.to_string(),
-                    flow_id: flow_id.to_string(),
-                },
-                host_flow,
-            )])),
-            default_env: "local".to_string(),
-            validation: ValidationConfig {
-                mode: ValidationMode::Off,
-            },
-            cross_pack_resolver: None,
-            remote_dispatch_handler: None,
-            #[cfg(feature = "agentic-worker")]
-            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
-            #[cfg(feature = "agentic-worker")]
-            agent_node_handler: None,
-            #[cfg(feature = "agentic-worker")]
-            graph_node_handler: None,
-            #[cfg(feature = "agentic-worker")]
-            mcp_tool_source: None,
-        };
-        let rt = Runtime::new().unwrap();
-        let ctx = || FlowContext {
-            tenant: "demo",
-            pack_id,
-            flow_id,
-            node_id: None,
-            tool: None,
-            action: None,
-            session_id: None,
-            provider_id: None,
-            reply_scope: None,
-            retry_config: RetryConfig {
-                max_attempts: 1,
-                base_delay_ms: 1,
-            },
-            attempt: 1,
-            observer: None,
-            mocks: None,
-            caller: None,
-        };
-
-        // Turn 1: no action yet, so `card1` falls through and parks.
-        let first = rt.block_on(engine.execute(ctx(), Value::Null)).unwrap();
-        let snapshot = match first.status {
-            FlowStatus::Waiting(w) => w.snapshot,
-            other => panic!("expected Waiting at card1, got {other:?}"),
-        };
-        assert_eq!(snapshot.next_node, "card1");
-
-        // Turn 2: ONE submit. `card1` routes on it; `card2` must not.
-        let submit = json!({ "input": { "metadata": { "action": "submit" } } });
-        let second = rt.block_on(engine.resume(ctx(), snapshot, submit)).unwrap();
-        match second.status {
-            FlowStatus::Waiting(w) => assert_eq!(
-                w.snapshot.next_node, "card2",
-                "one submit must advance exactly one card and park at the next"
-            ),
-            FlowStatus::Completed => panic!(
-                "the run reached the terminal node: the consumed action re-fired \
-                 at card2 and skipped it"
-            ),
-        }
-    }
-
     fn card_answers_flow() -> Flow {
         let card_id = NodeId::from_str("card").unwrap();
         let next_id = NodeId::from_str("next").unwrap();
@@ -10188,12 +12216,12 @@ mod tests {
         let next_node = Node {
             id: next_id.clone(),
             component: FlowComponentRef {
-                id: "emit.response".parse().unwrap(),
+                id: "emit.log".parse().unwrap(),
                 pack_alias: None,
                 operation: None,
             },
             input: InputMapping {
-                mapping: json!({ "text": "{{node.card.answers.email}}" }),
+                mapping: json!({ "got_email": "{{node.card.answers.email}}" }),
             },
             output: OutputMapping {
                 mapping: Value::Null,
@@ -10243,11 +12271,11 @@ mod tests {
         let flow_id = "card.answers.flow";
         let pack_id = "test-pack";
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
-            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: pack_id.to_string(),
@@ -10269,6 +12297,9 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_secrets: None,
+            operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
 
@@ -10333,15 +12364,15 @@ mod tests {
             matches!(result2.status, FlowStatus::Completed),
             "the submit must route past the card to `next`"
         );
-        // This lane has no `FlowExecution::node_outputs` to inspect, so the
-        // later node emits the value as a response and we assert on the flow
-        // output. Same claim: `{{node.card.answers.email}}` resolved, which it
-        // can only do if the resumed card attached the submitted answers.
-        let rendered = serde_json::to_string(&result2.output).expect("encode output");
-        assert!(
-            rendered.contains("a@b.c"),
-            "`next`, a LATER node, must read the answers through \
-             {{node.card.answers.email}}; got {rendered}"
+        assert_eq!(
+            result2.node_outputs["card"]["answers"]["email"],
+            json!("a@b.c"),
+            "the card's own re-dispatched output must carry the merged answers"
+        );
+        assert_eq!(
+            result2.node_outputs["next"]["got_email"],
+            json!("a@b.c"),
+            "`next`, a LATER node, must read the answers through {{node.card.answers.email}}"
         );
     }
 }
@@ -10406,40 +12437,6 @@ pub struct RetryConfig {
 /// `ExecutionState` because the callers have already consumed `state` via
 /// `state.finalize_with(...)`; we capture a cheap clone of `state.nodes` up
 /// front and pass it in here.
-/// Build an MCP node's output, marking it failed when the tool did not run.
-///
-/// `mcp_node::invoke` is infallible by contract: a runner without MCP
-/// credentials, a tool missing from the tenant catalog, and a dead endpoint all
-/// arrive as `{"error": ...}` inside `result`. Reporting `ok: true` for those
-/// left `lift_first_node_error_from_nodes` with nothing to find, so the flow
-/// completed clean — a Digital Worker run showed every node green and rendered
-/// its quote card with blank fields, because the MCP call had silently done
-/// nothing.
-///
-/// Only the status changes. `bound` is passed through untouched, so routing,
-/// `node.<id>.payload`, and any flow reading the bound value behave exactly as
-/// before; the node is simply no longer claiming success. `meta.error` uses the
-/// shape the lift reads (`kind` + `message`).
-fn mcp_output(bound: Value, result: &Value) -> NodeOutput {
-    let Some(message) = result.get("error") else {
-        return NodeOutput::new(bound);
-    };
-    let message = message
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| message.to_string());
-    NodeOutput {
-        ok: false,
-        payload: bound,
-        meta: json!({
-            "error": {
-                "kind": "mcp_call_failed",
-                "message": message,
-            }
-        }),
-    }
-}
-
 fn lift_first_node_error_from_nodes(output: Value, nodes: &HashMap<String, NodeOutput>) -> Value {
     let Some((node_id, failed)) = nodes.iter().find(|(_, out)| !out.ok) else {
         return output;

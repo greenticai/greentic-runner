@@ -4,28 +4,15 @@ version     = { workspace = true }
 edition     = { workspace = true }
 license     = { workspace = true }
 description = "Enterprise Agentic Worker runtime — Plan-Act-Observe loop, Redis state, tool dispatch via greentic-ext-runtime"
+publish     = false
 
 [features]
-default   = []
+default   = ["state-disk"]
 test-mock = []
-# NOTE: the three gates below are bare `--cfg` flags, NOT cargo features, on
-# purpose. Each parks code that cannot build against the dependency versions
-# this lane pins, and CI builds `--all-features` — a cargo feature would be
-# switched on and break the build. Turn one on with
-# `RUSTFLAGS="--cfg <name>"` once its dependency catches up.
-#
-# greentic_guardrail_ext: WASM-backed guardrail evaluation. Needs a
-# greentic-ext-runtime carrying the
-# `greentic:extension-design@0.3.0` WIT surface (`evaluate_guardrail` +
-# `GuardrailVerdictWire`); the dev lane's runtime is on 0.2.0 and has neither,
-# so this stays off there and `UnavailableGuardrailEvaluator` fails closed
-# instead. Turn on once that surface lands.
-# greentic_mcp_local_wasm: local-wasm MCP tool DISCOVERY. Needs `greentic_mcp_exec::{ToolDef, list_tools}`,
-# which the mcp-exec line this lane carries does not have. Dispatch of an
-# already-known local tool still works without it (`exec` is present); only
-# discovery is gated. Remote (http) MCP servers are unaffected.
-# greentic_dw_manifest_tools: tool refs derived from a DigitalWorkerManifest. Needs `extension_tools` on
-# `DigitalWorkerManifest`, absent from this lane's greentic-dw-manifest.
+# On-disk state backend (redb, pure-Rust embedded KV). Default-on; compile out
+# with --no-default-features to drop the redb dependency (disk selection then
+# falls back to the in-memory backend with a warning).
+state-disk = ["dep:redb"]
 # Multi-provider in-process LLM backend: routes the worker's LLM call through
 # greentic-llm (DeepSeek, Anthropic, Gemini, … — the full provider matrix)
 # instead of the hardwired OpenAI client. Pulls in rig-core, so it is opt-in.
@@ -43,21 +30,11 @@ name = "aw-serve"
 path = "src/bin/aw_serve.rs"
 required-features = ["serve", "test-mock"]
 
-# The three parked gates above are bare `--cfg` flags rather than cargo
-# features (see the note in [features]); tell check-cfg they are expected so
-# `-D warnings` does not fire `unexpected_cfgs` on every use.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(greentic_guardrail_ext)',
-    'cfg(greentic_mcp_local_wasm)',
-    'cfg(greentic_dw_manifest_tools)',
-] }
-
 [dependencies]
 anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
-async-nats          = { version = "0.49", optional = true }
-aw-event-bridge     = { path = "../aw-event-bridge", version = ">=1.2.0-dev, <1.3.0-0", optional = true }
+async-nats          = { version = "0.46", optional = true }
+aw-event-bridge     = { path = "../aw-event-bridge", optional = true }
 # Store-pull + verify (Task 2): download a .gtxpack, verify sha256 + the Ed25519
 # signature on its describe.json, extract extension.wasm into the local cache.
 # Versions track the runner workspace lock (zip 8, ed25519-dalek 2, sha2 0.11,
@@ -69,24 +46,37 @@ zip                 = { workspace = true }
 chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
-greentic-dw-manifest = "=1.2.0-dev.32221041662"
+greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research" }
 # Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
-greentic-dw-memory-long-term = "=1.2.0-dev.32325487059"
-greentic-ext-runtime = "=1.2.34077794832"
-greentic-extension-sdk-contract = "=1.2.23"
+greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research" }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "74e5926fc900b260ae805d973aedee887d61313f" }
+greentic-extension-sdk-contract = "=1.3.0-research.5"
 # Multi-provider LLM door (rig-core under the hood). Optional — see the
 # `greentic-llm-backend` feature.
 greentic-llm = { version = "=1.3.1-research.0", optional = true }
 greentic-secrets-lib = { workspace = true }
 greentic-types       = { workspace = true }
 # MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
-greentic-mcp-client = { version = "=1.3.0-research.3", features = ["native"] }
+#
+# `-research.4` is the first release that keeps a tool's `title`
+# (greentic-mcp-client#11). `map_tools_list` read four fields and that was
+# not one of them, so a human label the server DID advertise was discarded
+# at that boundary and no consumer could recover it — greentic-designer's
+# tool picker was listing 60-character identifiers.
+#
+# This pin is EXACT, and greentic-designer pins the same crate exactly, so
+# the two cannot differ: cargo refuses to resolve two distinct `=` versions
+# of one crate in a single graph. That is why this crate moves FIRST and the
+# designer follows the rev — never the other way round.
+greentic-mcp-client = { version = "=1.3.0-research.4", features = ["native"] }
 # Local (in-process) wasix:mcp executor for the local-wasm transport (Task 3).
-greentic-mcp-exec = { version = "=1.2.0-dev.32252048794" }
+greentic-mcp-exec = { version = "=1.3.0-research.3" }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
+greentic-trust      = { workspace = true }
+redb                = { version = "2", optional = true }
 redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
 reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 secrecy             = "0.10"
@@ -103,6 +93,7 @@ url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+greentic-trust = { workspace = true, features = ["testing"] }
 semver = "1"
 serial_test = { workspace = true }
 tempfile = "3"

@@ -20,12 +20,15 @@ pub mod config_provider;
 pub mod cost;
 pub mod dispatch_ledger;
 pub mod dw;
+pub mod end_conversation;
 pub mod error;
+pub mod flow_source;
 pub mod graph;
 pub mod guardrail;
 pub mod guardrail_provider;
 pub mod http_provider;
 pub mod knowledge;
+pub mod kv;
 pub mod layered_provider;
 pub mod llm;
 pub mod llm_credential;
@@ -38,24 +41,23 @@ pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod mcp_local;
+pub mod mcp_scope;
 pub mod mcp_secrets;
 pub mod mcp_source;
 pub mod mcp_store_pull;
 pub mod memory;
 pub mod short_term;
+pub mod sorla_source;
 pub mod state;
+pub mod state_kv;
 pub mod state_redis;
 pub mod telemetry;
 pub mod tenant;
+pub mod tool_wire_name;
 pub mod tools;
 
 #[cfg(feature = "test-mock")]
 pub mod mock;
-
-/// Test-only constructors. Available to this crate's own `#[cfg(test)]` code
-/// and, via `test-mock`, to integration tests and the `aw-serve` harness.
-#[cfg(any(test, feature = "test-mock"))]
-pub mod test_support;
 
 #[cfg(feature = "serve")]
 pub mod serve;
@@ -70,11 +72,15 @@ pub use config::{
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
-pub use cost::{RedisTokenMeter, TokenMeter};
+pub use cost::{KvTokenMeter, RedisTokenMeter, TokenMeter};
 pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
+pub use flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
+#[cfg(feature = "state-disk")]
+pub use kv::RedbKv;
+pub use kv::{AwKv, MemoryKv};
 pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use llm_extension::{
@@ -89,15 +95,20 @@ pub use long_term::{
 };
 pub use manifest_provider::ManifestToolOverlayProvider;
 pub use mcp_source::{
-    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpRoute, McpToolCatalog, McpToolEntry,
-    McpToolSource, dispatch_route,
+    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpCallerIdentity, McpPackRoute, McpRoute,
+    McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route,
 };
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
+pub use sorla_source::{
+    SorlaToolCatalog, SorlaToolEntry, SorlaToolSource, SorxInvoker, SorxOperation,
+};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
+pub use state_kv::KvAgentStateStore;
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::{TenantContext, VerifiedCaller};
-pub use tools::{RedisToolLedger, ToolLedger};
+pub use tool_wire_name::{ToolNameCodec, is_wire_safe, wire_tool_name};
+pub use tools::{KvToolLedger, RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
 
@@ -127,10 +138,23 @@ pub trait StepObserver: Send + Sync {
     /// Called with each incremental text chunk of the assistant reply.
     /// Only invoked when [`StepObserver::wants_streaming`] returns `true`.
     fn on_token_delta(&self, _chunk: &str) {}
-    /// Called just before a tool is dispatched.
-    fn on_tool_call(&self, _name: &str, _call_id: &str) {}
+    /// Called just before a tool is dispatched, with its arguments.
+    fn on_tool_call(&self, _name: &str, _call_id: &str, _args: &serde_json::Value) {}
     /// Called after a tool dispatch succeeds, with the tool's result.
     fn on_tool_result(&self, _name: &str, _call_id: &str, _result: &serde_json::Value) {}
+    /// Called after a tool dispatch fails or is blocked (e.g. not in the
+    /// agent's allow-list), with the error/reason payload. Additive hook —
+    /// see the "Extending this trait" note above.
+    fn on_tool_failed(&self, _name: &str, _call_id: &str, _error: &serde_json::Value) {}
+    /// Called after each LLM iteration completes, with that call's token usage.
+    /// Additive hook — lets a streaming consumer surface a per-message LLM/token
+    /// trace even for turns that call no tools (the token trail is otherwise
+    /// only in the final `AgentOutput.trail`, which the SSE stream omits).
+    fn on_llm_call(&self, _tokens_in: u64, _tokens_out: u64) {}
+    /// Called for every guardrail denial — blocked (Enforce) or merely recorded
+    /// (Monitor). Default no-op: only the audit observer forwards these.
+    /// Additive hook — see the "Extending this trait" note above.
+    fn on_guardrail(&self, _obs: &crate::guardrail::GuardrailObservation) {}
 }
 
 /// No-op observer used by the non-streaming [`AgentRuntime::step`].
@@ -171,6 +195,18 @@ pub struct AgentRuntime {
     /// invoker (over the runner-host `PackRuntime` component host) is injected
     /// at the runner-host edge, never compiled in.
     pub(crate) components: Option<Arc<crate::component_source::ComponentToolSource>>,
+    /// Per-tenant agentic-worker flow tool source. `None` disables flow tools
+    /// entirely (`flow:`-prefixed tool refs then resolve to nothing). Set via
+    /// [`AgentRuntime::with_flow_source`]; the concrete invoker (over the
+    /// runner-host pack flow runtime) is injected at the runner-host edge, never
+    /// compiled in.
+    pub(crate) flows: Option<Arc<crate::flow_source::FlowToolSource>>,
+    /// Per-tenant agentic-worker SoRLa SoR tool source. `None` disables sorla
+    /// tools entirely (`sorla:`-prefixed tool refs then resolve to nothing).
+    /// Set via [`AgentRuntime::with_sorla_source`]; the concrete invoker (over
+    /// the host SoRX interact client) is injected at the runner-host edge,
+    /// never compiled in.
+    pub(crate) sorla: Option<Arc<crate::sorla_source::SorlaToolSource>>,
     /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
     /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
     /// concrete backend is injected at the runner-host edge, never compiled in.
@@ -215,6 +251,8 @@ impl AgentRuntime {
             guardrail_policy: Arc::new(crate::guardrail::NoMandatoryGuardrails),
             guardrail_evaluator: Arc::new(crate::guardrail::AcceptAllEvaluator),
             components: None,
+            flows: None,
+            sorla: None,
             long_term_memory: None,
             knowledge: None,
             short_term_memory: None,
@@ -256,6 +294,30 @@ impl AgentRuntime {
         components: Option<Arc<crate::component_source::ComponentToolSource>>,
     ) -> Self {
         self.components = components;
+        self
+    }
+
+    /// Wire the flow tool source so `flow:`-prefixed tool refs resolve to pack
+    /// flows invoked over the host flow runtime. Coexists with the
+    /// MCP/extension/component tool surfaces; defaults off when not set.
+    #[must_use]
+    pub fn with_flow_source(
+        mut self,
+        flows: Option<Arc<crate::flow_source::FlowToolSource>>,
+    ) -> Self {
+        self.flows = flows;
+        self
+    }
+
+    /// Attach a per-tenant SoRLa SoR tool source: `sorla:<pack>` tool refs
+    /// resolve to a SoR BusinessAction invoked over the host SoRX interact
+    /// client. Coexists with the mcp/component/flow sources.
+    #[must_use]
+    pub fn with_sorla_source(
+        mut self,
+        sorla: Option<Arc<crate::sorla_source::SorlaToolSource>>,
+    ) -> Self {
+        self.sorla = sorla;
         self
     }
 
@@ -317,19 +379,52 @@ impl AgentRuntime {
         self
     }
 
+    /// Whether a knowledge / RAG backend is mounted. Mirrors the check
+    /// [`knowledge::knowledge_active`] applies against `runtime.knowledge` in the
+    /// agentic loop, exposed so hosts and tests can confirm the seam is wired
+    /// without issuing a (network-bound) [`Self::search_knowledge`] call.
+    ///
+    /// This answers "can retrieval be attempted at all", NOT "is a corpus
+    /// mounted": a host may mount a backend that delegates elsewhere per turn,
+    /// in which case this is true with no corpus behind it. Ask
+    /// [`knowledge::Knowledge::wrapped_backend`] for that, via
+    /// [`Self::knowledge_backend`].
+    #[must_use]
+    pub fn has_knowledge(&self) -> bool {
+        self.knowledge.is_some()
+    }
+
+    /// The mounted knowledge backend, if any.
+    ///
+    /// Exposed so a host that mounts a SECOND backend can wrap the first
+    /// instead of replacing it: [`Self::with_knowledge`] overwrites the field,
+    /// and two mounts that each assume they are the only one would silently
+    /// disable whichever ran first.
+    #[must_use]
+    pub fn knowledge_backend(&self) -> Option<Arc<dyn knowledge::Knowledge>> {
+        self.knowledge.clone()
+    }
+
     /// Hybrid retrieval over the agent's knowledge corpus. Returns
     /// [`knowledge::KnowledgeError::NotConfigured`] when no backend is wired.
+    ///
+    /// `binding` is the agent's own `config.knowledge.knowledge` provider ref
+    /// for this turn. It is threaded through because a backend may delegate to
+    /// a target named in the binding's `params` — see
+    /// [`knowledge::Knowledge::search_bound`] for why that cannot ride on the
+    /// runtime-level field or inside [`knowledge::KnowledgeQuery`].
     pub async fn search_knowledge(
         &self,
         tenant: &TenantContext,
         query: knowledge::KnowledgeQuery,
+        binding: Option<&config::MemoryProviderRef>,
     ) -> knowledge::KnowledgeResult<Vec<knowledge::RetrievedChunk>> {
         let kb = self
             .knowledge
             .as_ref()
             .ok_or(knowledge::KnowledgeError::NotConfigured)?;
         let ctx = knowledge::to_types_tenant(tenant)?;
-        kb.search(&ctx, query).await
+        kb.search_bound(&ctx, query, binding).await
     }
 
     /// Execute one agentic step against the given session.
@@ -367,9 +462,30 @@ impl AgentRuntime {
 }
 
 /// Inbound user message handed to [`AgentRuntime::step`].
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentInput {
     pub text: String,
+    /// Whether THIS invocation is a conversational segment. Set from the flow
+    /// node's `conversational` flag so a node marked conversational makes the
+    /// agent's host `end_conversation` tool available (and the closing prompt
+    /// note) even when the agent's own [`AgentConfig::conversational`] default
+    /// is false — the node, not just the agent config, can opt in. OR-ed with
+    /// the agent config in the loop.
+    #[serde(default)]
+    pub conversational: bool,
+}
+
+/// Token + iteration accounting for one [`AgentRuntime::step`]. Surfaced on
+/// [`AgentOutput`] so a caller (e.g. the designer's Run Demo trace) can show
+/// per-turn LLM usage without a separate telemetry channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StepUsage {
+    /// Prompt tokens summed across every LLM call in this step.
+    pub tokens_in: u64,
+    /// Completion tokens summed across every LLM call in this step.
+    pub tokens_out: u64,
+    /// Plan-Act-Observe iterations the loop ran this step.
+    pub iterations: u32,
 }
 
 /// Outbound reply produced by [`AgentRuntime::step`].
@@ -378,6 +494,10 @@ pub struct AgentOutput {
     pub reply: String,
     pub trail: Vec<AgentStep>,
     pub terminated_by: TerminationReason,
+    /// Per-step token + iteration usage (default zero for callers that don't
+    /// track it, e.g. mocks).
+    #[serde(default)]
+    pub usage: StepUsage,
 }
 
 /// One iteration of the Plan-Act-Observe loop, surfaced in the audit
@@ -386,10 +506,28 @@ pub struct AgentOutput {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentStep {
+    /// One LLM iteration's assistant output + token cost, recorded before that
+    /// iteration's tool calls. Lets a caller show a per-message breakdown (each
+    /// model call), not just the aggregate `AgentOutput.usage`. `content` is the
+    /// assistant text for the turn (empty when the model only emitted tool calls).
+    LlmCall {
+        content: String,
+        tokens_in: u64,
+        tokens_out: u64,
+    },
     ToolCall {
         name: String,
         call_id: String,
+        /// The arguments the model passed to the tool (its input). Lets a caller
+        /// show what was actually requested, not just the tool name. Defaults to
+        /// `null` for older trails that predate this field.
+        #[serde(default)]
+        args: serde_json::Value,
         result: serde_json::Value,
+        /// Wall-clock time spent dispatching this tool call, in milliseconds.
+        /// `0` for host built-ins that resolve instantly and for older trails.
+        #[serde(default)]
+        duration_ms: u64,
     },
     ToolCallReused {
         name: String,

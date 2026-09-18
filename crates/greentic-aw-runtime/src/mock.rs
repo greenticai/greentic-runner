@@ -382,6 +382,40 @@ mod inner {
         }
     }
 
+    /// Billing meter with a fixed `over_budget` verdict, for exercising the credit
+    /// gate without HTTP. `emit` records nothing — the gate is what is under test.
+    pub struct MockBillingMeter {
+        over: bool,
+    }
+
+    impl MockBillingMeter {
+        #[must_use]
+        pub fn new(over: bool) -> Self {
+            Self { over }
+        }
+    }
+
+    impl crate::billing::BillingMeter for MockBillingMeter {
+        fn emit<'a>(
+            &'a self,
+            _tenant: &'a TenantContext,
+            _input_tokens: u64,
+            _output_tokens: u64,
+            _agent_id: &'a str,
+            _model: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::billing::BillingError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn over_budget<'a>(
+            &'a self,
+            _tenant: &'a TenantContext,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            Box::pin(std::future::ready(self.over))
+        }
+    }
+
     /// Convenience: assert a [`TerminationReason`] matches the expected value.
     pub fn assert_terminated_by(actual: &TerminationReason, expected: &TerminationReason) {
         assert_eq!(actual, expected, "expected {expected:?}, got {actual:?}");
@@ -389,6 +423,6 @@ mod inner {
 }
 
 pub use inner::{
-    MockAgentStateStore, MockConfigProvider, MockKnowledge, MockLlmBackend, MockLongTermMemory,
-    MockTelemetry, NoopToolLedger, assert_terminated_by,
+    MockAgentStateStore, MockBillingMeter, MockConfigProvider, MockKnowledge, MockLlmBackend,
+    MockLongTermMemory, MockTelemetry, NoopToolLedger, assert_terminated_by,
 };

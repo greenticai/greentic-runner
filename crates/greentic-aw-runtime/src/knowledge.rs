@@ -15,6 +15,8 @@
 //! runner-host edge (W4 4d). When W3 ships a lightweight trait-only crate (as the
 //! memory tier does via `greentic-dw-memory-long-term`), this can re-export it.
 
+use std::sync::Arc;
+
 use crate::AgentConfig;
 use crate::tenant::TenantContext;
 use greentic_types::{EnvId, TenantCtx, TenantId};
@@ -30,6 +32,11 @@ pub struct KnowledgeChunk {
     pub text: String,
     #[serde(default)]
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Optional pre-computed embedding vector for this chunk. When present,
+    /// backends should use this vector directly instead of embedding `text`;
+    /// `None` preserves the existing backend-computed-embedding behavior.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Outcome of an ingest: the backend-assigned id for each stored chunk.
@@ -99,6 +106,58 @@ pub trait Knowledge: Send + Sync {
         tenant: &TenantCtx,
         query: KnowledgeQuery,
     ) -> KnowledgeResult<Vec<RetrievedChunk>>;
+
+    /// Retrieval with the agent's per-turn knowledge binding in hand.
+    ///
+    /// [`Self::search`] mirrors the `greentic-dw-knowledge` contract and must
+    /// keep mirroring it, so the provider binding cannot be carried inside
+    /// [`KnowledgeQuery`]. But a backend whose target is chosen PER WORKER —
+    /// "delegate retrieval to extension X's tool Y" — cannot read its own ids
+    /// from a runtime-level field: [`crate::AgentRuntime::knowledge`] is set
+    /// once when the runtime is built, while the binding arrives per turn in
+    /// [`AgentConfig`]. The out-of-process serve path serves many agents from
+    /// one runtime, so mounting per-runtime from config would hand one worker
+    /// another worker's provider.
+    ///
+    /// The default delegates to [`Self::search`], so a backend that ignores the
+    /// binding (an env-configured Chronicle corpus, say) needs no change.
+    async fn search_bound(
+        &self,
+        tenant: &TenantCtx,
+        query: KnowledgeQuery,
+        _binding: Option<&crate::config::MemoryProviderRef>,
+    ) -> KnowledgeResult<Vec<RetrievedChunk>> {
+        self.search(tenant, query).await
+    }
+
+    /// The backend this one delegates to, when it is a WRAPPER rather than a
+    /// leaf. `None` for every backend that retrieves by itself.
+    ///
+    /// [`crate::AgentRuntime::with_knowledge`] replaces the mounted backend, so
+    /// a host that mounts two must have the second wrap the first. Once one of
+    /// those mounts is unconditional — as the runner-host's extension adapter
+    /// is, because which extension to invoke is a per-turn decision it cannot
+    /// make at build time — [`crate::AgentRuntime::has_knowledge`] is true on
+    /// that path whether or not a corpus backend was ever mounted. It therefore
+    /// stops being able to answer "did the corpus mount run", which is a
+    /// question a host regression guard has to keep asking: a corpus mount that
+    /// silently stopped running is what made the model hallucinate instead of
+    /// retrieving. This answers it.
+    fn wrapped_backend(&self) -> Option<Arc<dyn Knowledge>> {
+        None
+    }
+
+    /// A stable identifier for this backend IMPLEMENTATION, so a host walking a
+    /// wrapper chain can tell one layer from another.
+    ///
+    /// Never for dispatch — nothing in this crate reads it. It exists because
+    /// [`Self::wrapped_backend`] returning `Some` says only "something is
+    /// underneath", which a second delegating wrapper satisfies exactly as well
+    /// as a corpus backend does; a host asking "did my corpus mount actually
+    /// run" needs to tell those apart.
+    fn backend_id(&self) -> &'static str {
+        "unidentified"
+    }
 }
 
 /// Convert the runtime's [`TenantContext`] into the `greentic-types`
@@ -156,6 +215,74 @@ pub(crate) fn augment_system_prompt(base: &str, chunks: &[RetrievedChunk]) -> St
     out
 }
 
+/// Surface an auto knowledge retrieval as a trace step, so the UI can show which
+/// corpus chunks were pulled into context — doc id, chunk index, score, and text.
+///
+/// Emitted through the tool-call observer seam ONLY, and deliberately NOT pushed
+/// onto `AgentOutput.trail`. Retrieval is automatic pre-context, not a
+/// model-invoked tool: it belongs in the live trace the test-chat UI streams, but
+/// must stay out of the flow trail / metering, whose consumers treat each entry
+/// as a real agent action. A no-op when nothing was retrieved (no empty step).
+///
+/// The synthetic `call_id` is per-call so the UI pairs this result with its own
+/// call and never a neighbouring tool's. `doc`/`index` ride through as JSON `null`
+/// when the backend did not supply them (`RetrievedChunk`'s `Option` fields).
+pub(crate) fn emit_retrieval_trace(
+    observer: &dyn crate::StepObserver,
+    query: &str,
+    chunks: &[RetrievedChunk],
+) {
+    if chunks.is_empty() {
+        return;
+    }
+    const NAME: &str = "search_knowledge";
+    let call_id = uuid::Uuid::new_v4().to_string();
+    observer.on_tool_call(NAME, &call_id, &serde_json::json!({ "query": query }));
+
+    let hits: Vec<serde_json::Value> = chunks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "doc": c.doc_id,
+                "index": c.chunk_index,
+                "score": c.score,
+                "text": c.text,
+            })
+        })
+        .collect();
+    observer.on_tool_result(
+        NAME,
+        &call_id,
+        &serde_json::json!({ "chunks": hits, "count": chunks.len() }),
+    );
+}
+
+/// Surface a FAILED auto knowledge retrieval as a trace step.
+///
+/// The counterpart to [`emit_retrieval_trace`], and the reason it exists: a
+/// retrieval that errors degrades to no injection, and until this existed that
+/// degrade was indistinguishable from "the corpus held nothing relevant" —
+/// same empty prompt, same confident answer, no trace step either way. The
+/// operator watching test-chat could not tell a dead backend from an empty one.
+///
+/// Emitted through the same observer seam and with the same synthetic
+/// `call_id` discipline. The result payload carries `"error"` rather than
+/// `"chunks"`, which is what makes the two cases distinguishable downstream.
+pub(crate) fn emit_retrieval_failure_trace(
+    observer: &dyn crate::StepObserver,
+    query: &str,
+    error: &KnowledgeError,
+) {
+    const NAME: &str = "search_knowledge";
+    let call_id = uuid::Uuid::new_v4().to_string();
+    observer.on_tool_call(NAME, &call_id, &serde_json::json!({ "query": query }));
+    observer.on_tool_result(
+        NAME,
+        &call_id,
+        &serde_json::json!({ "error": error.to_string(), "count": 0 }),
+    );
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -202,6 +329,8 @@ mod tests {
                 top_k: top_k.unwrap_or_else(crate::config::default_knowledge_top_k),
             }),
             guardrails: vec![],
+            conversational: false,
+            opening_message: None,
         }
     }
 
@@ -304,6 +433,7 @@ mod tests {
                     chunk_index: 0,
                     text: "Refunds within 5 days.".into(),
                     metadata: serde_json::Map::new(),
+                    embedding: None,
                 }],
             )
             .await
@@ -321,6 +451,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "retrieved for: refund policy");
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        // (event, tool_name, payload) per observer call.
+        calls: std::sync::Mutex<Vec<(&'static str, String, serde_json::Value)>>,
+    }
+    impl crate::StepObserver for RecordingObserver {
+        fn on_tool_call(&self, name: &str, _call_id: &str, args: &serde_json::Value) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("call", name.to_string(), args.clone()));
+        }
+        fn on_tool_result(&self, name: &str, _call_id: &str, result: &serde_json::Value) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("result", name.to_string(), result.clone()));
+        }
+    }
+
+    #[test]
+    fn emit_retrieval_trace_reports_chunk_fields_as_a_tool_step() {
+        let rec = RecordingObserver::default();
+        let chunks = vec![RetrievedChunk {
+            text: "Agentic worker adalah komponen...".into(),
+            score: 0.89,
+            doc_id: Some("greentic.pdf".into()),
+            chunk_index: Some(3),
+            metadata: serde_json::Map::new(),
+        }];
+        emit_retrieval_trace(&rec, "Apa itu agentic?", &chunks);
+
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one on_tool_call + one on_tool_result");
+        assert_eq!(calls[0].0, "call");
+        assert_eq!(calls[0].1, "search_knowledge");
+        assert_eq!(calls[0].2["query"], "Apa itu agentic?");
+
+        assert_eq!(calls[1].0, "result");
+        assert_eq!(calls[1].2["count"], 1);
+        let hit = &calls[1].2["chunks"][0];
+        assert_eq!(hit["doc"], "greentic.pdf");
+        assert_eq!(hit["index"], 3);
+        assert_eq!(hit["score"], 0.89);
+        assert_eq!(hit["text"], "Agentic worker adalah komponen...");
+    }
+
+    /// Backends that leave `doc_id`/`chunk_index` unset must not break the step —
+    /// they ride through as JSON `null`, which the UI tolerates.
+    #[test]
+    fn emit_retrieval_trace_carries_null_for_missing_doc_and_index() {
+        let rec = RecordingObserver::default();
+        emit_retrieval_trace(&rec, "q", &[chunk("no metadata", 0.5)]);
+
+        let calls = rec.calls.lock().unwrap();
+        let hit = &calls[1].2["chunks"][0];
+        assert!(hit["doc"].is_null());
+        assert!(hit["index"].is_null());
+        assert_eq!(hit["score"], 0.5);
+    }
+
+    #[test]
+    fn emit_retrieval_trace_is_noop_without_chunks() {
+        let rec = RecordingObserver::default();
+        emit_retrieval_trace(&rec, "q", &[]);
+        assert!(
+            rec.calls.lock().unwrap().is_empty(),
+            "no chunks retrieved => no trace step at all"
+        );
+    }
+
+    /// The whole point of the failure trace: an operator watching the live
+    /// trace must be able to tell "the corpus held nothing relevant" from "the
+    /// backend did not answer". Those were the same empty prompt before.
+    #[test]
+    fn a_failed_retrieval_is_distinguishable_from_an_empty_one() {
+        let empty = RecordingObserver::default();
+        emit_retrieval_trace(&empty, "q", &[]);
+        assert!(empty.calls.lock().unwrap().is_empty());
+
+        let failed = RecordingObserver::default();
+        emit_retrieval_failure_trace(
+            &failed,
+            "q",
+            &KnowledgeError::Backend("service refused".into()),
+        );
+        let calls = failed.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one on_tool_call + one on_tool_result");
+        assert_eq!(calls[0].1, "search_knowledge");
+        assert_eq!(calls[0].2["query"], "q");
+        assert_eq!(calls[1].2["count"], 0);
+        assert!(
+            calls[1].2["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("service refused")),
+            "the result must name the failure, not merely report zero chunks: {:?}",
+            calls[1].2
+        );
+        assert!(
+            calls[1].2.get("chunks").is_none(),
+            "a failure must not look like a successful retrieval of nothing"
+        );
+    }
+
+    /// A backend that ignores the binding — every backend that existed before
+    /// this seam — must keep working through the default method.
+    #[tokio::test]
+    async fn search_bound_defaults_to_search_for_a_binding_agnostic_backend() {
+        let kb: Arc<dyn Knowledge> = Arc::new(StubKnowledge);
+        let ctx = to_types_tenant(&TenantContext::new("acme", "dev")).unwrap();
+        let binding = crate::config::MemoryProviderRef {
+            provider: "provider.knowledge.chronicle".into(),
+            capability: "cap://dw.knowledge".into(),
+            params: serde_json::Map::new(),
+            credential_ref: None,
+        };
+        let hits = kb
+            .search_bound(
+                &ctx,
+                KnowledgeQuery {
+                    query: "refund policy".into(),
+                    limit: Some(3),
+                },
+                Some(&binding),
+            )
+            .await
+            .unwrap();
         assert_eq!(hits[0].text, "retrieved for: refund policy");
     }
 }

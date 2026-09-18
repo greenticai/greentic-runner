@@ -1152,3 +1152,335 @@ fn envelope_payload(value: &Value) -> Result<Value> {
         .context("envelope payload missing")?;
     decode_binary_value(payload_value)
 }
+
+// ── R1: MCP-shaped tool errors must respect `has_error_route` ──────────────
+//
+// These tests build `qa.process` fresh from `tests/fixtures/runner-components`
+// (via `build_components`) rather than going through `component_artifact_path`'s
+// prebuilt `runner-components.gtpack`: that archive's embedded `qa.process`
+// binary predates the crate's `extract_payload`/`should_return_envelope` split
+// and unconditionally echoes the whole invocation envelope, so a bare payload
+// (no `metadata.__return_envelope`) always comes back wrapped and never lets a
+// node's raw dispatch value be exactly the MCP tool-error wire shape. The
+// current crate source (`tests/fixtures/runner-components/qa_process/src/lib.rs`)
+// echoes just the decoded `payload` by default, which is what lets these tests
+// put an object shaped like `{"error": {"code", "message"}}` — no `result`, no
+// `ok` — directly at the top level of what `invoke_component_call` sees,
+// exercising the real `mcp_tool_error` decision instead of only the detector
+// function.
+
+fn mcp_tool_error_payload() -> Value {
+    // `status` is included deliberately: `mcp_tool_error` folds it into the
+    // message ("boom (status 502)"), and the routed and bailed paths must
+    // agree on that formatted message, not just on the bare "boom".
+    json!({ "error": { "code": "E1", "message": "boom", "status": 502 } })
+}
+
+/// Builds a flow whose `run` node calls `qa.process` with an MCP-shaped tool
+/// error as its input. With `with_error_route == true`, `run` carries an
+/// `on_error`-family `Routing::Custom` branch to a trivial `err` node (and an
+/// `on_success` branch to a trivial `ok` node); with `false`, `run` is a plain
+/// `Routing::End` node with no error branch at all.
+fn build_mcp_error_flow(flow_id: &str, with_error_route: bool) -> Result<Flow> {
+    let run_id = NodeId::from_str("run").context("build node id")?;
+    let mut nodes = HashMap::new();
+
+    let run_routing = if with_error_route {
+        Routing::Custom(json!([
+            { "condition": r#"event == "on_success""#, "to": "ok" },
+            { "condition": r#"event == "on_error""#, "to": "err" }
+        ]))
+    } else {
+        Routing::End
+    };
+
+    nodes.insert(
+        run_id.clone(),
+        Node {
+            id: run_id.clone(),
+            component: FlowComponentRef {
+                id: "qa.process".parse()?,
+                pack_alias: None,
+                operation: Some("process".into()),
+            },
+            input: InputMapping {
+                mapping: mcp_tool_error_payload(),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: run_routing,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        },
+    );
+
+    if with_error_route {
+        for branch in ["ok", "err"] {
+            let node_id = NodeId::from_str(branch).context("build node id")?;
+            nodes.insert(
+                node_id.clone(),
+                Node {
+                    id: node_id,
+                    component: FlowComponentRef {
+                        id: "qa.process".parse()?,
+                        pack_alias: None,
+                        operation: Some("process".into()),
+                    },
+                    input: InputMapping { mapping: json!({}) },
+                    output: OutputMapping {
+                        mapping: Value::Null,
+                    },
+                    err_map: None,
+                    routing: Routing::End,
+                    telemetry: TelemetryHints::default(),
+                    conversational: false,
+                },
+            );
+        }
+    }
+
+    Ok(Flow {
+        schema_version: "1.0".into(),
+        id: FlowId::from_str(flow_id)?,
+        kind: FlowKind::Messaging,
+        entrypoints: BTreeMap::from([("default".to_string(), Value::String(run_id.to_string()))]),
+        nodes: nodes.into_iter().collect(),
+        metadata: FlowMetadata::default(),
+    })
+}
+
+/// Same shape as `build_pack_with_flow_id`, but takes the component wasm path
+/// directly instead of resolving it through `component_artifact_path` (see the
+/// module comment above for why the R1 tests need a freshly built component).
+fn build_mcp_error_pack(
+    pack_id: &str,
+    flow: Flow,
+    pack_path: &Path,
+    component_path: &Path,
+) -> Result<()> {
+    let manifest = PackManifest {
+        agents: Default::default(),
+        schema_version: "1.0".into(),
+        pack_id: pack_id.parse()?,
+        name: None,
+        version: Version::parse("0.0.0")?,
+        kind: PackKind::Application,
+        publisher: "test".into(),
+        components: vec![ComponentManifest {
+            id: "qa.process".parse()?,
+            version: Version::parse("0.1.0")?,
+            supports: vec![FlowKind::Messaging],
+            world: "greentic:component@0.4.0".into(),
+            profiles: ComponentProfiles::default(),
+            capabilities: ComponentCapabilities::default(),
+            configurators: None,
+            operations: Vec::new(),
+            config_schema: None,
+            resources: ResourceHints::default(),
+            dev_flows: BTreeMap::new(),
+        }],
+        flows: vec![PackFlowEntry {
+            id: flow.id.clone(),
+            kind: flow.kind,
+            flow,
+            tags: Vec::new(),
+            entrypoints: vec!["default".into()],
+        }],
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        signatures: Default::default(),
+        secret_requirements: Vec::new(),
+        bootstrap: None,
+        extensions: None,
+    };
+
+    let mut zip = zip::ZipWriter::new(File::create(pack_path).context("create pack archive")?);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let manifest_bytes = encode_pack_manifest(&manifest)?;
+    zip.start_file("manifest.cbor", options)?;
+    zip.write_all(&manifest_bytes)?;
+
+    zip.start_file("components/qa.process.wasm", options)?;
+    let mut comp_file = File::open(component_path)?;
+    std::io::copy(&mut comp_file, &mut zip)?;
+    zip.finish().context("finalise pack archive")?;
+    Ok(())
+}
+
+fn qa_process_component_path() -> Result<PathBuf> {
+    let components = build_components()?;
+    components
+        .into_iter()
+        .find(|(name, _)| name == "qa.process")
+        .map(|(_, path)| path)
+        .context("qa.process component missing from build_components() output")
+}
+
+/// A node with an `on_error`-family route must surface an MCP-shaped tool
+/// error (greentic-mcp-generator's `tool_error_with_status` wire shape) as an
+/// errored node_io output and route to that branch, rather than aborting the
+/// whole flow. Mirrors the already-fixed `component_error` branch.
+#[test]
+fn mcp_tool_error_with_route_completes_instead_of_bailing() -> Result<()> {
+    let rt = *RUNTIME;
+    let component_path = qa_process_component_path()?;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("mcp-error-routed.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    let flow = build_mcp_error_flow("mcp.error.routed", true)?;
+    build_mcp_error_pack("mcp.error.routed.pack", flow, &pack_path, &component_path)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let pack = Arc::new(rt.block_on(PackRuntime::load(
+        &pack_path,
+        Arc::clone(&config),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(greentic_runner_host::wasi::RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?);
+    let engine = rt.block_on(FlowEngine::new(
+        vec![Arc::clone(&pack)],
+        Arc::clone(&config),
+    ))?;
+
+    let retry_config = config.retry.clone().into();
+    let ctx = FlowContext {
+        tenant: config.tenant.as_str(),
+        pack_id: pack.metadata().pack_id.as_str(),
+        flow_id: "mcp.error.routed",
+        node_id: None,
+        tool: None,
+        action: None,
+        session_id: None,
+        provider_id: None,
+        reply_scope: None,
+        retry_config,
+        attempt: 1,
+        observer: None,
+        mocks: None,
+        caller: None,
+    };
+
+    let execution = rt.block_on(engine.execute(ctx, Value::Null)).context(
+        "an MCP-shaped tool error on a node with an error route must not abort the flow",
+    )?;
+    match execution.status {
+        FlowStatus::Completed => {}
+        FlowStatus::Waiting(wait) => {
+            anyhow::bail!(
+                "flow paused unexpectedly instead of routing to the error branch: {:?}",
+                wait.reason
+            );
+        }
+    }
+
+    // Completing is not enough on its own — an empty `{errors}` envelope would
+    // complete too. Assert the on_error branch (not on_success) is the one
+    // that actually ran, and that the `run` node's own output carries a
+    // populated `{errors}` envelope with the real code/message, status included.
+    assert!(
+        execution.node_outputs.contains_key("err"),
+        "the on_error branch (err node) must have run: {:?}",
+        execution.node_outputs
+    );
+    assert!(
+        !execution.node_outputs.contains_key("ok"),
+        "the on_success branch (ok node) must NOT have run: {:?}",
+        execution.node_outputs
+    );
+
+    let run_output = execution
+        .node_outputs
+        .get("run")
+        .context("the run node itself must be recorded in node_outputs")?;
+    let errors = run_output["errors"].as_array().with_context(|| {
+        format!(
+            "a routed MCP tool error must populate the {{errors}} envelope, \
+             not leave it empty (read as success data): {run_output:?}"
+        )
+    })?;
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one error in the envelope: {run_output:?}"
+    );
+    assert_eq!(errors[0]["code"], "E1");
+    assert_eq!(
+        errors[0]["message"], "boom (status 502)",
+        "the routed error must carry the same status-qualified message the \
+         bail! path would have used, not the bare message"
+    );
+    Ok(())
+}
+
+/// The same MCP-shaped tool error on a node with NO error route must still
+/// abort the flow (the historical hard-fail behaviour, unchanged).
+#[test]
+fn mcp_tool_error_without_route_still_bails() -> Result<()> {
+    let rt = *RUNTIME;
+    let component_path = qa_process_component_path()?;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("mcp-error-unrouted.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    let flow = build_mcp_error_flow("mcp.error.unrouted", false)?;
+    build_mcp_error_pack("mcp.error.unrouted.pack", flow, &pack_path, &component_path)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let pack = Arc::new(rt.block_on(PackRuntime::load(
+        &pack_path,
+        Arc::clone(&config),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(greentic_runner_host::wasi::RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?);
+    let engine = rt.block_on(FlowEngine::new(
+        vec![Arc::clone(&pack)],
+        Arc::clone(&config),
+    ))?;
+
+    let retry_config = config.retry.clone().into();
+    let ctx = FlowContext {
+        tenant: config.tenant.as_str(),
+        pack_id: pack.metadata().pack_id.as_str(),
+        flow_id: "mcp.error.unrouted",
+        node_id: None,
+        tool: None,
+        action: None,
+        session_id: None,
+        provider_id: None,
+        reply_scope: None,
+        retry_config,
+        attempt: 1,
+        observer: None,
+        mocks: None,
+        caller: None,
+    };
+
+    let err = rt.block_on(engine.execute(ctx, Value::Null)).expect_err(
+        "an MCP-shaped tool error on a node with no error route must still abort the flow",
+    );
+    assert!(
+        err.to_string().contains("returned tool error"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
