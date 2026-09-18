@@ -218,11 +218,13 @@ pub(crate) fn augment_system_prompt(base: &str, chunks: &[RetrievedChunk]) -> St
 /// Surface an auto knowledge retrieval as a trace step, so the UI can show which
 /// corpus chunks were pulled into context — doc id, chunk index, score, and text.
 ///
-/// Emitted through the tool-call observer seam ONLY, and deliberately NOT pushed
-/// onto `AgentOutput.trail`. Retrieval is automatic pre-context, not a
-/// model-invoked tool: it belongs in the live trace the test-chat UI streams, but
-/// must stay out of the flow trail / metering, whose consumers treat each entry
-/// as a real agent action. A no-op when nothing was retrieved (no empty step).
+/// This is the LIVE trace, emitted through the tool-call observer seam so the
+/// test-chat UI can stream it. It is not how the retrieval is recorded: the
+/// loop also pushes an `AgentStep::KnowledgeRetrieval` onto `AgentOutput.trail`
+/// (#770), a distinct kind rather than a `ToolCall`, because retrieval is
+/// automatic pre-context and must not be counted as a model-invoked tool. A
+/// trail consumer that also listens to this observer sees the retrieval twice
+/// and must pick one. A no-op when nothing was retrieved (no empty step).
 ///
 /// The synthetic `call_id` is per-call so the UI pairs this result with its own
 /// call and never a neighbouring tool's. `doc`/`index` ride through as JSON `null`
@@ -582,5 +584,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits[0].text, "retrieved for: refund policy");
+    }
+
+    /// #770: the serialised shape of `AgentStep::KnowledgeRetrieval` is a
+    /// cross-repo contract — greentic-start's `agent_provenance` reads
+    /// `kind == "knowledge_retrieval"` and each chunk's `text`/`score`/
+    /// `doc_id`/`metadata`. Pin it, and pin that it round-trips.
+    #[test]
+    fn knowledge_retrieval_step_serialises_with_a_stable_shape() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("title".into(), serde_json::json!("Refund policy"));
+        let step = crate::AgentStep::KnowledgeRetrieval {
+            chunks: vec![RetrievedChunk {
+                text: "Refunds take 5 days.".into(),
+                score: 0.5,
+                doc_id: Some("doc-1".into()),
+                chunk_index: Some(2),
+                metadata,
+            }],
+        };
+        let value = serde_json::to_value(&step).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "knowledge_retrieval",
+                "chunks": [{
+                    "text": "Refunds take 5 days.",
+                    "score": 0.5,
+                    "doc_id": "doc-1",
+                    "chunk_index": 2,
+                    "metadata": {"title": "Refund policy"}
+                }]
+            })
+        );
+        let back: crate::AgentStep = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            back,
+            crate::AgentStep::KnowledgeRetrieval { ref chunks } if chunks.len() == 1
+        ));
     }
 }

@@ -246,7 +246,9 @@ pub async fn run_step(
     // augment the same turn, the knowledge block appended after the LT facts.
     // Retrieval failures degrade to no injection rather than failing the turn.
     let kn_active = crate::knowledge::knowledge_active(runtime.knowledge.is_some(), &config);
-    let system_prompt = if kn_active {
+    // The chunks injected this step are kept alongside the prompt so they can be
+    // recorded in the trail (`AgentStep::KnowledgeRetrieval`) once it exists.
+    let (system_prompt, retrieved_chunks) = if kn_active {
         // The agent's own knowledge binding, threaded through so a backend that
         // delegates retrieval to a per-worker target can read its ids from the
         // binding's `params` (see `Knowledge::search_bound`).
@@ -298,9 +300,10 @@ pub async fn run_step(
                 Vec::new()
             }
         };
-        crate::knowledge::augment_system_prompt(&system_prompt, &chunks)
+        let augmented = crate::knowledge::augment_system_prompt(&system_prompt, &chunks);
+        (augmented, chunks)
     } else {
-        system_prompt
+        (system_prompt, Vec::new())
     };
 
     // --- Conversational note: tell the model the `end_conversation` tool
@@ -367,6 +370,14 @@ pub async fn run_step(
     let mut tokens_in_total: u64 = 0;
     let mut tokens_out_total: u64 = 0;
     let mut trail: Vec<AgentStep> = Vec::new();
+    // Record the built-in knowledge retrieval FIRST: it happened before any LLM
+    // call, and it is the only place a knowledge-grounded answer's sources are
+    // written down (the observer trace is live-only and never persisted).
+    if !retrieved_chunks.is_empty() {
+        trail.push(AgentStep::KnowledgeRetrieval {
+            chunks: retrieved_chunks,
+        });
+    }
     let mut terminated_by = TerminationReason::MaxIterations;
     let mut iterations: u32 = 0;
     let mut reply = String::new();
@@ -964,7 +975,7 @@ mod tests {
     use crate::llm::LlmResponse;
     use crate::mock::{MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry};
     use crate::tenant::TenantContext;
-    use crate::{AgentInput, AgentRuntime};
+    use crate::{AgentInput, AgentRuntime, AgentStep};
 
     fn cfg() -> AgentConfig {
         AgentConfig {
@@ -1418,7 +1429,7 @@ mod tests {
         )
         .with_knowledge(kb);
 
-        runtime
+        let out = runtime
             .step(
                 tc,
                 "sess-k",
@@ -1431,6 +1442,41 @@ mod tests {
             .await
             .unwrap();
 
+        // #770: the retrieval is recorded in the trail, ahead of the LLM call,
+        // with the chunk exactly as retrieved — this is what lets a consumer
+        // cite a knowledge-grounded answer.
+        assert!(
+            matches!(
+                out.trail.first(),
+                Some(AgentStep::KnowledgeRetrieval { .. })
+            ),
+            "first trail step must be KnowledgeRetrieval: {:?}",
+            out.trail
+        );
+        let chunks = out
+            .trail
+            .iter()
+            .find_map(|s| match s {
+                AgentStep::KnowledgeRetrieval { chunks } => Some(chunks),
+                _ => None,
+            })
+            .expect("retrieval step");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].text,
+            "Refunds are processed within 5 business days."
+        );
+        assert!((chunks[0].score - 0.9).abs() < f64::EPSILON);
+        assert_eq!(
+            out.trail
+                .iter()
+                .filter(|s| matches!(s, AgentStep::KnowledgeRetrieval { .. }))
+                .count(),
+            1,
+            "one retrieval per step: {:?}",
+            out.trail
+        );
+
         let prompts = llm.seen_system_prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1);
         assert!(
@@ -1442,6 +1488,64 @@ mod tests {
             prompts[0].contains("Refunds are processed within 5 business days."),
             "retrieved chunk missing from system prompt: {}",
             prompts[0]
+        );
+    }
+
+    /// #770: a retrieval that returns nothing injected nothing, so it has
+    /// nothing to cite and must not add an (empty) `KnowledgeRetrieval` step.
+    #[tokio::test]
+    async fn empty_knowledge_retrieval_records_no_trail_step() {
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("ok".into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]));
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        let mut c = cfg();
+        c.knowledge = Some(crate::config::KnowledgeSettings {
+            knowledge: Some(crate::config::MemoryProviderRef {
+                provider: "provider.knowledge.chronicle".into(),
+                capability: "cap://dw.knowledge".into(),
+                params: serde_json::Map::new(),
+                credential_ref: None,
+            }),
+            embedding: None,
+            top_k: 3,
+        });
+        cp.insert(&tc, "a", c);
+        let runtime = AgentRuntime::new(
+            Arc::new(cp),
+            Arc::new(MockAgentStateStore::new()),
+            Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
+            llm,
+            Arc::new(MockTelemetry::new()),
+            Arc::new(crate::cost::MockTokenMeter::new(0)),
+            Arc::new(crate::mock::NoopToolLedger),
+            None,
+        )
+        .with_knowledge(Arc::new(crate::mock::MockKnowledge::new(Vec::new())));
+
+        let out = runtime
+            .step(
+                tc,
+                "sess-k0",
+                "a",
+                AgentInput {
+                    text: "anything?".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !out.trail
+                .iter()
+                .any(|s| matches!(s, AgentStep::KnowledgeRetrieval { .. })),
+            "empty retrieval must not be recorded: {:?}",
+            out.trail
         );
     }
 
