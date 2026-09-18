@@ -831,8 +831,8 @@ impl TenantRuntime {
             // Also needed after `merged_agents` is moved into
             // `build_agent_node_handler`/`_ephemeral` below, to resolve the
             // in-process operala.call LLM key the same way (see the
-            // `desktop-agent-ephemeral` block after the DwAgent wiring).
-            #[cfg(feature = "desktop-agent-ephemeral")]
+            // `operala-in-process` block after the DwAgent wiring).
+            #[cfg(feature = "operala-in-process")]
             let operala_agents = merged_agents.clone();
             let agent_handler = if redis_set {
                 crate::runner::agent_node::build_agent_node_handler(
@@ -882,9 +882,9 @@ impl TenantRuntime {
             }
 
             // In-process deep-worker runtime for `operala.call` nodes
-            // (desktop-agent-ephemeral only, e.g. the designer's offline
-            // Test-chat sidecar — same feature the ephemeral DwAgent handler
-            // above uses). Reuses the exact key-resolution policy the
+            // (`operala-in-process`; `desktop-agent-ephemeral` implies it, so
+            // the designer's offline Test-chat sidecar keeps it). Reuses the
+            // exact key-resolution policy the
             // in-process dw.agent LLM backend uses (env key wins; otherwise
             // the first agent's `llm.credential_ref` resolved from the
             // per-tenant secrets store), then builds a
@@ -894,7 +894,7 @@ impl TenantRuntime {
             // `operala.call` falls back to the NATS `RemoteDispatchHandler`,
             // failing without it) when no LLM key resolves or the provider
             // fails to build.
-            #[cfg(feature = "desktop-agent-ephemeral")]
+            #[cfg(feature = "operala-in-process")]
             {
                 let env_key = std::env::var("GREENTIC_LLM_API_KEY")
                     .ok()

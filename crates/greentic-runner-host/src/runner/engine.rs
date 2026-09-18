@@ -81,7 +81,7 @@ pub struct FlowEngine {
     /// runtime (see `runner::operala_node`). Not feature-gated (like
     /// `remote_dispatch_handler`): `operala.call` is a core runtime-dispatch
     /// node and the trait itself has no feature-gated dependencies — only the
-    /// concrete production impl (built under `desktop-agent-ephemeral` in
+    /// concrete production impl (built under `operala-in-process` in
     /// `runtime.rs`) does. `None` falls back to the existing NATS
     /// `RemoteDispatchHandler` path (`execute_remote_dispatch`).
     operala_node_handler: Option<Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
@@ -675,8 +675,9 @@ impl FlowEngine {
 
     /// Set the handler that bridges `operala.call` flow nodes into an
     /// in-process deep-worker runtime. Constructed by the runner binary
-    /// (`runtime.rs`, `desktop-agent-ephemeral` feature) so `operala.call`
-    /// nodes run with no NATS in that build. Mirrors [`set_agent_node_handler`].
+    /// (`runtime.rs`, `operala-in-process` feature, unless
+    /// `GREENTIC_OPERALA_DISPATCH=nats`) so `operala.call` nodes run with no
+    /// NATS in that build. Mirrors [`set_agent_node_handler`].
     ///
     /// [`set_agent_node_handler`]: FlowEngine::set_agent_node_handler
     pub fn set_operala_node_handler(
@@ -1743,9 +1744,8 @@ impl FlowEngine {
 
     /// Dispatch an `operala.call` flow node.
     ///
-    /// When an in-process [`OperalaNodeHandler`] is wired (`desktop-agent-
-    /// ephemeral`, e.g. the designer's offline Test-chat sidecar), the node
-    /// runs the deep-worker runtime directly — no NATS, no
+    /// When an in-process [`OperalaNodeHandler`] is wired (`operala-in-process`),
+    /// the node runs the deep-worker runtime directly — no NATS, no
     /// `RemoteDispatchHandler` — and completes inline. Otherwise falls back to
     /// the shared remote-dispatch seam, identical to [`execute_sorla_call`]
     /// except the runtime name is `"operala"`.

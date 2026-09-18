@@ -130,6 +130,11 @@ greentic-llm-backend = [
     "greentic-runner-host/greentic-llm-backend",
     "greentic-runner-desktop/greentic-llm-backend",
 ]
+# In-process deep-worker runtime for `operala.call` nodes. Server-safe (no mock
+# types). With it, `operala.call` runs in this process when an LLM key resolves,
+# unless GREENTIC_OPERALA_DISPATCH=nats. Off by default; greentic-start / the
+# designer image opt in.
+operala-in-process = ["agentic-worker", "greentic-runner-host/operala-in-process"]
 
 [dev-dependencies]
 greentic-flow.workspace = true

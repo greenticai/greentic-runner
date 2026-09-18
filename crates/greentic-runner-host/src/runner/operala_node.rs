@@ -6,10 +6,11 @@
 //! The trait itself is unconditional (like `AgentNodeHandler`) so the engine
 //! can hold `Option<Arc<dyn OperalaNodeHandler>>` regardless of build
 //! features; the concrete [`RuntimeOperalaNodeHandler`] impl (wrapping
-//! `DeepWorkerInvoker`) is feature-gated behind `desktop-agent-ephemeral` —
+//! `DeepWorkerInvoker`) is feature-gated behind `operala-in-process` —
 //! the same feature the designer's offline Test-chat sidecar already builds
-//! with — so `operala.call` nodes run with NO NATS in that build. Server
-//! builds without that feature keep the existing NATS
+//! with (via `desktop-agent-ephemeral`, which implies it) — so `operala.call`
+//! nodes run with NO NATS in that build. Builds without that feature — and
+//! any build with `GREENTIC_OPERALA_DISPATCH=nats` — keep the NATS
 //! `RemoteDispatchHandler` fallback (`execute_remote_dispatch`) untouched.
 
 use anyhow::Result;
@@ -46,11 +47,11 @@ pub trait OperalaNodeHandler: Send + Sync {
 /// silently sends the key to the wrong API (e.g. a DeepSeek key to OpenAI → 401).
 ///
 /// Its only production caller is `dw::RuntimeOperalaNodeHandler::build_invoker`
-/// below, which lives in the `desktop-agent-ephemeral`-gated `mod dw`; cfg-gate
+/// below, which lives in the `operala-in-process`-gated `mod dw`; cfg-gate
 /// this the same way (plus `test`, for the unit tests at the bottom of this
 /// file) so it isn't flagged dead in builds where that feature is off (e.g. a
 /// lean `--no-default-features --features verify` build).
-#[cfg(any(feature = "desktop-agent-ephemeral", test))]
+#[cfg(any(feature = "operala-in-process", test))]
 fn resolve_operala_provider_model(
     input: &Value,
     fallback_provider: Option<&str>,
@@ -103,10 +104,10 @@ pub fn operala_dispatch_in_process(env_value: Option<&str>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// desktop-agent-ephemeral feature: DeepWorkerInvoker-backed handler
+// operala-in-process feature: DeepWorkerInvoker-backed handler
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "desktop-agent-ephemeral")]
+#[cfg(feature = "operala-in-process")]
 mod dw {
     use std::sync::Arc;
 
@@ -220,7 +221,7 @@ mod dw {
     }
 }
 
-#[cfg(feature = "desktop-agent-ephemeral")]
+#[cfg(feature = "operala-in-process")]
 pub use dw::RuntimeOperalaNodeHandler;
 
 #[cfg(test)]

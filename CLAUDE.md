@@ -402,7 +402,8 @@ Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERI
 - `component-v0-6-introspection` — v0.6 component inspection
 - `greentic-x-provider` — Greentic-X extension runtime integration (host crate; pulls `greentic-x-runtime` + `greentic-x-types`)
 - `legacy-gen-bindings` — gates the `greentic-gen-bindings` binary (runner crate only)
-- `desktop-agent-ephemeral` — ephemeral in-memory desktop-agent mode: enables `agentic-worker` plus `greentic-aw-runtime`'s `test-mock` and `dev-allow-unsigned` (not for production)
+- `operala-in-process` — in-process deep-worker (`operala.call`) runtime: enables `agentic-worker` plus the greentic-dw operala invoker/bridge and `greentic-llm`. Server-safe. `GREENTIC_OPERALA_DISPATCH=nats` keeps NATS dispatch at run time.
+- `desktop-agent-ephemeral` — ephemeral in-memory desktop-agent mode: enables `agentic-worker`, `greentic-llm-backend`, `operala-in-process` and `greentic-aw-runtime`'s `test-mock` (not for production; `dev-allow-unsigned` must be named separately)
 - `greentic-llm-backend` — in-process LLM backend for the agentic worker: enables `agentic-worker` plus `greentic-aw-runtime/greentic-llm-backend`
 
 ## Git Conventions
