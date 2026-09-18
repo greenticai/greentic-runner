@@ -2489,10 +2489,12 @@ mod aw {
                 agents,
                 "acme".to_string(),
                 crate::secrets::default_manager().expect("env secrets manager"),
+                None,
                 vec![],
                 Arc::new(MockAgentStateStore::new()),
                 Arc::new(MockTokenMeter::new(0)),
                 Arc::new(NoopToolLedger),
+                None,
                 None,
                 None,
             )
@@ -2500,7 +2502,15 @@ mod aw {
             .expect("handler should build from mock stores");
 
             let _ = handler
-                .execute("acme", "prod", "greeter", "s", &json!({"user_text": "hi"}))
+                .execute(
+                    "acme",
+                    "prod",
+                    "greeter",
+                    "s",
+                    &json!({"user_text": "hi"}),
+                    false,
+                    None,
+                )
                 .await;
 
             unsafe {

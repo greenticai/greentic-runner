@@ -248,7 +248,7 @@ impl RunnerHost {
     }
 
     pub async fn handle_activity(&self, tenant: &str, activity: Activity) -> Result<Vec<Activity>> {
-        let (runtime, prepared) = self.prepare_turn(tenant, activity)?;
+        let (runtime, prepared) = self.prepare_turn(tenant, activity).await?;
         match prepared {
             Prepared::ShortCircuit(replies) => Ok(replies),
             Prepared::Run(envelope) => {
@@ -267,7 +267,7 @@ impl RunnerHost {
         tenant: &str,
         activity: Activity,
     ) -> Result<TurnTrace> {
-        let (runtime, prepared) = self.prepare_turn(tenant, activity)?;
+        let (runtime, prepared) = self.prepare_turn(tenant, activity).await?;
         match prepared {
             Prepared::ShortCircuit(replies) => Ok(TurnTrace {
                 replies,
@@ -292,7 +292,7 @@ impl RunnerHost {
     /// Shared setup for [`Self::handle_activity`] / [`Self::handle_activity_traced`]:
     /// resolve the tenant runtime and build the canonical ingress envelope. The
     /// single seam guarantees the traced and untraced paths cannot diverge.
-    fn prepare_turn(
+    async fn prepare_turn(
         &self,
         tenant: &str,
         activity: Activity,
@@ -301,7 +301,7 @@ impl RunnerHost {
             .active
             .load_pack(tenant)
             .with_context(|| format!("tenant {tenant} not loaded"))?;
-        let prepared = self.build_prepared(&runtime, tenant, activity)?;
+        let prepared = self.build_prepared(&runtime, tenant, activity).await?;
         Ok((runtime, prepared))
     }
 
@@ -666,10 +666,10 @@ impl RunnerHost {
     /// and reply shaping never drift between them.
     /// Build the ingress envelope for a turn (fast2flow routing + welcome-flow
     /// override), or short-circuit with a pre-built response (fast2flow
-    /// Respond/Deny). Sync — the caller runs the state machine on the `Run` arm,
+    /// Respond/Deny). The caller runs the state machine on the `Run` arm,
     /// so the traced (`handle_traced`) and untraced (`handle`) paths share this
     /// single envelope-building seam and cannot diverge.
-    fn build_prepared(
+    async fn build_prepared(
         &self,
         runtime: &TenantRuntime,
         tenant: &str,
@@ -781,7 +781,7 @@ impl RunnerHost {
         tenant: &str,
         activity: Activity,
     ) -> Result<Vec<Activity>> {
-        match self.build_prepared(runtime, tenant, activity)? {
+        match self.build_prepared(runtime, tenant, activity).await? {
             Prepared::ShortCircuit(replies) => Ok(replies),
             Prepared::Run(envelope) => {
                 let result = runtime.state_machine().handle(*envelope).await?;
