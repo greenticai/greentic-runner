@@ -11780,7 +11780,10 @@ mod tests {
     /// ends the flow directly. Mirrors `conversational_dw_flow`'s shape for
     /// the (non-conversational) operala path.
     fn operala_flow(target: &str) -> HostFlow {
-        operala_flow_with_payload(target, json!({ "operation": "", "input": { "goal": "hi" } }))
+        operala_flow_with_payload(
+            target,
+            json!({ "operation": "", "input": { "goal": "hi" } }),
+        )
     }
 
     /// Like [`operala_flow`] but with a caller-chosen node payload.
