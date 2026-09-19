@@ -589,8 +589,11 @@ mod tests {
 
             let key = mcp_unit_secret_key("ff308b9c-951a-4c1e-9b1d-0a6c2e3f4a5b", id).unwrap();
             let uri = mcp_secret_uri("acme", Some("sales"), &key).unwrap();
-            greentic_secrets_lib::spec::SecretUri::parse(&uri)
-                .unwrap_or_else(|e| panic!("`{id}` produced an invalid URI `{uri}`: {e}"));
+            let parsed = greentic_secrets_lib::spec::SecretUri::parse(&uri);
+            assert!(
+                parsed.is_ok(),
+                "`{id}` produced an invalid URI `{uri}`: {parsed:?}"
+            );
         }
     }
 
