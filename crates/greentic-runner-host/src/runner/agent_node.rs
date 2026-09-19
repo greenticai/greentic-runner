@@ -3963,10 +3963,10 @@ pub(crate) use aw::{
 };
 
 // Only consumed by `runtime.rs`'s in-process operala.call wiring, which is
-// itself gated behind `desktop-agent-ephemeral` — re-exporting unconditionally
+// itself gated behind `operala-in-process` — re-exporting unconditionally
 // under plain `agentic-worker` would trip `unused_imports` on builds that have
-// `agentic-worker` without `desktop-agent-ephemeral`.
-#[cfg(feature = "desktop-agent-ephemeral")]
+// `agentic-worker` without `operala-in-process`.
+#[cfg(feature = "operala-in-process")]
 pub(crate) use aw::resolve_in_process_llm_key;
 
 // flow_source_from_packs is used only inside the aw module (build_runtime_handler_with_stores

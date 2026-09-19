@@ -120,6 +120,7 @@ pub fn collect() -> InfoReport {
             "component-v0-6-introspection",
             cfg!(feature = "component-v0-6-introspection"),
         ),
+        ("operala-in-process", cfg!(feature = "operala-in-process")),
     ] {
         if on {
             enabled.push(feat.to_string());

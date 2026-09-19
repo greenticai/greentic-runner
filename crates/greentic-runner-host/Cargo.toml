@@ -39,13 +39,24 @@ greentic-llm-backend = [
     "dep:greentic-llm",
     "greentic-aw-runtime?/greentic-llm-backend",
 ]
+# In-process deep-worker runtime for `operala.call` flow nodes
+# (`greentic-dw-operala-invoker` running `DeepLoopCoordinator` with a
+# `greentic_llm::RigBackend`). Server-safe: it pulls NO mock types, so a
+# production binary (greentic-start, the runner binary) may enable it. When on,
+# `runtime.rs` wires the handler unless GREENTIC_OPERALA_DISPATCH=nats, and only
+# when an LLM key resolves; otherwise `operala.call` keeps the NATS
+# `RemoteDispatchHandler` path. `greentic-llm`'s default `rig` feature is what
+# provides `RigBackend`, so `greentic-llm-backend` is not required.
+operala-in-process = [
+    "agentic-worker",
+    "dep:greentic-dw-operala-invoker",
+    "dep:greentic-dw-operala-bridge",
+    "dep:greentic-llm",
+]
 # Adds the ephemeral (in-memory) agent builder for desktop/local runs.
 # Enables the test-mock types from greentic-aw-runtime; must NOT be enabled
-# in the server binary — the server always uses the Redis path.
-# Also wires the in-process deep-worker (`operala.call`) runtime (the same
-# `greentic-dw-operala-invoker`/`greentic-dw-operala-bridge` line the runner
-# already git-deps for other greentic-dw crates) so `operala.call` nodes run
-# with no NATS — needed for the designer's offline Test-chat sidecar.
+# in the server binary — the server always uses the Redis path. A server that
+# wants in-process `operala.call` enables `operala-in-process` instead.
 desktop-agent-ephemeral = [
     "agentic-worker",
     # dw.agent MUST use the multi-provider in-process backend (GreenticLlmBackend
@@ -53,7 +64,7 @@ desktop-agent-ephemeral = [
     # the OpenAI-only `OpenAiLlmBackend`, which ignores the agent's configured
     # provider and calls OpenAI with the (usually empty) OpenAI key — a hard 401
     # for any non-OpenAI worker (e.g. a DeepSeek dw.agent in the offline
-    # Test-chat sidecar). This feature already pulls `dep:greentic-llm` below.
+    # Test-chat sidecar).
     "greentic-llm-backend",
     "greentic-aw-runtime?/test-mock",
     # NOTE: deliberately does NOT pull `greentic-aw-runtime?/dev-allow-unsigned`.
@@ -61,9 +72,8 @@ desktop-agent-ephemeral = [
     # disabled extension signature verification — two unrelated things, one of
     # them a security control. Anything that needs the bypass must now name it:
     # `--features dev-allow-unsigned`. See that feature's comment below.
-    "dep:greentic-dw-operala-invoker",
-    "dep:greentic-dw-operala-bridge",
-    "dep:greentic-llm",
+    # The offline Test-chat sidecar runs `operala.call` with no NATS.
+    "operala-in-process",
 ]
 # Lets `GREENTIC_EXT_ALLOW_UNSIGNED=1` skip extension signature verification.
 #
@@ -140,12 +150,12 @@ greentic-dw-providers-common = { git = "https://github.com/greenticai/greentic-d
 # here). All optional, gated by the `knowledge-chronicle` feature.
 greentic-dw-knowledge-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
 greentic-dw-knowledge = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-# In-process deep-worker runtime for `operala.call` flow nodes (desktop-agent-
-# ephemeral only — see that feature's comment). Same git source (greentic-dw,
-# branch research) the runner already pulls greentic-dw-manifest from via
-# greentic-aw-runtime, so this reuses the already-locked commit.
-greentic-dw-operala-invoker = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research", optional = true }
-greentic-dw-operala-bridge = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research", optional = true }
+# In-process deep-worker runtime for `operala.call` flow nodes (feature
+# `operala-in-process`; `desktop-agent-ephemeral` implies it). Same git source
+# (greentic-dw, branch research) the runner already pulls greentic-dw-manifest
+# from via greentic-aw-runtime, so this reuses the already-locked commit.
+greentic-dw-operala-invoker = { git = "https://github.com/greenticai/greentic-dw.git", rev = "00cf18318a20f071d5878aff66e8f33b157cb1ed", optional = true }
+greentic-dw-operala-bridge = { git = "https://github.com/greenticai/greentic-dw.git", rev = "00cf18318a20f071d5878aff66e8f33b157cb1ed", optional = true }
 # Needed directly (not just transitively via greentic-aw-runtime) to build the
 # `Arc<dyn greentic_llm::LlmProvider>` that `DeepWorkerInvoker::new` takes.
 # Pinned to the exact registry version already resolved elsewhere in the

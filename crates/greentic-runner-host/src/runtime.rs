@@ -831,8 +831,8 @@ impl TenantRuntime {
             // Also needed after `merged_agents` is moved into
             // `build_agent_node_handler`/`_ephemeral` below, to resolve the
             // in-process operala.call LLM key the same way (see the
-            // `desktop-agent-ephemeral` block after the DwAgent wiring).
-            #[cfg(feature = "desktop-agent-ephemeral")]
+            // `operala-in-process` block after the DwAgent wiring).
+            #[cfg(feature = "operala-in-process")]
             let operala_agents = merged_agents.clone();
             let agent_handler = if redis_set {
                 crate::runner::agent_node::build_agent_node_handler(
@@ -882,9 +882,9 @@ impl TenantRuntime {
             }
 
             // In-process deep-worker runtime for `operala.call` nodes
-            // (desktop-agent-ephemeral only, e.g. the designer's offline
-            // Test-chat sidecar — same feature the ephemeral DwAgent handler
-            // above uses). Reuses the exact key-resolution policy the
+            // (`operala-in-process`; `desktop-agent-ephemeral` implies it, so
+            // the designer's offline Test-chat sidecar keeps it). Reuses the
+            // exact key-resolution policy the
             // in-process dw.agent LLM backend uses (env key wins; otherwise
             // the first agent's `llm.credential_ref` resolved from the
             // per-tenant secrets store), then builds a
@@ -894,72 +894,106 @@ impl TenantRuntime {
             // `operala.call` falls back to the NATS `RemoteDispatchHandler`,
             // failing without it) when no LLM key resolves or the provider
             // fails to build.
-            #[cfg(feature = "desktop-agent-ephemeral")]
+            #[cfg(feature = "operala-in-process")]
             {
-                let env_key = std::env::var("GREENTIC_LLM_API_KEY")
+                use crate::runner::operala_node::{
+                    OPERALA_DISPATCH_ENV, OperalaSelection, select_operala_handler,
+                };
+
+                // Provider/model are resolved PER WORKER from each
+                // `operala.call` node's `input.llm` binding (stamped by
+                // greentic-dw-authoring for authored deep-worker packs); the
+                // handler builds the LLM per dispatch. For a node that carries
+                // NO `input.llm` — e.g. an operala.call synthesized at runtime
+                // for a dw.agent's chronicle knowledge/memory retrieval — fall
+                // back to the agent's OWN configured provider/model (the same
+                // `operala_agents` the api_key is resolved from). The
+                // process-level env still OVERRIDES both. Only when neither the
+                // node, the agent config, nor the env carries a provider/model
+                // does the dispatch error explicitly.
+                let agent_llm = operala_agents
+                    .values()
+                    .map(|agent| &agent.llm)
+                    .find(|llm| !llm.provider.trim().is_empty() && !llm.model.trim().is_empty());
+                let fallback_provider = std::env::var("GREENTIC_LLM_PROVIDER")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
-                    .or_else(|| {
-                        std::env::var("OPENAI_API_KEY")
-                            .ok()
-                            .filter(|value| !value.trim().is_empty())
-                    });
-                let api_key = match env_key {
-                    Some(key) => Some(key),
-                    None => {
-                        crate::runner::agent_node::resolve_in_process_llm_key(
-                            &secrets_manager,
-                            &config.tenant,
-                            &operala_agents,
-                        )
-                        .await
+                    .or_else(|| agent_llm.map(|llm| llm.provider.clone()));
+                let fallback_model = std::env::var("GREENTIC_LLM_MODEL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| agent_llm.map(|llm| llm.model.clone()));
+                let base_url = std::env::var("GREENTIC_LLM_BASE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty());
+
+                // Same key policy the in-process dw.agent backend uses: env key
+                // wins; otherwise the first agent's `llm.credential_ref` from the
+                // per-tenant secrets store.
+                let key_secrets = &secrets_manager;
+                let key_tenant = config.tenant.as_str();
+                let key_agents = &operala_agents;
+                let resolve_key = move || async move {
+                    let env_key = std::env::var("GREENTIC_LLM_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| {
+                            std::env::var("OPENAI_API_KEY")
+                                .ok()
+                                .filter(|value| !value.trim().is_empty())
+                        });
+                    match env_key {
+                        Some(key) => Some(key),
+                        None => {
+                            crate::runner::agent_node::resolve_in_process_llm_key(
+                                key_secrets,
+                                key_tenant,
+                                key_agents,
+                            )
+                            .await
+                        }
                     }
                 };
-                match api_key {
-                    Some(api_key) => {
-                        // Provider/model are resolved PER WORKER from each
-                        // `operala.call` node's `input.llm` binding (stamped by
-                        // greentic-dw-authoring for authored deep-worker packs);
-                        // the handler builds the LLM per dispatch. For a node
-                        // that carries NO `input.llm` — e.g. an operala.call
-                        // synthesized at runtime for a dw.agent's chronicle
-                        // knowledge/memory retrieval — fall back to the agent's
-                        // OWN configured provider/model (the same `operala_agents`
-                        // the api_key is resolved from), which is NOT a guess: it
-                        // is this worker's declared LLM, consistent with its key.
-                        // The process-level env still OVERRIDES both. Only when
-                        // neither the node, the agent config, nor the env carries
-                        // a provider/model does the dispatch error explicitly.
-                        let agent_llm =
-                            operala_agents.values().map(|agent| &agent.llm).find(|llm| {
-                                !llm.provider.trim().is_empty() && !llm.model.trim().is_empty()
-                            });
-                        let fallback_provider = std::env::var("GREENTIC_LLM_PROVIDER")
-                            .ok()
-                            .filter(|value| !value.trim().is_empty())
-                            .or_else(|| agent_llm.map(|llm| llm.provider.clone()));
-                        let fallback_model = std::env::var("GREENTIC_LLM_MODEL")
-                            .ok()
-                            .filter(|value| !value.trim().is_empty())
-                            .or_else(|| agent_llm.map(|llm| llm.model.clone()));
-                        let base_url = std::env::var("GREENTIC_LLM_BASE_URL")
-                            .ok()
-                            .filter(|value| !value.trim().is_empty());
-                        engine.set_operala_node_handler(Arc::new(
-                            crate::runner::operala_node::RuntimeOperalaNodeHandler::new(
-                                api_key,
-                                base_url,
-                                fallback_provider,
-                                fallback_model,
-                            ),
-                        ));
+
+                let dispatch_env = std::env::var(OPERALA_DISPATCH_ENV).ok();
+                match select_operala_handler(
+                    dispatch_env.as_deref(),
+                    resolve_key,
+                    base_url,
+                    fallback_provider,
+                    fallback_model,
+                )
+                .await
+                {
+                    OperalaSelection::InProcess(handler) => {
+                        engine.set_operala_node_handler(handler);
                         tracing::info!(
+                            dispatch = "in-process",
                             "operala.call in-process deep-worker runtime wired into FlowEngine \
                              (provider/model resolved per-worker from node input.llm)"
                         );
                     }
-                    None => {
+                    OperalaSelection::Nats => {
+                        tracing::info!(
+                            dispatch = "nats",
+                            "GREENTIC_OPERALA_DISPATCH=nats: operala.call dispatches over NATS; \
+                             in-process deep-worker handler not wired"
+                        );
+                        if std::env::var("GREENTIC_EVENTS_NATS_URL")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .is_none()
+                        {
+                            tracing::warn!(
+                                "GREENTIC_OPERALA_DISPATCH=nats but GREENTIC_EVENTS_NATS_URL is \
+                                 unset; operala.call nodes will fail (no remote dispatch \
+                                 handler). Set the NATS URL or unset the flag."
+                            );
+                        }
+                    }
+                    OperalaSelection::NoKey => {
                         tracing::warn!(
+                            dispatch = "nats",
                             "no LLM API key resolved (env or store) for operala.call \
                              in-process wiring; operala.call nodes will fall back to NATS \
                              (and fail without it)"

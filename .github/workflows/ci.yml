@@ -70,6 +70,13 @@ jobs:
       - name: Clippy (all targets, all features, warnings denied)
         run: cargo clippy --all-targets --all-features --workspace --locked -- -D warnings
 
+      # `--all-features` above also enables desktop-agent-ephemeral, so it cannot
+      # tell whether `operala-in-process` compiles ON ITS OWN — the combination a
+      # server binary (greentic-start) ships. `-p` is deliberate: it stops
+      # workspace feature unification from pulling the ephemeral feature back in.
+      - name: Clippy (host, operala-in-process without desktop-agent-ephemeral)
+        run: cargo clippy -p greentic-runner-host --all-targets --features operala-in-process --locked -- -D warnings
+
   fmt:
     runs-on: ubuntu-latest
     steps:
