@@ -606,6 +606,20 @@ impl FlowEngine {
         &self.rollout_ids
     }
 
+    /// The deployed unit an MCP credential is scoped to: this engine's
+    /// revision `bundle_id`.
+    ///
+    /// Read from the engine, not from `GREENTIC_BUNDLE_ID`: one greentic-start
+    /// process serves every revision of an environment, each through its own
+    /// `TenantRuntime` -> `FlowEngine` built by `TenantRuntime::load_revision`,
+    /// so the per-engine rollout identity is the only value that differs per
+    /// unit in every lane. `None` on the legacy tenant-only runtime, which then
+    /// resolves the team / `_` scopes exactly as before.
+    #[cfg(feature = "agentic-worker")]
+    pub(crate) fn mcp_credential_unit(&self) -> Option<&str> {
+        self.rollout_ids.bundle_id.as_deref()
+    }
+
     /// Use an MCP tool source the embedding host built, in place of the one
     /// [`FlowEngine::new`] derives from the process-global `GREENTIC_AW_*`
     /// environment.
@@ -1955,6 +1969,7 @@ impl FlowEngine {
             ctx.tenant,
             &self.default_env,
             auth_team,
+            self.mcp_credential_unit(),
             server_id,
             tool,
             &arguments,
@@ -7636,6 +7651,22 @@ mod tests {
         assert_eq!(engine.rollout_ids.deployment_id.as_deref(), Some("01JTKS"));
         // A freshly-built engine carries no rollout identity (legacy runtime).
         assert!(minimal_engine().rollout_ids.is_empty());
+    }
+
+    /// The MCP credential unit is the revision's `bundle_id` — the per-engine
+    /// identity, since one greentic-start process serves many revisions — and
+    /// is absent on the legacy tenant-only runtime.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn mcp_credential_unit_is_the_revisions_bundle_id() {
+        let engine = minimal_engine().with_rollout_ids(RolloutIds {
+            customer_id: None,
+            deployment_id: Some("01JTKS".into()),
+            bundle_id: Some("customer.support".into()),
+            revision_id: Some("01JTKR".into()),
+        });
+        assert_eq!(engine.mcp_credential_unit(), Some("customer.support"));
+        assert_eq!(minimal_engine().mcp_credential_unit(), None);
     }
 
     /// The composition that matters: what a `flow.goto` NODE produces is a jump

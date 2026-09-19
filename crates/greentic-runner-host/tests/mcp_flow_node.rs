@@ -1055,6 +1055,36 @@ async fn invoke_with_pack_routes(
     tool: &str,
     arguments: &Value,
 ) -> Value {
+    invoke_with_pack_routes_for_unit(
+        source,
+        pack_routes,
+        secrets,
+        tenant,
+        env,
+        team,
+        None,
+        server_id,
+        tool,
+        arguments,
+    )
+    .await
+}
+
+/// [`invoke_with_pack_routes`] for a named deployed unit (the running
+/// revision's `bundle_id`).
+#[allow(clippy::too_many_arguments)]
+async fn invoke_with_pack_routes_for_unit(
+    source: Option<&Arc<greentic_aw_runtime::McpToolSource>>,
+    pack_routes: Option<&greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes>,
+    secrets: Option<greentic_runner_host::secrets::DynSecretsManager>,
+    tenant: &str,
+    env: &str,
+    team: Option<&str>,
+    unit: Option<&str>,
+    server_id: &str,
+    tool: &str,
+    arguments: &Value,
+) -> Value {
     greentic_runner_host::runner::mcp_node::aw::invoke_with_secrets(
         source,
         pack_routes,
@@ -1062,6 +1092,7 @@ async fn invoke_with_pack_routes(
         tenant,
         env,
         team,
+        unit,
         server_id,
         tool,
         arguments,
@@ -1279,4 +1310,99 @@ async fn a_sidecar_without_auth_team_reads_only_the_tenant_default_scope() {
         error.contains("secrets://default/acme/_/mcp/srv-1"),
         "got: {error}"
     );
+}
+
+// ── per-unit credential scope ────────────────────────────────────────────────
+//
+// Two workers in one environment bind the same MCP server. Each deployed unit
+// (revision `bundle_id`) resolves its OWN token first, at
+// `…/mcp/<server_id>.unit-<segment>`, so neither can read the other's.
+
+/// A unit resolves the credential staged for it, and a second unit with no
+/// credential of its own does NOT borrow the first one's.
+#[tokio::test]
+async fn each_unit_resolves_only_its_own_unit_scoped_secret() {
+    let server = fake_mcp_server(json!({ "structuredContent": { "premium": 11 } })).await;
+    let routes = greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes::from_pack_bytes(
+        &pack_with_http_route("srv-1", &server.uri(), "Authorization"),
+    )
+    .expect("routes");
+
+    let unit_a_key =
+        greentic_aw_runtime::mcp_secrets::mcp_unit_secret_key("srv-1", "worker-a").expect("key");
+    let unit_b_key =
+        greentic_aw_runtime::mcp_secrets::mcp_unit_secret_key("srv-1", "worker-b").expect("key");
+    let secrets = stub_secrets_manager(&[(
+        format!("secrets://default/acme/_/mcp/{unit_a_key}"),
+        "token-a".to_string(),
+    )]);
+
+    let a = invoke_with_pack_routes_for_unit(
+        None,
+        Some(&routes),
+        Some(secrets.clone()),
+        "acme",
+        "default",
+        None,
+        Some("worker-a"),
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(a["premium"], 11, "unit A must dispatch, got {a}");
+
+    let b = invoke_with_pack_routes_for_unit(
+        None,
+        Some(&routes),
+        Some(secrets),
+        "acme",
+        "default",
+        None,
+        Some("worker-b"),
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+    let error = b["error"].as_str().expect("unit B has no credential");
+    assert!(
+        error.contains(&format!("secrets://default/acme/_/mcp/{unit_b_key}"))
+            && error.contains("secrets://default/acme/_/mcp/srv-1"),
+        "the miss must name unit B's own scope and the shared fallback, got: {error}"
+    );
+    assert!(
+        !error.contains(&unit_a_key),
+        "unit B must never look at unit A's scope, got: {error}"
+    );
+}
+
+/// The compatibility fallback: a deployment staged before the unit scope
+/// existed keeps resolving its shared credential when the runner moves.
+#[tokio::test]
+async fn a_unit_with_no_scoped_secret_falls_back_to_the_shared_one() {
+    let server = fake_mcp_server(json!({ "structuredContent": { "premium": 12 } })).await;
+    let routes = greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes::from_pack_bytes(
+        &pack_with_http_route_scoped("srv-1", &server.uri(), "Authorization", Some("sales")),
+    )
+    .expect("routes");
+    let secrets = stub_secrets_manager(&[(
+        "secrets://default/acme/_/mcp/srv-1".to_string(),
+        "shared-token".to_string(),
+    )]);
+
+    let value = invoke_with_pack_routes_for_unit(
+        None,
+        Some(&routes),
+        Some(secrets),
+        "acme",
+        "default",
+        Some("sales"),
+        Some("worker-a"),
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(value["premium"], 12, "expected a dispatch, got {value}");
 }
