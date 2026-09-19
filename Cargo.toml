@@ -281,7 +281,7 @@ greentic-extension-sdk-state = { git = "https://github.com/greenticai/greentic-d
 # `greentic-dw-operala-invoker` (and its sibling `*-llm` provider crates in
 # greentic-dw) pin `greentic-llm` via a git tag (v1.2.6-research), while this
 # workspace already depends on the same crate published to crates.io
-# (=1.3.0-research.0, pulled transitively through greentic-aw-runtime's
+# (=1.3.1-research.0, pulled transitively through greentic-aw-runtime's
 # `greentic-llm-backend` feature and now also directly by greentic-runner-host
 # for the in-process operala wiring). Without unifying the two, `Arc<dyn
 # greentic_llm::LlmProvider>` built against the registry crate would not type-
