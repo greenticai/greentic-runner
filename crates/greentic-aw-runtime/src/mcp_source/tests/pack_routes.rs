@@ -260,3 +260,67 @@ fn an_admin_built_catalog_records_no_server_diagnostics() {
     assert!(catalog.server_error("srv-1").is_none());
     assert!(catalog.resolve_route("srv-1", "get_issue").is_none());
 }
+
+// ── per-unit credential scope (agent loop) ──────────────────────────────────
+
+#[tokio::test]
+async fn a_unit_scoped_source_reads_its_own_unit_secret_first() {
+    let mcp = fake_mcp_server(two_tools(), json!({})).await;
+    let unit_key = crate::mcp_secrets::mcp_unit_secret_key("srv-1", "worker-a").unwrap();
+    let unit_uri = format!("secrets://default/acme/sales/mcp/{unit_key}");
+    let secrets = MapSecrets::with(&[
+        (unit_uri.as_str(), "unit-token"),
+        ("secrets://default/acme/sales/mcp/srv-1", "team-token"),
+    ]);
+    let source = McpToolSource::from_pack_routes(
+        vec![http_record("srv-1", &mcp.uri(), Some("sales"))],
+        Some(secrets.clone()),
+    )
+    .with_unit(Some("worker-a".to_string()));
+
+    let catalog = source.catalog(&tenant()).await;
+    assert!(catalog.resolve_route("srv-1", "get_issue").is_some());
+    assert_eq!(
+        secrets.seen.lock().unwrap().as_slice(),
+        &[unit_uri],
+        "the unit scope must be tried first and win"
+    );
+}
+
+#[tokio::test]
+async fn two_unit_scoped_sources_do_not_share_a_credential() {
+    // Unit B has nothing of its own and no shared fallback: it must stay
+    // routeless rather than read unit A's token.
+    let key_a = crate::mcp_secrets::mcp_unit_secret_key("srv-1", "worker-a").unwrap();
+    let key_b = crate::mcp_secrets::mcp_unit_secret_key("srv-1", "worker-b").unwrap();
+    let uri_a = format!("secrets://default/acme/_/mcp/{key_a}");
+    let secrets = MapSecrets::with(&[(uri_a.as_str(), "token-a")]);
+
+    let unit_b = McpToolSource::from_pack_routes(
+        vec![http_record("srv-1", "https://mcp.example.com/", None)],
+        Some(secrets.clone()),
+    )
+    .with_unit(Some("worker-b".to_string()));
+    let catalog = unit_b.catalog(&tenant()).await;
+    assert!(catalog.resolve_route("srv-1", "get_issue").is_none());
+    let detail = catalog.server_error("srv-1").expect("a diagnostic");
+    assert!(detail.contains(&key_b), "got: {detail}");
+    assert!(!secrets.seen.lock().unwrap().contains(&uri_a));
+}
+
+#[tokio::test]
+async fn a_blank_unit_is_no_unit() {
+    let mcp = fake_mcp_server(two_tools(), json!({})).await;
+    let secrets = MapSecrets::with(&[("secrets://default/acme/_/mcp/srv-1", "tenant-token")]);
+    let source = McpToolSource::from_pack_routes(
+        vec![http_record("srv-1", &mcp.uri(), None)],
+        Some(secrets.clone()),
+    )
+    .with_unit(Some("   ".to_string()));
+    let catalog = source.catalog(&tenant()).await;
+    assert!(catalog.resolve_route("srv-1", "get_issue").is_some());
+    assert_eq!(
+        secrets.seen.lock().unwrap().as_slice(),
+        &["secrets://default/acme/_/mcp/srv-1".to_string()]
+    );
+}

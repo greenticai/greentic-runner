@@ -39,6 +39,11 @@ pub struct McpToolSource {
     /// fetched from the admin. Mutually exclusive with `base_url`/`token`, which
     /// are empty on this path — see [`McpToolSource::from_pack_routes`].
     pack_routes: Option<Vec<McpPackRoute>>,
+    /// The deployed unit (revision `bundle_id`) this source resolves pack-route
+    /// credentials for. `Some` makes [`crate::mcp_secrets::read_mcp_secret_for_unit`]
+    /// try the unit-scoped secret before the team / `_` scopes; see
+    /// [`McpToolSource::with_unit`].
+    unit: Option<String>,
 }
 
 impl McpToolSource {
@@ -59,6 +64,7 @@ impl McpToolSource {
             cache: DashMap::new(),
             secrets: None,
             pack_routes: None,
+            unit: None,
         }
     }
 
@@ -94,6 +100,18 @@ impl McpToolSource {
         source.secrets = secrets;
         source.pack_routes = Some(routes);
         source
+    }
+
+    /// Scope pack-route credentials to one deployed unit (the revision's
+    /// `bundle_id`), so two workers in one environment can hold different
+    /// tokens for the same MCP server.
+    ///
+    /// Only the pack-route path reads it: an admin-backed catalog gets its
+    /// token from the admin, not from the secrets store. `None` (or a blank id)
+    /// keeps the pre-existing team-then-`_` lookup exactly.
+    pub fn with_unit(mut self, unit: Option<String>) -> Self {
+        self.unit = unit.filter(|value| !value.trim().is_empty());
+        self
     }
 
     /// Name the tenant + user this source asks the admin on behalf of, so the
@@ -201,10 +219,11 @@ impl McpToolSource {
             let is_http = record.transport != "local-wasm";
             let token = match self.secrets.as_ref().filter(|_| is_http) {
                 Some(manager) => {
-                    match crate::mcp_secrets::read_mcp_secret(
+                    match crate::mcp_secrets::read_mcp_secret_for_unit(
                         manager.as_ref(),
                         &tenant.tenant_id,
                         record.auth_team.as_deref(),
+                        self.unit.as_deref(),
                         &record.server_id,
                     )
                     .await

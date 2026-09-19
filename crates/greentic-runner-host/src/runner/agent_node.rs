@@ -567,6 +567,13 @@ mod aw {
     /// tenant-scoped in the admin, so a collision between two packs of the same
     /// tenant means the same server; a collision across tenants in one host is
     /// pre-existing and not made worse here (spec §11 O-3).
+    ///
+    /// The dedup cannot mix UNITS: `packs` is one revision's pack list (the
+    /// runtime is built per `TenantRuntime`, i.e. per deployed unit), so every
+    /// record here belongs to the unit named by `unit`. `unit` is that
+    /// revision's `bundle_id` and scopes the credential read (see
+    /// [`greentic_aw_runtime::mcp_secrets::read_mcp_secret_for_unit`]); `None`
+    /// on the legacy tenant-only runtime keeps the team / `_` lookup exactly.
     /// The secrets manager an agent's `mcp:` tools resolve their credential
     /// with — the injected host manager, UNLESS `SECRETS_BACKEND` explicitly
     /// names one.
@@ -625,6 +632,7 @@ mod aw {
         packs: &[Arc<crate::pack::PackRuntime>],
         tenant: &str,
         secrets: Option<crate::secrets::DynSecretsManager>,
+        unit: Option<&str>,
     ) -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
         if std::env::var("GREENTIC_AW_MCP").ok().as_deref() == Some("0") {
             tracing::info!("GREENTIC_AW_MCP=0; pack-backed MCP tool source disabled");
@@ -666,7 +674,8 @@ mod aw {
             "pack-backed MCP tool source constructed"
         );
         Some(Arc::new(
-            greentic_aw_runtime::McpToolSource::from_pack_routes(records, secrets),
+            greentic_aw_runtime::McpToolSource::from_pack_routes(records, secrets)
+                .with_unit(unit.map(str::to_string)),
         ))
     }
 
@@ -1553,6 +1562,9 @@ mod aw {
     ///
     /// Returns `None` when the extension runtime fails to initialise (the only
     /// failure mode at this layer — store errors are handled by callers).
+    ///
+    /// `unit` is the deployed unit's `bundle_id` (`None` on the legacy
+    /// tenant-only path); it scopes the pack-carried MCP credential read.
     #[allow(clippy::too_many_arguments)]
     async fn build_runtime_with_stores(
         merged_agents: HashMap<String, AgentConfig>,
@@ -1563,6 +1575,7 @@ mod aw {
         state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore>,
         token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
         ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
+        unit: Option<String>,
     ) -> Option<Arc<AgentRuntime>> {
         use std::time::Duration;
 
@@ -1681,8 +1694,9 @@ mod aw {
             // merge rule for a server present in both with different URLs.
             {
                 let mcp_secrets = mcp_secrets_manager(&secrets);
-                mcp_source_from_env(Some(mcp_secrets.clone()))
-                    .or_else(|| mcp_source_from_packs(&packs, &tenant, Some(mcp_secrets)))
+                mcp_source_from_env(Some(mcp_secrets.clone())).or_else(|| {
+                    mcp_source_from_packs(&packs, &tenant, Some(mcp_secrets), unit.as_deref())
+                })
             },
         )
         .with_component_source(component_source_from_packs(&packs, &tenant))
@@ -1775,6 +1789,8 @@ mod aw {
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
+        // The deployed unit (`bundle_id`) doubles as the MCP credential scope:
+        // the same identity billing attributes this runtime's spend to.
         let runtime = build_runtime_with_stores(
             merged_agents,
             tenant,
@@ -1784,6 +1800,7 @@ mod aw {
             state_store,
             token_meter,
             ledger,
+            project_id.clone(),
         )
         .await?;
         Some(Arc::new(RuntimeAgentNodeHandler::new(
@@ -3392,6 +3409,7 @@ mod aw {
                     state_store,
                     token_meter,
                     ledger,
+                    None,
                 )
                 .await
             }
@@ -3580,7 +3598,7 @@ mod aw {
                 std::env::set_var("GREENTIC_AW_MCP", "0");
             }
             assert!(
-                super::mcp_source_from_packs(&[], "acme", None).is_none(),
+                super::mcp_source_from_packs(&[], "acme", None, None).is_none(),
                 "an operator who disabled outbound MCP must not have it \
                  re-enabled by a pack-carried sidecar"
             );
@@ -3588,7 +3606,7 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_MCP");
             }
             assert!(
-                super::mcp_source_from_packs(&[], "acme", None).is_none(),
+                super::mcp_source_from_packs(&[], "acme", None, None).is_none(),
                 "empty packs => None even when the gate is unset"
             );
         }
@@ -3615,7 +3633,7 @@ mod aw {
             let consulted = Cell::new(false);
             let chosen = super::mcp_source_from_env(None).or_else(|| {
                 consulted.set(true);
-                super::mcp_source_from_packs(&[], "acme", None)
+                super::mcp_source_from_packs(&[], "acme", None, None)
             });
 
             unsafe {

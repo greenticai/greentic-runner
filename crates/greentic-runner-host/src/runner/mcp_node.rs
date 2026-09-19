@@ -168,6 +168,11 @@ pub mod aw {
     /// a team scope starts working, because the deployed runtime carries no team
     /// of its own and so resolved `_` only.
     ///
+    /// Ahead of both it tries the UNIT scope when `unit` (the running
+    /// revision's `bundle_id`) is known, so two workers in one environment can
+    /// hold different tokens for the same server — see
+    /// [`greentic_aw_runtime::mcp_secrets::mcp_unit_secret_key`].
+    ///
     /// Only an `http` route reads a token here. A `local-wasm` route has no
     /// HTTP credential at all — admin writes no `mcp/<server_id>` entry for one
     /// — and the component reads its own secrets through the
@@ -184,14 +189,16 @@ pub mod aw {
         secrets: Option<&crate::secrets::DynSecretsManager>,
         tenant: &str,
         team: Option<&str>,
+        unit: Option<&str>,
     ) -> Result<greentic_aw_runtime::McpRoute, String> {
         let is_http = route.transport != "local-wasm";
 
         let token = match secrets.filter(|_| is_http) {
-            Some(manager) => match greentic_aw_runtime::mcp_secrets::read_mcp_secret(
+            Some(manager) => match greentic_aw_runtime::mcp_secrets::read_mcp_secret_for_unit(
                 manager.as_ref(),
                 tenant,
                 team,
+                unit,
                 &route.server_id,
             )
             .await
@@ -249,6 +256,10 @@ pub mod aw {
     /// [`choose_mcp_secrets`] for the precedence. It is also what lets a test
     /// control the backend at all, and the pack-route path is defined by which
     /// credential it resolves.
+    ///
+    /// `unit` is the running revision's `bundle_id` (`None` on the legacy
+    /// tenant-only runtime). It scopes only the pack-route credential read; the
+    /// admin-catalog fallback resolves its token from the admin.
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_with_secrets(
         source: Option<&Arc<McpToolSource>>,
@@ -257,6 +268,7 @@ pub mod aw {
         tenant: &str,
         env: &str,
         team: Option<&str>,
+        unit: Option<&str>,
         server_id: &str,
         tool: &str,
         arguments: &Value,
@@ -268,6 +280,7 @@ pub mod aw {
             tenant,
             env,
             team,
+            unit,
             server_id,
             tool,
             arguments,
@@ -296,6 +309,7 @@ pub mod aw {
         tenant: &str,
         env: &str,
         team: Option<&str>,
+        unit: Option<&str>,
         server_id: &str,
         tool: &str,
         arguments: &Value,
@@ -309,7 +323,7 @@ pub mod aw {
         // no admin credentials dispatch at all; falling through to the admin
         // catalog keeps every existing deployment and Run Demo unchanged.
         if let Some(route) = pack_routes.and_then(|routes| routes.get(server_id)) {
-            return match route_from_pack(route, secrets, tenant, team).await {
+            return match route_from_pack(route, secrets, tenant, team, unit).await {
                 Ok(resolved) => {
                     let scope = call_scope(tenant_ctx, secrets);
                     dispatch_route(&resolved.with_tool(tool), &args_str, &scope).await
