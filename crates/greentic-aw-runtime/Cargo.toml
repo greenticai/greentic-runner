@@ -50,7 +50,7 @@ greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", 
 # Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
-greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research" }
+greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272" }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "74e5926fc900b260ae805d973aedee887d61313f" }
 greentic-extension-sdk-contract = "=1.3.0-research.5"
 # Multi-provider LLM door (rig-core under the hood). Optional — see the

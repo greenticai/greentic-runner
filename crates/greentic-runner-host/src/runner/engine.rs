@@ -3806,6 +3806,8 @@ fn normalize_mcp_tool_error(value: &Value, code: &str, message: &str) -> Value {
 /// the `output:` binding key — survives alongside the new top-level
 /// `ok`/`error` fields: `node.<id>.<binding-key>` keeps resolving exactly as
 /// before, while `node.<id>.errors[0].message` now resolves too.
+// Gated like its only caller, `execute_mcp` (agentic-worker).
+#[cfg(feature = "agentic-worker")]
 fn mcp_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeOutput {
     if !has_error_route {
         return NodeOutput::new(bound);

@@ -23,6 +23,7 @@ jobs:
   dev-prepare:
     uses: greenticai/.github/.github/workflows/dev-prepare.yml@main
     with:
+      debuginfo: "line-tables-only"
       exclude-crates: "echo-secret component-v0-6-dummy"
       wasm-target: true
       require-pre-release: true
