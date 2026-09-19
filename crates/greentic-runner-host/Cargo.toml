@@ -135,21 +135,21 @@ base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.3.0-research.0", features = ["serve"], optional = true }
-greentic-dw-memory-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-llm = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-llm-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-embedding = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-embedding-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
+greentic-dw-memory-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
+greentic-dw-llm = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
+greentic-dw-llm-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
+greentic-dw-embedding = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
+greentic-dw-embedding-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
 # Pulled only to enable its `pack-manifest-agents` feature (see the
 # long-term-chronicle feature). The crate is otherwise a transitive dep of the
 # openai-compatible providers above.
-greentic-dw-providers-common = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true, features = ["pack-manifest-agents"] }
+greentic-dw-providers-common = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true, features = ["pack-manifest-agents"] }
 # Knowledge (document-RAG / W4) tier. The chronicle provider + its core trait/DTOs
 # come from greentic-dw-providers; the SurrealDB driver + GraphDriver trait come
 # from greentic-chronicle-ext and are built at this edge (bindgen / RocksDB live
 # here). All optional, gated by the `knowledge-chronicle` feature.
-greentic-dw-knowledge-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-knowledge = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
+greentic-dw-knowledge-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
+greentic-dw-knowledge = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
 # In-process deep-worker runtime for `operala.call` flow nodes (feature
 # `operala-in-process`; `desktop-agent-ephemeral` implies it). Same git source
 # (greentic-dw, branch research) the runner already pulls greentic-dw-manifest

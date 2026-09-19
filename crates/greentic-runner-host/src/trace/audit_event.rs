@@ -210,6 +210,12 @@ pub fn violation_subject(tenant: &str) -> String {
 /// channel saturates and the NATS publish is fire-and-forget. The payload
 /// carries `code` (a stable, non-sensitive classifier), never `message`
 /// (free text that may echo user content) or the guarded content itself.
+///
+/// Gated like its only caller (`trace::agent_audit`): the observation type
+/// lives in `greentic-aw-runtime`, which only `agentic-worker` pulls in.
+/// Ungated, a `default-features = false` build — how greentic-setup consumes
+/// this crate — fails with E0433.
+#[cfg(feature = "agentic-worker")]
 pub fn build_guardrail_violation_event(
     tenant: &TenantCtx,
     agent_id: &str,
@@ -296,6 +302,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "agentic-worker")]
     fn obs_blocked() -> greentic_aw_runtime::guardrail::GuardrailObservation {
         greentic_aw_runtime::guardrail::GuardrailObservation {
             cap_id: "greentic:guardrail/pii".to_string(),
@@ -306,6 +313,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "agentic-worker")]
     fn obs_monitored() -> greentic_aw_runtime::guardrail::GuardrailObservation {
         greentic_aw_runtime::guardrail::GuardrailObservation {
             action: greentic_aw_runtime::guardrail::GuardrailAction::Monitored,
@@ -486,6 +494,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agentic-worker")]
     fn guardrail_violation_event_has_the_expected_shape() {
         let tenant = tenant_ctx_named("acme", "production");
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
@@ -516,6 +525,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agentic-worker")]
     fn monitored_violation_is_tagged_monitored() {
         let tenant = tenant_ctx_named("acme", "production");
         let ev = build_guardrail_violation_event(

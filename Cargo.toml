@@ -31,17 +31,23 @@ async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
 futures = "0.3"
-greentic-flow = "=1.3.0-research.1"
+greentic-flow = "=1.3.0-research.5"
 greentic-session = "=1.3.0-research.1"
 greentic-state = "=1.3.0-research.1"
 greentic-config = "=1.3.0-research.1"
 greentic-config-types = "=1.3.0-research.1"
-greentic-secrets-lib = "=1.3.0-research.1"
+greentic-secrets-lib = "=1.3.0-research.3"
 greentic-trust = { git = "https://github.com/greenticai/greentic-trust", rev = "725fb4c" }
 # Additive (from main): runner-host uses `greentic_deploy_spec::ids::{RevisionId,BundleId}`.
 # Pinned to the research line so it unifies with greentic-start/greentic-deployer
 # (which cross deploy-spec types with runner-host) instead of forking a 0.2.x copy.
-greentic-deploy-spec = "=1.3.0-research.1"
+#
+# 1.3.0-research.3 (greentic-start#595): greentic-deployer develop's deploy-spec,
+# moved onto the research line — the first research build carrying
+# `blob_base_url` / `resolve_default_bundle` / `DefaultBundleReason`, which
+# greentic-start uses. flow research.5, pack-lib research.13, distributor-client
+# research.4 and secrets-lib research.3 moved with it (see [patch.crates-io]).
+greentic-deploy-spec = "=1.3.0-research.3"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
@@ -124,10 +130,10 @@ features = [
 
 [workspace.dependencies.greentic_pack]
 package = "greentic-pack-lib"
-version = "=1.3.0-research.2"
+version = "=1.3.0-research.13"
 
 [workspace.dependencies.greentic-distributor-client]
-version = "=1.3.0-research.1"
+version = "=1.3.0-research.4"
 features = [
     "dist-client",
 ]
@@ -269,6 +275,19 @@ strip = true
 # requirement from greentic-ext-runtime v1.2.13-research onto the git
 # tag so the workspace can adopt it without waiting on a registry release.
 [patch.crates-io]
+# Research-line chain (greentic-start#595). crates.io publishing is locked
+# fleet-wide, so these research-line builds (each develop's code under a
+# never-published number) exist only in git. greentic-secrets-spec is patched
+# because greentic-deploy-spec requires it from crates.io; without it the graph
+# holds two secrets-spec copies. A patch section does not travel into a
+# published crate; every consumer carries the same set at its own root.
+# TO UNWIND once publishing is restored: delete these lines, `cargo update`.
+greentic-flow = { git = "https://github.com/greenticai/greentic-flow", rev = "348cceb857034ad6533905d747328dca13c1b610" }
+greentic-pack-lib = { git = "https://github.com/greenticai/greentic-pack", rev = "46851ce1477c4b440aad7f7e3032260d63f85109" }
+greentic-distributor-client = { git = "https://github.com/greenticai/greentic-distributor-client", rev = "d594bb896c9722f439bf3c0cb98a3b85afb9b540" }
+greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
+greentic-secrets-spec = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
+greentic-deploy-spec = { git = "https://github.com/greenticai/greentic-deployer", rev = "a706eea6db1e8f20a5460ea7af0470ff9c53f552" }
 greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.5" }
 # greentic-ext-runtime now anchors describe signatures to a TOFU publisher-key
 # store, reusing sdk-registry's `TrustStore` rather than porting it. That pulls
