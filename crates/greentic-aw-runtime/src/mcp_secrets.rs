@@ -22,15 +22,8 @@ use greentic_types::TenantCtx;
 /// Category segment admin uses for MCP secrets.
 const MCP_CATEGORY: &str = "mcp";
 
-/// Env segment for MCP secrets. Admin pins ALL MCP secrets to `default`
-/// regardless of the tenant's flow env — both when sealing (`mcp_scope`) and
-/// resolving (`ResolveCtx`) in greentic-designer-admin. The reader must match,
-/// or it would look under the flow env (`prod`/`local`) and silently miss
-/// admin's write.
-const MCP_ENV_SEGMENT: &str = "default";
-
 /// Team segment admin writes for a secret that is not scoped to a team.
-pub const MCP_TENANT_DEFAULT_TEAM: &str = "_";
+pub const MCP_TENANT_DEFAULT_TEAM: &str = crate::scoped_secrets::TENANT_DEFAULT_TEAM;
 
 /// Build the secret URI for an MCP key, byte-for-byte compatible with admin's
 /// `SecretScope::uri` for the `mcp` category: env pinned to `default`, key and
@@ -43,17 +36,7 @@ pub const MCP_TENANT_DEFAULT_TEAM: &str = "_";
 /// path start resolving different URIs for the same server with nothing
 /// failing. Both now call this.
 pub fn mcp_secret_uri(tenant: &str, team: Option<&str>, key: &str) -> Result<String, String> {
-    if key.trim().is_empty() {
-        return Err("secret key must not be empty".to_string());
-    }
-    Ok(format!(
-        "secrets://{}/{}/{}/{}/{}",
-        MCP_ENV_SEGMENT,
-        tenant,
-        team.unwrap_or(MCP_TENANT_DEFAULT_TEAM),
-        MCP_CATEGORY,
-        key
-    ))
+    crate::scoped_secrets::secret_uri(MCP_CATEGORY, tenant, team, key)
 }
 
 /// [`mcp_secret_uri`] with the tenant and team read off a [`TenantCtx`].
@@ -167,45 +150,6 @@ pub fn mcp_unit_secret_key(server_id: &str, unit_id: &str) -> Option<String> {
     Some(format!("{server_id}{MCP_UNIT_KEY_MARKER}{segment}"))
 }
 
-/// Every credential URI [`read_mcp_secret_for_unit`] will try, in order:
-///
-/// 1. the UNIT scope — `…/<team|_>/mcp/<key>.unit-<segment>` — when a unit is
-///    known;
-/// 2. the caller's team scope;
-/// 3. the tenant-default `_` scope.
-///
-/// 2 and 3 mirror greentic-designer-admin's own `AdminSecretResolver`
-/// precedence, so a deployed pack resolves the same value the composer resolved
-/// when the author bound the tool. A caller with no team, or one already naming
-/// `_`, yields a single tenant-default URI for them.
-///
-/// REVIEW BY 2026-12-18: when a unit is known, candidates 2 and 3 are a
-/// COMPATIBILITY fallback, not a design choice. They exist so a deployment
-/// staged before the unit scope existed keeps its credential when its runner
-/// moves; the next deploy writes the unit-scoped key. Once every lane stages
-/// unit-scoped keys (greentic-designer `per-unit-setup-isolation` Phase 2), the
-/// fallback lets one unit silently read a value another unit's writer left at
-/// the shared address — decide then whether to drop it for the unit case.
-/// (Candidates 2 and 3 remain the ONLY candidates when no unit is known — the
-/// legacy tenant-only runtime and the process-level serve path.)
-fn mcp_secret_uri_candidates(
-    tenant: &str,
-    team: Option<&str>,
-    unit: Option<&str>,
-    key: &str,
-) -> Result<Vec<String>, String> {
-    let team = team.filter(|t| !t.is_empty() && *t != MCP_TENANT_DEFAULT_TEAM);
-    let mut uris = Vec::with_capacity(3);
-    if let Some(unit_key) = unit.and_then(|unit| mcp_unit_secret_key(key, unit)) {
-        uris.push(mcp_secret_uri(tenant, team, &unit_key)?);
-    }
-    if let Some(team) = team {
-        uris.push(mcp_secret_uri(tenant, Some(team), key)?);
-    }
-    uris.push(mcp_secret_uri(tenant, None, key)?);
-    Ok(uris)
-}
-
 /// No credential was readable at any scope [`read_mcp_secret`] tried.
 ///
 /// Carries the URIs rather than an opaque `NotFound` because on this path the
@@ -250,7 +194,7 @@ pub async fn read_mcp_secret(
 
 /// Read an MCP secret for one deployed unit: the unit scope first, then the
 /// team scope, then the tenant-default `_` scope (see
-/// [`mcp_secret_uri_candidates`]). First hit wins.
+/// [`crate::scoped_secrets::secret_uri_candidates`]). First hit wins.
 ///
 /// `unit` is the running revision's `bundle_id` — the deployment name,
 /// unique within an environment — taken from the runtime's exec context, never
@@ -266,22 +210,12 @@ pub async fn read_mcp_secret_for_unit(
     unit: Option<&str>,
     key: &str,
 ) -> Result<Vec<u8>, McpSecretMiss> {
-    let uris =
-        mcp_secret_uri_candidates(tenant, team, unit, key).map_err(|error| McpSecretMiss {
-            uris: Vec::new(),
-            error,
-        })?;
-    let mut last_error = String::from("no scope tried");
-    for uri in &uris {
-        match secrets.read(uri).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => last_error = e.to_string(),
-        }
-    }
-    Err(McpSecretMiss {
-        uris,
-        error: last_error,
-    })
+    crate::scoped_secrets::read_secret_for_unit(secrets, MCP_CATEGORY, tenant, team, unit, key)
+        .await
+        .map_err(|miss| McpSecretMiss {
+            uris: miss.uris,
+            error: miss.error,
+        })
 }
 
 /// `SecretsStore` backed by the runner's secrets manager.

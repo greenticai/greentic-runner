@@ -7,6 +7,41 @@ use serde_json::{Value, json};
 
 use super::source::Transport;
 
+/// One A2A agent a worker may call, as the pack sidecar
+/// (`assets/a2a-routes.json`, cross-repo contract 2026-09-21 §4) describes it.
+///
+/// Carries NO credential. `requires_auth` only says one is stored; the token
+/// itself is read from the secrets store at call time (§5), so a rotation
+/// takes effect without a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct A2aRoute {
+    /// The admin row id; the `a2a:<agent_id>` tool ref and the secret name.
+    pub agent_id: String,
+    /// Where the agent card lives (`<base_url>/.well-known/agent-card.json`).
+    pub base_url: String,
+    /// Header the token travels in. `None` means `Authorization: Bearer`.
+    pub auth_header_name: Option<String>,
+    /// Team slug the credential is sealed under. `None` means `_`.
+    pub auth_team: Option<String>,
+    /// A token is stored and must be sent. A route with this set and no
+    /// resolvable token is refused, never called unauthenticated.
+    pub requires_auth: bool,
+}
+
+impl A2aRoute {
+    /// A route with no credential, which is what [`super::A2aToolSource::new`]
+    /// builds from a bare `(agent_id, base_url)` pair.
+    pub fn unauthenticated(agent_id: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            base_url: base_url.into(),
+            auth_header_name: None,
+            auth_team: None,
+            requires_auth: false,
+        }
+    }
+}
+
 /// One agent, as the LLM will see it.
 ///
 /// There is no `parameters` here, unlike the flow and MCP entries: an A2A
@@ -98,7 +133,13 @@ impl A2aToolCatalog {
         };
         match caller.call(agent_id, &args_to_text(args)).await {
             Ok(reply) => json!({ "reply": reply }),
-            Err(reason) => json!({ "error": reason }),
+            Err(reason) => {
+                // The model is the only reader of the `{"error"}` value; this
+                // line is what lets an operator see the failure at all. The
+                // reason never carries the token (see `auth`).
+                tracing::warn!(agent = %agent_id, error = %reason, "a2a tool call failed");
+                json!({ "error": reason })
+            }
         }
     }
 }

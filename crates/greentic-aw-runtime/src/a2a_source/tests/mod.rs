@@ -3,12 +3,14 @@
 //! Split by concern:
 //! - `catalog` — catalog building from live agent cards, resilience to dead
 //!   or malformed agents
+//! - `credentials` — per-call credential resolution and where it may be sent
 //! - `dispatch` — `SendMessage` request/response handling
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod catalog;
+mod credentials;
 mod dispatch;
 
 /// A real-shaped agent card. `PLACEHOLDER` becomes the interface URL, so a
@@ -66,4 +68,97 @@ async fn mount_reply(server: &MockServer, body: serde_json::Value) {
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(server)
         .await;
+}
+
+/// A secrets manager whose entries can change between calls (rotation), and
+/// which counts every read so a test can prove the store was never consulted.
+struct TestSecrets {
+    entries: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl TestSecrets {
+    fn with(pairs: &[(&str, &str)]) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            entries: std::sync::Mutex::new(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), v.as_bytes().to_vec()))
+                    .collect(),
+            ),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn set(&self, uri: &str, value: &str) {
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(uri.to_string(), value.as_bytes().to_vec());
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl greentic_secrets_lib::SecretsManager for TestSecrets {
+    async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entries
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+    }
+    async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+    async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+}
+
+/// One sidecar-shaped route.
+fn route(
+    agent_id: &str,
+    base: String,
+    header: Option<&str>,
+    team: Option<&str>,
+    requires_auth: bool,
+) -> crate::a2a_source::A2aRoute {
+    crate::a2a_source::A2aRoute {
+        agent_id: agent_id.to_string(),
+        base_url: base,
+        auth_header_name: header.map(str::to_string),
+        auth_team: team.map(str::to_string),
+        requires_auth,
+    }
+}
+
+/// A source for tenant `acme` resolving credentials from `secrets`.
+fn credentialed_source(
+    routes: Vec<crate::a2a_source::A2aRoute>,
+    secrets: std::sync::Arc<TestSecrets>,
+    unit: Option<&str>,
+) -> crate::a2a_source::A2aToolSource {
+    let secrets: std::sync::Arc<dyn greentic_secrets_lib::SecretsManager> = secrets;
+    crate::a2a_source::A2aToolSource::from_routes(
+        routes,
+        Some(secrets),
+        "acme",
+        unit.map(str::to_string),
+    )
+    .expect("a client with no redirect policy and a timeout is buildable")
+}
+
+/// The value of header `name` on a recorded request, if present.
+fn header_of(request: &wiremock::Request, name: &str) -> Option<String> {
+    request
+        .headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
