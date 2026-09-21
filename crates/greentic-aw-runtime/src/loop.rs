@@ -359,6 +359,9 @@ pub async fn run_step(
             component_catalog.as_deref(),
             flow_catalog.as_deref(),
             sorla_catalog.as_deref(),
+            // Wiring a real A2A catalogue into the loop is a later task; this
+            // stays `None` here.
+            None,
             &config.tools,
         ),
         config.tools.len(),
@@ -409,6 +412,9 @@ pub async fn run_step(
             component_catalog.as_deref(),
             flow_catalog.as_deref(),
             sorla_catalog.as_deref(),
+            // Wiring a real A2A catalogue into the loop is a later task; this
+            // stays `None` here.
+            None,
             &config.tools,
         );
         if lt_active {
@@ -662,6 +668,9 @@ pub async fn run_step(
                     component_catalog.clone(),
                     flow_catalog.clone(),
                     sorla_catalog.clone(),
+                    // Wiring a real A2A catalogue into the loop is a later
+                    // task; this stays `None` here.
+                    None,
                     call.clone(),
                     &tenant,
                 )

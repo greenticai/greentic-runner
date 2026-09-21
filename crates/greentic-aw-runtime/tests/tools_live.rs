@@ -38,7 +38,7 @@ async fn unloaded_tool_is_invisible_to_llm_and_dispatch_fails_safe() {
     }];
 
     // A tool whose extension isn't loaded never reaches the LLM's tool list.
-    let schemas = list_tools_for_llm(&runtime, None, None, None, None, &allowed);
+    let schemas = list_tools_for_llm(&runtime, None, None, None, None, None, &allowed);
     assert!(
         schemas.is_empty(),
         "an unloaded extension must yield no LLM-visible tools, got {schemas:?}"
@@ -54,7 +54,8 @@ async fn unloaded_tool_is_invisible_to_llm_and_dispatch_fails_safe() {
         args: serde_json::json!({}),
     };
     let tc = TenantContext::new("t", "e");
-    let result = dispatch_tool_call(Arc::new(runtime), None, None, None, None, call, &tc).await;
+    let result =
+        dispatch_tool_call(Arc::new(runtime), None, None, None, None, None, call, &tc).await;
 
     let err = result.expect_err("dispatch against an unloaded extension must error");
     let message = err.to_string();

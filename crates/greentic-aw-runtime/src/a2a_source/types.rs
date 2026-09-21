@@ -31,6 +31,27 @@ pub struct A2aToolCatalog {
 }
 
 impl A2aToolCatalog {
+    /// A catalogue with the given `(agent_id, description)` entries and no
+    /// transport, for tests of code that only reads entries.
+    #[cfg(test)]
+    pub(crate) fn for_tests(entries: &[(&str, &str)]) -> Self {
+        Self {
+            tools: entries
+                .iter()
+                .map(|(id, description)| {
+                    (
+                        (*id).to_string(),
+                        A2aToolEntry {
+                            description: (*description).to_string(),
+                        },
+                    )
+                })
+                .collect(),
+            errors: HashMap::new(),
+            caller: None,
+        }
+    }
+
     pub fn tool_entry(&self, agent_id: &str) -> Option<&A2aToolEntry> {
         self.tools.get(agent_id)
     }
