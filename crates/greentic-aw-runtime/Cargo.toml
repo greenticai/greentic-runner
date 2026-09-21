@@ -46,6 +46,9 @@ zip                 = { workspace = true }
 chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
+# A2A (Agent2Agent) wire types and agent-card retrieval, for the a2a: tool
+# source (letting an agentic worker call an external A2A agent as a tool).
+greentic-a2a        = { path = "../greentic-a2a" }
 greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", rev = "00cf18318a20f071d5878aff66e8f33b157cb1ed" }
 # Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at

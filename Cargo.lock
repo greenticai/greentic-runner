@@ -3257,6 +3257,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "futures",
+ "greentic-a2a",
  "greentic-dw-manifest",
  "greentic-dw-memory-long-term",
  "greentic-ext-runtime",

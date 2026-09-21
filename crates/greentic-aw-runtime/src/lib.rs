@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod a2a_source;
 pub mod billing;
 pub mod component_source;
 pub mod config;
@@ -62,6 +63,7 @@ pub mod mock;
 #[cfg(feature = "serve")]
 pub mod serve;
 
+pub use a2a_source::{A2aToolCatalog, A2aToolEntry, A2aToolSource};
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
