@@ -25,16 +25,18 @@ pub enum A2aError {
     },
 }
 
-/// Build the card URL for an agent base, refusing plaintext.
+/// Build the card URL for an agent base, refusing plaintext except on loopback.
 ///
-/// Refused rather than warned about: the card names the address we will later
+/// Plaintext is refused rather than warned about: the card names the address we will later
 /// send a credential to, so trusting one fetched over plaintext would hand an
-/// on-path attacker the agent's endpoint.
+/// on-path attacker the agent's endpoint. On loopback (`127.0.0.1`, `::1`, `localhost`),
+/// there is no on-path attacker — the packets never leave the host — so plaintext is allowed
+/// for in-process test servers and sidecar agents.
 pub fn card_url(base: &str) -> Result<String, A2aError> {
     let parsed = url::Url::parse(base).map_err(|_| A2aError::BadBase {
         base: base.to_string(),
     })?;
-    if parsed.scheme() != "https" {
+    if parsed.scheme() != "https" && !is_loopback(&parsed) {
         return Err(A2aError::InsecureBase {
             base: base.to_string(),
         });
@@ -48,6 +50,19 @@ pub fn card_url(base: &str) -> Result<String, A2aError> {
             base: base.to_string(),
         })?;
     Ok(card.to_string())
+}
+
+/// Whether a base names this host, and so cannot be observed on the wire.
+///
+/// Matched on the PARSED host: `http://127.0.0.1.evil.example` carries the
+/// loopback address as a substring of a completely different name.
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 struct Entry {
@@ -181,6 +196,37 @@ mod tests {
             card_url("http://api.example.com"),
             Err(A2aError::InsecureBase { .. })
         ));
+    }
+
+    #[test]
+    fn plaintext_is_allowed_on_loopback_because_there_is_no_on_path_attacker() {
+        // A sidecar agent on loopback is a real deployment, and it is the only
+        // shape an in-process test server can offer. The refusal exists to stop
+        // an on-path attacker learning the endpoint we will send a credential
+        // to; on loopback the packets never leave the host.
+        assert_eq!(
+            card_url("http://127.0.0.1:8080").unwrap(),
+            "http://127.0.0.1:8080/.well-known/agent-card.json"
+        );
+        assert!(card_url("http://localhost:8080").is_ok());
+        assert!(card_url("http://[::1]:8080").is_ok());
+    }
+
+    #[test]
+    fn plaintext_is_still_refused_for_every_non_loopback_host() {
+        for base in [
+            "http://api.example.com",
+            "http://10.0.0.1",
+            // Not loopback, and the name is attacker-chosen: only the literal
+            // loopback names and addresses qualify.
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+        ] {
+            assert!(
+                matches!(card_url(base), Err(A2aError::InsecureBase { .. })),
+                "{base} must still be refused"
+            );
+        }
     }
 
     #[test]
