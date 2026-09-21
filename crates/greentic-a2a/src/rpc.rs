@@ -14,6 +14,7 @@ pub const METHOD_CANCEL_TASK: &str = "CancelTask";
 pub const METHOD_LIST_TASKS: &str = "ListTasks";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JsonRpcRequest<P> {
     pub jsonrpc: String,
     pub id: u64,
@@ -35,6 +36,7 @@ impl<P> JsonRpcRequest<P> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JsonRpcResponse<R> {
     pub jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +48,7 @@ pub struct JsonRpcResponse<R> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
