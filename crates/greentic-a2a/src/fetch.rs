@@ -39,7 +39,15 @@ pub fn card_url(base: &str) -> Result<String, A2aError> {
             base: base.to_string(),
         });
     }
-    Ok(format!("{}{WELL_KNOWN_PATH}", base.trim_end_matches('/')))
+    // `join` re-roots at the origin rather than concatenating the base's raw
+    // text, so a base carrying a path, query or fragment (`https://a.com/x?y=1`)
+    // still resolves to the well-known location instead of appending onto it.
+    let card = parsed
+        .join(WELL_KNOWN_PATH)
+        .map_err(|_| A2aError::BadBase {
+            base: base.to_string(),
+        })?;
+    Ok(card.to_string())
 }
 
 struct Entry {
@@ -63,7 +71,17 @@ impl CardCache {
         Self {
             ttl,
             entries: Mutex::new(HashMap::new()),
-            client: reqwest::Client::new(),
+            // Redirects are refused outright rather than merely limited: a
+            // plaintext downgrade (`https://` -> `http://`) arrives as a
+            // redirect, and no legitimate well-known card location needs one.
+            // A timeout is set for the same reason `card_url` refuses
+            // plaintext — this fetch can run inside an agent loop, and a hung
+            // agent must not block its caller forever.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("a client with no redirect policy and a timeout is always buildable"),
         }
     }
 
@@ -88,12 +106,19 @@ impl CardCache {
         if let Some(hit) = self.cached(url) {
             return Ok(hit);
         }
-        let body = self
+        let response = self
             .client
             .get(url)
             .send()
             .await
-            .map_err(|err| A2aError::Transport(err.to_string()))?
+            .map_err(|err| A2aError::Transport(err.to_string()))?;
+        if !response.status().is_success() {
+            return Err(A2aError::Transport(format!(
+                "unexpected status {}",
+                response.status()
+            )));
+        }
+        let body = response
             .text()
             .await
             .map_err(|err| A2aError::Transport(err.to_string()))?;
@@ -156,6 +181,27 @@ mod tests {
             card_url("http://api.example.com"),
             Err(A2aError::InsecureBase { .. })
         ));
+    }
+
+    #[test]
+    fn a_base_with_a_path_still_resolves_to_the_well_known_location() {
+        // String concatenation would have produced
+        // ".../foo/bar/.well-known/agent-card.json"; the well-known location
+        // is origin-rooted, so a base's own path must be discarded.
+        assert_eq!(
+            card_url("https://api.example.com/foo/bar").unwrap(),
+            "https://api.example.com/.well-known/agent-card.json"
+        );
+    }
+
+    #[test]
+    fn a_base_with_a_query_still_resolves_to_the_well_known_location() {
+        // String concatenation would have produced
+        // ".../?x=1/.well-known/agent-card.json"; the query must not survive.
+        assert_eq!(
+            card_url("https://api.example.com/?x=1").unwrap(),
+            "https://api.example.com/.well-known/agent-card.json"
+        );
     }
 
     #[tokio::test]
