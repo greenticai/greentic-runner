@@ -32,9 +32,24 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// reason: an agent must not be able to redirect a credentialed call
 /// elsewhere.
 pub struct A2aToolSource {
+    transport: Arc<Transport>,
+}
+
+/// The agents plus the means to reach them, shared between the source and
+/// every catalogue it builds so a catalogue can dispatch a call — the same
+/// arrangement as `FlowToolCatalog` holding its invoker.
+pub(super) struct Transport {
     agents: HashMap<String, String>,
     cards: CardCache,
     client: reqwest::Client,
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transport")
+            .field("agents", &self.agents.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 impl A2aToolSource {
@@ -51,9 +66,11 @@ impl A2aToolSource {
             .timeout(CALL_TIMEOUT)
             .build()?;
         Ok(Self {
-            agents: agents.into_iter().collect(),
-            cards: CardCache::new(CARD_TTL)?,
-            client,
+            transport: Arc::new(Transport {
+                agents: agents.into_iter().collect(),
+                cards: CardCache::new(CARD_TTL)?,
+                client,
+            }),
         })
     }
 
@@ -62,8 +79,27 @@ impl A2aToolSource {
     /// Infallible by contract, mirroring [`crate::mcp_source::McpToolSource`]:
     /// one dead or malformed agent must not remove a worker's OTHER tools, so
     /// a fetch failure is recorded in [`A2aToolCatalog::error_for`] instead of
-    /// failing the whole build.
+    /// failing the whole build. The catalogue can dispatch calls itself.
     pub async fn catalog(&self) -> Arc<A2aToolCatalog> {
+        let mut catalog = self.transport.fetch_cards().await;
+        catalog.caller = Some(Arc::clone(&self.transport));
+        Arc::new(catalog)
+    }
+
+    /// Call one agent with a plain-text prompt and return its reply text.
+    pub async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
+        self.transport.call(agent_id, text).await
+    }
+}
+
+impl Transport {
+    /// Whether `agent_id` is one of the configured bindings.
+    pub(super) fn knows(&self, agent_id: &str) -> bool {
+        self.agents.contains_key(agent_id)
+    }
+
+    /// Fetch every configured agent's card into a catalogue with no caller.
+    async fn fetch_cards(&self) -> A2aToolCatalog {
         let mut tools = HashMap::new();
         let mut errors = HashMap::new();
         for (agent_id, base) in &self.agents {
@@ -81,7 +117,11 @@ impl A2aToolSource {
                 }
             }
         }
-        Arc::new(A2aToolCatalog { tools, errors })
+        A2aToolCatalog {
+            tools,
+            errors,
+            caller: None,
+        }
     }
 
     /// Call one agent with a plain-text prompt and return its reply text.
@@ -91,7 +131,7 @@ impl A2aToolSource {
     /// interface's `tenant`, when the card set one, is echoed into
     /// `SendMessageParams.tenant` — the A2A spec makes that a MUST for
     /// clients, not a courtesy.
-    pub async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
+    pub(super) async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
         let base = self
             .agents
             .get(agent_id)

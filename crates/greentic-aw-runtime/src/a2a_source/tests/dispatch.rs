@@ -278,3 +278,75 @@ fn task_reply(state: &str, artifact_text: &str) -> serde_json::Value {
         "artifacts": [{"parts": [{"text": artifact_text}]}]
     }}})
 }
+
+#[tokio::test]
+async fn a_catalogue_dispatches_a_call_and_wraps_the_reply() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, text_reply("an omelette")).await;
+
+    let catalog = source_for(vec![("recipe", server.uri())]).catalog().await;
+    let value = catalog
+        .dispatch("recipe", &json!({ "message": "eggs?" }))
+        .await;
+
+    assert_eq!(value, json!({ "reply": "an omelette" }));
+    let requests = server.received_requests().await.expect("request log");
+    let rpc = requests
+        .iter()
+        .find(|r| r.method.as_str() == "POST")
+        .expect("a POST must have reached the agent");
+    let body: serde_json::Value = rpc.body_json().expect("a json body");
+    assert_eq!(
+        body["params"]["message"]["parts"][0]["text"], "eggs?",
+        "the `message` field is what the agent receives"
+    );
+}
+
+#[tokio::test]
+async fn a_catalogue_built_while_an_agent_was_down_still_calls_it_once_it_is_back() {
+    // The listing advertises an unreachable agent's tool from its author
+    // contract. That fallback is only worth anything if dispatch still tries.
+    let server = MockServer::start().await;
+    let catalog = source_for(vec![("recipe", server.uri())]).catalog().await;
+    assert!(
+        catalog.tool_entry("recipe").is_none(),
+        "precondition: no card was served when the catalogue was built"
+    );
+
+    mount_card(&server).await;
+    mount_reply(&server, text_reply("back again")).await;
+
+    let value = catalog.dispatch("recipe", &json!("hi")).await;
+    assert_eq!(value, json!({ "reply": "back again" }));
+}
+
+#[tokio::test]
+async fn dispatching_an_unconfigured_agent_is_an_error_value_naming_it() {
+    let server = MockServer::start().await;
+    let catalog = source_for(vec![("recipe", server.uri())]).catalog().await;
+
+    let value = catalog.dispatch("stranger", &json!("hi")).await;
+
+    let error = value["error"]
+        .as_str()
+        .expect("an error value, not a panic");
+    assert!(error.contains("stranger"), "got: {error}");
+}
+
+#[tokio::test]
+async fn a_failed_call_is_an_error_value_the_model_can_read() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(
+        &server,
+        json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "overloaded"}}),
+    )
+    .await;
+
+    let catalog = source_for(vec![("recipe", server.uri())]).catalog().await;
+    let value = catalog.dispatch("recipe", &json!("hi")).await;
+
+    let error = value["error"].as_str().expect("an error value");
+    assert!(error.contains("overloaded"), "got: {error}");
+}
