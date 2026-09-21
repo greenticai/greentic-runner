@@ -451,6 +451,65 @@ pub fn write_pack_secret_blocking(
     Ok(())
 }
 
+/// The address an agentic worker's bound extension TOOL secret resolves at.
+///
+/// An AW tool extension asks for `secret://<provider>/<key>`, and
+/// `runner::agent_node::StoreToolSecretsBackend` maps that reference onto a
+/// store URI. This is THE function that builds it — the designer stages the
+/// value through it too (it links this crate), so a writer can never spell an
+/// address the reader does not ask for. That failure is silent at every layer:
+/// the deploy reports the value staged, the worker boots, and the tool is
+/// dropped from the LLM's list with a `warn` line nobody reads.
+///
+/// Two shapes, differing in exactly ONE segment:
+///
+/// ```text
+/// unit-scoped   secrets://<env>/<tenant>/_/<unit_pack_segment(provider, unit)>/<key>
+/// env-wide      secrets://<env>/<tenant>/_/<provider>/<key>
+/// ```
+///
+/// The unit rides in the CATEGORY segment for the same reason
+/// [`unit_pack_segment`] gives: `greentic_secrets_lib`'s `SecretUri::parse`
+/// accepts exactly five segments and rejects a sixth. Reusing that function
+/// rather than minting a second slug-and-hash rule is deliberate — it is
+/// already pinned as a fixed point of BOTH canonicalizers
+/// ([`canonicalize_secret_key`] here, `canonical_secret_name` in
+/// greentic-setup / greentic-deployer / greentic-start), so the segment
+/// survives every hop between the designer's `op secrets put` and this read.
+///
+/// The `team` segment is the literal `_` and the `key` is VERBATIM, because
+/// both are already true of the env-wide address this one sits beside. A read
+/// tries the unit-scoped URI first and the env-wide one second, so the two
+/// must differ in nothing else or the fallback would be a duplicate read
+/// rather than a fallback.
+///
+/// `unit_id` is the running revision's `bundle_id` — the same identity
+/// [`read_pack_secret_blocking`] scopes a pack secret by and billing
+/// attributes spend to. `None` (or blank) yields the env-wide address, which
+/// is the only address on the legacy tenant-only path and the process-level
+/// serve path.
+///
+/// Returns `None` for a blank provider or a blank key: there is no address to
+/// build, and inventing one would write where nothing reads.
+pub fn agent_tool_secret_uri(
+    env: &str,
+    tenant: &str,
+    provider: &str,
+    key: &str,
+    unit_id: Option<&str>,
+) -> Option<String> {
+    let provider = provider.trim();
+    let key = key.trim();
+    if provider.is_empty() || key.is_empty() {
+        return None;
+    }
+    let category = match unit_id.and_then(|unit| unit_pack_segment(provider, unit)) {
+        Some(segment) => segment,
+        None => provider.to_string(),
+    };
+    Some(format!("secrets://{env}/{tenant}/_/{category}/{key}"))
+}
+
 pub fn canonicalize_secret_key(raw: &str) -> String {
     raw.trim()
         .chars()
@@ -751,6 +810,110 @@ mod tests {
                 .expect("ok")
                 .is_none()
         );
+    }
+
+    // ── the agentic-worker bound-tool address ───────────────────────────
+
+    /// The env-wide shape is unchanged, byte for byte: it is the address every
+    /// worker deployed before this change already reads, and a deploy staged
+    /// against it must keep resolving.
+    #[test]
+    fn the_bare_agent_tool_address_is_unchanged() {
+        assert_eq!(
+            agent_tool_secret_uri("dev", "acme", "tavily", "api_key", None).expect("uri"),
+            "secrets://dev/acme/_/tavily/api_key"
+        );
+        // A blank unit is the same as no unit — there is no scope to build.
+        assert_eq!(
+            agent_tool_secret_uri("dev", "acme", "tavily", "api_key", Some("   ")).expect("uri"),
+            "secrets://dev/acme/_/tavily/api_key"
+        );
+    }
+
+    /// The unit-scoped shape differs from the env-wide one in exactly ONE
+    /// segment. If it differed in any other, the read's second candidate would
+    /// be a different address rather than the fallback it is meant to be.
+    #[test]
+    fn the_unit_scoped_agent_tool_address_differs_only_in_the_category() {
+        let bare =
+            agent_tool_secret_uri("dev", "acme", "tavily", "api_key", None).expect("bare uri");
+        let scoped = agent_tool_secret_uri("dev", "acme", "tavily", "api_key", Some("web-chat"))
+            .expect("unit uri");
+        assert_ne!(bare, scoped);
+
+        let bare_parts: Vec<&str> = bare.split('/').collect();
+        let scoped_parts: Vec<&str> = scoped.split('/').collect();
+        assert_eq!(bare_parts.len(), scoped_parts.len());
+        let differing: Vec<usize> = bare_parts
+            .iter()
+            .zip(&scoped_parts)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(differing.len(), 1, "{bare} vs {scoped}");
+        assert_eq!(
+            scoped_parts[differing[0]],
+            unit_pack_segment("tavily", "web-chat").expect("segment")
+        );
+    }
+
+    /// The property the whole address depends on. The category segment travels
+    /// through `greentic-setup` / `greentic-deployer` / `greentic-start` on the
+    /// way to the store, and through [`canonicalize_secret_key`] on some read
+    /// paths here; a segment that is not a fixed point of both is an address
+    /// one side writes and the other never reads, with nothing red anywhere.
+    #[test]
+    fn the_agent_tool_category_is_a_fixed_point_of_both_canonicalizers() {
+        for (provider, unit) in [
+            ("tavily", "web-chat"),
+            ("HubSpot", "Web Assistant (prod)"),
+            ("greentic.hubspot", "unit_01JTKS.v2"),
+            ("a-b_c", "ÜNÏCÖDÉ-Ünit"),
+            ("...", "a/b@c"),
+        ] {
+            let uri =
+                agent_tool_secret_uri("dev", "acme", provider, "api_key", Some(unit)).expect("uri");
+            let category = uri.split('/').nth(5).expect("category segment");
+            assert_eq!(canonicalize_secret_key(category), category, "{uri}");
+            assert_eq!(
+                greentic_secrets_lib::spec::canonical_secret_name(category),
+                category,
+                "{uri}"
+            );
+            assert!(
+                greentic_secrets_lib::spec::SecretUri::parse(&uri).is_ok(),
+                "`{uri}` is not a valid secret URI"
+            );
+        }
+    }
+
+    /// Two units of one environment asking for the SAME `<provider>/<key>`
+    /// address two different places. This is the whole point: before it, both
+    /// projected onto one URI and the second staged value won silently.
+    #[test]
+    fn two_units_one_provider_and_key_are_two_addresses() {
+        let a = agent_tool_secret_uri("dev", "acme", "hubspot", "access_token", Some("sales-bot"))
+            .expect("a");
+        let b = agent_tool_secret_uri(
+            "dev",
+            "acme",
+            "hubspot",
+            "access_token",
+            Some("support-bot"),
+        )
+        .expect("b");
+        let shared =
+            agent_tool_secret_uri("dev", "acme", "hubspot", "access_token", None).expect("shared");
+        assert_ne!(a, b);
+        assert_ne!(a, shared);
+        assert_ne!(b, shared);
+    }
+
+    #[test]
+    fn a_blank_provider_or_key_has_no_agent_tool_address() {
+        assert!(agent_tool_secret_uri("dev", "acme", "", "api_key", Some("u")).is_none());
+        assert!(agent_tool_secret_uri("dev", "acme", "tavily", "   ", Some("u")).is_none());
     }
 
     #[test]
