@@ -8,6 +8,7 @@ members = [
     "crates/telco-x-event-bridge",
     "crates/tests",
     "crates/runner-core",
+    "crates/greentic-a2a",
     "tests/fixtures/packs/secrets_store_smoke/components",
     "tests/assets/component-v0-6-dummy",
 ]
