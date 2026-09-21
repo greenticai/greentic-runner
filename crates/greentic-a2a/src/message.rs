@@ -217,7 +217,15 @@ mod tests {
                     context_id: None,
                     task_id: None,
                     role: Role::Agent,
-                    parts: vec![Part::text("hello"), Part::data(serde_json::json!({"k": 1}))],
+                    parts: vec![
+                        Part::text("hello"),
+                        Part::data(serde_json::json!({"k": 1})),
+                        Part {
+                            text: Some("typed".into()),
+                            media_type: Some("text/plain".into()),
+                            ..Default::default()
+                        },
+                    ],
                     metadata: None,
                 }),
                 timestamp: None,
