@@ -882,6 +882,14 @@ mod call_site_ratchet {
             "three test constructors; both production paths mount",
         ),
         (
+            "src/runner/a2a_pack_source.rs",
+            1,
+            "one test constructor: the end-to-end test proves a pack's a2a \
+             sidecar reaches the LLM and the agent; it exercises no retrieval, \
+             and the production path it models (`build_runtime_with_stores`) \
+             mounts",
+        ),
+        (
             "src/runner/engine.rs",
             1,
             "one test constructor; engine.rs builds no production AW runtime",
