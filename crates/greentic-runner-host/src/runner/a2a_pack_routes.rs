@@ -7,9 +7,10 @@
 //! MCP reader would take an A2A record for an MCP server.
 //!
 //! The sidecar carries no credential. A route with `requires_auth` has its
-//! token read at CALL time from
-//! `secrets://default/<tenant>/<auth_team|_>/a2a/<agent_id>` (§5); see
-//! `greentic_aw_runtime::a2a_source`.
+//! token read at CALL time from the first of
+//! `secrets://default/<tenant>/<auth_team|_>/a2a/<agent_id>.unit-<segment>`
+//! (running as a unit), `…/<auth_team>/a2a/<agent_id>` and
+//! `…/_/a2a/<agent_id>` (§5); see `greentic_aw_runtime::a2a_source`.
 //!
 //! Twin of [`super::mcp_pack_routes`], and one step more lenient. Malformed
 //! JSON reads as ABSENT, with a warning. A single record that does not parse

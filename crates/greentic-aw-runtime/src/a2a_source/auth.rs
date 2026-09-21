@@ -57,6 +57,9 @@ impl CredentialScope {
         let agent_id = route.agent_id.as_str();
         ensure_safe_agent_id(agent_id)?;
         let team = route.auth_team.as_deref();
+        if let Some(team) = team.filter(|t| !t.is_empty() && *t != "_") {
+            ensure_safe_segment(agent_id, "auth_team", team)?;
+        }
         let unit = self.unit.as_deref();
         let Some(secrets) = self.secrets.as_ref() else {
             let uris = crate::scoped_secrets::secret_uri_candidates(
@@ -151,15 +154,31 @@ const RESERVED_HEADERS: [HeaderName; 9] = [
 /// `..` can only come from a hand-built or crafted sidecar — refused rather
 /// than looked up.
 pub(super) fn ensure_safe_agent_id(agent_id: &str) -> Result<(), String> {
-    let charset_ok = agent_id
+    if is_safe_segment(agent_id) {
+        return Ok(());
+    }
+    Err(format!(
+        "a2a agent id '{agent_id}' is not a safe secret name; refusing to look up its credential"
+    ))
+}
+
+/// The same rule for `auth_team`, which becomes the team segment of the same
+/// URI and comes from the same sidecar.
+fn ensure_safe_segment(agent_id: &str, field: &str, value: &str) -> Result<(), String> {
+    if is_safe_segment(value) {
+        return Ok(());
+    }
+    Err(format!(
+        "a2a agent {agent_id}: {field} '{value}' is not a safe secret-path segment; \
+         refusing to look up its credential"
+    ))
+}
+
+fn is_safe_segment(value: &str) -> bool {
+    let charset_ok = value
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if agent_id.is_empty() || !charset_ok || agent_id.starts_with('.') || agent_id.contains("..") {
-        return Err(format!(
-            "a2a agent id '{agent_id}' is not a safe secret name; refusing to look up its credential"
-        ));
-    }
-    Ok(())
+    !value.is_empty() && charset_ok && !value.starts_with('.') && !value.contains("..")
 }
 
 /// Refuse to carry a credential to any host other than the one the admin

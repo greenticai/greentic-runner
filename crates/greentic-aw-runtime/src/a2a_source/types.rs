@@ -133,7 +133,13 @@ impl A2aToolCatalog {
         };
         match caller.call(agent_id, &args_to_text(args)).await {
             Ok(reply) => json!({ "reply": reply }),
-            Err(reason) => json!({ "error": reason }),
+            Err(reason) => {
+                // The model is the only reader of the `{"error"}` value; this
+                // line is what lets an operator see the failure at all. The
+                // reason never carries the token (see `auth`).
+                tracing::warn!(agent = %agent_id, error = %reason, "a2a tool call failed");
+                json!({ "error": reason })
+            }
         }
     }
 }

@@ -152,6 +152,7 @@ impl Transport {
                     );
                 }
                 Err(err) => {
+                    tracing::warn!(agent = %agent_id, error = %err, "a2a agent card unavailable");
                     errors.insert(agent_id.clone(), err.to_string());
                 }
             }
@@ -170,9 +171,9 @@ impl Transport {
     /// a credentialed route it then requires the interface to share the
     /// configured base's host and port, and only then reads the credential;
     /// a missing or unusable one refuses the call with nothing sent. The
-    /// `SendMessage` POST is the only request that carries the credential. The interface's `tenant`, when the card set
-    /// one, is echoed into `SendMessageParams.tenant`; the A2A spec makes that
-    /// a MUST for clients.
+    /// `SendMessage` POST is the only request that carries the credential.
+    /// The interface's `tenant`, when the card set one, is echoed into
+    /// `SendMessageParams.tenant`; the A2A spec makes that a MUST for clients.
     pub(super) async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
         let route = self
             .agents

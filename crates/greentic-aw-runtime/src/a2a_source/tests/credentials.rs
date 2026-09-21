@@ -527,3 +527,26 @@ async fn an_agent_id_that_could_leave_its_secret_key_is_never_looked_up() {
     assert_eq!(secrets.reads(), 0, "never looked up");
     assert!(posts(&server).await.is_empty(), "nothing is sent");
 }
+
+#[tokio::test]
+async fn an_auth_team_that_could_leave_its_secret_path_is_never_looked_up() {
+    // `auth_team` becomes the team segment of the same URI as the agent id and
+    // comes from the same sidecar, so it gets the same rule.
+    let server = wiremock::MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, ok_reply()).await;
+    let secrets = TestSecrets::with(&[(TENANT_DEFAULT_URI, "tok-1")]);
+    for bad in ["../other-tenant/x", "a/b", ".."] {
+        let source = credentialed_source(
+            vec![route("recipe", server.uri(), None, Some(bad), true)],
+            secrets.clone(),
+            None,
+        );
+
+        let err = source.call("recipe", "hi").await.expect_err(bad);
+
+        assert!(err.contains("auth_team"), "{bad}: {err}");
+    }
+    assert_eq!(secrets.reads(), 0, "never looked up");
+    assert!(posts(&server).await.is_empty(), "nothing is sent");
+}

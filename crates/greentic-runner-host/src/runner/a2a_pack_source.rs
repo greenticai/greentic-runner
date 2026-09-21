@@ -62,6 +62,16 @@ pub(crate) fn a2a_source_from_packs(
     }
 
     let agents = routes.len();
+    // Where each credential will go, so an operator can audit it: the sidecar
+    // is trusted input (contract §9), and this is the one place the pairing of
+    // secret name and destination is visible before any call is made.
+    for route in routes.iter().filter(|r| r.requires_auth) {
+        let host = url::Url::parse(&route.base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "<unparseable base_url>".to_string());
+        tracing::info!(tenant = %tenant, agent = %route.agent_id, host = %host, "a2a credential destination");
+    }
     match greentic_aw_runtime::A2aToolSource::from_routes(
         routes,
         secrets,

@@ -101,6 +101,56 @@ runtime returns an in-band `{"error": ...}` value to the LLM. MCP can never
 take an agent step down. Full design:
 `docs/2026-06-07-aw-runtime-mcp-tools-design.md`.
 
+## A2A agents (`a2a:` tools)
+
+An agentic worker can call an external agent that speaks A2A (Agent2Agent
+v1.0), bound as one tool per agent:
+
+```yaml
+tools:
+  - extension_id: a2a:<agent_id>   # the admin registry's agent id
+    tool_name: ask
+    input_schema: { type: object, properties: { message: { type: string } }, required: [message] }
+```
+
+The `input_schema` is required: an A2A agent card carries no input schema, so
+a ref without one is not offered to the model. The description shown to the
+model is the agent card's own, falling back to the ref's.
+
+**Where agents come from.** Only from the pack: `assets/a2a-routes.json`,
+written by the designer (one record per agent: `agent_id`, `base_url`,
+`auth_header_name`, `auth_team`, `requires_auth` — never a token). There is no
+admin-backed A2A source. The source is built for the in-pack `dw.agent`
+runtime (deployed units, the desktop runner and the designer's test-chat
+sidecar); the process-level serve path and graph turns have none.
+
+**Credentials.** A route with `requires_auth` has its token read at **call
+time** (so rotation needs no restart), from the first of:
+
+1. `secrets://default/<tenant>/<auth_team|_>/a2a/<agent_id>.unit-<segment>` — when running as a unit
+2. `secrets://default/<tenant>/<auth_team>/a2a/<agent_id>` — when `auth_team` is set
+3. `secrets://default/<tenant>/_/a2a/<agent_id>`
+
+It is sent as `Authorization: Bearer <token>` (no header name, or any
+spelling of `Authorization`), or raw under the configured header name. It goes
+only on the `SendMessage` POST, never on the public agent-card fetch, and
+**only when the card's interface URL has the same host and port as the
+configured `base_url`** — otherwise the call is refused and nothing is sent.
+A missing credential refuses the call; there is no unauthenticated retry.
+
+**Switch:** `GREENTIC_AW_A2A=0` disables A2A tools for the whole runner.
+
+**What an operator sees on failure.** A failed call returns an in-band
+`{"error": ...}` value to the model naming the agent and the cause (every
+secret URI tried, or both hosts on a mismatch), and logs it at `warn`
+(`a2a tool call failed`, `a2a agent card unavailable`). At construction an
+`info` line per credentialed agent (`a2a credential destination`) records
+which host each credential will go to.
+
+**Trust.** The sidecar is trusted input: a pack that pairs a real `agent_id`
+with a different `base_url` would send that agent's token there. Only install
+packs you trust. Ids and team segments outside `[A-Za-z0-9._-]` are refused.
+
 ## Agent graphs
 
 Multi-agent orchestration is supported via the `dw.agent_graph` flow-node kind,
