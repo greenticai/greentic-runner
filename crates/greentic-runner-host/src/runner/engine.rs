@@ -2580,10 +2580,11 @@ impl FlowEngine {
                 .map_err(|err| anyhow!(err.to_string()))?;
         }
         let value = pack
-            .invoke_component_as(
+            .invoke_component_for(
                 call.component_ref.as_str(),
                 exec_ctx,
                 caller,
+                ctx.provider_id,
                 call.operation.as_str(),
                 config_json,
                 input_json,
@@ -3440,9 +3441,13 @@ impl NodeOutput {
 /// `tenant` is the HOST's scope for the component's secrets and state, and is
 /// unchanged by a caller: `team` stays `None` so tenant-wide secrets keep
 /// resolving, and `user` stays the provider id so existing component state is
-/// not re-keyed. The provider-verified caller travels separately in `caller`
-/// (from `FlowContext::caller`, never from the node payload) and is what the
-/// component is told its `user`/`team` are — see
+/// not re-keyed. That `user` is a storage key, NOT an identity: it is never
+/// presented to the component as its user. The provider-verified caller
+/// travels separately in `caller` (from `FlowContext::caller`, never from the
+/// node payload) and is what the component is told its `user`/`team` are;
+/// with no verified subject the component is told no user at all, and the
+/// provider is presented in its own slot — see
+/// `PackRuntime::invoke_component_for`,
 /// [`crate::caller_identity::ComponentCaller`] and [`component_caller`].
 fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx {
     ComponentExecCtx {
@@ -7620,23 +7625,75 @@ mod tests {
         assert_eq!(exec.tenant.team, None);
     }
 
-    /// An unverified block, or none at all, presents exactly what was
-    /// presented before #765.
+    /// Partner blocker #3: an unverified block, or none at all, must not make
+    /// the caller look like a user named after the provider — which is what
+    /// made an anonymous caller of a deployed environment indistinguishable
+    /// from Run Demo. The component is told NO user, the provider is presented
+    /// in its own 0.5 slot, and the host scope that keys the component's state
+    /// still carries the provider id, so no state moves.
     #[test]
-    fn component_exec_ctx_without_a_verified_caller_is_unchanged() {
+    fn component_exec_ctx_without_a_verified_caller_presents_no_user() {
         let unverified = json!({ "user_verified": false, "sub": "u-1", "team": "sales" });
-        for caller in [None, Some(&unverified)] {
-            let mut ctx = jump_ctx("caller.flow");
-            ctx.provider_id = Some("messaging-webchat");
-            ctx.caller = caller;
-            let exec = component_exec_ctx(&ctx, "lookup");
-            let caller = component_caller(&ctx);
-            assert!(caller.is_none());
-            let v05 = crate::component_api::exec_ctx_v0_5_as(&exec, caller.as_ref());
-            assert_eq!(v05.tenant.user_id.as_deref(), Some("messaging-webchat"));
-            assert_eq!(v05.tenant.team_id, None);
-            assert!(v05.tenant.attributes.is_empty());
+        for provider in ["messaging-webchat", "greentic-run-demo"] {
+            for caller in [None, Some(&unverified)] {
+                let mut ctx = jump_ctx("caller.flow");
+                ctx.provider_id = Some(provider);
+                ctx.caller = caller;
+                let exec = component_exec_ctx(&ctx, "lookup");
+                let caller = component_caller(&ctx);
+                assert!(caller.is_none());
+
+                let v05 = crate::component_api::exec_ctx_v0_5_for(
+                    &exec,
+                    caller.as_ref(),
+                    ctx.provider_id,
+                );
+                assert_eq!(v05.tenant.user_id, None);
+                assert_eq!(v05.tenant.user, None);
+                assert_eq!(v05.tenant.provider_id.as_deref(), Some(provider));
+                assert_eq!(v05.tenant.team_id, None);
+                assert!(v05.tenant.attributes.is_empty());
+
+                let v04 = crate::component_api::exec_ctx_v0_4_for(
+                    &exec,
+                    caller.as_ref(),
+                    ctx.provider_id,
+                );
+                assert_eq!(v04.tenant.user, None);
+
+                let v06 = crate::component_api::envelope_v0_6_for(
+                    &exec,
+                    caller.as_ref(),
+                    ctx.provider_id,
+                    "c",
+                    "{}",
+                )
+                .unwrap();
+                assert_eq!(v06.ctx.user_id, None);
+
+                // Host scope: unchanged. `exec.tenant.user` is what keys the
+                // component's state (greentic-state FQN), so it must still be
+                // the provider id.
+                assert_eq!(exec.tenant.user.as_deref(), Some(provider));
+                assert_eq!(exec.tenant.team, None);
+            }
         }
+    }
+
+    /// A verified caller still wins, and the provider is still named in its
+    /// own slot beside it.
+    #[test]
+    fn component_exec_ctx_with_a_verified_caller_also_names_the_provider() {
+        let block = json!({ "user_verified": true, "sub": "u-1@acme" });
+        let mut ctx = jump_ctx("caller.flow");
+        ctx.provider_id = Some("messaging-webchat");
+        ctx.caller = Some(&block);
+        let exec = component_exec_ctx(&ctx, "lookup");
+        let caller = component_caller(&ctx);
+        let v05 = crate::component_api::exec_ctx_v0_5_for(&exec, caller.as_ref(), ctx.provider_id);
+        assert_eq!(v05.tenant.user_id.as_deref(), Some("u-1@acme"));
+        assert_eq!(v05.tenant.provider_id.as_deref(), Some("messaging-webchat"));
+        assert_eq!(exec.tenant.user.as_deref(), Some("messaging-webchat"));
     }
 
     #[test]
