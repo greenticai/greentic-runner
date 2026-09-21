@@ -461,7 +461,13 @@ pub fn envelope_v0_6_as(
             component_id: component_id.to_string(),
             attempt: ctx.tenant.attempt,
             payload_cbor,
-            metadata_cbor: None,
+            // The 0.6 world has no typed slot for `role`, `groups` or the
+            // verification flag — see `ComponentCaller::metadata_cbor`. This
+            // is the carrier that already exists in the published WIT, so a
+            // 0.6 component can read `caller.*` without a world bump. `None`
+            // whenever there is no caller, which keeps every existing
+            // invocation byte-identical.
+            metadata_cbor: caller.and_then(crate::caller_identity::ComponentCaller::metadata_cbor),
         },
     )
 }
@@ -623,6 +629,80 @@ mod tests {
 
         assert_eq!(ctx.tenant.user.as_deref(), Some("user.demo"));
         assert_eq!(ctx.tenant.team.as_deref(), Some("team.demo"));
+    }
+
+    /// The 0.6 world has no typed slot for `role`, `groups` or the
+    /// verification flag, so they ride in `metadata_cbor` — the field the
+    /// published 0.6 WIT already carries and the host used to leave empty.
+    ///
+    /// This is what lets a 0.6 component read `caller.*` without a world bump,
+    /// which is the alternative: eight repositories moving in order and ~40
+    /// components rebuilt.
+    #[test]
+    fn a_v0_6_envelope_carries_the_caller_in_metadata() {
+        let ctx = sample_exec_ctx();
+        let verified = crate::caller_identity::ComponentCaller {
+            sub: Some("u-1@acme".to_string()),
+            team: Some("sales".to_string()),
+            groups: vec!["employee".to_string(), "admins".to_string()],
+            role: Some("approver".to_string()),
+        };
+
+        let envelope =
+            envelope_v0_6_as(&ctx, Some(&verified), "component.demo", "{}").expect("envelope");
+        let bytes = envelope.metadata_cbor.expect("a caller must reach 0.6");
+        let map: std::collections::BTreeMap<String, String> =
+            serde_cbor::from_slice(&bytes).expect("metadata decodes as a string map");
+
+        assert_eq!(map.get("caller.sub").map(String::as_str), Some("u-1@acme"));
+        assert_eq!(map.get("caller.team").map(String::as_str), Some("sales"));
+        assert_eq!(map.get("caller.role").map(String::as_str), Some("approver"));
+        assert_eq!(
+            map.get("caller.groups").map(String::as_str),
+            Some(r#"["employee","admins"]"#)
+        );
+        assert_eq!(
+            map.get("caller.user_verified").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    /// One vocabulary, two transports. A component reading `caller.*` off a
+    /// 0.5 `attributes` list and one reading it out of 0.6 `metadata_cbor`
+    /// must see the same keys and the same values — otherwise the two drift
+    /// and the one that drifts is the one nobody is looking at.
+    #[test]
+    fn the_v0_5_attributes_and_the_v0_6_metadata_say_the_same_thing() {
+        let ctx = sample_exec_ctx();
+        let verified = crate::caller_identity::ComponentCaller {
+            sub: Some("u-1@acme".to_string()),
+            team: Some("sales".to_string()),
+            groups: vec!["employee".to_string()],
+            role: Some("approver".to_string()),
+        };
+
+        let v05: std::collections::BTreeMap<String, String> =
+            exec_ctx_v0_5_as(&ctx, Some(&verified))
+                .tenant
+                .attributes
+                .into_iter()
+                .collect();
+        let envelope =
+            envelope_v0_6_as(&ctx, Some(&verified), "component.demo", "{}").expect("envelope");
+        let v06: std::collections::BTreeMap<String, String> =
+            serde_cbor::from_slice(&envelope.metadata_cbor.expect("metadata")).expect("decodes");
+
+        assert_eq!(v05, v06);
+    }
+
+    /// An invocation with no caller keeps the exact envelope it had before
+    /// this field was ever populated. Every deployed 0.6 component sees no
+    /// change at all.
+    #[test]
+    fn an_uncallered_v0_6_envelope_carries_no_metadata() {
+        let ctx = sample_exec_ctx();
+        let envelope = envelope_v0_6_as(&ctx, None, "component.demo", "{}").expect("envelope");
+        assert!(envelope.metadata_cbor.is_none());
     }
 
     #[test]

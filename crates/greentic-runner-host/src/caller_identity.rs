@@ -189,6 +189,49 @@ impl ComponentCaller {
         }
         attrs
     }
+
+    /// The same attributes, CBOR-encoded for a world that has no typed slot
+    /// for them.
+    ///
+    /// # Why this exists
+    ///
+    /// `greentic:component@0.6.0`'s `tenant-ctx` carries ten identity fields
+    /// and no free-form map — `attributes` was not argued out of the 0.6
+    /// design, it was simply never listed when 0.6 was rewritten onto a
+    /// minimal `types-core`. So a 0.6 component can be handed `user_id` and
+    /// `team_id` and has nowhere to receive `role`, `groups` or the
+    /// verification flag, while the identical 0.5 component receives all five.
+    ///
+    /// A partner hit this and worked around it by reading the raw
+    /// `{{in}}.extensions.caller` out of the flow template instead — which
+    /// works, but only for a node whose input they control, and not at all for
+    /// a tool or a component someone else wrote.
+    ///
+    /// `invocation-envelope.metadata_cbor` is already in the published 0.6 WIT
+    /// and the host has always sent `None`. Filling it needs no WIT change, no
+    /// new world version and no component rebuild: a component that does not
+    /// read the field is unaffected, and one that wants `caller.*` can have it
+    /// without leaving 0.6. The alternative — a typed slot — means
+    /// `types-core@0.6.1`, a new `component@0.6.1`, eight repositories moving
+    /// in order and roughly forty components rebuilt, re-signed and
+    /// republished, because a published OCI WIT tag is immutable and WIT
+    /// records are structural.
+    ///
+    /// **The vocabulary is deliberately identical to [`Self::attributes`]** —
+    /// same keys, same value encoding, `groups` as a JSON array string. Two
+    /// spellings of one fact is how the two transports would drift, and the
+    /// one that drifted would be the one nobody was looking at.
+    ///
+    /// `None` when there is nothing to say, so the envelope keeps the exact
+    /// bytes it had before for every uncallered invocation.
+    pub fn metadata_cbor(&self) -> Option<Vec<u8>> {
+        let attrs = self.attributes();
+        if attrs.is_empty() {
+            return None;
+        }
+        let map: std::collections::BTreeMap<String, String> = attrs.into_iter().collect();
+        serde_cbor::to_vec(&map).ok()
+    }
 }
 
 #[cfg(test)]
