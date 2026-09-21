@@ -14,3 +14,30 @@
 //! share these definitions rather than growing two.
 
 pub mod card;
+pub mod message;
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    /// Return the first OBJECT KEY in `value` that is not camelCase.
+    ///
+    /// Walks keys only. A2A **values** legitimately contain underscores —
+    /// `ROLE_USER`, `TASK_STATE_SUBMITTED` — so asserting over the raw
+    /// serialised string would fail on correct output.
+    pub(crate) fn first_snake_case_key(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if key.contains('_') {
+                        return Some(key.clone());
+                    }
+                    if let Some(found) = first_snake_case_key(child) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(first_snake_case_key),
+            _ => None,
+        }
+    }
+}

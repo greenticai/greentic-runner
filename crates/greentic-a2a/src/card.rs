@@ -241,4 +241,15 @@ mod tests {
         let back: AgentCard = serde_json::from_str(&out).unwrap();
         assert_eq!(card, back);
     }
+
+    #[test]
+    fn no_struct_emits_a_snake_case_key() {
+        let card: AgentCard = serde_json::from_str(CARD).unwrap();
+        let value = serde_json::to_value(&card).expect("serialises");
+        assert_eq!(
+            crate::testutil::first_snake_case_key(&value),
+            None,
+            "a struct lost rename_all = \"camelCase\""
+        );
+    }
 }
