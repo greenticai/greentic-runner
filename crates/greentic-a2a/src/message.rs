@@ -15,10 +15,10 @@ pub enum Role {
 
 /// One piece of a message.
 ///
-/// The proto models the content as a `oneof`, but `metadata`, `filename` and
-/// `media_type` sit OUTSIDE it as ordinary siblings — so the JSON is **flat**:
-/// `{"text": "hi", "mediaType": "text/plain"}`, never
-/// `{"text": {"text": "hi"}}`.
+/// The proto models the content as a `oneof` (`text | raw | url | data`), but
+/// `metadata`, `filename` and `media_type` sit OUTSIDE it as ordinary
+/// siblings — so the JSON is **flat**: `{"text": "hi", "mediaType":
+/// "text/plain"}`, never `{"text": {"text": "hi"}}`.
 ///
 /// An externally-tagged Rust enum would produce that nested form and would
 /// silently speak a dialect no agent understands, which is why this is a
@@ -30,6 +30,12 @@ pub enum Role {
 pub struct Part {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The proto's `raw` oneof arm: inline file bytes. Bytes travel
+    /// base64-encoded in JSON, so the wire (and Rust) type is a `String`, not
+    /// `Vec<u8>` — decoding is left to the caller, who knows what the bytes
+    /// are meant to be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,6 +204,19 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_bytes_part_parses_instead_of_landing_all_none() {
+        // Before the `raw` field existed, a received file-with-bytes part
+        // deserialized to an all-`None` `Part` with no signal it was
+        // anything at all. Bytes travel base64-encoded, so the wire type is
+        // a plain string.
+        let part: Part = serde_json::from_str(r#"{ "raw": "aGVsbG8=" }"#).unwrap();
+        assert_eq!(part.raw.as_deref(), Some("aGVsbG8="));
+        assert!(part.text.is_none());
+        let out = serde_json::to_string(&part).unwrap();
+        assert_eq!(out, r#"{"raw":"aGVsbG8="}"#);
+    }
+
+    #[test]
     fn a_text_part_serializes_flat_not_nested() {
         // The trap this type exists to avoid: an externally-tagged enum would
         // emit {"text":{"text":"hi"}}, which no agent understands.
@@ -223,6 +242,10 @@ mod tests {
                         Part {
                             text: Some("typed".into()),
                             media_type: Some("text/plain".into()),
+                            ..Default::default()
+                        },
+                        Part {
+                            raw: Some("aGVsbG8=".into()),
                             ..Default::default()
                         },
                     ],
