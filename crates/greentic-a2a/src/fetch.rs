@@ -68,15 +68,23 @@ impl CardCache {
     }
 
     /// Fetch the card for an agent base, or serve it from cache.
+    ///
+    /// This is the entry point, and it is what enforces the https rule: it
+    /// builds the URL through [`card_url`] before ever handing it to the
+    /// internal fetch below.
     pub async fn get(&self, base: &str) -> Result<Arc<AgentCard>, A2aError> {
         self.get_from_url(&card_url(base)?).await
     }
 
-    /// Fetch by an already-built card URL.
+    /// The internal fetch, by an already-built URL.
     ///
-    /// Separate from [`Self::get`] so tests can serve a card over plaintext
-    /// loopback without weakening [`card_url`]'s https rule for real callers.
-    pub async fn get_from_url(&self, url: &str) -> Result<Arc<AgentCard>, A2aError> {
+    /// This is the one place the https rule can be bypassed — pass it a
+    /// `http://` URL directly and it will fetch over plaintext — which is
+    /// exactly why it stays private. `mod tests` below is a child of this
+    /// module, so it can still reach this function to exercise the cache
+    /// against a loopback HTTP server without [`card_url`]'s refusal ever
+    /// being weakened for an external caller.
+    async fn get_from_url(&self, url: &str) -> Result<Arc<AgentCard>, A2aError> {
         if let Some(hit) = self.cached(url) {
             return Ok(hit);
         }
