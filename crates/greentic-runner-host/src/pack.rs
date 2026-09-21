@@ -158,6 +158,9 @@ pub struct PackRuntime {
     /// [`PackRuntime::mcp_routes`]. Read on first use rather than at load so a
     /// pack with no MCP nodes never touches the archive for it.
     mcp_routes: std::sync::OnceLock<Option<crate::runner::mcp_pack_routes::PackMcpRoutes>>,
+    /// Lazily-parsed `assets/a2a-routes.json` sidecar — see
+    /// [`PackRuntime::a2a_routes`]. Twin of `mcp_routes`, read on first use.
+    a2a_routes: std::sync::OnceLock<Option<crate::runner::a2a_pack_routes::PackA2aRoutes>>,
     /// The deployed unit this pack instance belongs to — the revision's
     /// `bundle_id`, set by [`TenantRuntime::load_revision`] through
     /// [`set_unit_id`](Self::set_unit_id).
@@ -2249,6 +2252,7 @@ impl PackRuntime {
             runtime_config_non_secret: None,
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
+            a2a_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
     }
@@ -3412,6 +3416,23 @@ impl PackRuntime {
             .as_ref()
     }
 
+    /// A2A agent route material from the optional `assets/a2a-routes.json`
+    /// sidecar (cross-repo contract 2026-09-21 §4).
+    ///
+    /// `None` when the pack carries none. That is how a pack built before
+    /// the feature reads, and it means "no A2A agents". Parsed at most once
+    /// per `PackRuntime`; a hot reload allocates a fresh one.
+    pub fn a2a_routes(&self) -> Option<&crate::runner::a2a_pack_routes::PackA2aRoutes> {
+        self.a2a_routes
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::a2a_pack_routes::A2A_ROUTES_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::a2a_pack_routes::PackA2aRoutes::from_sidecar_bytes(&bytes)
+                    })
+            })
+            .as_ref()
+    }
+
     /// Raw agent-config blobs from the optional `dw-agents.json` sidecar.
     ///
     /// Designer-built packs (old greentic-pack, which cannot populate
@@ -3763,6 +3784,7 @@ impl PackRuntime {
             runtime_config_non_secret: None,
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
+            a2a_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
     }
@@ -5867,6 +5889,7 @@ pub(crate) mod tests {
             runtime_config_non_secret: None,
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
+            a2a_routes: std::sync::OnceLock::new(),
             unit_id: None,
             cache,
         }
@@ -6170,6 +6193,52 @@ pub(crate) mod tests {
             id_a(),
             "first Identified wins; later id does not replace"
         );
+    }
+
+    #[test]
+    fn a2a_routes_are_read_from_a_pack_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/a2a-routes.json"),
+            br#"[{"agent_id":"recipe","base_url":"https://agent.example.com","requires_auth":true}]"#,
+        )
+        .unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        let routes = pack.a2a_routes().expect("sidecar present");
+        assert!(routes.get("recipe").unwrap().requires_auth);
+        assert!(
+            std::ptr::eq(routes, pack.a2a_routes().unwrap()),
+            "memoised: the second read returns the same parse"
+        );
+    }
+
+    #[test]
+    fn a2a_routes_are_read_from_a_gtpack_archive() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("worker.gtpack");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("assets/a2a-routes.json", options)
+            .unwrap();
+        writer
+            .write_all(br#"[{"agent_id":"recipe","base_url":"https://agent.example.com"}]"#)
+            .unwrap();
+        writer.finish().unwrap();
+
+        let pack = pack_runtime_for_dir(&archive_path);
+        assert!(pack.a2a_routes().and_then(|r| r.get("recipe")).is_some());
+    }
+
+    #[test]
+    fn a_pack_without_the_a2a_sidecar_has_no_a2a_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.a2a_routes().is_none());
     }
 }
 
