@@ -12,8 +12,10 @@ pub const WELL_KNOWN_PATH: &str = "/.well-known/agent-card.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum A2aError {
-    #[error("agent base URL must be https, got {base}")]
+    #[error("agent URL must be https (plaintext is allowed only on loopback), got {base}")]
     InsecureBase { base: String },
+    #[error("an agent reached at a remote base may not name a loopback interface: {url}")]
+    LoopbackFromRemote { url: String },
     #[error("agent base URL is not a URL: {base}")]
     BadBase { base: String },
     #[error("fetching the agent card failed: {0}")]
@@ -64,6 +66,28 @@ pub fn require_secure(url: &str) -> Result<url::Url, A2aError> {
     Ok(parsed)
 }
 
+/// Check the interface URL an agent card names, before sending anything to it.
+///
+/// [`require_secure`] alone is not enough here. Its loopback carve-out exists
+/// because a plaintext hop that never leaves the host cannot be observed — a
+/// fact about the BASE the operator configured. An interface URL is only text
+/// inside a card the agent controls, so a remote agent naming
+/// `http://127.0.0.1:<port>/` would otherwise turn this client into a way to
+/// reach services on the runner's own host. A loopback interface is therefore
+/// accepted only when the configured base is itself loopback.
+pub fn require_secure_interface(base: &str, interface: &str) -> Result<url::Url, A2aError> {
+    let target = require_secure(interface)?;
+    let base = url::Url::parse(base).map_err(|_| A2aError::BadBase {
+        base: base.to_string(),
+    })?;
+    if is_loopback(&target) && !is_loopback(&base) {
+        return Err(A2aError::LoopbackFromRemote {
+            url: interface.to_string(),
+        });
+    }
+    Ok(target)
+}
+
 /// Whether a base names this host, and so cannot be observed on the wire.
 ///
 /// Matched on the PARSED host: `http://127.0.0.1.evil.example` carries the
@@ -94,6 +118,7 @@ pub struct CardCache {
 }
 
 impl CardCache {
+    /// A cache whose entries are trusted for `ttl`.
     ///
     /// Fails only if the HTTP client cannot be built. The error is returned
     /// rather than papered over with a default client, which would follow
@@ -126,12 +151,9 @@ impl CardCache {
 
     /// The internal fetch, by an already-built URL.
     ///
-    /// This is the one place the https rule can be bypassed — pass it a
-    /// `http://` URL directly and it will fetch over plaintext — which is
-    /// exactly why it stays private. `mod tests` below is a child of this
-    /// module, so it can still reach this function to exercise the cache
-    /// against a loopback HTTP server without [`card_url`]'s refusal ever
-    /// being weakened for an external caller.
+    /// It applies no scheme rule of its own — [`get`](Self::get) does, through
+    /// [`card_url`] — which is why it stays private: a public by-URL entry
+    /// point would let a caller skip the https rule entirely.
     async fn get_from_url(&self, url: &str) -> Result<Arc<AgentCard>, A2aError> {
         if let Some(hit) = self.cached(url) {
             return Ok(hit);
@@ -225,6 +247,47 @@ mod tests {
         );
         assert!(card_url("http://localhost:8080").is_ok());
         assert!(card_url("http://[::1]:8080").is_ok());
+    }
+
+    #[test]
+    fn a_remote_agent_may_not_name_a_loopback_interface() {
+        // The loopback carve-out is about the BASE the operator configured. An
+        // interface URL is text in a card the agent controls; honouring a
+        // loopback one from a remote agent would let it aim this client at
+        // services on the runner's own host.
+        for interface in [
+            "http://127.0.0.1:8080/a2a",
+            "https://127.0.0.1:8443/a2a",
+            "http://localhost/a2a",
+            "http://[::1]/a2a",
+        ] {
+            assert!(
+                matches!(
+                    require_secure_interface("https://agent.example.com", interface),
+                    Err(A2aError::LoopbackFromRemote { .. })
+                ),
+                "{interface} must be refused for a remote base"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loopback_agent_may_name_a_loopback_interface() {
+        assert!(
+            require_secure_interface("http://127.0.0.1:9000", "http://127.0.0.1:9000/a2a").is_ok()
+        );
+    }
+
+    #[test]
+    fn a_remote_agent_may_name_a_remote_https_interface_but_not_a_plaintext_one() {
+        assert!(
+            require_secure_interface("https://agent.example.com", "https://api.example.com/a2a")
+                .is_ok()
+        );
+        assert!(matches!(
+            require_secure_interface("https://agent.example.com", "http://api.example.com/a2a"),
+            Err(A2aError::InsecureBase { .. })
+        ));
     }
 
     #[test]

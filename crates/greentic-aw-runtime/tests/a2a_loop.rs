@@ -151,7 +151,10 @@ fn recipe_tool_ref() -> ToolRef {
     ToolRef {
         extension_id: "a2a:recipe".into(),
         tool_name: "ask".into(),
-        description: None,
+        // A full author contract on purpose: without a description the ref
+        // could never be listed, and `no_a2a_source_offers_no_a2a_tool` would
+        // pass whether or not the source gates the listing.
+        description: Some("Ask the recipe agent.".into()),
         input_schema: Some(json!({
             "type": "object",
             "properties": { "message": { "type": "string" } }

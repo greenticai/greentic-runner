@@ -31,10 +31,11 @@ pub struct A2aToolCatalog {
 }
 
 impl A2aToolCatalog {
-    /// A catalogue with the given `(agent_id, description)` entries and no
-    /// transport, for tests of code that only reads entries.
+    /// A catalogue with no transport, for tests of code that only reads it:
+    /// `entries` are configured agents whose card was fetched, `down` are
+    /// configured agents whose card fetch failed.
     #[cfg(test)]
-    pub(crate) fn for_tests(entries: &[(&str, &str)]) -> Self {
+    pub(crate) fn for_tests(entries: &[(&str, &str)], down: &[&str]) -> Self {
         Self {
             tools: entries
                 .iter()
@@ -47,9 +48,22 @@ impl A2aToolCatalog {
                     )
                 })
                 .collect(),
-            errors: HashMap::new(),
+            errors: down
+                .iter()
+                .map(|id| ((*id).to_string(), "card unreachable (test)".to_string()))
+                .collect(),
             caller: None,
         }
+    }
+
+    /// Whether `agent_id` is one of the agents this catalogue was built for.
+    ///
+    /// Every configured agent lands in exactly one of `tools` (card fetched)
+    /// or `errors` (fetch failed), so this needs no field of its own and
+    /// cannot drift from them. The listing, the preflight check and dispatch
+    /// all gate on it, so they agree on which `a2a:` refs exist at all.
+    pub fn is_configured(&self, agent_id: &str) -> bool {
+        self.tools.contains_key(agent_id) || self.errors.contains_key(agent_id)
     }
 
     pub fn tool_entry(&self, agent_id: &str) -> Option<&A2aToolEntry> {
@@ -64,13 +78,18 @@ impl A2aToolCatalog {
     /// `{"error": <reason>}` so the LLM observes a failure as a normal tool
     /// result, as the flow and MCP arms do.
     ///
-    /// The call is attempted even when this catalogue has no entry for the
-    /// agent. The listing advertises such a tool from its author contract, so
-    /// that a worker keeps it while an agent is briefly down; refusing it here
-    /// would make that fallback useless. Only an agent that was never
-    /// configured is refused outright.
+    /// The call is attempted for any configured agent, including one whose
+    /// card could not be fetched when this catalogue was built — the listing
+    /// advertises such a tool from its author contract. The call re-fetches
+    /// the card, so it succeeds only if the agent has recovered since; while
+    /// the card is still down, the call fails with that cause. An agent that
+    /// was never configured is refused outright.
     pub async fn dispatch(&self, agent_id: &str, args: &Value) -> Value {
-        let Some(caller) = self.caller.as_ref().filter(|c| c.knows(agent_id)) else {
+        let caller = self
+            .caller
+            .as_ref()
+            .filter(|_| self.is_configured(agent_id));
+        let Some(caller) = caller else {
             let reason = self
                 .error_for(agent_id)
                 .map(|cause| format!("a2a agent {agent_id} is unavailable: {cause}"))

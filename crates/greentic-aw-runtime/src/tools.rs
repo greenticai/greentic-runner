@@ -189,12 +189,21 @@ pub fn list_tools_for_llm(
             continue;
         }
         if let Some(agent_id) = t.extension_id.strip_prefix("a2a:") {
-            // The card wins on description: it is the agent's own live
-            // statement about itself, as the mcp catalogue is. The schema can
-            // only come from the author contract — an `AgentSkill` carries
-            // none — so a ref without one cannot be advertised at all.
-            let description = a2a
-                .and_then(|c| c.tool_entry(agent_id))
+            // Only a configured agent is a tool at all: dispatch refuses any
+            // other, so advertising one would offer the model a call that can
+            // only fail. Then the card wins on description — it is the agent's
+            // own live statement about itself, as the mcp catalogue is — and
+            // the schema can only come from the author contract, since an
+            // `AgentSkill` carries none.
+            let Some(catalog) = a2a.filter(|c| c.is_configured(agent_id)) else {
+                tracing::warn!(
+                    extension = %t.extension_id, tool = %t.tool_name,
+                    "a2a agent is not configured for this worker; dropping from LLM tool list"
+                );
+                continue;
+            };
+            let description = catalog
+                .tool_entry(agent_id)
                 .map(|e| e.description.clone())
                 .or_else(|| t.description.clone());
             match (description, t.input_schema.clone()) {
@@ -328,18 +337,25 @@ pub fn missing_tools(
             continue;
         }
         if let Some(agent_id) = t.extension_id.strip_prefix("a2a:") {
-            // Mirrors `list_tools_for_llm`'s a2a branch: the description may
-            // come from the card OR the author contract, but the schema has
-            // only one source, so a ref without one is genuinely unusable.
-            let described =
-                a2a.and_then(|c| c.tool_entry(agent_id)).is_some() || t.description.is_some();
-            if !(described && t.input_schema.is_some()) {
+            // Mirrors `list_tools_for_llm`'s a2a branch exactly: the agent must
+            // be configured; then the description may come from the card OR
+            // the author contract, but the schema has only one source.
+            let reason = match a2a.filter(|c| c.is_configured(agent_id)) {
+                None => Some("a2a agent is not configured for this worker"),
+                Some(catalog) => {
+                    let described =
+                        catalog.tool_entry(agent_id).is_some() || t.description.is_some();
+                    (!(described && t.input_schema.is_some())).then_some(
+                        "a2a agent card unavailable, or the agent config carries \
+                         no input schema for it",
+                    )
+                }
+            };
+            if let Some(reason) = reason {
                 missing.push(MissingTool {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    reason: "a2a agent card unavailable, or the agent config \
-                             carries no input schema for it"
-                        .to_string(),
+                    reason: reason.to_string(),
                 });
             }
             continue;
@@ -1791,7 +1807,7 @@ mod tests {
             "properties": { "q": { "type": "string" } }
         });
         let allowed = vec![a2a_ref(Some("local"), Some(params.clone()))];
-        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")]);
+        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
 
         let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
         assert_eq!(schemas.len(), 1, "got: {schemas:?}");
@@ -1807,7 +1823,7 @@ mod tests {
         // an AgentSkill carries no schema, so there is no fallback source.
         let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![a2a_ref(Some("local"), None)];
-        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")]);
+        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
 
         let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
         assert!(schemas.is_empty(), "got: {schemas:?}");
@@ -1815,13 +1831,12 @@ mod tests {
 
     #[test]
     fn an_a2a_ref_falls_back_to_its_own_description_when_the_agent_is_unreachable() {
-        // Empty catalogue (the agent's card could not be fetched this run).
-        // The ref's own description and schema still advertise the tool, so a
-        // worker keeps running when an agent is briefly down.
+        // The agent is configured, but its card could not be fetched this run.
+        // The ref's own description and schema still advertise the tool.
         let rt = ExtensionRuntime::for_test().unwrap();
         let params = serde_json::json!({"type": "object", "properties": {}});
         let allowed = vec![a2a_ref(Some("own description"), Some(params.clone()))];
-        let catalog = A2aToolCatalog::for_tests(&[]);
+        let catalog = A2aToolCatalog::for_tests(&[], &["my-agent"]);
 
         let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
         assert_eq!(schemas.len(), 1, "got: {schemas:?}");
@@ -1838,7 +1853,7 @@ mod tests {
         let rt = ExtensionRuntime::for_test().unwrap();
         let params = serde_json::json!({"type": "object", "properties": {}});
         let allowed = vec![a2a_ref(None, Some(params))];
-        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")]);
+        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
 
         let missing = missing_tools(&rt, None, None, None, None, Some(&catalog), &allowed);
         assert!(missing.is_empty(), "got: {missing:?}");
@@ -1859,6 +1874,34 @@ mod tests {
             "got: {}",
             missing[0].reason
         );
+    }
+
+    #[test]
+    fn an_a2a_ref_for_an_unconfigured_agent_is_neither_advertised_nor_silent() {
+        // A full author contract is not enough: dispatch refuses an agent the
+        // worker was not configured with, so listing it would offer the model
+        // a call that can only fail. The listing and the preflight check must
+        // agree — dropped from one, reported by the other.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let params = serde_json::json!({"type": "object", "properties": {}});
+        let allowed = vec![a2a_ref(Some("own description"), Some(params))];
+        let other_agent = A2aToolCatalog::for_tests(&[("someone-else", "x")], &[]);
+
+        for catalog in [None, Some(&other_agent)] {
+            let schemas = list_tools_for_llm(&rt, None, None, None, None, catalog, &allowed);
+            assert!(
+                schemas.is_empty(),
+                "must not be advertised, got: {schemas:?}"
+            );
+
+            let missing = missing_tools(&rt, None, None, None, None, catalog, &allowed);
+            assert_eq!(missing.len(), 1, "must be reported, got: {missing:?}");
+            assert!(
+                missing[0].reason.contains("not configured"),
+                "got: {}",
+                missing[0].reason
+            );
+        }
     }
 
     #[tokio::test]

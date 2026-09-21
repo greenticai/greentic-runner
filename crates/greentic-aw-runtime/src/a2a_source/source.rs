@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use greentic_a2a::fetch::{CardCache, require_secure};
+use greentic_a2a::fetch::{CardCache, require_secure_interface};
 use greentic_a2a::message::{Message, Part, Role, Task, TaskState};
 use greentic_a2a::rpc::{
     JsonRpcRequest, JsonRpcResponse, METHOD_SEND_MESSAGE, SendMessageParams, SendMessageResult,
@@ -93,17 +93,21 @@ impl A2aToolSource {
 }
 
 impl Transport {
-    /// Whether `agent_id` is one of the configured bindings.
-    pub(super) fn knows(&self, agent_id: &str) -> bool {
-        self.agents.contains_key(agent_id)
-    }
-
     /// Fetch every configured agent's card into a catalogue with no caller.
     async fn fetch_cards(&self) -> A2aToolCatalog {
+        // Concurrently: fetched one after another, N hanging agents would cost
+        // N card timeouts before the model is even called, every step.
+        let fetched = futures::future::join_all(
+            self.agents
+                .iter()
+                .map(|(agent_id, base)| async move { (agent_id, self.cards.get(base).await) }),
+        )
+        .await;
+
         let mut tools = HashMap::new();
         let mut errors = HashMap::new();
-        for (agent_id, base) in &self.agents {
-            match self.cards.get(base).await {
+        for (agent_id, result) in fetched {
+            match result {
                 Ok(card) => {
                     tools.insert(
                         agent_id.clone(),
@@ -152,7 +156,7 @@ impl Transport {
         // is whatever the card SAYS. Apply the same rule to it, or an https
         // card could route the message — and any credential sent with it —
         // over plaintext to anywhere.
-        let target = require_secure(&interface.url)
+        let target = require_secure_interface(base, &interface.url)
             .map_err(|err| format!("a2a agent {agent_id} names an unusable interface: {err}"))?;
 
         let message = Message {
