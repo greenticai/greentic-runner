@@ -1,4 +1,6 @@
 pub mod a2a_pack_routes;
+#[cfg(feature = "agentic-worker")]
+pub(crate) mod a2a_pack_source;
 pub mod adapt_events_email;
 pub mod adapt_timer;
 pub mod agent_node;

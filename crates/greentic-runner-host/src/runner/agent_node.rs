@@ -1725,6 +1725,13 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
+        // One manager for every remote tool source that reads a credential at
+        // run time (MCP and A2A). Hoisted out of the MCP block so both honour
+        // the same explicit `SECRETS_BACKEND` override; see
+        // `mcp_secrets_manager` for why that override must win over the
+        // injected manager.
+        let remote_tool_secrets = mcp_secrets_manager(&secrets);
+
         let base = AgentRuntime::new(
             config_provider,
             state_store,
@@ -1750,16 +1757,28 @@ mod aw {
             // A per-server merge (pack fills only the servers the admin catalog
             // lacks) is a strictly better v2 and is out of scope: it needs a
             // merge rule for a server present in both with different URLs.
-            {
-                let mcp_secrets = mcp_secrets_manager(&secrets);
-                mcp_source_from_env(Some(mcp_secrets.clone())).or_else(|| {
-                    mcp_source_from_packs(&packs, &tenant, Some(mcp_secrets), unit.as_deref())
-                })
-            },
+            mcp_source_from_env(Some(remote_tool_secrets.clone())).or_else(|| {
+                mcp_source_from_packs(
+                    &packs,
+                    &tenant,
+                    Some(remote_tool_secrets.clone()),
+                    unit.as_deref(),
+                )
+            }),
         )
         .with_component_source(component_source_from_packs(&packs, &tenant))
         .with_flow_source(flow_source_from_packs(&packs, &tenant))
-        .with_sorla_source(sorla_source_from_env().await);
+        .with_sorla_source(sorla_source_from_env().await)
+        // Pack-only: there is no admin A2A source to prefer. This one site
+        // covers deployed dw.agent units, the desktop runner and the designer's
+        // test-chat sidecar. `build_agent_runtime` (process-level serve, no
+        // packs) and graph turns stay without one, as they are for pack MCP.
+        .with_a2a_source(crate::runner::a2a_pack_source::a2a_source_from_packs(
+            &packs,
+            &tenant,
+            Some(remote_tool_secrets),
+            unit.as_deref(),
+        ));
 
         // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
         // `dw.agent` workers ground on the ingested corpus exactly as the
@@ -3794,6 +3813,63 @@ mod aw {
             assert!(
                 super::mcp_source_from_packs(&[], "acme", None, None).is_none(),
                 "empty packs => None even when the gate is unset"
+            );
+        }
+
+        /// Wiring guard: the in-process runtime built by
+        /// `build_runtime_with_stores` carries the pack-backed A2A source.
+        /// Without this, a dropped `.with_a2a_source(..)` fails only at run
+        /// time, as a bound tool that silently vanished.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn the_in_process_runtime_wires_the_pack_carried_a2a_source() {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_A2A");
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+            }
+
+            async fn build(pack_dir: &std::path::Path) -> Arc<AgentRuntime> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                let secrets: crate::secrets::DynSecretsManager =
+                    Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+                let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(pack_dir));
+                super::build_runtime_with_stores(
+                    agents,
+                    "t1".to_string(),
+                    secrets,
+                    None,
+                    vec![pack],
+                    Arc::new(MockAgentStateStore::new()),
+                    Arc::new(MockTokenMeter::new(0)),
+                    Arc::new(NoopToolLedger),
+                    Some("worker-a".to_string()),
+                )
+                .await
+                .expect("runtime should build")
+            }
+
+            let with_sidecar = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(with_sidecar.path().join("assets")).unwrap();
+            std::fs::write(
+                with_sidecar.path().join("assets/a2a-routes.json"),
+                br#"[{"agent_id":"recipe","base_url":"https://agent.example.com"}]"#,
+            )
+            .unwrap();
+            assert!(
+                build(with_sidecar.path()).await.has_a2a_source(),
+                "a pack carrying assets/a2a-routes.json must wire an A2A source"
+            );
+
+            let without = tempfile::tempdir().unwrap();
+            assert!(
+                !build(without.path()).await.has_a2a_source(),
+                "control: no sidecar, no source"
             );
         }
 
