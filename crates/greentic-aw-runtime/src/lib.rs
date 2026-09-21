@@ -64,7 +64,7 @@ pub mod mock;
 #[cfg(feature = "serve")]
 pub mod serve;
 
-pub use a2a_source::{A2aToolCatalog, A2aToolEntry, A2aToolSource};
+pub use a2a_source::{A2aRoute, A2aToolCatalog, A2aToolEntry, A2aToolSource};
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
@@ -412,6 +412,17 @@ impl AgentRuntime {
     #[must_use]
     pub fn has_knowledge(&self) -> bool {
         self.knowledge.is_some()
+    }
+
+    /// Whether an A2A tool source is wired, so `a2a:` refs can resolve.
+    ///
+    /// Exposed for the host's wiring regression test. The runtime is built in
+    /// runner-host, where this field is not visible, and a dropped
+    /// `with_a2a_source` call otherwise fails only as "the tool vanished" at
+    /// run time.
+    #[must_use]
+    pub fn has_a2a_source(&self) -> bool {
+        self.a2a.is_some()
     }
 
     /// The mounted knowledge backend, if any.

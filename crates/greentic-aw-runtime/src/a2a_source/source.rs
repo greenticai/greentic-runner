@@ -10,8 +10,10 @@ use greentic_a2a::message::{Message, Part, Role, Task, TaskState};
 use greentic_a2a::rpc::{
     JsonRpcRequest, JsonRpcResponse, METHOD_SEND_MESSAGE, SendMessageParams, SendMessageResult,
 };
+use greentic_secrets_lib::SecretsManager;
 
-use super::types::{A2aToolCatalog, A2aToolEntry};
+use super::auth::{CredentialScope, ensure_same_host};
+use super::types::{A2aRoute, A2aToolCatalog, A2aToolEntry};
 
 /// How long a fetched agent card is trusted before a refetch is considered.
 /// Mirrors [`crate::mcp_source`]'s catalog TTL: a card changes rarely, so
@@ -25,12 +27,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The A2A agents one worker may call, plus the transport to reach them.
 ///
-/// Holds the configured `(agent_id, base)` pairs, a [`CardCache`] (which
-/// enforces the https-except-loopback rule on every fetch), and a
-/// `reqwest::Client` built with `redirect::Policy::none()` and a timeout —
-/// the same posture `greentic-a2a`'s own client uses, and for the same
-/// reason: an agent must not be able to redirect a credentialed call
-/// elsewhere.
+/// Holds the configured [`A2aRoute`]s, a [`CardCache`] (which enforces the
+/// https-except-loopback rule on every fetch), the scope a credentialed
+/// route's token is read from, and a `reqwest::Client` built with
+/// `redirect::Policy::none()` and a timeout. That is the same posture
+/// `greentic-a2a`'s own client uses, for the same reason: an agent must not be
+/// able to redirect a credentialed call elsewhere.
 pub struct A2aToolSource {
     transport: Arc<Transport>,
 }
@@ -39,9 +41,10 @@ pub struct A2aToolSource {
 /// every catalogue it builds so a catalogue can dispatch a call — the same
 /// arrangement as `FlowToolCatalog` holding its invoker.
 pub(super) struct Transport {
-    agents: HashMap<String, String>,
+    agents: HashMap<String, A2aRoute>,
     cards: CardCache,
     client: reqwest::Client,
+    credentials: CredentialScope,
 }
 
 impl std::fmt::Debug for Transport {
@@ -53,23 +56,55 @@ impl std::fmt::Debug for Transport {
 }
 
 impl A2aToolSource {
-    /// `agents` is `(agent_id, base_url)` pairs — the bindings a worker's
-    /// tool list resolved to `a2a:<agent_id>`.
+    /// `agents` is `(agent_id, base_url)` pairs with no credential: the no-auth
+    /// form, kept for callers (and tests) that bind public agents only.
     ///
     /// Fails only if the HTTP client cannot be built. That failure is
     /// returned rather than papered over: falling back to a default client
     /// would silently drop the no-redirect policy and the timeout, which are
     /// the two properties this type exists to guarantee.
     pub fn new(agents: Vec<(String, String)>) -> Result<Self, reqwest::Error> {
+        let routes = agents
+            .into_iter()
+            .map(|(agent_id, base)| A2aRoute::unauthenticated(agent_id, base))
+            .collect();
+        Self::build(routes, CredentialScope::none())
+    }
+
+    /// Build from sidecar routes, any of which may require a credential.
+    ///
+    /// `tenant` and `unit` are captured here, as the flow and component
+    /// sources capture theirs, so [`Self::catalog`] stays tenant-less. The
+    /// token is NOT read here: it is read on every call, so a rotated secret
+    /// takes effect without a restart. A route with `requires_auth` and no
+    /// `secrets` builds fine and refuses at call time, naming the scope.
+    ///
+    /// Routes are deduplicated by `agent_id`, first wins, matching the
+    /// first-pack-wins rule of the caller that assembles them.
+    pub fn from_routes(
+        routes: Vec<A2aRoute>,
+        secrets: Option<Arc<dyn SecretsManager>>,
+        tenant: impl Into<String>,
+        unit: Option<String>,
+    ) -> Result<Self, reqwest::Error> {
+        Self::build(routes, CredentialScope::new(secrets, tenant.into(), unit))
+    }
+
+    fn build(routes: Vec<A2aRoute>, credentials: CredentialScope) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(CALL_TIMEOUT)
             .build()?;
+        let mut agents = HashMap::with_capacity(routes.len());
+        for route in routes {
+            agents.entry(route.agent_id.clone()).or_insert(route);
+        }
         Ok(Self {
             transport: Arc::new(Transport {
-                agents: agents.into_iter().collect(),
+                agents,
                 cards: CardCache::new(CARD_TTL)?,
                 client,
+                credentials,
             }),
         })
     }
@@ -79,7 +114,8 @@ impl A2aToolSource {
     /// Infallible by contract, mirroring [`crate::mcp_source::McpToolSource`]:
     /// one dead or malformed agent must not remove a worker's OTHER tools, so
     /// a fetch failure is recorded in [`A2aToolCatalog::error_for`] instead of
-    /// failing the whole build. The catalogue can dispatch calls itself.
+    /// failing the whole build. The catalogue can dispatch calls itself. Card
+    /// fetches are unauthenticated: public cards are unauthenticated in A2A.
     pub async fn catalog(&self) -> Arc<A2aToolCatalog> {
         let mut catalog = self.transport.fetch_cards().await;
         catalog.caller = Some(Arc::clone(&self.transport));
@@ -97,12 +133,11 @@ impl Transport {
     async fn fetch_cards(&self) -> A2aToolCatalog {
         // Concurrently: fetched one after another, N hanging agents would cost
         // N card timeouts before the model is even called, every step.
-        let fetched = futures::future::join_all(
-            self.agents
-                .iter()
-                .map(|(agent_id, base)| async move { (agent_id, self.cards.get(base).await) }),
-        )
-        .await;
+        let fetched =
+            futures::future::join_all(self.agents.iter().map(|(agent_id, route)| async move {
+                (agent_id, self.cards.get(&route.base_url).await)
+            }))
+            .await;
 
         let mut tools = HashMap::new();
         let mut errors = HashMap::new();
@@ -130,20 +165,23 @@ impl Transport {
 
     /// Call one agent with a plain-text prompt and return its reply text.
     ///
-    /// Resolves the agent's card, takes its first `supported_interfaces`
-    /// entry, and posts a `SendMessage` request to that interface's URL. The
-    /// interface's `tenant`, when the card set one, is echoed into
-    /// `SendMessageParams.tenant` — the A2A spec makes that a MUST for
-    /// clients, not a courtesy.
+    /// Resolves the agent's (public, unauthenticated) card, takes its first
+    /// `supported_interfaces` entry, and checks that interface is secure. For
+    /// a credentialed route it then requires the interface to share the
+    /// configured base's host and port, and only then reads the credential;
+    /// a missing or unusable one refuses the call with nothing sent. The
+    /// `SendMessage` POST is the only request that carries the credential. The interface's `tenant`, when the card set
+    /// one, is echoed into `SendMessageParams.tenant`; the A2A spec makes that
+    /// a MUST for clients.
     pub(super) async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
-        let base = self
+        let route = self
             .agents
             .get(agent_id)
             .ok_or_else(|| format!("unknown a2a agent: {agent_id}"))?;
 
         let card = self
             .cards
-            .get(base)
+            .get(&route.base_url)
             .await
             .map_err(|err| format!("fetching card for a2a agent {agent_id} failed: {err}"))?;
 
@@ -154,10 +192,19 @@ impl Transport {
 
         // The card was fetched over https (or loopback), but the interface URL
         // is whatever the card SAYS. Apply the same rule to it, or an https
-        // card could route the message — and any credential sent with it —
+        // card could route the message — and the credential sent with it —
         // over plaintext to anywhere.
-        let target = require_secure_interface(base, &interface.url)
+        let target = require_secure_interface(&route.base_url, &interface.url)
             .map_err(|err| format!("a2a agent {agent_id} names an unusable interface: {err}"))?;
+
+        // A credential goes only to the host and port the admin configured.
+        // Checked before the secret is read, so a card naming another host
+        // never causes a secrets lookup, and nothing is sent: there is no
+        // unauthenticated retry.
+        if route.requires_auth {
+            ensure_same_host(agent_id, &route.base_url, &target)?;
+        }
+        let auth = self.credentials.header_for(route).await?;
 
         let message = Message {
             message_id: uuid::Uuid::new_v4().to_string(),
@@ -174,10 +221,11 @@ impl Transport {
         };
         let request = JsonRpcRequest::new(1, METHOD_SEND_MESSAGE, params);
 
-        let response = self
-            .client
-            .post(target)
-            .json(&request)
+        let mut post = self.client.post(target).json(&request);
+        if let Some((name, value)) = auth {
+            post = post.header(name, value);
+        }
+        let response = post
             .send()
             .await
             .map_err(|err| format!("calling a2a agent {agent_id} failed: {err}"))?;

@@ -213,6 +213,7 @@ async fn a2a_tool_offered_called_and_result_in_trail() {
         Ok(final_reply("An omelette sounds great.")),
     ]));
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(vec![recipe_tool_ref()]));
+    assert!(rt.has_a2a_source(), "a wired source must be observable");
 
     let out = rt
         .step(
@@ -274,6 +275,7 @@ async fn a2a_tool_offered_called_and_result_in_trail() {
 async fn no_a2a_source_offers_no_a2a_tool() {
     let llm = Arc::new(RecordingLlmBackend::new(vec![Ok(final_reply("no tools"))]));
     let (rt, tc) = build_runtime(llm.clone(), None, cfg(vec![recipe_tool_ref()]));
+    assert!(!rt.has_a2a_source());
 
     let out = rt
         .step(

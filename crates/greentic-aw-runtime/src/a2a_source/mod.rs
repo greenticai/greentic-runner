@@ -21,11 +21,14 @@
 //!
 //! # Module layout
 //!
-//! - `types` — [`A2aToolEntry`], [`A2aToolCatalog`]
+//! - `types` — [`A2aRoute`], [`A2aToolEntry`], [`A2aToolCatalog`]
+//! - `auth` — the per-call credential: §5 URI candidates via
+//!   [`crate::scoped_secrets`], header rule, same-host rule, missing-credential refusal
 //! - `source` — [`A2aToolSource`]: card fetch, catalog build, `SendMessage`
 //!   dispatch
 //! - `tests` — unit + integration tests (cfg(test) only)
 
+mod auth;
 mod source;
 mod types;
 
@@ -36,4 +39,4 @@ mod tests;
 // --- Public re-exports (stable API surface) ---
 
 pub use source::A2aToolSource;
-pub use types::{A2aToolCatalog, A2aToolEntry};
+pub use types::{A2aRoute, A2aToolCatalog, A2aToolEntry};
