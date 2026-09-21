@@ -1,0 +1,18 @@
+[package]
+name        = "greentic-a2a"
+version     = "0.1.0"
+edition     = "2024"
+license     = "MIT"
+description = "A2A (Agent2Agent) v1.0 wire types and agent-card retrieval"
+
+[dependencies]
+anyhow              = { workspace = true }
+reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde               = { version = "1", features = ["derive"] }
+serde_json          = { workspace = true }
+thiserror           = { workspace = true }
+url                 = { workspace = true }
+
+[dev-dependencies]
+tiny_http           = { workspace = true }
+tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
