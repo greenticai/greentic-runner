@@ -679,6 +679,16 @@ impl PolicySecretsHost {
     }
 }
 
+/// Pseudo-pack segment for [`PolicySecretsHost`].
+///
+/// **Deliberately NOT unit-scoped**, for a blunter reason than
+/// `TenantRuntime::get_secret`'s: this host is unreachable. It is installed on
+/// `HostBundle.secrets`, a field nothing in the workspace ever reads — every
+/// live secret read goes through `HostState` (`pack.rs`) or
+/// `TenantRuntime::get_secret`. Threading a unit through dead code would be
+/// one more thing to keep in step with the live path for no behaviour; removing
+/// it means removing `HostBundle.secrets`, the `SecretsHost` trait and
+/// `FnSecretsHost` with it, which is a wider cleanup than this change.
 const POLICY_SECRETS_PACK_ID: &str = "_runner";
 
 #[async_trait]
