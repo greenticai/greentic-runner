@@ -13,11 +13,43 @@ pub const METHOD_GET_TASK: &str = "GetTask";
 pub const METHOD_CANCEL_TASK: &str = "CancelTask";
 pub const METHOD_LIST_TASKS: &str = "ListTasks";
 
+/// A JSON-RPC 2.0 id: `string | number | null`.
+///
+/// Modelled faithfully rather than narrowed to a number, because a server MUST
+/// echo back the id it received. Narrowing it works for a client that only ever
+/// mints its own ids and silently breaks the moment this crate is used to
+/// answer a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcId {
+    Number(i64),
+    Str(String),
+    Null,
+}
+
+impl From<i64> for JsonRpcId {
+    fn from(id: i64) -> Self {
+        Self::Number(id)
+    }
+}
+
+impl From<String> for JsonRpcId {
+    fn from(id: String) -> Self {
+        Self::Str(id)
+    }
+}
+
+impl From<&str> for JsonRpcId {
+    fn from(id: &str) -> Self {
+        Self::Str(id.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JsonRpcRequest<P> {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: JsonRpcId,
     pub method: String,
     pub params: P,
 }
@@ -25,10 +57,10 @@ pub struct JsonRpcRequest<P> {
 impl<P> JsonRpcRequest<P> {
     /// Build a request with the protocol's fixed `jsonrpc` value, so no call
     /// site has to remember it.
-    pub fn new(id: u64, method: &str, params: P) -> Self {
+    pub fn new(id: impl Into<JsonRpcId>, method: &str, params: P) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
-            id,
+            id: id.into(),
             method: method.to_string(),
             params,
         }
@@ -39,8 +71,7 @@ impl<P> JsonRpcRequest<P> {
 #[serde(rename_all = "camelCase")]
 pub struct JsonRpcResponse<R> {
     pub jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<u64>,
+    pub id: JsonRpcId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<R>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +95,14 @@ pub struct SendMessageParams {
     /// makes that a MUST, not a courtesy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// Arbitrary caller-supplied metadata, carried on the proto's
+    /// `SendMessageRequest` alongside `configuration`.
+    ///
+    /// `configuration` (blocking/streaming preferences, push-notification
+    /// config, history length) is deliberately left unmodelled until a
+    /// consumer needs it — an omission recorded as a decision, not missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// What `SendMessage` answers with.
@@ -113,6 +152,15 @@ pub struct ListTasksResult {
     /// Always present; an empty string means this was the final page.
     #[serde(default)]
     pub next_page_token: String,
+    /// The page size the server actually used. Required on the proto's
+    /// `ListTasksResponse` — a client may ignore it, but a server answering
+    /// this crate's future `serve` side MUST emit it.
+    #[serde(default)]
+    pub page_size: i32,
+    /// The total number of tasks across all pages. Same requiredness as
+    /// `page_size` above.
+    #[serde(default)]
+    pub total_size: i32,
 }
 
 #[cfg(test)]
@@ -196,12 +244,66 @@ mod tests {
                     metadata: None,
                 },
                 tenant: Some("acme".into()),
+                metadata: None,
             },
         );
         let out = serde_json::to_string(&req).unwrap();
         assert!(out.contains("\"method\":\"SendMessage\""));
         assert!(out.contains("\"tenant\":\"acme\""));
         assert!(out.contains("\"jsonrpc\":\"2.0\""));
+    }
+
+    #[test]
+    fn a_string_id_round_trips_unchanged() {
+        // A server MUST echo the id it received, and a real caller may send a
+        // UUID-shaped string rather than a number — the whole point of
+        // Critical 1.
+        let req: JsonRpcRequest<SendMessageParams> = JsonRpcRequest::new(
+            "abc-123",
+            METHOD_GET_TASK,
+            SendMessageParams {
+                message: Message {
+                    message_id: "m-1".into(),
+                    context_id: None,
+                    task_id: None,
+                    role: Role::User,
+                    parts: vec![Part::text("hi")],
+                    metadata: None,
+                },
+                tenant: None,
+                metadata: None,
+            },
+        );
+        assert_eq!(req.id, JsonRpcId::Str("abc-123".to_string()));
+        let out = serde_json::to_string(&req).unwrap();
+        assert!(out.contains("\"id\":\"abc-123\""));
+        let back: JsonRpcRequest<SendMessageParams> = serde_json::from_str(&out).unwrap();
+        assert_eq!(back.id, JsonRpcId::Str("abc-123".to_string()));
+    }
+
+    #[test]
+    fn a_numeric_id_still_round_trips() {
+        let req: JsonRpcRequest<SendMessageParams> = JsonRpcRequest::new(
+            42,
+            METHOD_GET_TASK,
+            SendMessageParams {
+                message: Message {
+                    message_id: "m-1".into(),
+                    context_id: None,
+                    task_id: None,
+                    role: Role::User,
+                    parts: vec![Part::text("hi")],
+                    metadata: None,
+                },
+                tenant: None,
+                metadata: None,
+            },
+        );
+        assert_eq!(req.id, JsonRpcId::Number(42));
+        let out = serde_json::to_string(&req).unwrap();
+        assert!(out.contains("\"id\":42"));
+        let back: JsonRpcRequest<SendMessageParams> = serde_json::from_str(&out).unwrap();
+        assert_eq!(back.id, JsonRpcId::Number(42));
     }
 
     #[test]
@@ -235,12 +337,34 @@ mod tests {
         let list_result = ListTasksResult {
             tasks: vec![],
             next_page_token: "token".into(),
+            page_size: 20,
+            total_size: 100,
         };
         let value = serde_json::to_value(&list_result).expect("serialises");
         assert_eq!(
             crate::testutil::first_snake_case_key(&value),
             None,
             "ListTasksResult lost rename_all = \"camelCase\""
+        );
+
+        // SendMessageParams with all fields populated
+        let send_message = SendMessageParams {
+            message: Message {
+                message_id: "m-1".into(),
+                context_id: None,
+                task_id: None,
+                role: Role::User,
+                parts: vec![Part::text("hi")],
+                metadata: None,
+            },
+            tenant: Some("acme".into()),
+            metadata: Some(serde_json::json!({"k": 1})),
+        };
+        let value = serde_json::to_value(&send_message).expect("serialises");
+        assert_eq!(
+            crate::testutil::first_snake_case_key(&value),
+            None,
+            "SendMessageParams lost rename_all = \"camelCase\""
         );
     }
 
