@@ -71,72 +71,11 @@ pub struct SendMessageParams {
 /// An agent MAY reply with a `Message` directly, or with a `Task` the caller
 /// then polls. Both are conformant, so both are modelled — a client that
 /// handles only one fails against half the agents in the wild.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SendMessageResult {
     Message(Message),
     Task(Task),
-}
-
-impl Serialize for SendMessageResult {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        match self {
-            SendMessageResult::Message(m) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("message", m)?;
-                map.end()
-            }
-            SendMessageResult::Task(t) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("task", t)?;
-                map.end()
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for SendMessageResult {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::MapAccess;
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = SendMessageResult;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("an object with either 'message' or 'task' key")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                if let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
-                    match key.as_str() {
-                        "message" => {
-                            let message: Message =
-                                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-                            Ok(SendMessageResult::Message(message))
-                        }
-                        "task" => {
-                            let task: Task =
-                                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-                            Ok(SendMessageResult::Task(task))
-                        }
-                        _ => Err(serde::de::Error::custom("expected 'message' or 'task' key")),
-                    }
-                } else {
-                    Err(serde::de::Error::custom("expected non-empty object"))
-                }
-            }
-        }
-        deserializer.deserialize_map(Visitor)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
