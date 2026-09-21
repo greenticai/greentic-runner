@@ -209,6 +209,13 @@ pub struct AgentRuntime {
     /// the host SoRX interact client) is injected at the runner-host edge,
     /// never compiled in.
     pub(crate) sorla: Option<Arc<crate::sorla_source::SorlaToolSource>>,
+    /// Agentic-worker A2A tool source. `None` disables A2A tools entirely
+    /// (`a2a:`-prefixed tool refs are then dropped from the tool list and
+    /// reported by the preflight check). Set via
+    /// [`AgentRuntime::with_a2a_source`]. Unlike the flow and component
+    /// sources this one owns its transport, since an A2A agent is plain
+    /// HTTP(S) reachable from here.
+    pub(crate) a2a: Option<Arc<crate::a2a_source::A2aToolSource>>,
     /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
     /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
     /// concrete backend is injected at the runner-host edge, never compiled in.
@@ -255,6 +262,7 @@ impl AgentRuntime {
             components: None,
             flows: None,
             sorla: None,
+            a2a: None,
             long_term_memory: None,
             knowledge: None,
             short_term_memory: None,
@@ -320,6 +328,15 @@ impl AgentRuntime {
         sorla: Option<Arc<crate::sorla_source::SorlaToolSource>>,
     ) -> Self {
         self.sorla = sorla;
+        self
+    }
+
+    /// Wire the A2A tool source so `a2a:`-prefixed tool refs resolve to
+    /// external A2A agents invoked over HTTP(S). Coexists with the
+    /// mcp/component/flow/sorla sources; defaults off when not set.
+    #[must_use]
+    pub fn with_a2a_source(mut self, a2a: Option<Arc<crate::a2a_source::A2aToolSource>>) -> Self {
+        self.a2a = a2a;
         self
     }
 

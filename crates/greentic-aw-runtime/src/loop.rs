@@ -347,6 +347,14 @@ pub async fn run_step(
         None => None,
     };
 
+    // Resolve the A2A tool catalog once per step (mirrors the sorla catalog
+    // above). Infallible + card-cached; `None` source → no `a2a:` tools at
+    // all.
+    let a2a_catalog = match runtime.a2a.as_ref() {
+        Some(src) => Some(src.catalog().await),
+        None => None,
+    };
+
     // Preflight: surface declared tools that won't reach the LLM. Without this
     // the runtime drops unresolved tools silently (per-tool debug warns) and the
     // agent runs with a smaller — or empty — tool set, then hallucinates tool
@@ -359,9 +367,7 @@ pub async fn run_step(
             component_catalog.as_deref(),
             flow_catalog.as_deref(),
             sorla_catalog.as_deref(),
-            // Wiring a real A2A catalogue into the loop is a later task; this
-            // stays `None` here.
-            None,
+            a2a_catalog.as_deref(),
             &config.tools,
         ),
         config.tools.len(),
@@ -412,9 +418,7 @@ pub async fn run_step(
             component_catalog.as_deref(),
             flow_catalog.as_deref(),
             sorla_catalog.as_deref(),
-            // Wiring a real A2A catalogue into the loop is a later task; this
-            // stays `None` here.
-            None,
+            a2a_catalog.as_deref(),
             &config.tools,
         );
         if lt_active {
@@ -668,9 +672,7 @@ pub async fn run_step(
                     component_catalog.clone(),
                     flow_catalog.clone(),
                     sorla_catalog.clone(),
-                    // Wiring a real A2A catalogue into the loop is a later
-                    // task; this stays `None` here.
-                    None,
+                    a2a_catalog.clone(),
                     call.clone(),
                     &tenant,
                 )
