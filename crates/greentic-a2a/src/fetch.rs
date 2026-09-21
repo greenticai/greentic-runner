@@ -33,14 +33,7 @@ pub enum A2aError {
 /// there is no on-path attacker — the packets never leave the host — so plaintext is allowed
 /// for in-process test servers and sidecar agents.
 pub fn card_url(base: &str) -> Result<String, A2aError> {
-    let parsed = url::Url::parse(base).map_err(|_| A2aError::BadBase {
-        base: base.to_string(),
-    })?;
-    if parsed.scheme() != "https" && !is_loopback(&parsed) {
-        return Err(A2aError::InsecureBase {
-            base: base.to_string(),
-        });
-    }
+    let parsed = require_secure(base)?;
     // `join` re-roots at the origin rather than concatenating the base's raw
     // text, so a base carrying a path, query or fragment (`https://a.com/x?y=1`)
     // still resolves to the well-known location instead of appending onto it.
@@ -50,6 +43,25 @@ pub fn card_url(base: &str) -> Result<String, A2aError> {
             base: base.to_string(),
         })?;
     Ok(card.to_string())
+}
+
+/// Parse `url` and refuse it unless it is `https`, or plaintext on loopback.
+///
+/// The rule [`card_url`] applies to a base, exposed so a caller can apply the
+/// SAME rule to every other address it will send to — above all the interface
+/// URL an agent card names. Checking only the card's own address is not
+/// enough: an https card may still name a plaintext interface, and the message
+/// (and any credential with it) would then leave in the clear.
+pub fn require_secure(url: &str) -> Result<url::Url, A2aError> {
+    let parsed = url::Url::parse(url).map_err(|_| A2aError::BadBase {
+        base: url.to_string(),
+    })?;
+    if parsed.scheme() != "https" && !is_loopback(&parsed) {
+        return Err(A2aError::InsecureBase {
+            base: url.to_string(),
+        });
+    }
+    Ok(parsed)
 }
 
 /// Whether a base names this host, and so cannot be observed on the wire.
@@ -82,8 +94,12 @@ pub struct CardCache {
 }
 
 impl CardCache {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
+    ///
+    /// Fails only if the HTTP client cannot be built. The error is returned
+    /// rather than papered over with a default client, which would follow
+    /// redirects and have no timeout — the two properties set below.
+    pub fn new(ttl: Duration) -> Result<Self, reqwest::Error> {
+        Ok(Self {
             ttl,
             entries: Mutex::new(HashMap::new()),
             // Redirects are refused outright rather than merely limited: a
@@ -95,9 +111,8 @@ impl CardCache {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("a client with no redirect policy and a timeout is always buildable"),
-        }
+                .build()?,
+        })
     }
 
     /// Fetch the card for an agent base, or serve it from cache.
@@ -256,7 +271,7 @@ mod tests {
         let base = spawn_card_server(Arc::clone(&hits));
         let url = format!("{base}{WELL_KNOWN_PATH}");
 
-        let cache = CardCache::new(Duration::from_secs(300));
+        let cache = CardCache::new(Duration::from_secs(300)).expect("client builds");
         let first = cache.get_from_url(&url).await.expect("first fetch");
         let second = cache.get_from_url(&url).await.expect("cached");
 

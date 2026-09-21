@@ -35,6 +35,12 @@ const RPC_PATH: &str = "/a2a";
 /// [`RPC_PATH`] on the same server.
 async fn mount_card(server: &MockServer) {
     let card = CARD.replace("PLACEHOLDER", &format!("{}{RPC_PATH}", server.uri()));
+    mount_raw_card(server, card).await;
+}
+
+/// Serve `card` verbatim at the well-known path, for tests that need a card
+/// [`mount_card`] cannot express (a tenant, a foreign interface URL).
+async fn mount_raw_card(server: &MockServer, card: String) {
     Mock::given(method("GET"))
         .and(path("/.well-known/agent-card.json"))
         .respond_with(ResponseTemplate::new(200).set_body_string(card))
@@ -51,4 +57,13 @@ fn source_for(agents: Vec<(&str, String)>) -> crate::a2a_source::A2aToolSource {
             .collect(),
     )
     .expect("a client with no redirect policy and a timeout is buildable")
+}
+
+/// Answer the agent's `SendMessage` with `body` as the JSON-RPC response.
+async fn mount_reply(server: &MockServer, body: serde_json::Value) {
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
 }

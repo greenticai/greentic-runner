@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use greentic_a2a::fetch::CardCache;
-use greentic_a2a::message::{Message, Part, Role};
+use greentic_a2a::fetch::{CardCache, require_secure};
+use greentic_a2a::message::{Message, Part, Role, Task, TaskState};
 use greentic_a2a::rpc::{
     JsonRpcRequest, JsonRpcResponse, METHOD_SEND_MESSAGE, SendMessageParams, SendMessageResult,
 };
@@ -52,7 +52,7 @@ impl A2aToolSource {
             .build()?;
         Ok(Self {
             agents: agents.into_iter().collect(),
-            cards: CardCache::new(CARD_TTL),
+            cards: CardCache::new(CARD_TTL)?,
             client,
         })
     }
@@ -108,6 +108,13 @@ impl A2aToolSource {
             .first()
             .ok_or_else(|| format!("a2a agent {agent_id} advertises no interfaces"))?;
 
+        // The card was fetched over https (or loopback), but the interface URL
+        // is whatever the card SAYS. Apply the same rule to it, or an https
+        // card could route the message — and any credential sent with it —
+        // over plaintext to anywhere.
+        let target = require_secure(&interface.url)
+            .map_err(|err| format!("a2a agent {agent_id} names an unusable interface: {err}"))?;
+
         let message = Message {
             message_id: uuid::Uuid::new_v4().to_string(),
             context_id: None,
@@ -125,7 +132,7 @@ impl A2aToolSource {
 
         let response = self
             .client
-            .post(interface.url.as_str())
+            .post(target)
             .json(&request)
             .send()
             .await
@@ -146,27 +153,75 @@ impl A2aToolSource {
             .map_err(|err| format!("a2a agent {agent_id} sent an unreadable reply: {err}"))?;
 
         if let Some(error) = body.error {
-            return Err(error.message);
+            return Err(format!(
+                "a2a agent {agent_id} returned an error: {}",
+                error.message
+            ));
         }
 
         match body.result {
-            Some(SendMessageResult::Message(reply)) => Ok(reply
-                .parts
-                .iter()
-                .filter_map(|part| part.text.as_deref())
-                .collect::<String>()),
-            // This slice does not poll a `Task` to completion — that is a
-            // later slice. Returning `Ok` with a sentence naming the task's
-            // id and state gives an operator something actionable rather
-            // than silence.
-            Some(SendMessageResult::Task(task)) => Ok(format!(
-                "the agent started a task instead of replying directly (id: {}, state: {:?}); \
-                 polling a task to completion is not supported yet",
-                task.id, task.status.state
-            )),
+            Some(SendMessageResult::Message(reply)) => {
+                reply_text(agent_id, &reply.parts, "replied with no text part")
+            }
+            Some(SendMessageResult::Task(task)) => task_outcome(agent_id, &task),
             None => Err(format!(
                 "a2a agent {agent_id} returned neither a result nor an error"
             )),
         }
+    }
+}
+
+/// The text of `parts`, one part per line.
+///
+/// A reply with no text part at all is an error rather than an empty result:
+/// an empty tool result tells the model nothing, and it would carry on as if
+/// the agent had answered.
+fn reply_text(agent_id: &str, parts: &[Part], empty: &str) -> Result<String, String> {
+    let texts: Vec<&str> = parts
+        .iter()
+        .filter_map(|part| part.text.as_deref())
+        .collect();
+    if texts.is_empty() {
+        return Err(format!("a2a agent {agent_id} {empty}"));
+    }
+    Ok(texts.join("\n"))
+}
+
+/// What the model should see when an agent answered with a `Task`.
+///
+/// This slice does not poll. A task that has already finished is answered
+/// from its artifacts; one that failed is an error, so the model does not read
+/// a failure as a successful result; one still in flight is reported as
+/// pending, which is true.
+fn task_outcome(agent_id: &str, task: &Task) -> Result<String, String> {
+    let detail = task
+        .status
+        .message
+        .as_ref()
+        .and_then(|m| reply_text(agent_id, &m.parts, "").ok())
+        .map(|text| format!(": {text}"))
+        .unwrap_or_default();
+    match task.status.state {
+        TaskState::Completed => {
+            let parts: Vec<Part> = task
+                .artifacts
+                .iter()
+                .flat_map(|artifact| artifact.parts.iter().cloned())
+                .collect();
+            reply_text(agent_id, &parts, "completed a task with no text artifact")
+        }
+        TaskState::Submitted | TaskState::Working | TaskState::InputRequired => Ok(format!(
+            "a2a agent {agent_id} accepted the request as task {} ({:?}); \
+             polling a task to completion is not supported yet{detail}",
+            task.id, task.status.state
+        )),
+        TaskState::Failed
+        | TaskState::Rejected
+        | TaskState::Canceled
+        | TaskState::AuthRequired
+        | TaskState::Unspecified => Err(format!(
+            "a2a agent {agent_id} ended task {} as {:?}{detail}",
+            task.id, task.status.state
+        )),
     }
 }
