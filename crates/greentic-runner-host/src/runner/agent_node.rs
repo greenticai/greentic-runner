@@ -791,17 +791,31 @@ mod aw {
     /// reference from the per-tenant secrets store first, then falls back to the
     /// process env. This is what makes `gtc start` zero-env: `gtc setup` persists
     /// the value in the dev store, and the injected secrets manager's read-side
-    /// candidate fallback bridges the canonical `secrets://{env}/{tenant}/_/{provider}/{key}`
-    /// scope to the pack-namespaced scope setup actually wrote. The env fallback
-    /// preserves existing `TAVILY_API_KEY`-style runs.
+    /// candidate fallback bridges the canonical store scope to the pack-namespaced
+    /// scope setup actually wrote. The env fallback preserves existing
+    /// `TAVILY_API_KEY`-style runs.
+    ///
+    /// `unit` is the deployed unit's `bundle_id` and scopes the store read. It
+    /// has to: one environment can run the same provider credential for two
+    /// workers, and without it both resolve
+    /// `secrets://{env}/{tenant}/_/{provider}/{key}` — ONE address for the whole
+    /// environment, so the second value staged wins and the other worker
+    /// silently authenticates as the wrong account. `None` on the legacy
+    /// tenant-only path and the process-level serve path, where there is no unit
+    /// to scope by.
     struct StoreToolSecretsBackend {
         secrets: crate::secrets::DynSecretsManager,
         tenant: String,
         env: String,
+        unit: Option<String>,
     }
 
     impl StoreToolSecretsBackend {
-        fn new(secrets: crate::secrets::DynSecretsManager, tenant: String) -> Self {
+        fn new(
+            secrets: crate::secrets::DynSecretsManager,
+            tenant: String,
+            unit: Option<String>,
+        ) -> Self {
             let env = std::env::var("GREENTIC_ENV")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -810,28 +824,61 @@ mod aw {
                 secrets,
                 tenant,
                 env,
+                unit,
             }
         }
 
-        /// Map `secret://<provider>/<key>` to the canonical store URI
-        /// `secrets://{env}/{tenant}/_/{provider}/{key}`. The injected manager's
-        /// candidate fallback handles the env/team/pack-namespace bridging.
-        fn canonical_store_uri(&self, uri: &str) -> Option<String> {
+        /// Every store URI a `secret://<provider>/<key>` read will try, in
+        /// order: this unit's own address first, then the env-wide one.
+        ///
+        /// Both are built by
+        /// [`crate::secrets::agent_tool_secret_uri`] — the one function the
+        /// designer stages through as well, so a writer cannot spell an address
+        /// this reader never asks for.
+        ///
+        /// REVIEW BY 2026-12-18: the env-wide candidate is a COMPATIBILITY
+        /// fallback when a unit is known, not a design choice. It exists so an
+        /// environment staged before this scope existed keeps working when its
+        /// runner moves; the next stage writes the unit-scoped address. Once
+        /// every lane stages unit-scoped tool secrets, it lets one unit read a
+        /// value another unit's writer left at the shared address — decide then
+        /// whether to drop it for the unit case. It remains the ONLY candidate
+        /// when no unit is known. This mirrors, deliberately, the same decision
+        /// `crate::secrets::pack_secret_path_candidates` records for a pack
+        /// secret and `greentic_aw_runtime::mcp_secrets` for an MCP token.
+        fn store_uri_candidates(&self, uri: &str) -> Vec<String> {
             let body = uri.strip_prefix("secret://").unwrap_or(uri);
-            let (provider, key) = body.split_once('/')?;
-            if provider.is_empty() || key.is_empty() {
-                return None;
+            let Some((provider, key)) = body.split_once('/') else {
+                return Vec::new();
+            };
+            let bare =
+                crate::secrets::agent_tool_secret_uri(&self.env, &self.tenant, provider, key, None);
+            let scoped = self.unit.as_deref().and_then(|unit| {
+                crate::secrets::agent_tool_secret_uri(
+                    &self.env,
+                    &self.tenant,
+                    provider,
+                    key,
+                    Some(unit),
+                )
+            });
+            // A scoped URI equal to the bare one would make the fallback a
+            // duplicate read rather than a fallback; it cannot happen (the unit
+            // segment always carries `_unit_<hash>`), but the guard keeps that a
+            // fact rather than a hope.
+            match (scoped, bare) {
+                (Some(scoped), Some(bare)) if scoped != bare => vec![scoped, bare],
+                (Some(scoped), None) => vec![scoped],
+                (_, Some(bare)) => vec![bare],
+                (None, None) => Vec::new(),
             }
-            Some(format!(
-                "secrets://{}/{}/_/{}/{}",
-                self.env, self.tenant, provider, key
-            ))
         }
     }
 
     impl greentic_ext_runtime::SecretsBackend for StoreToolSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
-            if let Some(store_uri) = self.canonical_store_uri(uri) {
+            let candidates = self.store_uri_candidates(uri);
+            if !candidates.is_empty() {
                 // Read off a dedicated thread with its own current-thread runtime:
                 // the extension runtime may invoke this from within the async
                 // runner, where a nested `block_on` would panic.
@@ -841,7 +888,14 @@ mod aw {
                         .enable_all()
                         .build()
                         .ok()?;
-                    runtime.block_on(async move { secrets.read(&store_uri).await.ok() })
+                    runtime.block_on(async move {
+                        for candidate in &candidates {
+                            if let Ok(bytes) = secrets.read(candidate).await {
+                                return Some(bytes);
+                            }
+                        }
+                        None
+                    })
                 })
                 .join()
                 .ok()
@@ -1589,8 +1643,12 @@ mod aw {
         // Per-tenant path: tool secrets resolve from the store first (zero-env),
         // env as fallback. `secrets` is the injected per-tenant manager whose
         // candidate fallback bridges the gtc-setup dev-store scope.
+        // The deployed unit scopes the tool-secret read for the same reason it
+        // scopes the MCP one below: this runtime is built per `TenantRuntime`,
+        // i.e. per deployed unit, so `unit` already names the only worker whose
+        // credentials this backend may resolve.
         let secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend> = Arc::new(
-            StoreToolSecretsBackend::new(secrets.clone(), tenant.clone()),
+            StoreToolSecretsBackend::new(secrets.clone(), tenant.clone(), unit.clone()),
         );
         let ext_runtime = build_ext_runtime(secrets_backend, ext_llm_port, &packs)?;
 
@@ -3468,6 +3526,132 @@ mod aw {
             }
         }
 
+        /// Build a backend for one unit over a seeded store.
+        fn backend_for(
+            unit: Option<&str>,
+            seed: &[(&str, &str)],
+        ) -> super::StoreToolSecretsBackend {
+            let map = seed
+                .iter()
+                .map(|(uri, value)| (uri.to_string(), value.as_bytes().to_vec()))
+                .collect::<std::collections::HashMap<_, _>>();
+            super::StoreToolSecretsBackend {
+                secrets: Arc::new(MapSecrets(map)),
+                tenant: "acme".to_string(),
+                env: "dev".to_string(),
+                unit: unit.map(str::to_string),
+            }
+        }
+
+        fn tool_uri(provider: &str, key: &str, unit: Option<&str>) -> String {
+            crate::secrets::agent_tool_secret_uri("dev", "acme", provider, key, unit)
+                .expect("agent tool uri")
+        }
+
+        /// The defect this scope exists for: one environment, two workers, one
+        /// `hubspot/access_token`, two different accounts. Before the unit
+        /// segment both read one address and the second staged value won, so
+        /// one worker silently authenticated as the other's account.
+        #[test]
+        fn two_units_with_one_provider_and_key_each_read_their_own_value() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let seed = [
+                (
+                    tool_uri("hubspot", "access_token", Some("sales-bot")),
+                    "sales-token",
+                ),
+                (
+                    tool_uri("hubspot", "access_token", Some("support-bot")),
+                    "support-token",
+                ),
+            ];
+            let seed: Vec<(&str, &str)> = seed
+                .iter()
+                .map(|(uri, value)| (uri.as_str(), *value))
+                .collect();
+
+            assert_eq!(
+                backend_for(Some("sales-bot"), &seed)
+                    .get("secret://hubspot/access_token")
+                    .expect("sales value"),
+                "sales-token"
+            );
+            assert_eq!(
+                backend_for(Some("support-bot"), &seed)
+                    .get("secret://hubspot/access_token")
+                    .expect("support value"),
+                "support-token"
+            );
+        }
+
+        /// A unit's own value beats the env-wide one left by an older stage.
+        #[test]
+        fn the_unit_scope_wins_over_the_env_wide_address() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let scoped = tool_uri("tavily", "api_key", Some("web-chat"));
+            let bare = tool_uri("tavily", "api_key", None);
+            let backend = backend_for(
+                Some("web-chat"),
+                &[(scoped.as_str(), "mine"), (bare.as_str(), "shared")],
+            );
+            assert_eq!(
+                backend.get("secret://tavily/api_key").expect("value"),
+                "mine"
+            );
+        }
+
+        /// The compatibility fallback: an environment staged before the unit
+        /// scope existed keeps resolving when its runner moves.
+        #[test]
+        fn a_unit_with_no_own_value_falls_back_to_the_env_wide_address() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let bare = tool_uri("tavily", "api_key", None);
+            let backend = backend_for(Some("web-chat"), &[(bare.as_str(), "shared")]);
+            assert_eq!(
+                backend.get("secret://tavily/api_key").expect("value"),
+                "shared"
+            );
+        }
+
+        /// With no unit — the legacy tenant-only path and the process-level
+        /// serve path — the env-wide address is the ONLY one tried, and a
+        /// unit-scoped value is never picked up by accident.
+        #[test]
+        fn no_unit_reads_exactly_the_env_wide_address() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let backend = backend_for(None, &[]);
+            assert_eq!(
+                backend.store_uri_candidates("secret://tavily/api_key"),
+                vec![tool_uri("tavily", "api_key", None)]
+            );
+
+            let scoped = tool_uri("tavily", "api_key", Some("web-chat"));
+            let other = backend_for(None, &[(scoped.as_str(), "someone-elses")]);
+            // Falls through to the env fallback, which has nothing either.
+            assert!(other.get("secret://tavily/api_key").is_err());
+        }
+
+        #[test]
+        fn the_candidates_are_the_unit_address_then_the_env_wide_one() {
+            let backend = backend_for(Some("web-chat"), &[]);
+            assert_eq!(
+                backend.store_uri_candidates("secret://tavily/api_key"),
+                vec![
+                    tool_uri("tavily", "api_key", Some("web-chat")),
+                    tool_uri("tavily", "api_key", None),
+                ]
+            );
+        }
+
+        /// A reference with no `<provider>/<key>` split has no store address at
+        /// all, and must fall through to the env rather than build a malformed
+        /// URI.
+        #[test]
+        fn a_reference_with_no_key_has_no_store_candidates() {
+            let backend = backend_for(Some("web-chat"), &[]);
+            assert!(backend.store_uri_candidates("secret://tavily").is_empty());
+        }
+
         #[test]
         fn store_tool_secret_backend_maps_secret_uri_to_store_scope() {
             use greentic_ext_runtime::SecretsBackend as _;
@@ -3484,6 +3668,7 @@ mod aw {
                 secrets,
                 tenant: "acme".to_string(),
                 env: "dev".to_string(),
+                unit: None,
             };
             let got = backend
                 .get("secret://tavily/api_key")
@@ -3501,6 +3686,7 @@ mod aw {
                 secrets,
                 tenant: "acme".to_string(),
                 env: "dev".to_string(),
+                unit: None,
             };
             // SAFETY: single-threaded test; no concurrent env mutation.
             unsafe {
