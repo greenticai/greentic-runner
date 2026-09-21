@@ -14,6 +14,7 @@
 //! share these definitions rather than growing two.
 
 pub mod card;
+pub mod fetch;
 pub mod message;
 pub mod rpc;
 

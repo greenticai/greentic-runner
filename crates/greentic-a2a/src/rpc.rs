@@ -243,4 +243,20 @@ mod tests {
             "ListTasksResult lost rename_all = \"camelCase\""
         );
     }
+
+    #[test]
+    fn send_message_result_serializes_with_the_arm_as_the_single_key() {
+        let value = serde_json::to_value(SendMessageResult::Message(Message {
+            message_id: "m-1".into(),
+            context_id: None,
+            task_id: None,
+            role: Role::Agent,
+            parts: vec![Part::text("hi")],
+            metadata: None,
+        }))
+        .expect("serialises");
+        let object = value.as_object().expect("an object");
+        assert_eq!(object.len(), 1, "externally tagged: exactly one key");
+        assert!(object.contains_key("message"), "the arm names the key");
+    }
 }
