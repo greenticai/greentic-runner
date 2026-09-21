@@ -15,6 +15,7 @@
 
 pub mod card;
 pub mod message;
+pub mod rpc;
 
 #[cfg(test)]
 pub(crate) mod testutil {
