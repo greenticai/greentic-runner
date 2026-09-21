@@ -307,19 +307,77 @@ pub mod node {
 // and `ExecCtx.tenant` stays the HOST's scope for the invocation's secrets
 // and state.
 
-/// The `user` a component is told: the verified subject when there is one,
-/// otherwise the host scope's user.
+/// Environment variable that restores the pre-2026-09 presentation, in which a
+/// component invoked with no verified caller was told the PROVIDER id as its
+/// `user` (see [`presented_user`]).
+///
+/// Default: unset, i.e. the provider is NOT presented as the user. A truthy
+/// value (`1`, `true`, `yes`, `on`, case-insensitive) opts back into the
+/// legacy value for a component that keyed behaviour on it. It changes only
+/// what a component is TOLD; the host scope that keys its state and secrets
+/// is the same either way.
+pub const PRESENT_PROVIDER_AS_USER_ENV: &str = "GREENTIC_PRESENT_PROVIDER_AS_USER";
+
+/// Parse [`PRESENT_PROVIDER_AS_USER_ENV`]. Pure so it can be tested without
+/// mutating the process environment.
+fn legacy_provider_as_user_from(raw: Option<&str>) -> bool {
+    raw.map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn legacy_provider_as_user() -> bool {
+    legacy_provider_as_user_from(std::env::var(PRESENT_PROVIDER_AS_USER_ENV).ok().as_deref())
+}
+
+/// The `user` a component is told.
+///
+/// * A verified caller with a subject: that subject.
+/// * Otherwise, when the host scope's user IS the provider that delivered the
+///   invocation (`provider_id`) — which is what the flow engine's
+///   `component_exec_ctx` stores there, so that component state keyed on it is
+///   never re-keyed — nobody: `None`. An unverified or anonymous caller of a
+///   deployed environment must not look like a user named after the provider,
+///   and in particular must not look like Run Demo (`greentic-run-demo`).
+///   The provider is presented in its own slot instead (0.5 `provider_id`).
+///   This matches the JSON `InvocationEnvelope` path, which has always left
+///   `user` empty for an unverified caller.
+/// * Otherwise, the host scope's user, unchanged (e.g. an embedder that set a
+///   real user on the `ExecCtx`).
+///
+/// [`PRESENT_PROVIDER_AS_USER_ENV`] restores the legacy fallback to the
+/// provider id.
 fn presented_user(
     ctx: &node::ExecCtx,
     caller: Option<&crate::caller_identity::ComponentCaller>,
+    provider_id: Option<&str>,
 ) -> Option<String> {
-    caller
-        .and_then(|caller| caller.sub.clone())
-        .or_else(|| ctx.tenant.user.clone())
+    presented_user_with(ctx, caller, provider_id, legacy_provider_as_user())
+}
+
+fn presented_user_with(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+    provider_id: Option<&str>,
+    legacy_provider_as_user: bool,
+) -> Option<String> {
+    if let Some(sub) = caller.and_then(|caller| caller.sub.clone()) {
+        return Some(sub);
+    }
+    let host_user = ctx.tenant.user.as_deref()?;
+    let host_user_is_the_provider = provider_id == Some(host_user);
+    if host_user_is_the_provider && !legacy_provider_as_user {
+        return None;
+    }
+    Some(host_user.to_string())
 }
 
 /// The `team` a component is told: the verified team when there is one,
 /// otherwise the host scope's team.
+///
+/// Unlike [`presented_user`] there is nothing to strip here: the flow engine's
+/// host scope never carries the provider in `team` (`component_exec_ctx` sets
+/// it to `None` so tenant-wide secrets resolve), so an unverified caller
+/// already reaches a component with no team.
 fn presented_team(
     ctx: &node::ExecCtx,
     caller: Option<&crate::caller_identity::ComponentCaller>,
@@ -338,11 +396,25 @@ pub fn exec_ctx_v0_4_as(
     ctx: &node::ExecCtx,
     caller: Option<&crate::caller_identity::ComponentCaller>,
 ) -> v0_4::exports::greentic::component::node::ExecCtx {
+    exec_ctx_v0_4_for(ctx, caller, None)
+}
+
+/// [`exec_ctx_v0_4_as`] for an invocation delivered by `provider_id`.
+///
+/// The 0.4 world has no provider slot, so the provider is not presented at
+/// all; `provider_id` only decides whether the host scope's user is the
+/// provider and therefore must not be presented as the user
+/// ([`presented_user`]).
+pub fn exec_ctx_v0_4_for(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+    provider_id: Option<&str>,
+) -> v0_4::exports::greentic::component::node::ExecCtx {
     v0_4::exports::greentic::component::node::ExecCtx {
         tenant: v0_4::exports::greentic::component::node::TenantCtx {
             tenant: ctx.tenant.tenant.clone(),
             team: presented_team(ctx, caller),
-            user: presented_user(ctx, caller),
+            user: presented_user(ctx, caller, provider_id),
             trace_id: ctx.tenant.trace_id.clone(),
             correlation_id: ctx.tenant.correlation_id.clone(),
             deadline_unix_ms: ctx.tenant.deadline_unix_ms,
@@ -364,9 +436,21 @@ pub fn exec_ctx_v0_5_as(
     ctx: &node::ExecCtx,
     caller: Option<&crate::caller_identity::ComponentCaller>,
 ) -> v0_5::exports::greentic::component::node::ExecCtx {
+    exec_ctx_v0_5_for(ctx, caller, None)
+}
+
+/// [`exec_ctx_v0_5_as`] for an invocation delivered by `provider_id`, which
+/// is presented in the world's `provider_id` slot — the place a component
+/// reads which provider (or `greentic-run-demo`, for the designer's Run Demo)
+/// delivered the turn, instead of inferring it from `user_id`.
+pub fn exec_ctx_v0_5_for(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+    provider_id: Option<&str>,
+) -> v0_5::exports::greentic::component::node::ExecCtx {
     let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
     let team_id = presented_team(ctx, caller);
-    let user_id = presented_user(ctx, caller);
+    let user_id = presented_user(ctx, caller, provider_id);
     let deadline_ms = ctx
         .tenant
         .deadline_unix_ms
@@ -389,7 +473,7 @@ pub fn exec_ctx_v0_5_as(
             session_id: ctx.tenant.correlation_id.clone(),
             flow_id: Some(ctx.flow_id.clone()),
             node_id: ctx.node_id.clone(),
-            provider_id: None,
+            provider_id: provider_id.map(str::to_string),
             deadline_ms,
             attempt: ctx.tenant.attempt,
             idempotency_key: ctx.tenant.idempotency_key.clone(),
@@ -413,6 +497,21 @@ pub fn envelope_v0_6(
 pub fn envelope_v0_6_as(
     ctx: &node::ExecCtx,
     caller: Option<&crate::caller_identity::ComponentCaller>,
+    component_id: &str,
+    payload_json: &str,
+) -> Result<v0_6::exports::greentic::component::node::InvocationEnvelope> {
+    envelope_v0_6_for(ctx, caller, None, component_id, payload_json)
+}
+
+/// [`envelope_v0_6_as`] for an invocation delivered by `provider_id`.
+///
+/// The 0.6 `TenantCtx` has no provider slot, so the provider is not presented;
+/// `provider_id` only decides whether the host scope's user is the provider
+/// and therefore must not be presented as the user ([`presented_user`]).
+pub fn envelope_v0_6_for(
+    ctx: &node::ExecCtx,
+    caller: Option<&crate::caller_identity::ComponentCaller>,
+    provider_id: Option<&str>,
     component_id: &str,
     payload_json: &str,
 ) -> Result<v0_6::exports::greentic::component::node::InvocationEnvelope> {
@@ -447,7 +546,7 @@ pub fn envelope_v0_6_as(
             ctx: v0_6::exports::greentic::component::node::TenantCtx {
                 tenant_id: ctx.tenant.tenant.clone(),
                 team_id: presented_team(ctx, caller),
-                user_id: presented_user(ctx, caller),
+                user_id: presented_user(ctx, caller, provider_id),
                 env_id: env,
                 trace_id,
                 correlation_id,
@@ -569,9 +668,11 @@ pub fn invoke_result_from_v0_6_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        cbor_to_json_string, envelope_v0_6, envelope_v0_6_as, exec_ctx_v0_4, exec_ctx_v0_4_as,
-        exec_ctx_v0_5, exec_ctx_v0_5_as, invoke_result_from_v0_4, invoke_result_from_v0_5,
-        invoke_result_from_v0_6, invoke_result_from_v0_6_run, node,
+        PRESENT_PROVIDER_AS_USER_ENV, cbor_to_json_string, envelope_v0_6, envelope_v0_6_as,
+        envelope_v0_6_for, exec_ctx_v0_4, exec_ctx_v0_4_as, exec_ctx_v0_4_for, exec_ctx_v0_5,
+        exec_ctx_v0_5_as, exec_ctx_v0_5_for, invoke_result_from_v0_4, invoke_result_from_v0_5,
+        invoke_result_from_v0_6, invoke_result_from_v0_6_run, legacy_provider_as_user_from, node,
+        presented_user_with,
     };
     use greentic_types::{EnvId, InvocationEnvelope, TenantCtx, TenantId};
     use std::str::FromStr;
@@ -744,6 +845,108 @@ mod tests {
         assert_eq!(v05.tenant.user_id.as_deref(), Some("user.demo"));
         assert_eq!(v05.tenant.deadline_ms, Some(123));
         assert_eq!(v05.tenant.flow_id.as_deref(), Some("flow.demo"));
+        // No provider was named, so none is presented, and a host user that is
+        // not a provider id is still presented as the user.
+        assert_eq!(v05.tenant.provider_id, None);
+    }
+
+    /// The flow engine's host scope: `user` is the provider id (a state key),
+    /// no team.
+    fn provider_scoped_exec_ctx(provider: &str) -> node::ExecCtx {
+        let mut ctx = sample_exec_ctx();
+        ctx.tenant.user = Some(provider.to_string());
+        ctx.tenant.team = None;
+        ctx
+    }
+
+    /// Partner blocker #3, per world: with no verified caller, a host user that
+    /// is the provider is not presented as the component's user in 0.4, 0.5
+    /// or 0.6. 0.5 names the provider in its own slot.
+    #[test]
+    fn an_unverified_invocation_presents_no_user_in_every_world() {
+        for provider in ["messaging-webchat", "greentic-run-demo", "provider"] {
+            let ctx = provider_scoped_exec_ctx(provider);
+
+            let v04 = exec_ctx_v0_4_for(&ctx, None, Some(provider));
+            assert_eq!(v04.tenant.user, None, "0.4 user for {provider}");
+            assert_eq!(v04.tenant.team, None);
+
+            let v05 = exec_ctx_v0_5_for(&ctx, None, Some(provider));
+            assert_eq!(v05.tenant.user, None, "0.5 user for {provider}");
+            assert_eq!(v05.tenant.user_id, None, "0.5 user_id for {provider}");
+            assert_eq!(v05.tenant.provider_id.as_deref(), Some(provider));
+
+            let v06 = envelope_v0_6_for(&ctx, None, Some(provider), "c", "{}").expect("envelope");
+            assert_eq!(v06.ctx.user_id, None, "0.6 user_id for {provider}");
+            assert!(v06.metadata_cbor.is_none());
+
+            // The host scope is untouched: it still keys state on the provider.
+            assert_eq!(ctx.tenant.user.as_deref(), Some(provider));
+        }
+    }
+
+    /// A verified caller that names a team but no subject presents no user
+    /// either, rather than falling back to the provider.
+    #[test]
+    fn a_verified_caller_without_a_subject_presents_no_user() {
+        let ctx = provider_scoped_exec_ctx("messaging-webchat");
+        let verified = crate::caller_identity::ComponentCaller {
+            sub: None,
+            team: Some("sales".to_string()),
+            groups: Vec::new(),
+            role: None,
+        };
+        let v05 = exec_ctx_v0_5_for(&ctx, Some(&verified), Some("messaging-webchat"));
+        assert_eq!(v05.tenant.user_id, None);
+        assert_eq!(v05.tenant.team_id.as_deref(), Some("sales"));
+    }
+
+    /// Only the provider id is withheld. A host user that is something else —
+    /// an embedder that set a real user on the `ExecCtx` — is still presented.
+    #[test]
+    fn a_host_user_that_is_not_the_provider_is_still_presented() {
+        let ctx = sample_exec_ctx();
+        let v05 = exec_ctx_v0_5_for(&ctx, None, Some("messaging-webchat"));
+        assert_eq!(v05.tenant.user_id.as_deref(), Some("user.demo"));
+        assert_eq!(v05.tenant.provider_id.as_deref(), Some("messaging-webchat"));
+    }
+
+    /// `GREENTIC_PRESENT_PROVIDER_AS_USER` restores the legacy value; a
+    /// verified subject still wins over it.
+    #[test]
+    fn the_opt_out_restores_the_provider_as_the_user() {
+        let ctx = provider_scoped_exec_ctx("messaging-webchat");
+        assert_eq!(
+            presented_user_with(&ctx, None, Some("messaging-webchat"), true).as_deref(),
+            Some("messaging-webchat")
+        );
+        assert_eq!(
+            presented_user_with(&ctx, None, Some("messaging-webchat"), false),
+            None
+        );
+        let verified = crate::caller_identity::ComponentCaller {
+            sub: Some("u-1@acme".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            presented_user_with(&ctx, Some(&verified), Some("messaging-webchat"), true).as_deref(),
+            Some("u-1@acme")
+        );
+    }
+
+    #[test]
+    fn the_opt_out_flag_parses_truthy_values_only() {
+        assert_eq!(
+            PRESENT_PROVIDER_AS_USER_ENV,
+            "GREENTIC_PRESENT_PROVIDER_AS_USER"
+        );
+        for on in ["1", "true", "TRUE", "yes", "On", " 1 "] {
+            assert!(legacy_provider_as_user_from(Some(on)), "{on:?}");
+        }
+        for off in ["0", "false", "no", "off", "", "2"] {
+            assert!(!legacy_provider_as_user_from(Some(off)), "{off:?}");
+        }
+        assert!(!legacy_provider_as_user_from(None));
     }
 
     #[test]

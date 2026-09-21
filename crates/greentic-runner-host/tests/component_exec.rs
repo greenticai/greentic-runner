@@ -953,6 +953,12 @@ timers: []\n",
     assert!(ctx_value.get("user").is_none());
     assert!(ctx_value.get("team").is_none());
     assert!(ctx_value.get("attributes").is_none());
+    // The provider is named in its own slot, never as the user — the shape
+    // the WIT-world conversions now converge on (partner blocker #3).
+    assert_eq!(
+        ctx_value.get("provider_id").and_then(Value::as_str),
+        Some("messaging-webchat")
+    );
     Ok(())
 }
 

@@ -243,6 +243,17 @@ cannot be built (no usable state backend — e.g. `GREENTIC_AW_STATE_BACKEND=red
 `GREENTIC_AW_REDIS_URL`, or a Redis connect failure — or no LLM key). With no backend env set
 it defaults to the in-memory backend, so the runtime builds without Redis.
 
+### What a component is told about its caller
+
+A `component.exec` node runs under two different identities, and they must not be confused:
+
+- **The host scope** (`ExecCtx.tenant`, built by `runner/engine.rs::component_exec_ctx`). `user` is the provider id (`messaging-webchat`, `greentic-run-demo`, or the literal `"provider"` that `IngressEnvelope::canonicalize` substitutes when none was stamped) and `team` is `None`. This is a STORAGE key: `pack.rs::tenant_ctx_from_v1` feeds it to greentic-state, whose FQN is `env:tenant:team:user`. Changing it would re-key every component's existing state. Secrets have no user segment.
+- **What the component is told** (`component_api.rs::presented_user` / `presented_team`, reached through the `*_for` conversions and `PackRuntime::invoke_component_for`). With a provider-verified caller (`FlowContext::caller`, `user_verified: true`) the component is told the caller's `sub` / `team` (and `caller.*` attributes in 0.5, `metadata_cbor` in 0.6). **With no verified subject it is told NO user** (`None`) whenever the host user is the provider id — so an anonymous caller of a deployed environment no longer looks like a user named after the provider, and in particular not like Run Demo. The provider is presented in the 0.5 `TenantCtx.provider_id` slot instead; 0.4 and 0.6 have no provider slot. This matches the JSON `InvocationEnvelope` path (`runner/invocation.rs`), which has always left `user` empty for an unverified caller (pinned in `tests/component_exec.rs`).
+
+`None`, not a literal `"anonymous"`: it is an already-exercised shape and cannot collide with a real subject of that name. A host user that is NOT the provider id (an embedder that put a real user on `ExecCtx`, `greentic_x_provider`'s actor) is still presented unchanged — only the provider-as-user substitution is withheld. `GREENTIC_PRESENT_PROVIDER_AS_USER=1` restores the pre-change fallback for a component that keyed behaviour on it; it changes only what is presented, never the host scope.
+
+Known gap, not closed here: `tenant_ctx_from_v1` lets a component override `team` / `user` on its state calls from the `TenantCtx` it passes back, so "a caller never re-keys host scope" is a convention, not an enforced rule. Withholding the provider-as-user does not widen it — a `None` user in the passed-back ctx does not override the host user.
+
 ### WASM Component Model
 
 - **Target**: `wasm32-wasip2` (WASI Preview 2, Component Model)
@@ -390,6 +401,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_AW_STATE_BACKEND` | AW state backend selector: `redis` \| `memory` \| `disk`. Unset → `redis` if `GREENTIC_AW_REDIS_URL` is set, else `memory` (ephemeral, in-process). `memory`/`disk` give single-process locking only — multi-instance HA needs `redis`. |
 | `GREENTIC_AW_STATE_PATH` | On-disk (redb) file path when `GREENTIC_AW_STATE_BACKEND=disk` (default `~/.greentic/aw-state.redb`, falling back to `/var/lib/greentic/aw-state.redb`). |
 | `GREENTIC_AW_REDIS_URL` | Agentic-worker Redis state store. **Optional** — the worker defaults to an in-memory backend when unset; set this (or `GREENTIC_AW_STATE_BACKEND=disk`) for durable / multi-instance state. |
+| `GREENTIC_PRESENT_PROVIDER_AS_USER` | Opt-in (default OFF): restore the legacy presentation in which a component invoked by a flow with no verified caller is told the PROVIDER id as its `user` / `user_id`. See "What a component is told about its caller" above. Truthy = `1`/`true`/`yes`/`on`. |
 
 Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
 

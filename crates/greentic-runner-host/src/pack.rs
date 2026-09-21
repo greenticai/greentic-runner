@@ -467,6 +467,7 @@ impl HostState {
         component: &Component,
         ctx: &ComponentExecCtx,
         caller: Option<&crate::caller_identity::ComponentCaller>,
+        provider_id: Option<&str>,
         component_ref: &str,
         operation: &str,
         input_json: &str,
@@ -474,8 +475,13 @@ impl HostState {
         let pre_instance = linker.instantiate_pre(component)?;
         match component_api::v0_6::ComponentPre::new(pre_instance) {
             Ok(pre) => {
-                let envelope =
-                    component_api::envelope_v0_6_as(ctx, caller, component_ref, input_json)?;
+                let envelope = component_api::envelope_v0_6_for(
+                    ctx,
+                    caller,
+                    provider_id,
+                    component_ref,
+                    input_json,
+                )?;
                 let operation_owned = operation.to_string();
                 let result = block_on(async {
                     let bindings = pre.instantiate_async(&mut *store).await?;
@@ -494,7 +500,8 @@ impl HostState {
                         let result = block_on(async {
                             let bindings = pre.instantiate_async(&mut *store).await?;
                             let node = bindings.greentic_component_node();
-                            let ctx_v05 = component_api::exec_ctx_v0_5_as(ctx, caller);
+                            let ctx_v05 =
+                                component_api::exec_ctx_v0_5_for(ctx, caller, provider_id);
                             let operation_owned = operation.to_string();
                             let input_owned = input_json.to_string();
                             node.call_invoke(&mut *store, &ctx_v05, &operation_owned, &input_owned)
@@ -511,7 +518,8 @@ impl HostState {
                                 let result = block_on(async {
                                     let bindings = pre.instantiate_async(&mut *store).await?;
                                     let node = bindings.greentic_component_node();
-                                    let ctx_v04 = component_api::exec_ctx_v0_4_as(ctx, caller);
+                                    let ctx_v04 =
+                                        component_api::exec_ctx_v0_4_for(ctx, caller, provider_id);
                                     let operation_owned = operation.to_string();
                                     let input_owned = input_json.to_string();
                                     node.call_invoke(
@@ -2471,6 +2479,40 @@ impl PackRuntime {
         config_json: Option<String>,
         input_json: String,
     ) -> Result<Value> {
+        self.invoke_component_for(
+            component_ref,
+            ctx,
+            caller,
+            None,
+            operation,
+            config_json,
+            input_json,
+        )
+        .await
+    }
+
+    /// [`Self::invoke_component_as`] for an invocation delivered by
+    /// `provider_id` (the flow engine's `FlowContext::provider_id`).
+    ///
+    /// The provider is presented to a 0.5 component in its `provider_id` slot,
+    /// and — when it is also the host scope's `user`, as the flow engine sets
+    /// it — is NOT presented as the component's user: a caller with no
+    /// verified subject reaches the component with no user (see
+    /// `component_api::presented_user` and `GREENTIC_PRESENT_PROVIDER_AS_USER`).
+    /// `ctx.tenant` is still passed to the host untouched, so the component's
+    /// state and secrets scope does not move.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_component_for(
+        &self,
+        component_ref: &str,
+        ctx: ComponentExecCtx,
+        caller: Option<crate::caller_identity::ComponentCaller>,
+        provider_id: Option<&str>,
+        operation: &str,
+        config_json: Option<String>,
+        input_json: String,
+    ) -> Result<Value> {
+        let provider_id = provider_id.map(str::to_string);
         let component_ref = resolve_component_key(component_ref, operation, |key| {
             self.components.contains_key(key)
         });
@@ -2532,6 +2574,7 @@ impl PackRuntime {
                 &component,
                 &ctx_owned,
                 caller.as_ref(),
+                provider_id.as_deref(),
                 &component_ref_owned,
                 &operation_owned,
                 &input_owned,
