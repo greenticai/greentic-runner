@@ -1269,6 +1269,17 @@ impl TenantRuntime {
         self.timer_handles.lock().extend(handles);
     }
 
+    /// Read a RUNTIME-level secret, at the `_runner` pseudo-pack segment.
+    ///
+    /// **Deliberately NOT unit-scoped**, unlike every pack secret a component
+    /// reads (see [`crate::secrets::unit_pack_segment`]). Its only caller is
+    /// the operator HTTP attachments path (`runner::operator::resolve_attachments`),
+    /// and `_runner` is not a deployed pack: nothing stages a per-unit value
+    /// there, in any lane. Scoping it per unit would move an address no writer
+    /// produces, so every currently-working `_runner` secret would resolve only
+    /// through the compatibility fallback — a strictly worse address for no
+    /// isolation gained. Revisit only if a per-unit writer for `_runner`
+    /// appears.
     pub fn get_secret(&self, key: &str) -> Result<String> {
         if crate::provider_core_only::is_enabled() {
             bail!(crate::provider_core_only::blocked_message("secrets"))

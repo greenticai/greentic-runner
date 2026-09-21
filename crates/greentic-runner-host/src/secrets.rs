@@ -670,7 +670,10 @@ mod tests {
     #[test]
     fn the_unit_segment_is_deterministic_and_carries_a_hash() {
         let a = unit_pack_segment("demo", "web-assistant").expect("segment");
-        assert_eq!(a, unit_pack_segment("demo", "web-assistant").expect("again"));
+        assert_eq!(
+            a,
+            unit_pack_segment("demo", "web-assistant").expect("again")
+        );
         assert_eq!(
             a,
             unit_pack_segment("  demo  ", "  web-assistant  ").expect("trimmed")
@@ -707,8 +710,14 @@ mod tests {
             (("demo", "a/b"), ("demo", "a-b")),
             (("demo", "unit_b"), ("demo_unit_b", "unit")),
             (
-                ("demo", "a-very-long-deployment-name-over-the-slug-limit-one"),
-                ("demo", "a-very-long-deployment-name-over-the-slug-limit-two"),
+                (
+                    "demo",
+                    "a-very-long-deployment-name-over-the-slug-limit-one",
+                ),
+                (
+                    "demo",
+                    "a-very-long-deployment-name-over-the-slug-limit-two",
+                ),
             ),
         ];
         for ((pack_l, unit_l), (pack_r, unit_r)) in pairs {
@@ -886,9 +895,8 @@ mod tests {
         let rendered = err.to_string();
         assert!(
             rendered.contains(&unit_uri(&ctx, "demo", "unit-a", "API_KEY"))
-                && rendered.contains(
-                    &scoped_secret_path_for_pack(&ctx, "demo", "API_KEY").expect("bare")
-                ),
+                && rendered
+                    .contains(&scoped_secret_path_for_pack(&ctx, "demo", "API_KEY").expect("bare")),
             "got: {rendered}"
         );
     }
