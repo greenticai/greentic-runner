@@ -368,6 +368,9 @@ impl TenantRuntime {
             &BTreeMap::new(),
             &BTreeMap::new(),
             None,
+            // Tenant-only path: no deployed unit, so pack secrets resolve the
+            // bare pack scope exactly as before.
+            None,
         )
         .await?;
         Self::from_packs(
@@ -470,6 +473,11 @@ impl TenantRuntime {
                 runtime_configs_by_pack_id,
                 runtime_refs_by_pack_id,
                 runtime_ref_resolver.as_ref(),
+                // The unit every extension credential in this pack is scoped
+                // to. Same value `FlowEngine::mcp_credential_unit` reads off
+                // `rollout_ids.bundle_id` below, so the flow-node MCP lane and
+                // the component lane cannot disagree about which unit is running.
+                Some(bundle_id.as_str()),
             )
             .await?;
             // Reject duplicate pack_id within a single revision — two refs
@@ -531,6 +539,15 @@ impl TenantRuntime {
     /// `runtime_refs_by_pack_id` mirrors the same shape for the C5
     /// `pack-config.v1.runtime_refs` channel; a matching entry is injected
     /// via [`PackRuntime::set_runtime_refs`] alongside `runtime_ref_resolver`.
+    ///
+    /// `unit_id` is the deployed unit this pack belongs to — the revision's
+    /// `bundle_id` on the [`load_revision`](Self::load_revision) path, `None`
+    /// on the legacy tenant-only [`load`](Self::load) path. It scopes every
+    /// extension credential the pack's components read, so two units of the
+    /// SAME pack in one environment can hold different values. It is taken as
+    /// a parameter rather than read from a process environment variable
+    /// because one greentic-start process serves every revision of an
+    /// environment, so an env var could not differ per unit.
     #[allow(clippy::too_many_arguments)]
     async fn load_pack_runtime(
         pack_path: &Path,
@@ -544,6 +561,7 @@ impl TenantRuntime {
         runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
         runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
         runtime_ref_resolver: Option<&Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+        unit_id: Option<&str>,
     ) -> Result<Arc<PackRuntime>> {
         let oauth_config = config.oauth_broker_config();
         let mut pack = PackRuntime::load(
@@ -571,6 +589,7 @@ impl TenantRuntime {
         if let Some(non_secret) = runtime_configs_by_pack_id.get(pack_id.as_str()) {
             pack.set_runtime_config_non_secret(Some(Arc::clone(non_secret)));
         }
+        pack.set_unit_id(unit_id.map(str::to_string));
         if let Some(refs) = runtime_refs_by_pack_id.get(pack_id.as_str()) {
             let resolver = runtime_ref_resolver.ok_or_else(|| {
                 anyhow!(

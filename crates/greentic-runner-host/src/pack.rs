@@ -96,7 +96,8 @@ use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
 use crate::config::HostConfig;
 use crate::fault;
 use crate::secrets::{
-    DynSecretsManager, canonicalize_secret_key, read_secret_blocking, write_secret_blocking,
+    DynSecretsManager, canonicalize_secret_key, read_pack_secret_blocking,
+    write_pack_secret_blocking,
 };
 use crate::storage::state::STATE_PREFIX;
 use crate::storage::{DynSessionStore, DynStateStore};
@@ -157,6 +158,17 @@ pub struct PackRuntime {
     /// [`PackRuntime::mcp_routes`]. Read on first use rather than at load so a
     /// pack with no MCP nodes never touches the archive for it.
     mcp_routes: std::sync::OnceLock<Option<crate::runner::mcp_pack_routes::PackMcpRoutes>>,
+    /// The deployed unit this pack instance belongs to — the revision's
+    /// `bundle_id`, set by [`TenantRuntime::load_revision`] through
+    /// [`set_unit_id`](Self::set_unit_id).
+    ///
+    /// It scopes every extension credential this pack's components read, so two
+    /// units of the SAME pack in one environment can hold different values.
+    /// `None` on the legacy tenant-only path and in `for_component_test`, which
+    /// then resolve the bare pack scope exactly as before.
+    ///
+    /// [`TenantRuntime::load_revision`]: crate::runtime::TenantRuntime::load_revision
+    unit_id: Option<String>,
 }
 
 struct PackComponent {
@@ -356,6 +368,11 @@ pub struct HostState {
     /// bindings plus the env-shared resolver. The host import resolves the
     /// URI on every call so the value tracks `runtime.json` hot-reloads.
     runtime_refs: Option<RuntimeRefsInjection>,
+    /// The deployed unit whose copy of this pack's secrets the component reads
+    /// and writes — see [`PackRuntime::unit_id`] and
+    /// [`with_unit`](Self::with_unit). `None` means "no unit known", which
+    /// resolves the bare pack scope exactly as before.
+    unit_id: Option<String>,
 }
 
 impl HostState {
@@ -391,7 +408,56 @@ impl HostState {
             provider_core_component,
             runtime_config_non_secret,
             runtime_refs,
+            unit_id: None,
         })
+    }
+
+    /// Bind this host state to a deployed unit, so its pack-secret reads try
+    /// that unit's own address before the shared one and its writes land there
+    /// only.
+    ///
+    /// A separate builder rather than a 14th argument to [`new`](Self::new):
+    /// `new` is public and already carries thirteen, and `None` — "no unit
+    /// known" — is a legitimate state (the legacy tenant-only runtime, the
+    /// process-level serve path), not an oversight. Every caller in
+    /// [`PackRuntime`] threads its own `unit_id` through here.
+    #[must_use]
+    pub fn with_unit(mut self, unit_id: Option<String>) -> Self {
+        self.unit_id = unit_id;
+        self
+    }
+
+    /// Read one of this pack's secrets at the unit scope, falling back to the
+    /// shared pack scope. THE single read path for every `SecretsStoreHost` /
+    /// `RuntimeConfigHost` entry point on this type — four call sites used to
+    /// spell the same address inline, which is how one of them would be missed.
+    fn read_pack_secret(&self, ctx: &TypesTenantCtx, canonical_key: &str) -> Result<Vec<u8>> {
+        read_pack_secret_blocking(
+            &self.secrets,
+            ctx,
+            &self.pack_id,
+            self.unit_id.as_deref(),
+            canonical_key,
+        )
+    }
+
+    /// Write one of this pack's secrets. Lands at the unit address ONLY when a
+    /// unit is known — never a write-through to the shared address, which every
+    /// other unit of this pack reads.
+    fn write_pack_secret(
+        &self,
+        ctx: &TypesTenantCtx,
+        canonical_key: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        write_pack_secret_blocking(
+            &self.secrets,
+            ctx,
+            &self.pack_id,
+            self.unit_id.as_deref(),
+            canonical_key,
+            value,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -575,7 +641,8 @@ impl HostState {
         }
         let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_secret_key(key);
-        let bytes = read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key)
+        let bytes = self
+            .read_pack_secret(&ctx, &canonical_key)
             .context("failed to read secret from manager")?;
         let value = String::from_utf8(bytes).context("secret value is not valid UTF-8")?;
         Ok(value)
@@ -807,7 +874,7 @@ impl SecretsStoreHost for HostState {
         }
         let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_secret_key(&key);
-        match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
+        match self.read_pack_secret(&ctx, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
                 warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
@@ -833,7 +900,7 @@ impl SecretsStoreHostV1_1 for HostState {
         }
         let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_secret_key(&key);
-        match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
+        match self.read_pack_secret(&ctx, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
                 warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
@@ -861,9 +928,7 @@ impl SecretsStoreHostV1_1 for HostState {
         }
         let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_secret_key(&key);
-        if let Err(err) =
-            write_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key, &value)
-        {
+        if let Err(err) = self.write_pack_secret(&ctx, &canonical_key, &value) {
             warn!(secret = %key, canonical = %canonical_key, error = %err, "secret write failed");
             panic!("secret write failed for key {key}");
         }
@@ -2176,7 +2241,28 @@ impl PackRuntime {
             runtime_config_non_secret: None,
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
+            unit_id: None,
         })
+    }
+
+    /// Bind this pack instance to the deployed unit it belongs to (the
+    /// revision's `bundle_id`), so every extension credential its components
+    /// read resolves that unit's own value before the value shared by every
+    /// unit of the same pack.
+    ///
+    /// Called by `TenantRuntime::load_revision` through `load_pack_runtime`,
+    /// before the `Arc<PackRuntime>` is created — the same seam
+    /// [`set_runtime_config_non_secret`](Self::set_runtime_config_non_secret)
+    /// uses. `None` is the legacy tenant-only path, which keeps the bare pack
+    /// scope.
+    pub fn set_unit_id(&mut self, unit_id: Option<String>) {
+        self.unit_id = unit_id;
+    }
+
+    /// The deployed unit this pack instance is bound to, if any. See
+    /// [`set_unit_id`](Self::set_unit_id).
+    pub fn unit_id(&self) -> Option<&str> {
+        self.unit_id.as_deref()
     }
 
     /// Inject the `pack-config.v1.non_secret` map for this pack. Called by
@@ -2402,6 +2488,9 @@ impl PackRuntime {
         let oauth_config = self.oauth_config.clone();
         let wasi_policy = Arc::clone(&self.wasi_policy);
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
         let allow_state_store = self.allows_state_store(component_ref);
         let component = pack_component.component.clone();
         let component_ref_owned = component_ref.to_string();
@@ -2432,7 +2521,8 @@ impl PackRuntime {
                 false,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
 
@@ -2580,6 +2670,9 @@ impl PackRuntime {
         let oauth_config = self.oauth_config.clone();
         let wasi_policy = Arc::clone(&self.wasi_policy);
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
         let allow_state_store = self.allows_state_store(&component_ref_owned);
         let input_owned = Self::merge_provider_config_into_input(
             binding.config_json.as_deref(),
@@ -2610,7 +2703,8 @@ impl PackRuntime {
                 true,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
 
@@ -2734,6 +2828,9 @@ impl PackRuntime {
         let secrets = Arc::clone(&self.secrets);
         let oauth_config = self.oauth_config.clone();
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
 
         // Locked-down WASI policy: no preopens, no env, no stdio.
         // The linker registers all imports (Wasmtime requires it for
@@ -2759,7 +2856,8 @@ impl PackRuntime {
                 true,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
 
@@ -2815,6 +2913,9 @@ impl PackRuntime {
         let secrets = Arc::clone(&self.secrets);
         let oauth_config = self.oauth_config.clone();
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
 
         // Locked-down WASI policy — same rationale as
         // `invoke_identify_instance`. See [`register_identity_probe`] docs.
@@ -2838,7 +2939,8 @@ impl PackRuntime {
                 true,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
 
@@ -3381,6 +3483,9 @@ impl PackRuntime {
         let oauth_config = self.oauth_config.clone();
         let wasi_policy = Arc::clone(&self.wasi_policy);
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
         let allow_state_store = self.allows_state_store(component_ref);
         let component = pack_component.component.clone();
         let component_ref_owned = component_ref.to_string();
@@ -3406,7 +3511,8 @@ impl PackRuntime {
                 false,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
             let pre_instance = linker.instantiate_pre(&component)?;
@@ -3514,10 +3620,14 @@ impl PackRuntime {
                     }
                 }
                 let ctx = self.config.tenant_ctx();
-                read_secret_blocking(
+                // Unit scope first: a requirement this unit has its own value
+                // for is SATISFIED, and reading only the shared address would
+                // report it missing and block the deploy gate.
+                read_pack_secret_blocking(
                     &self.secrets,
                     &ctx,
                     &self.metadata.pack_id,
+                    self.unit_id.as_deref(),
                     canonicalize_secret_key(req.key.as_str()).as_str(),
                 )
                 .is_err()
@@ -3610,6 +3720,7 @@ impl PackRuntime {
             runtime_config_non_secret: None,
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
+            unit_id: None,
         })
     }
 }
@@ -5713,6 +5824,7 @@ pub(crate) mod tests {
             runtime_config_non_secret: None,
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
+            unit_id: None,
             cache,
         }
     }
