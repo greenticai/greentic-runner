@@ -443,3 +443,87 @@ async fn a_route_without_a_credential_may_call_an_interface_on_another_host() {
 
     assert_eq!(posts(&elsewhere).await.len(), 1);
 }
+
+#[tokio::test]
+async fn a_token_carrying_crlf_is_refused_rather_than_smuggled_into_headers() {
+    let server = wiremock::MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, ok_reply()).await;
+    let source = credentialed_source(
+        vec![route("recipe", server.uri(), None, None, true)],
+        TestSecrets::with(&[(TENANT_DEFAULT_URI, "tok\r\nX-Injected: yes")]),
+        None,
+    );
+
+    let err = source.call("recipe", "hi").await.expect_err("must refuse");
+
+    assert!(!err.contains("X-Injected"), "never echoed: {err}");
+    assert!(posts(&server).await.is_empty(), "nothing is sent");
+}
+
+#[tokio::test]
+async fn an_interface_url_with_userinfo_is_refused_before_anything_is_sent() {
+    // reqwest turns userinfo into its own `Authorization: Basic`, so the POST
+    // would carry two competing credentials.
+    let server = wiremock::MockServer::start().await;
+    let with_userinfo = server.uri().replace("http://", "http://user:pass@");
+    mount_raw_card(
+        &server,
+        CARD.replace("PLACEHOLDER", &format!("{with_userinfo}{RPC_PATH}")),
+    )
+    .await;
+    mount_reply(&server, ok_reply()).await;
+    let secrets = TestSecrets::with(&[(TENANT_DEFAULT_URI, "tok-1")]);
+    let source = credentialed_source(
+        vec![route("recipe", server.uri(), None, None, true)],
+        secrets.clone(),
+        None,
+    );
+
+    let err = source.call("recipe", "hi").await.expect_err("must refuse");
+
+    assert!(err.contains("userinfo"), "got: {err}");
+    assert!(posts(&server).await.is_empty(), "nothing is sent");
+    assert_eq!(secrets.reads(), 0, "refused before the store is read");
+}
+
+#[tokio::test]
+async fn a_header_name_that_frames_the_request_cannot_carry_the_token() {
+    let server = wiremock::MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, ok_reply()).await;
+    for name in ["Host", "content-length", "Transfer-Encoding"] {
+        let source = credentialed_source(
+            vec![route("recipe", server.uri(), Some(name), None, true)],
+            TestSecrets::with(&[(TENANT_DEFAULT_URI, "tok-1")]),
+            None,
+        );
+
+        let err = source.call("recipe", "hi").await.expect_err(name);
+
+        assert!(!err.contains("tok-1"), "never echoed: {err}");
+    }
+    assert!(posts(&server).await.is_empty(), "nothing is sent");
+}
+
+#[tokio::test]
+async fn an_agent_id_that_could_leave_its_secret_key_is_never_looked_up() {
+    let server = wiremock::MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, ok_reply()).await;
+    let secrets = TestSecrets::with(&[(TENANT_DEFAULT_URI, "tok-1")]);
+    let source = credentialed_source(
+        vec![route("../recipe", server.uri(), None, None, true)],
+        secrets.clone(),
+        None,
+    );
+
+    let err = source
+        .call("../recipe", "hi")
+        .await
+        .expect_err("must refuse");
+
+    assert!(err.contains("not a safe secret name"), "got: {err}");
+    assert_eq!(secrets.reads(), 0, "never looked up");
+    assert!(posts(&server).await.is_empty(), "nothing is sent");
+}

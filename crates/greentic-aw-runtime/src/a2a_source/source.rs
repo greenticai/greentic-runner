@@ -196,6 +196,14 @@ impl Transport {
         // over plaintext to anywhere.
         let target = require_secure_interface(&route.base_url, &interface.url)
             .map_err(|err| format!("a2a agent {agent_id} names an unusable interface: {err}"))?;
+        // Userinfo in the interface URL makes the HTTP client add its own
+        // `Authorization: Basic` header, so a credentialed POST would carry two
+        // competing credentials. No legitimate card needs it.
+        if !target.username().is_empty() || target.password().is_some() {
+            return Err(format!(
+                "a2a agent {agent_id} names an interface URL carrying userinfo; refusing it"
+            ));
+        }
 
         // A credential goes only to the host and port the admin configured.
         // Checked before the secret is read, so a card naming another host

@@ -55,6 +55,7 @@ impl CredentialScope {
             return Ok(None);
         }
         let agent_id = route.agent_id.as_str();
+        ensure_safe_agent_id(agent_id)?;
         let team = route.auth_team.as_deref();
         let unit = self.unit.as_deref();
         let Some(secrets) = self.secrets.as_ref() else {
@@ -109,6 +110,11 @@ fn auth_header(
             format!("a2a agent {agent_id}: '{raw}' is not a valid HTTP header name")
         })?,
     };
+    if RESERVED_HEADERS.contains(&name) {
+        return Err(format!(
+            "a2a agent {agent_id}: '{name}' frames or routes the request and cannot carry a credential"
+        ));
+    }
     let raw_value = if name == AUTHORIZATION {
         format!("Bearer {token}")
     } else {
@@ -121,6 +127,39 @@ fn auth_header(
     })?;
     value.set_sensitive(true);
     Ok((name, value))
+}
+
+/// Headers that frame or route the request itself. Carrying a token in one
+/// would corrupt the request or send the token as a routing value, so an
+/// admin-configured header name is refused when it is one of these.
+const RESERVED_HEADERS: [HeaderName; 9] = [
+    reqwest::header::HOST,
+    reqwest::header::CONTENT_LENGTH,
+    reqwest::header::CONTENT_TYPE,
+    reqwest::header::TRANSFER_ENCODING,
+    reqwest::header::CONNECTION,
+    reqwest::header::UPGRADE,
+    reqwest::header::TE,
+    reqwest::header::TRAILER,
+    reqwest::header::EXPECT,
+];
+
+/// Refuse an `agent_id` that could step outside its own secret key.
+///
+/// The id becomes the last segment of `secrets://…/a2a/<agent_id>` verbatim.
+/// Admin ids are UUIDs, so anything beyond `[A-Za-z0-9._-]`, a leading dot or
+/// `..` can only come from a hand-built or crafted sidecar — refused rather
+/// than looked up.
+pub(super) fn ensure_safe_agent_id(agent_id: &str) -> Result<(), String> {
+    let charset_ok = agent_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if agent_id.is_empty() || !charset_ok || agent_id.starts_with('.') || agent_id.contains("..") {
+        return Err(format!(
+            "a2a agent id '{agent_id}' is not a safe secret name; refusing to look up its credential"
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse to carry a credential to any host other than the one the admin
@@ -162,5 +201,78 @@ fn authority(url: &url::Url) -> String {
     match url.port_or_known_default() {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod host_rule_tests {
+    use super::{ensure_safe_agent_id, ensure_same_host};
+
+    fn same(base: &str, target: &str) -> bool {
+        ensure_same_host("a", base, &url::Url::parse(target).unwrap()).is_ok()
+    }
+
+    #[test]
+    fn the_same_host_rule_normalises_what_url_normalises_and_nothing_more() {
+        // (base, interface, same?)
+        let cases = [
+            (
+                "https://agent.example.com",
+                "https://agent.example.com/a2a",
+                true,
+            ),
+            (
+                "https://agent.example.com",
+                "https://agent.example.com:443/a2a",
+                true,
+            ),
+            (
+                "https://AGENT.example.com",
+                "https://agent.EXAMPLE.com/a2a",
+                true,
+            ),
+            (
+                "https://agent.example.com",
+                "https://agent.example.com:8443/a2a",
+                false,
+            ),
+            (
+                "https://agent.example.com",
+                "https://agent.example.com./a2a",
+                false,
+            ),
+            (
+                "https://agent.example.com",
+                "https://api.example.com/a2a",
+                false,
+            ),
+            ("https://[::1]:9000", "https://[::1]:9000/a2a", true),
+        ];
+        for (base, target, expected) in cases {
+            assert_eq!(same(base, target), expected, "{base} vs {target}");
+        }
+    }
+
+    #[test]
+    fn an_agent_id_that_could_leave_its_secret_key_is_refused() {
+        for bad in [
+            "", "../other", "a/b", "..", ".hidden", "a..b", "a b", "a\nb",
+        ] {
+            assert!(
+                ensure_safe_agent_id(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        for good in [
+            "8d2f3c1a-0b7e-4c2f-9a61-2f4f0f1e9b10",
+            "recipe",
+            "recipe_v2.1",
+        ] {
+            assert!(
+                ensure_safe_agent_id(good).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
     }
 }
