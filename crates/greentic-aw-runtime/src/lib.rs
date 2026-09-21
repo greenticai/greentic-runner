@@ -47,6 +47,7 @@ pub mod mcp_secrets;
 pub mod mcp_source;
 pub mod mcp_store_pull;
 pub mod memory;
+pub mod scoped_secrets;
 pub mod short_term;
 pub mod sorla_source;
 pub mod state;
