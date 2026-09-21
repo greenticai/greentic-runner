@@ -12,8 +12,10 @@ pub const WELL_KNOWN_PATH: &str = "/.well-known/agent-card.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum A2aError {
-    #[error("agent base URL must be https, got {base}")]
+    #[error("agent URL must be https (plaintext is allowed only on loopback), got {base}")]
     InsecureBase { base: String },
+    #[error("an agent reached at a remote base may not name a loopback interface: {url}")]
+    LoopbackFromRemote { url: String },
     #[error("agent base URL is not a URL: {base}")]
     BadBase { base: String },
     #[error("fetching the agent card failed: {0}")]
@@ -25,20 +27,15 @@ pub enum A2aError {
     },
 }
 
-/// Build the card URL for an agent base, refusing plaintext.
+/// Build the card URL for an agent base, refusing plaintext except on loopback.
 ///
-/// Refused rather than warned about: the card names the address we will later
+/// Plaintext is refused rather than warned about: the card names the address we will later
 /// send a credential to, so trusting one fetched over plaintext would hand an
-/// on-path attacker the agent's endpoint.
+/// on-path attacker the agent's endpoint. On loopback (`127.0.0.1`, `::1`, `localhost`),
+/// there is no on-path attacker — the packets never leave the host — so plaintext is allowed
+/// for in-process test servers and sidecar agents.
 pub fn card_url(base: &str) -> Result<String, A2aError> {
-    let parsed = url::Url::parse(base).map_err(|_| A2aError::BadBase {
-        base: base.to_string(),
-    })?;
-    if parsed.scheme() != "https" {
-        return Err(A2aError::InsecureBase {
-            base: base.to_string(),
-        });
-    }
+    let parsed = require_secure(base)?;
     // `join` re-roots at the origin rather than concatenating the base's raw
     // text, so a base carrying a path, query or fragment (`https://a.com/x?y=1`)
     // still resolves to the well-known location instead of appending onto it.
@@ -48,6 +45,75 @@ pub fn card_url(base: &str) -> Result<String, A2aError> {
             base: base.to_string(),
         })?;
     Ok(card.to_string())
+}
+
+/// Parse `url` and refuse it unless it is `https`, or plaintext on loopback.
+///
+/// The rule [`card_url`] applies to a base, exposed so a caller can apply the
+/// SAME rule to every other address it will send to — above all the interface
+/// URL an agent card names. Checking only the card's own address is not
+/// enough: an https card may still name a plaintext interface, and the message
+/// (and any credential with it) would then leave in the clear.
+pub fn require_secure(url: &str) -> Result<url::Url, A2aError> {
+    let parsed = url::Url::parse(url).map_err(|_| A2aError::BadBase {
+        base: url.to_string(),
+    })?;
+    if parsed.scheme() != "https" && !is_loopback(&parsed) {
+        return Err(A2aError::InsecureBase {
+            base: url.to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Check the interface URL an agent card names, before sending anything to it.
+///
+/// [`require_secure`] alone is not enough here. Its loopback carve-out exists
+/// because a plaintext hop that never leaves the host cannot be observed — a
+/// fact about the BASE the operator configured. An interface URL is only text
+/// inside a card the agent controls, so a remote agent naming
+/// `http://127.0.0.1:<port>/` would otherwise turn this client into a way to
+/// reach services on the runner's own host. A loopback interface is therefore
+/// accepted only when the configured base is itself loopback.
+pub fn require_secure_interface(base: &str, interface: &str) -> Result<url::Url, A2aError> {
+    let target = require_secure(interface)?;
+    let base = url::Url::parse(base).map_err(|_| A2aError::BadBase {
+        base: base.to_string(),
+    })?;
+    if is_loopback(&target) && !is_loopback(&base) {
+        return Err(A2aError::LoopbackFromRemote {
+            url: interface.to_string(),
+        });
+    }
+    Ok(target)
+}
+
+/// Whether a base names this host, and so cannot be observed on the wire.
+///
+/// Matched on the PARSED host: `http://127.0.0.1.evil.example` carries the
+/// loopback address as a substring of a completely different name.
+///
+/// "This host" has more spellings than `Ipv4Addr::is_loopback` knows: the
+/// unspecified address (`0.0.0.0`, `::`) reaches local services on Linux, an
+/// IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) is still IPv4 loopback, and a
+/// trailing dot or a `*.localhost` name resolves to loopback too (RFC 6761).
+/// Missing one would let a remote card aim at a local port through
+/// [`require_secure_interface`] — refused plaintext, but still a port probe.
+fn is_loopback(url: &url::Url) -> bool {
+    fn v4_local(ip: std::net::Ipv4Addr) -> bool {
+        ip.is_loopback() || ip.is_unspecified()
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => v4_local(ip),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.is_unspecified() || ip.to_ipv4_mapped().is_some_and(v4_local)
+        }
+        Some(url::Host::Domain(name)) => {
+            let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        None => false,
+    }
 }
 
 struct Entry {
@@ -67,8 +133,13 @@ pub struct CardCache {
 }
 
 impl CardCache {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
+    /// A cache whose entries are trusted for `ttl`.
+    ///
+    /// Fails only if the HTTP client cannot be built. The error is returned
+    /// rather than papered over with a default client, which would follow
+    /// redirects and have no timeout — the two properties set below.
+    pub fn new(ttl: Duration) -> Result<Self, reqwest::Error> {
+        Ok(Self {
             ttl,
             entries: Mutex::new(HashMap::new()),
             // Redirects are refused outright rather than merely limited: a
@@ -80,9 +151,8 @@ impl CardCache {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("a client with no redirect policy and a timeout is always buildable"),
-        }
+                .build()?,
+        })
     }
 
     /// Fetch the card for an agent base, or serve it from cache.
@@ -96,12 +166,9 @@ impl CardCache {
 
     /// The internal fetch, by an already-built URL.
     ///
-    /// This is the one place the https rule can be bypassed — pass it a
-    /// `http://` URL directly and it will fetch over plaintext — which is
-    /// exactly why it stays private. `mod tests` below is a child of this
-    /// module, so it can still reach this function to exercise the cache
-    /// against a loopback HTTP server without [`card_url`]'s refusal ever
-    /// being weakened for an external caller.
+    /// It applies no scheme rule of its own — [`get`](Self::get) does, through
+    /// [`card_url`] — which is why it stays private: a public by-URL entry
+    /// point would let a caller skip the https rule entirely.
     async fn get_from_url(&self, url: &str) -> Result<Arc<AgentCard>, A2aError> {
         if let Some(hit) = self.cached(url) {
             return Ok(hit);
@@ -184,6 +251,85 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_is_allowed_on_loopback_because_there_is_no_on_path_attacker() {
+        // A sidecar agent on loopback is a real deployment, and it is the only
+        // shape an in-process test server can offer. The refusal exists to stop
+        // an on-path attacker learning the endpoint we will send a credential
+        // to; on loopback the packets never leave the host.
+        assert_eq!(
+            card_url("http://127.0.0.1:8080").unwrap(),
+            "http://127.0.0.1:8080/.well-known/agent-card.json"
+        );
+        assert!(card_url("http://localhost:8080").is_ok());
+        assert!(card_url("http://[::1]:8080").is_ok());
+    }
+
+    #[test]
+    fn a_remote_agent_may_not_name_a_loopback_interface() {
+        // The loopback carve-out is about the BASE the operator configured. An
+        // interface URL is text in a card the agent controls; honouring a
+        // loopback one from a remote agent would let it aim this client at
+        // services on the runner's own host.
+        for interface in [
+            "http://127.0.0.1:8080/a2a",
+            "https://127.0.0.1:8443/a2a",
+            "http://localhost/a2a",
+            "http://[::1]/a2a",
+            // Spellings `is_loopback` in std does not recognise, each of which
+            // still reaches this host.
+            "https://0.0.0.0:8443/a2a",
+            "https://[::]/a2a",
+            "https://[::ffff:127.0.0.1]/a2a",
+            "https://localhost./a2a",
+            "https://api.localhost/a2a",
+        ] {
+            assert!(
+                matches!(
+                    require_secure_interface("https://agent.example.com", interface),
+                    Err(A2aError::LoopbackFromRemote { .. })
+                ),
+                "{interface} must be refused for a remote base"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loopback_agent_may_name_a_loopback_interface() {
+        assert!(
+            require_secure_interface("http://127.0.0.1:9000", "http://127.0.0.1:9000/a2a").is_ok()
+        );
+    }
+
+    #[test]
+    fn a_remote_agent_may_name_a_remote_https_interface_but_not_a_plaintext_one() {
+        assert!(
+            require_secure_interface("https://agent.example.com", "https://api.example.com/a2a")
+                .is_ok()
+        );
+        assert!(matches!(
+            require_secure_interface("https://agent.example.com", "http://api.example.com/a2a"),
+            Err(A2aError::InsecureBase { .. })
+        ));
+    }
+
+    #[test]
+    fn plaintext_is_still_refused_for_every_non_loopback_host() {
+        for base in [
+            "http://api.example.com",
+            "http://10.0.0.1",
+            // Not loopback, and the name is attacker-chosen: only the literal
+            // loopback names and addresses qualify.
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+        ] {
+            assert!(
+                matches!(card_url(base), Err(A2aError::InsecureBase { .. })),
+                "{base} must still be refused"
+            );
+        }
+    }
+
+    #[test]
     fn a_base_with_a_path_still_resolves_to_the_well_known_location() {
         // String concatenation would have produced
         // ".../foo/bar/.well-known/agent-card.json"; the well-known location
@@ -210,7 +356,7 @@ mod tests {
         let base = spawn_card_server(Arc::clone(&hits));
         let url = format!("{base}{WELL_KNOWN_PATH}");
 
-        let cache = CardCache::new(Duration::from_secs(300));
+        let cache = CardCache::new(Duration::from_secs(300)).expect("client builds");
         let first = cache.get_from_url(&url).await.expect("first fetch");
         let second = cache.get_from_url(&url).await.expect("cached");
 

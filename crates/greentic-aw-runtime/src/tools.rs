@@ -20,6 +20,7 @@ use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 
+use crate::a2a_source::A2aToolCatalog;
 use crate::component_source::ComponentToolCatalog;
 use crate::config::ToolRef;
 use crate::error::{AgentError, StateError};
@@ -82,12 +83,22 @@ pub fn is_tool_allowed(call: &ToolCallRecord, allowed: &[ToolRef]) -> bool {
 /// `flow_ref`, which is the sole key (no operation). The catalog supplies the
 /// LLM-facing `description`/`parameters`. A `flow:` ref with no matching catalog
 /// entry (or no catalog) is likewise logged and dropped.
+///
+/// Tools whose `extension_id` starts with `"a2a:"` are resolved from the
+/// per-tenant [`A2aToolCatalog`] (`a2a`): the suffix after `"a2a:"` is the
+/// `agent_id`. Unlike every other prefix here, description and schema resolve
+/// in DIFFERENT directions: the catalog's description wins when present — it
+/// was fetched from the agent's own live card this run, the same reasoning as
+/// the `mcp:` branch above — but the schema can ONLY come from the `ToolRef`'s
+/// own author contract, because an A2A `AgentSkill` carries no input schema at
+/// all. A ref with no `input_schema` is dropped regardless of the catalog.
 pub fn list_tools_for_llm(
     ext_runtime: &ExtensionRuntime,
     mcp: Option<&McpToolCatalog>,
     components: Option<&ComponentToolCatalog>,
     flows: Option<&FlowToolCatalog>,
     sorla: Option<&SorlaToolCatalog>,
+    a2a: Option<&A2aToolCatalog>,
     allowed: &[ToolRef],
 ) -> Vec<LlmToolSchema> {
     let mut out = Vec::with_capacity(allowed.len());
@@ -177,6 +188,39 @@ pub fn list_tools_for_llm(
             }
             continue;
         }
+        if let Some(agent_id) = t.extension_id.strip_prefix("a2a:") {
+            // Only a configured agent is a tool at all: dispatch refuses any
+            // other, so advertising one would offer the model a call that can
+            // only fail. Then the card wins on description — it is the agent's
+            // own live statement about itself, as the mcp catalogue is — and
+            // the schema can only come from the author contract, since an
+            // `AgentSkill` carries none.
+            let Some(catalog) = a2a.filter(|c| c.is_configured(agent_id)) else {
+                tracing::warn!(
+                    extension = %t.extension_id, tool = %t.tool_name,
+                    "a2a agent is not configured for this worker; dropping from LLM tool list"
+                );
+                continue;
+            };
+            let description = catalog
+                .tool_entry(agent_id)
+                .map(|e| e.description.clone())
+                .or_else(|| t.description.clone());
+            match (description, t.input_schema.clone()) {
+                (Some(description), Some(parameters)) => out.push(LlmToolSchema {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    description: with_usage_note(description, &t.usage_note),
+                    parameters,
+                }),
+                _ => tracing::warn!(
+                    extension = %t.extension_id, tool = %t.tool_name,
+                    "a2a tool has no input schema on its author contract; \
+                     dropping from LLM tool list"
+                ),
+            }
+            continue;
+        }
         match ext_runtime.list_tools(&t.extension_id) {
             Ok(defs) => {
                 if let Some(def) = defs.into_iter().find(|d| d.name == t.tool_name) {
@@ -230,6 +274,7 @@ pub fn missing_tools(
     components: Option<&ComponentToolCatalog>,
     flows: Option<&FlowToolCatalog>,
     sorla: Option<&SorlaToolCatalog>,
+    a2a: Option<&A2aToolCatalog>,
     allowed: &[ToolRef],
 ) -> Vec<MissingTool> {
     let mut missing = Vec::new();
@@ -287,6 +332,30 @@ pub fn missing_tools(
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
                     reason: "flow tool not found in the catalog".to_string(),
+                });
+            }
+            continue;
+        }
+        if let Some(agent_id) = t.extension_id.strip_prefix("a2a:") {
+            // Mirrors `list_tools_for_llm`'s a2a branch exactly: the agent must
+            // be configured; then the description may come from the card OR
+            // the author contract, but the schema has only one source.
+            let reason = match a2a.filter(|c| c.is_configured(agent_id)) {
+                None => Some("a2a agent is not configured for this worker"),
+                Some(catalog) => {
+                    let described =
+                        catalog.tool_entry(agent_id).is_some() || t.description.is_some();
+                    (!(described && t.input_schema.is_some())).then_some(
+                        "a2a agent card unavailable, or the agent config carries \
+                         no input schema for it",
+                    )
+                }
+            };
+            if let Some(reason) = reason {
+                missing.push(MissingTool {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    reason: reason.to_string(),
                 });
             }
             continue;
@@ -401,12 +470,22 @@ fn stamp_caller(args: &mut serde_json::Value, caller: &crate::tenant::VerifiedCa
 /// [`SorlaToolCatalog::dispatch`]. Like the mcp/component paths it NEVER
 /// yields `Err` — an unknown action or a missing catalog becomes an
 /// `{"error": ...}` value. Other ids keep the existing blocking WASM path.
+///
+/// Calls whose `extension_id` starts with `"a2a:"` route through the
+/// per-tenant [`A2aToolCatalog`] (`a2a`): the suffix is the `agent_id` and
+/// dispatch goes over HTTP via [`A2aToolCatalog::dispatch`], which is
+/// attempted even for an agent absent from the catalog (the listing side can
+/// still advertise it from the author contract). Like the mcp/component/sorla
+/// paths it NEVER yields `Err` — an unknown or unreachable agent becomes an
+/// `{"error": ...}` value.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_tool_call(
     ext_runtime: Arc<ExtensionRuntime>,
     mcp: Option<Arc<McpToolCatalog>>,
     components: Option<Arc<ComponentToolCatalog>>,
     flows: Option<Arc<FlowToolCatalog>>,
     sorla: Option<Arc<SorlaToolCatalog>>,
+    a2a: Option<Arc<A2aToolCatalog>>,
     call: ToolCallRecord,
     tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
@@ -417,7 +496,9 @@ pub async fn dispatch_tool_call(
     // configures that server, not a plumbing detail of this one. The `flow:`
     // and `sorla:` arms (research-only) are left unstamped too: a flow's input
     // is flow data, which is exactly the position a caller must not travel
-    // through, and SoRX is its own service boundary.
+    // through, and SoRX is its own service boundary. The `a2a:` arm is
+    // likewise unstamped, for the same reason as `mcp:`: an A2A agent is a
+    // third-party server outside this deployment.
     let caller = tenant.caller_or_anonymous();
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
         // `resolve_route` takes the catalog's exact `(server, tool)` entry when
@@ -509,6 +590,17 @@ pub async fn dispatch_tool_call(
             None => {
                 tracing::warn!(flow = %flow_ref, "flow call has no catalog wired; returning error value");
                 serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") })
+            }
+        };
+        return Ok(value);
+    }
+
+    if let Some(agent_id) = call.extension_id.strip_prefix("a2a:") {
+        let value = match a2a.as_deref() {
+            Some(catalog) => catalog.dispatch(agent_id, &call.args).await,
+            None => {
+                tracing::warn!(agent = %agent_id, "a2a call has no catalog wired; returning error value");
+                serde_json::json!({ "error": format!("unknown a2a agent '{agent_id}'") })
             }
         };
         return Ok(value);
@@ -861,7 +953,7 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, &allowed);
         assert!(schemas.is_empty());
     }
 
@@ -878,7 +970,7 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let missing = missing_tools(&rt, None, None, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].extension_id, "greentic.hubspot");
         assert_eq!(missing[0].tool_name, "hubspot_contacts");
@@ -900,7 +992,7 @@ mod tests {
             usage_note: None,
         }];
         // No catalog provided → the mcp tool is unresolvable.
-        let missing = missing_tools(&rt, None, None, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
         assert!(
             missing[0].reason.contains("MCP tool not found"),
@@ -1017,7 +1109,7 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "mcp:s1");
@@ -1048,7 +1140,7 @@ mod tests {
         let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, &allowed);
         assert_eq!(schemas.len(), 1, "the author contract resolves the tool");
         assert_eq!(schemas[0].extension_id, "mcp:s1");
         assert_eq!(schemas[0].tool_name, "get_issue");
@@ -1074,7 +1166,7 @@ mod tests {
         let catalog = catalog_with("s1", "get_issue", "Live description", live_params, None);
         let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
 
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, &allowed);
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0].description, "Live description");
         assert_eq!(
@@ -1112,6 +1204,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[description_only, schema_only, bare],
         );
         assert!(schemas.is_empty(), "got: {schemas:?}");
@@ -1125,7 +1218,7 @@ mod tests {
         let mut t = mcp_ref_with_contract("s1", "get_issue");
         t.usage_note = Some("Only for open issues.".into());
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, &[t]);
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, &[t]);
         assert_eq!(schemas.len(), 1);
         assert_eq!(
             schemas[0].description,
@@ -1139,7 +1232,7 @@ mod tests {
         // tool that `list_tools_for_llm` now resolves and offers.
         let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
-        assert!(missing_tools(&rt, None, None, None, None, &allowed).is_empty());
+        assert!(missing_tools(&rt, None, None, None, None, None, &allowed).is_empty());
     }
 
     #[test]
@@ -1147,7 +1240,7 @@ mod tests {
         let rt = ExtensionRuntime::for_test().unwrap();
         let mut half = mcp_ref_with_contract("s1", "get_issue");
         half.input_schema = None;
-        let missing = missing_tools(&rt, None, None, None, None, &[half]);
+        let missing = missing_tools(&rt, None, None, None, None, None, &[half]);
         assert_eq!(missing.len(), 1);
         assert!(
             missing[0].reason.contains("MCP tool not found"),
@@ -1182,7 +1275,7 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-mcp ref still goes through ext_runtime (unloaded → dropped)"
@@ -1246,6 +1339,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             call,
             &tc,
         )
@@ -1260,9 +1354,18 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), Some(catalog), None, None, None, missing, &tc)
-            .await
-            .expect("missing mcp route still returns Ok");
+        let out = dispatch_tool_call(
+            rt.clone(),
+            Some(catalog),
+            None,
+            None,
+            None,
+            None,
+            missing,
+            &tc,
+        )
+        .await
+        .expect("missing mcp route still returns Ok");
         assert_eq!(
             out,
             serde_json::json!({ "error": "unknown mcp tool 's1/no_such'" }),
@@ -1276,7 +1379,7 @@ mod tests {
             tool_name: "nope".into(),
             args: serde_json::json!({}),
         };
-        let res = dispatch_tool_call(rt, None, None, None, None, non_mcp, &tc).await;
+        let res = dispatch_tool_call(rt, None, None, None, None, None, non_mcp, &tc).await;
         assert!(
             res.is_err(),
             "non-mcp dispatch against an unloaded extension must error"
@@ -1343,6 +1446,7 @@ mod tests {
             None,
             Some(&flows),
             None,
+            None,
             &allowed,
         );
         let s = schemas
@@ -1376,6 +1480,7 @@ mod tests {
             None,
             Some(&flows),
             None,
+            None,
             &allowed,
         );
         assert!(
@@ -1403,6 +1508,7 @@ mod tests {
             None,
             Some(&flows),
             None,
+            None,
             &allowed,
         );
         let s = schemas
@@ -1424,7 +1530,7 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), None, None, &allowed);
         assert!(
             schemas
                 .iter()
@@ -1440,7 +1546,7 @@ mod tests {
         };
         let rt_arc = Arc::new(ExtensionRuntime::for_test().unwrap());
         let tc = TenantContext::new("t", "e");
-        let out = dispatch_tool_call(rt_arc, None, None, Some(flows), None, call, &tc)
+        let out = dispatch_tool_call(rt_arc, None, None, Some(flows), None, None, call, &tc)
             .await
             .expect("flow dispatch must not return Err");
         assert!(
@@ -1487,7 +1593,7 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, None, None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "component:greentic.refund");
@@ -1520,7 +1626,7 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, None, None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-component ref still goes through ext_runtime (unloaded → dropped)"
@@ -1558,6 +1664,7 @@ mod tests {
             Some(catalog.clone()),
             None,
             None,
+            None,
             call,
             &tc,
         )
@@ -1572,9 +1679,18 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), None, Some(catalog), None, None, missing, &tc)
-            .await
-            .expect("missing component op still returns Ok");
+        let out = dispatch_tool_call(
+            rt.clone(),
+            None,
+            Some(catalog),
+            None,
+            None,
+            None,
+            missing,
+            &tc,
+        )
+        .await
+        .expect("missing component op still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");
 
         // No component catalog wired → shaped error value, still Ok (mirrors
@@ -1585,7 +1701,7 @@ mod tests {
             tool_name: "issue_refund".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt, None, None, None, None, no_cat, &tc)
+        let out = dispatch_tool_call(rt, None, None, None, None, None, no_cat, &tc)
             .await
             .expect("component dispatch with no catalog still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");
@@ -1629,7 +1745,7 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, Some(&catalog), &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, None, Some(&catalog), None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "sorla:landlord");
@@ -1663,10 +1779,152 @@ mod tests {
             tool_name: "record_rent_payment".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt, None, None, None, Some(catalog), call, &tc)
+        let out = dispatch_tool_call(rt, None, None, None, Some(catalog), None, call, &tc)
             .await
             .expect("sorla dispatch never returns Err");
         assert_eq!(out, serde_json::json!({"ok":true}), "got: {out}");
+    }
+
+    fn a2a_ref(description: Option<&str>, input_schema: Option<serde_json::Value>) -> ToolRef {
+        ToolRef {
+            extension_id: "a2a:my-agent".into(),
+            tool_name: "call".into(),
+            description: description.map(str::to_string),
+            input_schema,
+            usage_note: None,
+        }
+    }
+
+    #[test]
+    fn an_a2a_ref_is_advertised_with_the_cards_description_and_the_authors_schema() {
+        // The card wins on description: it is the agent's live statement
+        // about itself. The schema can ONLY be the author contract's — an
+        // AgentSkill has none — so the ref's own input_schema must survive
+        // even though its description is overridden by the card.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": { "q": { "type": "string" } }
+        });
+        let allowed = vec![a2a_ref(Some("local"), Some(params.clone()))];
+        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
+
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
+        assert_eq!(schemas.len(), 1, "got: {schemas:?}");
+        let s = &schemas[0];
+        assert_eq!(s.extension_id, "a2a:my-agent");
+        assert_eq!(s.description, "from the card");
+        assert_eq!(s.parameters, params);
+    }
+
+    #[test]
+    fn an_a2a_ref_without_an_author_schema_is_not_advertised() {
+        // No input_schema anywhere, so the tool cannot be called correctly —
+        // an AgentSkill carries no schema, so there is no fallback source.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let allowed = vec![a2a_ref(Some("local"), None)];
+        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
+
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
+        assert!(schemas.is_empty(), "got: {schemas:?}");
+    }
+
+    #[test]
+    fn an_a2a_ref_falls_back_to_its_own_description_when_the_agent_is_unreachable() {
+        // The agent is configured, but its card could not be fetched this run.
+        // The ref's own description and schema still advertise the tool.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let params = serde_json::json!({"type": "object", "properties": {}});
+        let allowed = vec![a2a_ref(Some("own description"), Some(params.clone()))];
+        let catalog = A2aToolCatalog::for_tests(&[], &["my-agent"]);
+
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
+        assert_eq!(schemas.len(), 1, "got: {schemas:?}");
+        let s = &schemas[0];
+        assert_eq!(s.description, "own description");
+        assert_eq!(s.parameters, params);
+    }
+
+    #[test]
+    fn a_resolvable_a2a_ref_is_not_reported_as_missing() {
+        // Without the a2a arm this falls through to the extension runtime and
+        // reports "extension failed to load" for a tool that works — a loud,
+        // wrong warning on every turn.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let params = serde_json::json!({"type": "object", "properties": {}});
+        let allowed = vec![a2a_ref(None, Some(params))];
+        let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
+
+        let missing = missing_tools(&rt, None, None, None, None, Some(&catalog), &allowed);
+        assert!(missing.is_empty(), "got: {missing:?}");
+    }
+
+    #[test]
+    fn an_a2a_ref_with_no_schema_and_no_catalog_entry_is_reported_as_missing() {
+        // Genuinely unusable: no card, no author schema. Must be reported,
+        // and the reason must name a2a rather than extensions.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let allowed = vec![a2a_ref(None, None)];
+
+        let missing = missing_tools(&rt, None, None, None, None, None, &allowed);
+        assert_eq!(missing.len(), 1, "got: {missing:?}");
+        assert_eq!(missing[0].extension_id, "a2a:my-agent");
+        assert!(
+            missing[0].reason.contains("a2a"),
+            "got: {}",
+            missing[0].reason
+        );
+    }
+
+    #[test]
+    fn an_a2a_ref_for_an_unconfigured_agent_is_neither_advertised_nor_silent() {
+        // A full author contract is not enough: dispatch refuses an agent the
+        // worker was not configured with, so listing it would offer the model
+        // a call that can only fail. The listing and the preflight check must
+        // agree — dropped from one, reported by the other.
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let params = serde_json::json!({"type": "object", "properties": {}});
+        let allowed = vec![a2a_ref(Some("own description"), Some(params))];
+        let other_agent = A2aToolCatalog::for_tests(&[("someone-else", "x")], &[]);
+
+        for catalog in [None, Some(&other_agent)] {
+            let schemas = list_tools_for_llm(&rt, None, None, None, None, catalog, &allowed);
+            assert!(
+                schemas.is_empty(),
+                "must not be advertised, got: {schemas:?}"
+            );
+
+            let missing = missing_tools(&rt, None, None, None, None, catalog, &allowed);
+            assert_eq!(missing.len(), 1, "must be reported, got: {missing:?}");
+            assert!(
+                missing[0].reason.contains("not configured"),
+                "got: {}",
+                missing[0].reason
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatching_an_a2a_call_with_no_catalog_yields_an_error_value_naming_the_agent() {
+        // With no catalogue wired at all, dispatch must still return `Ok` with
+        // an `{"error": ...}` value the LLM can observe — never `Err`, never a
+        // panic.
+        let rt = Arc::new(ExtensionRuntime::for_test().unwrap());
+        let tc = TenantContext::new("t", "e");
+        let call = ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "a2a:my-agent".into(),
+            tool_name: "call".into(),
+            args: serde_json::json!({ "message": "hi" }),
+        };
+        let out = dispatch_tool_call(rt, None, None, None, None, None, call, &tc)
+            .await
+            .expect("a2a dispatch with no catalog must not return Err");
+        let error = out
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("expected an error value");
+        assert!(error.contains("my-agent"), "got: {error}");
     }
 }
 
