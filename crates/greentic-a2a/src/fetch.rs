@@ -92,11 +92,26 @@ pub fn require_secure_interface(base: &str, interface: &str) -> Result<url::Url,
 ///
 /// Matched on the PARSED host: `http://127.0.0.1.evil.example` carries the
 /// loopback address as a substring of a completely different name.
+///
+/// "This host" has more spellings than `Ipv4Addr::is_loopback` knows: the
+/// unspecified address (`0.0.0.0`, `::`) reaches local services on Linux, an
+/// IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) is still IPv4 loopback, and a
+/// trailing dot or a `*.localhost` name resolves to loopback too (RFC 6761).
+/// Missing one would let a remote card aim at a local port through
+/// [`require_secure_interface`] — refused plaintext, but still a port probe.
 fn is_loopback(url: &url::Url) -> bool {
+    fn v4_local(ip: std::net::Ipv4Addr) -> bool {
+        ip.is_loopback() || ip.is_unspecified()
+    }
     match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => v4_local(ip),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.is_unspecified() || ip.to_ipv4_mapped().is_some_and(v4_local)
+        }
+        Some(url::Host::Domain(name)) => {
+            let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
         None => false,
     }
 }
@@ -260,6 +275,13 @@ mod tests {
             "https://127.0.0.1:8443/a2a",
             "http://localhost/a2a",
             "http://[::1]/a2a",
+            // Spellings `is_loopback` in std does not recognise, each of which
+            // still reaches this host.
+            "https://0.0.0.0:8443/a2a",
+            "https://[::]/a2a",
+            "https://[::ffff:127.0.0.1]/a2a",
+            "https://localhost./a2a",
+            "https://api.localhost/a2a",
         ] {
             assert!(
                 matches!(
