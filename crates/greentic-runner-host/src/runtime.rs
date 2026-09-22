@@ -854,7 +854,7 @@ impl TenantRuntime {
             #[cfg(feature = "operala-in-process")]
             let operala_agents = merged_agents.clone();
             let agent_handler = if redis_set {
-                crate::runner::agent_node::build_agent_node_handler(
+                crate::runner::agent_node::build_agent_node_wiring(
                     merged_agents,
                     config.tenant.clone(),
                     Arc::clone(&secrets_manager),
@@ -868,7 +868,7 @@ impl TenantRuntime {
             } else {
                 #[cfg(feature = "desktop-agent-ephemeral")]
                 {
-                    crate::runner::agent_node::build_agent_node_handler_ephemeral(
+                    crate::runner::agent_node::build_agent_node_wiring_ephemeral(
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
@@ -882,7 +882,7 @@ impl TenantRuntime {
                 }
                 #[cfg(not(feature = "desktop-agent-ephemeral"))]
                 {
-                    crate::runner::agent_node::build_agent_node_handler(
+                    crate::runner::agent_node::build_agent_node_wiring(
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
@@ -895,8 +895,14 @@ impl TenantRuntime {
                     .await
                 }
             };
-            if let Some(handler) = agent_handler {
-                engine.set_agent_node_handler(handler);
+            // The AgentRuntime behind dw.agent is also the tool surface of
+            // in-process deep workers (operala.call, below).
+            #[cfg(feature = "operala-in-process")]
+            let operala_agent_runtime = agent_handler
+                .as_ref()
+                .map(|wiring| Arc::clone(&wiring.runtime));
+            if let Some(wiring) = agent_handler {
+                engine.set_agent_node_handler(wiring.handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
             }
 
@@ -916,7 +922,32 @@ impl TenantRuntime {
             #[cfg(feature = "operala-in-process")]
             {
                 use crate::runner::operala_node::{
-                    OPERALA_DISPATCH_ENV, OperalaSelection, select_operala_handler,
+                    OPERALA_DISPATCH_ENV, OperalaSelection, select_operala_handler_with_tools,
+                };
+                use crate::runner::operala_tools::OperalaToolContext;
+
+                // Deep workers call their agent's bound tools through the SAME
+                // AgentRuntime dw.agent uses. Without one (no agents, or no
+                // state store: GREENTIC_AW_REDIS_URL unset in a build without
+                // `desktop-agent-ephemeral`) they run tool-less, which an
+                // operator must be able to see.
+                let operala_tools = match operala_agent_runtime {
+                    Some(runtime) => Some(Arc::new(OperalaToolContext::new(
+                        runtime,
+                        &operala_agents,
+                        agent_project_id.clone(),
+                    ))),
+                    None => {
+                        if operala_agents.values().any(|agent| !agent.tools.is_empty()) {
+                            tracing::warn!(
+                                tenant = %config.tenant,
+                                "no agent runtime was built for this tenant (no state store: \
+                                 set GREENTIC_AW_REDIS_URL); operala.call deep workers will run \
+                                 WITHOUT the tools their agents declare"
+                            );
+                        }
+                        None
+                    }
                 };
 
                 // Provider/model are resolved PER WORKER from each
@@ -975,12 +1006,13 @@ impl TenantRuntime {
                 };
 
                 let dispatch_env = std::env::var(OPERALA_DISPATCH_ENV).ok();
-                match select_operala_handler(
+                match select_operala_handler_with_tools(
                     dispatch_env.as_deref(),
                     resolve_key,
                     base_url,
                     fallback_provider,
                     fallback_model,
+                    operala_tools,
                 )
                 .await
                 {

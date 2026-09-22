@@ -118,6 +118,14 @@ mod dw {
     use serde_json::Value;
 
     use super::{OperalaNodeHandler, resolve_operala_provider_model};
+    use greentic_dw_operala_invoker::DeepWorkerTools;
+
+    use crate::runner::operala_tools::OperalaToolContext;
+
+    /// Builds the deep worker's LLM from a resolved `(provider, model)`.
+    /// Injectable so a test can drive the whole handler with a scripted model.
+    type LlmFactory =
+        Arc<dyn Fn(&str, &str) -> Result<Arc<dyn greentic_llm::LlmProvider>> + Send + Sync>;
 
     /// Production [`OperalaNodeHandler`]: builds the deep-worker's LLM from the
     /// WORKER's own `input.llm` provider/model binding, resolved per dispatch,
@@ -127,10 +135,13 @@ mod dw {
     /// only the credential material (not a pre-built invoker) lets one sidecar
     /// serve workers bound to different providers/models.
     pub struct RuntimeOperalaNodeHandler {
-        api_key: String,
-        base_url: Option<String>,
+        llm_factory: LlmFactory,
         fallback_provider: Option<String>,
         fallback_model: Option<String>,
+        /// The worker's bound tools. `None` when this `TenantRuntime` built no
+        /// `AgentRuntime` (no agents, or no state store) — the deep worker
+        /// then runs tool-less, as it did before tools existed.
+        tools: Option<Arc<OperalaToolContext>>,
     }
 
     impl RuntimeOperalaNodeHandler {
@@ -140,12 +151,29 @@ mod dw {
             fallback_provider: Option<String>,
             fallback_model: Option<String>,
         ) -> Self {
+            let llm_factory: LlmFactory = Arc::new(move |provider: &str, model: &str| {
+                rig_llm(&api_key, base_url.as_deref(), provider, model)
+            });
             Self {
-                api_key,
-                base_url,
+                llm_factory,
                 fallback_provider,
                 fallback_model,
+                tools: None,
             }
+        }
+
+        /// Replace the LLM construction, for tests that script the model.
+        #[cfg(test)]
+        pub(crate) fn with_llm_factory(mut self, llm_factory: LlmFactory) -> Self {
+            self.llm_factory = llm_factory;
+            self
+        }
+
+        /// Give deep workers access to their agent's bound tools.
+        #[must_use]
+        pub fn with_tool_context(mut self, tools: Option<Arc<OperalaToolContext>>) -> Self {
+            self.tools = tools;
+            self
         }
 
         /// Build a [`DeepWorkerInvoker`] whose LLM provider/model come from the
@@ -157,26 +185,37 @@ mod dw {
                 self.fallback_provider.as_deref(),
                 self.fallback_model.as_deref(),
             )?;
-            let provider_kind: greentic_llm::ProviderKind = provider.parse().map_err(|_| {
-                anyhow::anyhow!("unknown operala LLM provider '{provider}' (from worker config)")
-            })?;
-            // `Credential` is `ZeroizeOnDrop` (implements Drop), so struct-update
-            // syntax cannot move out of `Default::default()` — build a default
-            // and set the fields we have (mirrors the dw.agent backend).
-            #[allow(clippy::field_reassign_with_default)]
-            let credential = {
-                let mut credential = greentic_llm::Credential::default();
-                credential.api_key = self.api_key.clone();
-                credential.base_url = self.base_url.clone();
-                credential
-            };
-            let backend = greentic_llm::RigBackend::new(provider_kind, &model, &credential)
-                .with_context(|| {
-                    format!("building operala LLM provider '{provider}' model '{model}'")
-                })?;
-            let llm: Arc<dyn greentic_llm::LlmProvider> = Arc::new(backend);
+            let llm = (self.llm_factory)(&provider, &model)?;
             Ok(DeepWorkerInvoker::new(llm))
         }
+    }
+
+    /// The production LLM: a `greentic_llm::RigBackend` for the worker's
+    /// provider/model over the resolved credential.
+    fn rig_llm(
+        api_key: &str,
+        base_url: Option<&str>,
+        provider: &str,
+        model: &str,
+    ) -> Result<Arc<dyn greentic_llm::LlmProvider>> {
+        let provider_kind: greentic_llm::ProviderKind = provider.parse().map_err(|_| {
+            anyhow::anyhow!("unknown operala LLM provider '{provider}' (from worker config)")
+        })?;
+        // `Credential` is `ZeroizeOnDrop` (implements Drop), so struct-update
+        // syntax cannot move out of `Default::default()` — build a default
+        // and set the fields we have (mirrors the dw.agent backend).
+        #[allow(clippy::field_reassign_with_default)]
+        let credential = {
+            let mut credential = greentic_llm::Credential::default();
+            credential.api_key = api_key.to_string();
+            credential.base_url = base_url.map(str::to_string);
+            credential
+        };
+        let backend = greentic_llm::RigBackend::new(provider_kind, model, &credential)
+            .with_context(|| {
+                format!("building operala LLM provider '{provider}' model '{model}'")
+            })?;
+        Ok(Arc::new(backend))
     }
 
     #[async_trait]
@@ -191,6 +230,20 @@ mod dw {
             input: &Value,
         ) -> Result<Value> {
             let invoker = self.build_invoker(input)?;
+            let deep_worker_tools = match &self.tools {
+                Some(ctx) => ctx.tools_for(tenant, env, target, operation, input).await,
+                None => None,
+            };
+            // Resolved through the same AgentRuntime a dw.agent step uses.
+            if let Some(tools) = &deep_worker_tools {
+                tracing::debug!(
+                    target,
+                    tools = tools.list().len(),
+                    "operala.call deep worker runs with its agent's tools"
+                );
+            }
+            let invoker = invoker
+                .with_tools(deep_worker_tools.map(|tools| tools as Arc<dyn DeepWorkerTools>));
             let idempotency_key = (!session_id.trim().is_empty()).then_some(session_id);
             let outcome = invoker
                 .invoke(
@@ -244,23 +297,54 @@ mod dw {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Option<String>>,
     {
+        select_operala_handler_with_tools(
+            dispatch_env,
+            resolve_key,
+            base_url,
+            fallback_provider,
+            fallback_model,
+            None,
+        )
+        .await
+    }
+
+    /// [`select_operala_handler`], giving the in-process handler access to the
+    /// deep workers' bound tools through `tools`.
+    pub async fn select_operala_handler_with_tools<F, Fut>(
+        dispatch_env: Option<&str>,
+        resolve_key: F,
+        base_url: Option<String>,
+        fallback_provider: Option<String>,
+        fallback_model: Option<String>,
+        tools: Option<Arc<OperalaToolContext>>,
+    ) -> OperalaSelection
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
         if !super::operala_dispatch_in_process(dispatch_env) {
             return OperalaSelection::Nats;
         }
         match resolve_key().await {
-            Some(api_key) => OperalaSelection::InProcess(Arc::new(RuntimeOperalaNodeHandler::new(
-                api_key,
-                base_url,
-                fallback_provider,
-                fallback_model,
-            ))),
+            Some(api_key) => OperalaSelection::InProcess(Arc::new(
+                RuntimeOperalaNodeHandler::new(
+                    api_key,
+                    base_url,
+                    fallback_provider,
+                    fallback_model,
+                )
+                .with_tool_context(tools),
+            )),
             None => OperalaSelection::NoKey,
         }
     }
 }
 
 #[cfg(feature = "operala-in-process")]
-pub use dw::{OperalaSelection, RuntimeOperalaNodeHandler, select_operala_handler};
+pub use dw::{
+    OperalaSelection, RuntimeOperalaNodeHandler, select_operala_handler,
+    select_operala_handler_with_tools,
+};
 
 #[cfg(test)]
 mod tests {

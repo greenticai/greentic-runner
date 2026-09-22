@@ -11,7 +11,7 @@ use crate::llm::LlmRequest;
 use crate::state::{ChatMessage, ConversationState};
 use crate::telemetry::StepTelemetryCtx;
 use crate::tenant::TenantContext;
-use crate::tools::{dispatch_tool_call, is_tool_allowed, list_tools_for_llm};
+use crate::tools::is_tool_allowed;
 use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep, StepObserver, StepUsage};
 
 /// Agents already warned about unavailable tools, so the loud preflight warning
@@ -314,46 +314,13 @@ pub async fn run_step(
         system_prompt
     };
 
-    // Resolve the per-tenant agentic-worker MCP catalog once per step. The
-    // source is infallible (degrades to an empty catalog on any admin/server
-    // failure) and TTL-cached, so a stable config does not re-hit the network
-    // across iterations. `None` source → no MCP tools at all.
-    let mcp_catalog = match runtime.mcp.as_ref() {
-        Some(src) => Some(src.catalog(&tenant).await),
-        None => None,
-    };
-
-    // Resolve the per-tenant component tool catalog once per step (mirrors the
-    // MCP catalog above). Infallible + TTL-cached; `None` source → no
-    // `component:` tools at all.
-    let component_catalog = match runtime.components.as_ref() {
-        Some(src) => Some(src.catalog(&tenant).await),
-        None => None,
-    };
-
-    // Resolve the per-tenant flow tool catalog once per step (mirrors the
-    // component catalog above). Infallible + TTL-cached; `None` source → no
-    // `flow:` tools at all.
-    let flow_catalog = match runtime.flows.as_ref() {
-        Some(src) => Some(src.catalog(&tenant).await),
-        None => None,
-    };
-
-    // Resolve the per-tenant SoRLa SoR tool catalog once per step (mirrors the
-    // component/flow catalogs above). Infallible + TTL-cached; `None` source →
-    // no `sorla:` tools at all.
-    let sorla_catalog = match runtime.sorla.as_ref() {
-        Some(src) => Some(src.catalog(&tenant).await),
-        None => None,
-    };
-
-    // Resolve the A2A tool catalog once per step (mirrors the sorla catalog
-    // above). Infallible + card-cached; `None` source → no `a2a:` tools at
-    // all.
-    let a2a_catalog = match runtime.a2a.as_ref() {
-        Some(src) => Some(src.catalog().await),
-        None => None,
-    };
+    // Resolve the per-tenant tool catalogs (MCP, component, flow, SoRLa, A2A)
+    // once per step. Every source is infallible (degrades to an empty catalog
+    // on any admin/server failure) and TTL-cached, so a stable config does not
+    // re-hit the network across iterations. `None` source → no tools of that
+    // prefix. `ToolCatalogs` is shared with `AgentRuntime::tool_session`, so
+    // an external loop resolves exactly what this one does.
+    let catalogs = crate::tool_session::ToolCatalogs::resolve(runtime, &tenant).await;
 
     // Preflight: surface declared tools that won't reach the LLM. Without this
     // the runtime drops unresolved tools silently (per-tool debug warns) and the
@@ -361,15 +328,7 @@ pub async fn run_step(
     // results. Warn loudly, once per agent per process, with the reason + fix.
     preflight_warn_tools(
         &config.agent_id,
-        &crate::tools::missing_tools(
-            &runtime.ext_runtime,
-            mcp_catalog.as_deref(),
-            component_catalog.as_deref(),
-            flow_catalog.as_deref(),
-            sorla_catalog.as_deref(),
-            a2a_catalog.as_deref(),
-            &config.tools,
-        ),
+        &catalogs.missing(&runtime.ext_runtime, &config.tools),
         config.tools.len(),
     );
 
@@ -412,15 +371,7 @@ pub async fn run_step(
             break;
         }
 
-        let mut tools_schema = list_tools_for_llm(
-            &runtime.ext_runtime,
-            mcp_catalog.as_deref(),
-            component_catalog.as_deref(),
-            flow_catalog.as_deref(),
-            sorla_catalog.as_deref(),
-            a2a_catalog.as_deref(),
-            &config.tools,
-        );
+        let mut tools_schema = catalogs.list_for_llm(&runtime.ext_runtime, &config.tools);
         if lt_active {
             tools_schema.push(crate::long_term::recall_memory_tool_schema());
         }
@@ -666,17 +617,9 @@ pub async fn run_step(
                 // (they should remain retryable on the next turn).
                 observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                 let t0 = Instant::now();
-                let result = match dispatch_tool_call(
-                    runtime.ext_runtime.clone(),
-                    mcp_catalog.clone(),
-                    component_catalog.clone(),
-                    flow_catalog.clone(),
-                    sorla_catalog.clone(),
-                    a2a_catalog.clone(),
-                    call.clone(),
-                    &tenant,
-                )
-                .await
+                let result = match catalogs
+                    .dispatch(runtime.ext_runtime.clone(), call.clone(), &tenant)
+                    .await
                 {
                     Ok(r) => r,
                     Err(e) => {

@@ -169,3 +169,43 @@ backed by `greentic_aw_runtime::graph::GraphExecutor`. Graphs are defined in an
 `agent-graph.json` sidecar co-located with the pack. For the full design and
 sidecar schema see
 `docs/superpowers/specs/2026-06-06-runtime-agent-graph-execution-design.md`.
+
+## Deep workers (`operala.call`)
+
+A deep worker (an `operala.call` node run in-process, feature
+`operala-in-process`) calls its agent's bound tools. Every tool form above
+(extension, `mcp:`, `component:`, `flow:`, `sorla:`, `a2a:`) is available to
+it. Resolution and dispatch go through the same `AgentRuntime` a `dw.agent`
+step in that unit uses (`AgentRuntime::tool_session_for_agent`), so the deep
+worker sees exactly what the agent loop would. That means the same catalogs,
+schemas, allow-list, secrets scope and deployed-unit id.
+
+**Which agent's tools.** The first non-empty name among `input.agent_id`,
+the node's `target` (the worker id) and its `operation` decides. It must name
+an agent the unit carries. An unknown name gets no tools and a `warn` line;
+it never falls back to another agent, since that would hand one worker
+another worker's tools, secrets and unit. The operation `run` is the dispatch
+verb and names no agent. Only when nothing names an agent does the unit's
+single agent apply. With several agents and no name, the worker runs without
+tools and a `warn` line says why.
+
+**How calls behave.** The model sees each tool under its provider-safe wire
+name. A name outside the agent's allow-list is answered in-band with
+`{"error": "tool '…' is not allowed for this agent"}`. A failed extension
+dispatch is returned as an error, which greentic-dw neither caches nor
+retries silently. Other tool failures come back as in-band `{"error": …}`
+values, as they do in the agent loop. The agent loop's idempotency ledger is
+not used: the invoker supplies no call id, so a ledger entry could never be
+read back. Replay protection comes from greentic-dw's per-run cache, keyed by
+(name, canonical args). Host built-ins (`recall_memory`,
+`remember`/`recall`, `end_conversation`) are not offered, because they belong
+to the agent loop's conversation state. An `operala.call` carries no caller
+block, so extension and component tools receive an anonymous
+(`user_verified: false`) caller stamp.
+
+**When there are none.** Tools need an agent runtime, which needs a state
+store. Without `GREENTIC_AW_REDIS_URL`, and in a build without
+`desktop-agent-ephemeral`, no runtime is built. In that case deep workers run
+tool-less, and at startup the runner logs a `warn` if any agent declares
+tools. Tools are also skipped when the worker's model does not support tool
+calling.

@@ -49,7 +49,7 @@ futures             = { workspace = true }
 # A2A (Agent2Agent) wire types and agent-card retrieval, for the a2a: tool
 # source (letting an agentic worker call an external A2A agent as a tool).
 greentic-a2a        = { path = "../greentic-a2a" }
-greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", rev = "00cf18318a20f071d5878aff66e8f33b157cb1ed" }
+greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", rev = "506036a8266b9f2c456d22c77fdc0b616657db07" }
 # Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
