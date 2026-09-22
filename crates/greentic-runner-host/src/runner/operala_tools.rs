@@ -65,7 +65,8 @@ impl DeepWorkerTools for AwDeepWorkerTools {
 /// Why an `operala.call` could not be tied to one of the pack's agents.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UnresolvedAgent {
-    /// `input.agent_id` named an agent this runtime does not carry.
+    /// The call named an agent (`input.agent_id`, `target` or `operation`)
+    /// this runtime does not carry.
     UnknownExplicit(String),
     /// The runtime carries no agents at all.
     NoAgents,
@@ -73,37 +74,46 @@ pub enum UnresolvedAgent {
     Ambiguous(usize),
 }
 
-/// Which agent an `operala.call` dispatch belongs to, in precedence order:
+/// The dispatch verb of the `{await, operation, input}` contract. It names an
+/// action, not an agent, so it never counts as naming one.
+const RUN_OPERATION: &str = "run";
+
+/// Which agent an `operala.call` dispatch belongs to.
 ///
-/// 1. `input.agent_id` — explicit, so an id this runtime does not carry is a
-///    refusal, never a fall-through to some other agent's tools;
-/// 2. the node's `target`, then its `operation`, when either names a known
-///    agent (greentic-designer stamps the worker id as the operation);
-/// 3. the only agent, when exactly one exists.
+/// The FIRST non-empty name among `input.agent_id`, the node's `target` and
+/// its `operation` decides, and it must name an agent this runtime carries;
+/// an unknown name is a refusal, never a fall-through. In production `target`
+/// is the node's operation — the worker id — so it is almost always set, and
+/// falling back to "the only agent" for an unknown one would hand worker D
+/// the tools, secrets and unit of worker A.
+///
+/// Only when nothing names an agent at all (`operation` empty or `run`) does
+/// the single agent of the runtime apply.
 pub fn resolve_tool_agent<'a>(
     agent_ids: &'a [String],
     input: &Value,
     target: &str,
     operation: &str,
 ) -> std::result::Result<&'a str, UnresolvedAgent> {
-    let find = |candidate: &str| agent_ids.iter().find(|id| id.as_str() == candidate);
     let explicit = input
         .get("agent_id")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty());
-    if let Some(explicit) = explicit {
-        return find(explicit)
+        .unwrap_or_default();
+    let operation = operation.trim();
+    let operation = if operation == RUN_OPERATION {
+        ""
+    } else {
+        operation
+    };
+    let named = [explicit.trim(), target.trim(), operation]
+        .into_iter()
+        .find(|name| !name.is_empty());
+    if let Some(name) = named {
+        return agent_ids
+            .iter()
+            .find(|id| id.as_str() == name)
             .map(String::as_str)
-            .ok_or_else(|| UnresolvedAgent::UnknownExplicit(explicit.to_string()));
-    }
-    for candidate in [target.trim(), operation.trim()] {
-        if candidate.is_empty() {
-            continue;
-        }
-        if let Some(id) = find(candidate) {
-            return Ok(id.as_str());
-        }
+            .ok_or_else(|| UnresolvedAgent::UnknownExplicit(name.to_string()));
     }
     match agent_ids {
         [] => Err(UnresolvedAgent::NoAgents),
@@ -154,7 +164,6 @@ impl OperalaToolContext {
         env: &str,
         target: &str,
         operation: &str,
-        session_id: &str,
         input: &Value,
     ) -> Option<Arc<AwDeepWorkerTools>> {
         let agent_id = match resolve_tool_agent(&self.agent_ids, input, target, operation) {
@@ -175,7 +184,13 @@ impl OperalaToolContext {
             .tool_session_for_agent(&tenant_ctx, agent_id)
             .await
         {
-            Ok(session) => session.with_session_id(session_id),
+            // No session id on purpose. The invoker names no call id, so
+            // every call gets a fresh one and a ledger lookup could never
+            // hit; with a session id set, each call would only WRITE a ledger
+            // record nobody reads. Replay protection within a run comes from
+            // the dw invoker's own per-run cache, keyed by (name, canonical
+            // args).
+            Ok(session) => session,
             Err(error) => {
                 tracing::warn!(
                     agent_id, %error,
@@ -223,32 +238,53 @@ mod tests {
     }
 
     #[test]
-    fn target_then_operation_name_the_agent() {
+    fn an_unknown_target_is_refused_even_with_a_single_agent() {
+        // Production shape: `target` is the worker id. Deep worker D must
+        // never run with the sole agent A's tools, secrets and unit.
+        let agents = ids(&["A"]);
+        let got = resolve_tool_agent(&agents, &json!({}), "D", "run");
+        assert_eq!(got, Err(UnresolvedAgent::UnknownExplicit("D".into())));
+    }
+
+    #[test]
+    fn an_unknown_operation_is_refused_even_with_a_single_agent() {
+        let agents = ids(&["A"]);
+        let got = resolve_tool_agent(&agents, &json!({}), "", "D");
+        assert_eq!(got, Err(UnresolvedAgent::UnknownExplicit("D".into())));
+    }
+
+    #[test]
+    fn the_first_name_decides_and_a_later_match_does_not_rescue_it() {
         let agents = ids(&["planner", "writer"]);
         assert_eq!(
             resolve_tool_agent(&agents, &json!({}), "writer", "planner"),
             Ok("writer")
         );
         assert_eq!(
-            resolve_tool_agent(&agents, &json!({}), "operala", "planner"),
+            resolve_tool_agent(&agents, &json!({}), "", "planner"),
             Ok("planner")
+        );
+        assert_eq!(
+            resolve_tool_agent(&agents, &json!({}), "operala", "planner"),
+            Err(UnresolvedAgent::UnknownExplicit("operala".into()))
         );
     }
 
     #[test]
-    fn the_only_agent_is_used_when_nothing_names_one() {
+    fn the_only_agent_is_used_only_when_nothing_names_one() {
         let agents = ids(&["solo"]);
         assert_eq!(
             resolve_tool_agent(&agents, &json!({ "agent_id": "  " }), "", "run"),
             Ok("solo")
         );
+        assert_eq!(resolve_tool_agent(&agents, &json!({}), " ", ""), Ok("solo"));
     }
 
     #[test]
     fn several_agents_and_no_name_is_ambiguous() {
         let agents = ids(&["a", "b", "c"]);
         assert_eq!(
-            resolve_tool_agent(&agents, &json!({}), "operala", "run"),
+            resolve_tool_agent(&agents, &json!({}), "", "run"),
             Err(UnresolvedAgent::Ambiguous(3))
         );
     }
@@ -256,7 +292,7 @@ mod tests {
     #[test]
     fn no_agents_resolves_nothing() {
         assert_eq!(
-            resolve_tool_agent(&[], &json!({}), "x", "run"),
+            resolve_tool_agent(&[], &json!({}), "", "run"),
             Err(UnresolvedAgent::NoAgents)
         );
     }
@@ -338,7 +374,7 @@ mod tests {
             );
             let ctx = context(&agents);
             let tools = ctx
-                .tools_for("acme", "prod", "operala", "researcher", "s-1", &json!({}))
+                .tools_for("acme", "prod", "researcher", "run", &json!({}))
                 .await
                 .expect("the only agent's tools resolve");
             let listed = tools.list();
@@ -367,7 +403,7 @@ mod tests {
             agents.insert("bare".to_string(), agent("bare", json!([])));
             let ctx = context(&agents);
             assert!(
-                ctx.tools_for("acme", "prod", "", "run", "s-1", &json!({}))
+                ctx.tools_for("acme", "prod", "", "run", &json!({}))
                     .await
                     .is_none()
             );
@@ -381,7 +417,7 @@ mod tests {
             agents.insert("b".to_string(), agent("b", tools));
             let ctx = context(&agents);
             assert!(
-                ctx.tools_for("acme", "prod", "", "run", "s-1", &json!({}))
+                ctx.tools_for("acme", "prod", "", "run", &json!({}))
                     .await
                     .is_none()
             );

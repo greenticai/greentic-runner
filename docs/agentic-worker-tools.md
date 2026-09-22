@@ -180,14 +180,13 @@ step in that unit uses (`AgentRuntime::tool_session_for_agent`), so the deep
 worker sees exactly what the agent loop would. That means the same catalogs,
 schemas, allow-list, secrets scope and deployed-unit id.
 
-**Which agent's tools.** The first of these that applies:
-
-1. `input.agent_id`. If it names an agent the unit does not carry, the worker
-   gets no tools. It never falls back to another agent.
-2. The node's `target`, then its `operation`, when either names a known agent.
-3. The only agent, when the unit carries exactly one.
-
-Otherwise (several agents and nothing names one), the worker runs without
+**Which agent's tools.** The first non-empty name among `input.agent_id`,
+the node's `target` (the worker id) and its `operation` decides. It must name
+an agent the unit carries. An unknown name gets no tools and a `warn` line;
+it never falls back to another agent, since that would hand one worker
+another worker's tools, secrets and unit. The operation `run` is the dispatch
+verb and names no agent. Only when nothing names an agent does the unit's
+single agent apply. With several agents and no name, the worker runs without
 tools and a `warn` line says why.
 
 **How calls behave.** The model sees each tool under its provider-safe wire
@@ -195,8 +194,10 @@ name. A name outside the agent's allow-list is answered in-band with
 `{"error": "tool '…' is not allowed for this agent"}`. A failed extension
 dispatch is returned as an error, which greentic-dw neither caches nor
 retries silently. Other tool failures come back as in-band `{"error": …}`
-values, as they do in the agent loop. Within one run, greentic-dw caches
-results by (name, canonical args). Host built-ins (`recall_memory`,
+values, as they do in the agent loop. The agent loop's idempotency ledger is
+not used: the invoker supplies no call id, so a ledger entry could never be
+read back. Replay protection comes from greentic-dw's per-run cache, keyed by
+(name, canonical args). Host built-ins (`recall_memory`,
 `remember`/`recall`, `end_conversation`) are not offered, because they belong
 to the agent loop's conversation state. An `operala.call` carries no caller
 block, so extension and component tools receive an anonymous

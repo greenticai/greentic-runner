@@ -231,10 +231,7 @@ mod dw {
         ) -> Result<Value> {
             let invoker = self.build_invoker(input)?;
             let deep_worker_tools = match &self.tools {
-                Some(ctx) => {
-                    ctx.tools_for(tenant, env, target, operation, session_id, input)
-                        .await
-                }
+                Some(ctx) => ctx.tools_for(tenant, env, target, operation, input).await,
                 None => None,
             };
             // Resolved through the same AgentRuntime a dw.agent step uses.
