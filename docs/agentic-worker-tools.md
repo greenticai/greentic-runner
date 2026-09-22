@@ -122,7 +122,17 @@ written by the designer (one record per agent: `agent_id`, `base_url`,
 `auth_header_name`, `auth_team`, `requires_auth` — never a token). There is no
 admin-backed A2A source. The source is built for the in-pack `dw.agent`
 runtime (deployed units, the desktop runner and the designer's test-chat
-sidecar); the process-level serve path and graph turns have none.
+sidecar) and, from the same packs, tenant, unit and secrets manager, for
+`dw.agent_graph` handlers. The process-level serve path has none.
+
+**In an agent graph.** An agent turn is offered the `a2a:` tools of the config
+it runs: a specialist with `inheritFrom` or a node with `agentRef` gets the
+worker's bindings, author schema included. An inline node whose `tools` lists
+`a2a:<agent_id>/ask` carries no `input_schema`, so — as above — that tool is
+not offered to the model. A graph Tool node may name `a2a:<agent_id>/ask`
+directly; it dispatches through the same source (the node sends no arguments,
+so the agent receives `{}` as its message). The supervisor turn is tool-free
+and is offered nothing.
 
 **Credentials.** A route with `requires_auth` has its token read at **call
 time** (so rotation needs no restart), from the first of:
@@ -138,7 +148,8 @@ only on the `SendMessage` POST, never on the public agent-card fetch, and
 configured `base_url`** — otherwise the call is refused and nothing is sent.
 A missing credential refuses the call; there is no unauthenticated retry.
 
-**Switch:** `GREENTIC_AW_A2A=0` disables A2A tools for the whole runner.
+**Switch:** `GREENTIC_AW_A2A=0` disables A2A tools for the whole runner,
+graph turns and graph Tool nodes included.
 
 **What an operator sees on failure.** A failed call returns an in-band
 `{"error": ...}` value to the model naming the agent and the cause (every

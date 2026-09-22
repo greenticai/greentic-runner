@@ -334,11 +334,21 @@ mod aw {
     /// telemetry, token meter, ledger) are built exactly as for the single-agent
     /// path; the durable checkpoint store reuses the same multiplexed Redis
     /// connection manager.
+    ///
+    /// `tenant`, `secrets` and `unit` are the values the `dw.agent` handler of
+    /// the same `TenantRuntime` receives (`unit` is the deployed unit's
+    /// `bundle_id`, `None` on the legacy tenant-only path). They feed only the
+    /// pack-carried A2A tool source ([`graph_a2a_source`]); the rest of this
+    /// path keeps its env-only secrets, as before.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_graph_node_handler(
         graphs: HashMap<String, GraphConfig>,
         audit_sink: Option<AuditSink>,
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
         merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        unit: Option<String>,
     ) -> Option<Arc<dyn GraphNodeHandler>> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
         use greentic_aw_runtime::OtelTelemetry;
@@ -386,6 +396,7 @@ mod aw {
             None => Arc::new(local),
         };
 
+        let a2a_source = graph_a2a_source(&packs, &tenant, &secrets, unit.as_deref());
         let handler = RuntimeGraphNodeHandler::from_parts(
             provider,
             checkpoint,
@@ -398,10 +409,39 @@ mod aw {
             audit_sink,
             packs,
             Arc::new(merged_agents),
+            a2a_source,
         );
 
         tracing::info!(graph_count, "AW graph runtime constructed");
         Some(Arc::new(handler))
+    }
+
+    /// The pack-carried A2A tool source for a graph handler's agent turns and
+    /// Tool nodes.
+    ///
+    /// Built from exactly the inputs the single-turn `dw.agent` runtime uses —
+    /// the same packs, tenant and deployed unit, and the same remote-tool
+    /// secrets manager (`agent_node::mcp_secrets_manager`, so an explicit
+    /// `SECRETS_BACKEND` wins here too) — through the same helper, so
+    /// `GREENTIC_AW_A2A=0`, first-pack-wins dedup and the credential URI
+    /// (`secrets://default/<tenant>/<auth_team|_>/a2a/<agent_id>[.unit-<seg>]`)
+    /// cannot differ between the two paths.
+    ///
+    /// Built once per handler, not per turn: the handler belongs to one
+    /// `TenantRuntime`, so tenant, unit and packs are fixed for its lifetime,
+    /// and rebuilding per turn would throw away the source's agent-card cache.
+    pub(crate) fn graph_a2a_source(
+        packs: &[Arc<crate::pack::PackRuntime>],
+        tenant: &str,
+        secrets: &crate::secrets::DynSecretsManager,
+        unit: Option<&str>,
+    ) -> Option<Arc<greentic_aw_runtime::A2aToolSource>> {
+        crate::runner::a2a_pack_source::a2a_source_from_packs(
+            packs,
+            tenant,
+            Some(super::super::agent_node::mcp_secrets_manager(secrets)),
+            unit,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -459,6 +499,10 @@ mod aw {
         /// TTL catalog cache + warmed HTTP client are reused across every
         /// graph-agent visit rather than rebuilt (empty-cache) per turn.
         mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        /// Pack-carried A2A tool source ([`graph_a2a_source`]), built once for
+        /// the same reason as `mcp_source`: its agent-card cache is reused
+        /// across every graph-agent visit. The supervisor stays tool-free.
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
         /// The tenant's loaded packs, used to build a fresh, tenant-scoped
         /// [`greentic_aw_runtime::ComponentToolSource`] on EVERY turn (unlike
         /// `mcp_source`, this is NOT built once — the component source is
@@ -485,6 +529,7 @@ mod aw {
                 self.token_meter.clone(),
                 self.ledger.clone(),
                 self.mcp_source.clone(),
+                self.a2a_source.clone(),
                 self.packs.clone(),
                 self.merged_agents.clone(),
                 audit_sink,
@@ -542,8 +587,9 @@ mod aw {
 
     /// Production [`GraphNodeHandler`] wrapping the durable graph executor.
     ///
-    /// Tool dispatch goes straight through the shared [`ExtensionRuntime`] via
-    /// [`dispatch_tool_call`].
+    /// Tool dispatch goes through the shared [`ExtensionRuntime`] via
+    /// [`dispatch_tool_call`], with `a2a:` refs routed to the handler's
+    /// pack-carried A2A catalog.
     pub struct RuntimeGraphNodeHandler {
         graphs: Arc<dyn GraphConfigSource>,
         checkpoint: Arc<dyn CheckpointStore>,
@@ -584,8 +630,11 @@ mod aw {
             audit_sink: Option<AuditSink>,
             packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
             merged_agents: Arc<HashMap<String, AgentConfig>>,
+            a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
         ) -> Self {
-            let tool = build_tool(ext_runtime.clone());
+            // The Tool node and the agent turns share one A2A source, so an
+            // `a2a:` ref resolves identically whichever of the two dispatches it.
+            let tool = build_tool(ext_runtime.clone(), a2a_source.clone());
             // Built once here (like the other Arcs) so the MCP catalog cache +
             // HTTP client are reused across every graph-agent turn.
             // No per-tenant secrets manager reachable in this constructor
@@ -600,6 +649,7 @@ mod aw {
                 token_meter,
                 ledger,
                 mcp_source,
+                a2a_source,
                 packs,
                 merged_agents,
             });
@@ -949,6 +999,7 @@ mod aw {
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
         mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
         merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<AuditSink>,
@@ -962,6 +1013,7 @@ mod aw {
             let token_meter = token_meter.clone();
             let ledger = ledger.clone();
             let mcp_source = mcp_source.clone();
+            let a2a_source = a2a_source.clone();
             let packs = packs.clone();
             let merged_agents = merged_agents.clone();
             let audit_sink = audit_sink.clone();
@@ -976,6 +1028,7 @@ mod aw {
                     token_meter,
                     ledger,
                     mcp_source,
+                    a2a_source,
                     packs,
                     merged_agents,
                     audit_sink.as_ref(),
@@ -1160,6 +1213,7 @@ mod aw {
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
         mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
         merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<&AuditSink>,
@@ -1218,7 +1272,11 @@ mod aw {
             ledger,
             mcp_source,
         )
-        .with_component_source(component_source);
+        .with_component_source(component_source)
+        // A2A: the handler's pack-carried source (see `graph_a2a_source`),
+        // for inline, inheriting and referenced agents alike — exactly what
+        // the single-turn `dw.agent` runtime attaches.
+        .with_a2a_source(a2a_source);
 
         // Full fidelity ONLY for a referenced agent — mirrors
         // `agent_node::build_agent_runtime`'s guardrail/short-term-memory/
@@ -1546,10 +1604,14 @@ mod aw {
     /// [`GraphExecError::Tool`]. Dispatch goes through the shared
     /// [`ExtensionRuntime`] via [`dispatch_tool_call`], which wraps the blocking
     /// `invoke_tool` in `spawn_blocking`.
-    fn build_tool(ext_runtime: Arc<ExtensionRuntime>) -> ToolFn {
+    fn build_tool(
+        ext_runtime: Arc<ExtensionRuntime>,
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+    ) -> ToolFn {
         Arc::new(move |req: ToolCallRequest| {
             let ext_runtime = ext_runtime.clone();
-            Box::pin(async move { run_one_tool(req, ext_runtime).await })
+            let a2a_source = a2a_source.clone();
+            Box::pin(async move { run_one_tool(req, ext_runtime, a2a_source).await })
                 as BoxFut<'static, Result<Value, GraphExecError>>
         })
     }
@@ -1575,6 +1637,7 @@ mod aw {
     async fn run_one_tool(
         req: ToolCallRequest,
         ext_runtime: Arc<ExtensionRuntime>,
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
     ) -> Result<Value, GraphExecError> {
         let (extension_id, tool_name) = req.tool_name.split_once('/').ok_or_else(|| {
             GraphExecError::Tool(format!(
@@ -1598,17 +1661,23 @@ mod aw {
             args: json!({}),
         };
 
-        // Graph Tool nodes never carry mcp:, component:, sorla:, or a2a: ids
-        // (they use 'extension_id/tool' syntax over the WASM runtime), so
-        // none of the MCP, component, sorla, or a2a catalogs is threaded
-        // here — the agent-graph path does not wire a sorla or a2a source in
-        // SP1. The a2a catalog is `None` permanently at this call site: there
-        // is no per-request A2A source at the graph-node layer at all.
+        // A Tool node names 'extension_id/tool'. An `a2a:<agent_id>/ask` ref
+        // dispatches through the handler's pack-carried A2A catalog (the same
+        // source the agent turns use; see `graph_a2a_source`), which reads its
+        // credential with the tenant and unit it captured at build time, so
+        // the placeholder `TenantContext` below does not reach it. mcp:,
+        // component:, flow: and sorla: refs are still not wired here — the
+        // agent-graph Tool node has no catalog for them, and such a ref
+        // returns the dispatcher's "no catalog wired" error value.
         // No per-request TenantContext is available at the graph-node layer;
         // use a no-op placeholder so the extension's host-LLM port receives an
         // empty context (equivalent to the previous `invoke_tool` default).
+        let a2a = match a2a_source.as_ref() {
+            Some(source) => Some(source.catalog().await),
+            None => None,
+        };
         let tenant = TenantContext::new("", "");
-        dispatch_tool_call(ext_runtime, None, None, None, None, None, call, &tenant)
+        dispatch_tool_call(ext_runtime, None, None, None, None, a2a, call, &tenant)
             .await
             .map_err(|e| GraphExecError::Tool(format!("dispatch '{}': {e}", req.tool_name)))
     }
@@ -2873,6 +2942,7 @@ mod aw {
                 token_meter,
                 ledger,
                 None,
+                None,
                 Arc::new(vec![]),
                 Arc::new(HashMap::new()),
                 None,
@@ -2906,6 +2976,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                None,
                 None,
                 Arc::new(vec![]),
                 Arc::new(HashMap::new()),
@@ -2947,6 +3018,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                None,
                 None,
                 Arc::new(vec![]),
                 Arc::new(HashMap::new()),
@@ -3091,6 +3163,7 @@ mod aw {
                 token_meter,
                 ledger,
                 None,
+                None,
                 Arc::new(vec![]),
                 Arc::new(merged),
                 None,
@@ -3138,6 +3211,7 @@ mod aw {
                 token_meter,
                 ledger,
                 None,
+                None,
                 Arc::new(vec![]),
                 Arc::new(merged),
                 None,
@@ -3170,6 +3244,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                None,
                 None,
                 Arc::new(vec![]),
                 Arc::new(HashMap::new()),
@@ -3414,6 +3489,378 @@ mod aw {
             assert!(
                 rx.try_recv().is_err(),
                 "no tool call happens on this path, so no audit event is expected"
+            );
+        }
+    }
+
+    /// Graph turns and graph Tool nodes resolve `a2a:` tools from the same
+    /// pack-carried source a single-turn `dw.agent` does
+    /// ([`graph_a2a_source`]). Env-mutating, so every test is `#[serial]`
+    /// (crate convention, as in `a2a_pack_source`'s tests).
+    #[cfg(all(test, feature = "agentic-worker"))]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod a2a_tests {
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
+
+        use greentic_aw_runtime::cost::MockTokenMeter;
+        use greentic_aw_runtime::error::LlmError;
+        use greentic_aw_runtime::graph::{AgentTurnRequest, GraphRunState, ToolCallRequest};
+        use greentic_aw_runtime::llm::{LlmBackend, LlmRequest, LlmResponse};
+        use greentic_aw_runtime::mock::{MockAgentStateStore, MockTelemetry, NoopToolLedger};
+        use greentic_aw_runtime::state::ToolCallRecord;
+        use greentic_aw_runtime::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
+        use greentic_ext_runtime::ExtensionRuntime;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::{RuntimeTurnSource, TurnEffectSource, build_tool, graph_a2a_source};
+
+        /// A hyphenated id, as the admin mints them.
+        const AGENT_ID: &str = "8d2f0c1e-recipe";
+        const TENANT: &str = "acme";
+        const UNIT: &str = "unit-1";
+
+        async fn serve_agent(server: &MockServer, reply: &str) {
+            let card = json!({
+                "name": "Recipe Agent",
+                "description": "Suggests dishes.",
+                "version": "1.0.0",
+                "supportedInterfaces": [{
+                    "url": format!("{}/a2a", server.uri()),
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": "1.0"
+                }],
+                "capabilities": {"streaming": false, "pushNotifications": false},
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": []
+            });
+            Mock::given(method("GET"))
+                .and(path("/.well-known/agent-card.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(card))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/a2a"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {"message": {"messageId": "m-2", "role": "ROLE_AGENT",
+                                           "parts": [{"text": reply}]}}
+                })))
+                .mount(server)
+                .await;
+        }
+
+        /// A pack whose `assets/a2a-routes.json` names one team-scoped agent at
+        /// `server`.
+        fn pack_for(server: &MockServer) -> (tempfile::TempDir, Arc<crate::pack::PackRuntime>) {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+            let sidecar = json!([{
+                "agent_id": AGENT_ID,
+                "name": "Recipe agent",
+                "base_url": server.uri(),
+                "auth_header_name": null,
+                "auth_team": "sales",
+                "requires_auth": true
+            }]);
+            std::fs::write(
+                dir.path().join("assets/a2a-routes.json"),
+                sidecar.to_string(),
+            )
+            .unwrap();
+            let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(dir.path()));
+            (dir, pack)
+        }
+
+        struct MapSecrets(HashMap<String, Vec<u8>>);
+
+        #[async_trait::async_trait]
+        impl greentic_secrets_lib::SecretsManager for MapSecrets {
+            async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                self.0
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+            }
+            async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A store holding the token ONLY at the unit-scoped URI, so a call
+        /// that authenticates proves the tenant, the team and the unit all
+        /// reached the source.
+        fn unit_scoped_store() -> crate::secrets::DynSecretsManager {
+            let uri = greentic_aw_runtime::scoped_secrets::secret_uri_candidates(
+                "a2a",
+                TENANT,
+                Some("sales"),
+                Some(UNIT),
+                AGENT_ID,
+            )
+            .unwrap()
+            .remove(0);
+            assert!(uri.contains(".unit-"), "first candidate is the unit scope");
+            Arc::new(MapSecrets(HashMap::from([(uri, b"tok-1".to_vec())])))
+        }
+
+        #[allow(unsafe_code)]
+        fn set_gate(value: Option<&str>) {
+            // SAFETY: every caller is #[serial] (crate convention).
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("GREENTIC_AW_A2A", v),
+                    None => std::env::remove_var("GREENTIC_AW_A2A"),
+                }
+            }
+        }
+
+        /// LLM backend recording the tools offered on each call, then
+        /// replaying a script.
+        struct RecordingLlm {
+            responses: Mutex<Vec<LlmResponse>>,
+            offered: Mutex<Vec<Vec<(String, String)>>>,
+        }
+
+        impl LlmBackend for RecordingLlm {
+            fn complete<'a>(
+                &'a self,
+                req: LlmRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>>
+            {
+                self.offered.lock().unwrap().push(
+                    req.tools
+                        .iter()
+                        .map(|t| (t.extension_id.clone(), t.tool_name.clone()))
+                        .collect(),
+                );
+                let next = {
+                    let mut queue = self.responses.lock().unwrap();
+                    if queue.is_empty() {
+                        Err(LlmError::Transport("script exhausted".into()))
+                    } else {
+                        Ok(queue.remove(0))
+                    }
+                };
+                Box::pin(async move { next })
+            }
+        }
+
+        fn tool_ref() -> String {
+            format!("a2a:{AGENT_ID}")
+        }
+
+        /// The worker a specialist inherits from: it binds the `a2a:` tool
+        /// with the author contract the designer ships.
+        fn worker_with_a2a_tool() -> AgentConfig {
+            AgentConfig {
+                agent_id: "worker".into(),
+                system_prompt: "sys".into(),
+                tools: vec![ToolRef {
+                    extension_id: tool_ref(),
+                    tool_name: "ask".into(),
+                    description: Some("Ask the Recipe agent agent.".into()),
+                    input_schema: Some(json!({
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"]
+                    })),
+                    usage_note: None,
+                }],
+                llm: LlmProviderRef {
+                    provider: "mock".into(),
+                    model: "m".into(),
+                    credential_ref: None,
+                },
+                limits: AgentLimits::default(),
+                memory: None,
+                knowledge: None,
+                guardrails: vec![],
+                conversational: false,
+                opening_message: None,
+            }
+        }
+
+        /// Drive one graph agent turn through the PRODUCTION turn source (the
+        /// same `RuntimeTurnSource` `from_parts` builds), for a specialist that
+        /// inherits the worker's tools. Returns the reply and the tools offered
+        /// on the first LLM call.
+        async fn run_specialist_turn(
+            a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+            calls_tool: bool,
+        ) -> (String, Vec<(String, String)>) {
+            let mut script = Vec::new();
+            if calls_tool {
+                script.push(LlmResponse {
+                    content: None,
+                    tool_calls: vec![ToolCallRecord {
+                        call_id: "c1".into(),
+                        extension_id: tool_ref(),
+                        tool_name: "ask".into(),
+                        args: json!({"message": "eggs?"}),
+                    }],
+                    tokens_in: 5,
+                    tokens_out: 5,
+                });
+            }
+            script.push(LlmResponse {
+                content: Some("Try an omelette. [[RESOLVED]]".into()),
+                tool_calls: vec![],
+                tokens_in: 5,
+                tokens_out: 5,
+            });
+            let llm = Arc::new(RecordingLlm {
+                responses: Mutex::new(script),
+                offered: Mutex::new(Vec::new()),
+            });
+            let source = RuntimeTurnSource {
+                state_store: Arc::new(MockAgentStateStore::new()),
+                ext_runtime: Arc::new(ExtensionRuntime::for_test().unwrap()),
+                llm: llm.clone(),
+                telemetry: Arc::new(MockTelemetry::new()),
+                token_meter: Arc::new(MockTokenMeter::new(0)),
+                ledger: Arc::new(NoopToolLedger),
+                mcp_source: None,
+                a2a_source,
+                packs: Arc::new(vec![]),
+                merged_agents: Arc::new(HashMap::from([(
+                    "worker".to_string(),
+                    worker_with_a2a_tool(),
+                )])),
+            };
+            let real_tenant = greentic_types::TenantCtx::new(
+                greentic_types::EnvId::try_from("prod").unwrap(),
+                greentic_types::TenantId::try_from(TENANT).unwrap(),
+            );
+            let turn = source.agent_turn(None, real_tenant);
+            let result = turn(AgentTurnRequest {
+                node_id: "specialist".into(),
+                system_prompt: "You suggest recipes.".into(),
+                model: "m".into(),
+                state: GraphRunState::default(),
+                provider: Some("mock".into()),
+                tools: vec![],
+                agent_ref: None,
+                inherit_from: Some("worker".into()),
+            })
+            .await
+            .expect("the turn completes");
+            let offered = llm
+                .offered
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            (result.reply, offered)
+        }
+
+        /// (a) A graph agent turn is offered the `a2a:` tool from a pack
+        /// carrying `assets/a2a-routes.json`, and calling it reaches the agent
+        /// with the unit-scoped credential.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_graph_agent_turn_is_offered_and_calls_a_pack_carried_a2a_tool() {
+            set_gate(None);
+            let server = MockServer::start().await;
+            serve_agent(&server, "an omelette").await;
+            let (_dir, pack) = pack_for(&server);
+            let source = graph_a2a_source(&[pack], TENANT, &unit_scoped_store(), Some(UNIT));
+            assert!(source.is_some(), "the sidecar must yield a source");
+
+            let (reply, offered) = run_specialist_turn(source, true).await;
+
+            assert!(
+                offered.contains(&(tool_ref(), "ask".to_string())),
+                "the a2a tool must be offered to a graph agent turn; offered: {offered:?}"
+            );
+            assert_eq!(reply, "Try an omelette.");
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .expect("the agent must have been called");
+            assert_eq!(
+                post.headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer tok-1"),
+                "the credential is read at the unit scope the handler was built for"
+            );
+        }
+
+        /// (b) `GREENTIC_AW_A2A=0` disables the graph path too: no source is
+        /// built, so the turn is offered no `a2a:` tool.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn the_env_gate_disables_a2a_for_graph_turns() {
+            let server = MockServer::start().await;
+            serve_agent(&server, "unused").await;
+            let (_dir, pack) = pack_for(&server);
+            set_gate(Some("0"));
+            let gated = graph_a2a_source(
+                std::slice::from_ref(&pack),
+                TENANT,
+                &unit_scoped_store(),
+                Some(UNIT),
+            );
+            set_gate(None);
+            assert!(gated.is_none(), "the operator's kill switch must hold");
+
+            let (_, offered) = run_specialist_turn(gated, false).await;
+            assert!(
+                !offered.iter().any(|(ext, _)| ext.starts_with("a2a:")),
+                "a disabled A2A source must offer no a2a: tool; offered: {offered:?}"
+            );
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "a disabled source must never dial the agent"
+            );
+            assert!(
+                graph_a2a_source(&[pack], TENANT, &unit_scoped_store(), Some(UNIT)).is_some(),
+                "control: the same pack builds a source with the gate unset"
+            );
+        }
+
+        /// (c) A graph Tool node naming `a2a:<agent_id>/ask` dispatches through
+        /// the handler's A2A catalog rather than the extension runtime.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_graph_tool_node_dispatches_an_a2a_ref() {
+            set_gate(None);
+            let server = MockServer::start().await;
+            serve_agent(&server, "an omelette").await;
+            let (_dir, pack) = pack_for(&server);
+            let source = graph_a2a_source(&[pack], TENANT, &unit_scoped_store(), Some(UNIT));
+            let tool = build_tool(Arc::new(ExtensionRuntime::for_test().unwrap()), source);
+
+            let value = tool(ToolCallRequest {
+                node_id: "lookup".into(),
+                tool_name: format!("{}/ask", tool_ref()),
+                state: GraphRunState::default(),
+            })
+            .await
+            .expect("dispatch succeeds");
+
+            assert_eq!(value, json!({"reply": "an omelette"}));
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .expect("the agent must have been called");
+            assert_eq!(
+                post.headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer tok-1")
             );
         }
     }

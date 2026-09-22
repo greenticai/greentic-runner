@@ -614,7 +614,7 @@ mod aw {
     /// A failure to build from the variable falls back to the injected manager
     /// rather than to nothing: a malformed broker endpoint should degrade to
     /// the host's own resolution, not strip the agent of every credential.
-    fn mcp_secrets_manager(
+    pub(crate) fn mcp_secrets_manager(
         injected: &crate::secrets::DynSecretsManager,
     ) -> crate::secrets::DynSecretsManager {
         let requested = std::env::var("SECRETS_BACKEND").ok();
@@ -1769,10 +1769,12 @@ mod aw {
         .with_component_source(component_source_from_packs(&packs, &tenant))
         .with_flow_source(flow_source_from_packs(&packs, &tenant))
         .with_sorla_source(sorla_source_from_env().await)
-        // Pack-only: there is no admin A2A source to prefer. This one site
-        // covers deployed dw.agent units, the desktop runner and the designer's
-        // test-chat sidecar. `build_agent_runtime` (process-level serve, no
-        // packs) and graph turns stay without one, as they are for pack MCP.
+        // Pack-only: there is no admin A2A source to prefer. This site covers
+        // deployed dw.agent units, the desktop runner and the designer's
+        // test-chat sidecar; `graph_node::graph_a2a_source` builds the graph
+        // turns' source from the same inputs through the same helper.
+        // `build_agent_runtime` (process-level serve, no packs) stays without
+        // one, as it is for pack MCP.
         .with_a2a_source(crate::runner::a2a_pack_source::a2a_source_from_packs(
             &packs,
             &tenant,
@@ -4239,7 +4241,7 @@ pub use aw::build_agent_node_handler_ephemeral;
 #[cfg(feature = "agentic-worker")]
 pub(crate) use aw::{
     EnvSecretsBackend, build_ext_runtime, build_llm_backend, component_source_from_packs,
-    mcp_source_from_env,
+    mcp_secrets_manager, mcp_source_from_env,
 };
 
 // Only consumed by `runtime.rs`'s in-process operala.call wiring, which is
