@@ -8,9 +8,7 @@
 //! [`ToolSession`], and [`AwDeepWorkerTools`] adapts that session to the
 //! deep-worker tool contract.
 //!
-//! The contract itself (`DeepWorkerTools`) lives in greentic-dw and is not
-//! pinned here yet, so [`DeepWorkerToolsMirror`] mirrors its shape one-to-one;
-//! swapping the mirror for the real trait is mechanical.
+//! The contract itself is `greentic_dw_operala_invoker::DeepWorkerTools`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,24 +16,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use greentic_aw_runtime::config::AgentConfig;
-use greentic_aw_runtime::{AgentRuntime, TenantContext, ToolSession};
-use serde_json::Value;
-
-/// One tool as the deep worker presents it to its model. Mirrors
-/// `greentic_dw_operala_invoker::ToolSpec`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DeepWorkerToolSpec {
-    pub name: String,
-    pub description: String,
-    pub parameters: Value,
-}
-
-/// Local mirror of `greentic_dw_operala_invoker::DeepWorkerTools`.
-#[async_trait]
-pub trait DeepWorkerToolsMirror: Send + Sync {
-    fn list(&self) -> Vec<DeepWorkerToolSpec>;
-    async fn call(&self, name: &str, args: Value) -> Result<Value>;
-}
+use greentic_aw_runtime::{AgentRuntime, TenantContext, ToolSession, ToolSessionError};
+use greentic_dw_operala_invoker::{DeepWorkerTools, ToolSpec};
+use serde_json::{Value, json};
 
 /// The deep-worker tool contract over an aw-runtime [`ToolSession`].
 pub struct AwDeepWorkerTools {
@@ -50,12 +33,12 @@ impl AwDeepWorkerTools {
 }
 
 #[async_trait]
-impl DeepWorkerToolsMirror for AwDeepWorkerTools {
-    fn list(&self) -> Vec<DeepWorkerToolSpec> {
+impl DeepWorkerTools for AwDeepWorkerTools {
+    fn list(&self) -> Vec<ToolSpec> {
         self.session
             .schemas()
             .into_iter()
-            .map(|schema| DeepWorkerToolSpec {
+            .map(|schema| ToolSpec {
                 name: schema.wire_name,
                 description: schema.description,
                 parameters: schema.parameters,
@@ -63,11 +46,19 @@ impl DeepWorkerToolsMirror for AwDeepWorkerTools {
             .collect()
     }
 
+    /// A name outside the agent's allow-list is answered as a tool-level
+    /// error the model can read — the same observation the agent loop records
+    /// for a blocked call. Only a failed DISPATCH is an `Err`: the invoker
+    /// then does not cache it, so a transient extension failure stays
+    /// retryable, exactly as the loop leaves it out of the ledger.
     async fn call(&self, name: &str, args: Value) -> Result<Value> {
-        self.session
-            .call(name, args)
-            .await
-            .map_err(anyhow::Error::from)
+        match self.session.call(name, args).await {
+            Ok(value) => Ok(value),
+            Err(ToolSessionError::NotAllowed { .. }) => Ok(json!({
+                "error": format!("tool '{name}' is not allowed for this agent")
+            })),
+            Err(ToolSessionError::Dispatch(error)) => Err(anyhow::Error::new(error)),
+        }
     }
 }
 
@@ -358,12 +349,15 @@ mod tests {
                 .await
                 .expect("a declared tool dispatches");
             assert_eq!(out["flow"], "lookup");
+            let refused = tools
+                .call("greentic_DOT_mail_FN_send", json!({}))
+                .await
+                .expect("an undeclared tool is a tool-level answer, not an Err");
             assert!(
-                tools
-                    .call("greentic_DOT_mail_FN_send", json!({}))
-                    .await
-                    .is_err(),
-                "an undeclared tool must be refused"
+                refused["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("not allowed")),
+                "got {refused}"
             );
         }
 
@@ -390,6 +384,165 @@ mod tests {
                 ctx.tools_for("acme", "prod", "", "run", "s-1", &json!({}))
                     .await
                     .is_none()
+            );
+        }
+
+        /// Replays queued replies, one per `chat`; a reply of the form
+        /// `!tool:<name>:<json>` becomes a single tool call. Records the tool
+        /// names each request offered.
+        struct ScriptedLlm {
+            replies: std::sync::Mutex<std::collections::VecDeque<String>>,
+            offered: std::sync::Mutex<Vec<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl greentic_llm::LlmProvider for ScriptedLlm {
+            fn capabilities(&self) -> greentic_llm::Capabilities {
+                greentic_llm::Capabilities {
+                    chat: true,
+                    tools: true,
+                    streaming: false,
+                    vision: false,
+                    system_prompt: true,
+                }
+            }
+
+            fn provider_name(&self) -> &'static str {
+                "scripted"
+            }
+
+            fn model(&self) -> &str {
+                "scripted-model"
+            }
+
+            async fn chat(
+                &self,
+                req: greentic_llm::ChatRequest,
+            ) -> std::result::Result<greentic_llm::ChatResponse, greentic_llm::LlmError>
+            {
+                self.offered
+                    .lock()
+                    .expect("lock")
+                    .push(req.tools.iter().map(|tool| tool.name.clone()).collect());
+                let reply = self
+                    .replies
+                    .lock()
+                    .expect("lock")
+                    .pop_front()
+                    .unwrap_or_default();
+                if let Some(call) = reply.strip_prefix("!tool:") {
+                    let (name, args) = call.split_once(':').expect("!tool:<name>:<json>");
+                    return Ok(greentic_llm::ChatResponse {
+                        content: String::new(),
+                        tool_calls: vec![greentic_llm::ToolCall {
+                            id: "call-1".into(),
+                            name: name.to_string(),
+                            arguments: serde_json::from_str(args).expect("tool args"),
+                        }],
+                        finish_reason: greentic_llm::FinishReason::ToolCalls,
+                        usage: None,
+                    });
+                }
+                Ok(greentic_llm::ChatResponse {
+                    content: reply,
+                    tool_calls: vec![],
+                    finish_reason: greentic_llm::FinishReason::Stop,
+                    usage: None,
+                })
+            }
+
+            async fn chat_stream(
+                &self,
+                _req: greentic_llm::ChatRequest,
+            ) -> std::result::Result<greentic_llm::ChatStream, greentic_llm::LlmError> {
+                use futures::StreamExt;
+                Ok(
+                    futures::stream::iter(vec![Ok(greentic_llm::StreamEvent::Done {
+                        finish_reason: greentic_llm::FinishReason::Stop,
+                    })])
+                    .boxed(),
+                )
+            }
+        }
+
+        /// A one-step plan in the planner's serde shape.
+        fn one_step_plan() -> String {
+            json!({
+                "plan_id": "p", "goal": "g", "status": "active", "revision": 1,
+                "assumptions": [], "constraints": [],
+                "success_criteria": ["task completed"],
+                "steps": [{
+                    "step_id": "s1", "title": "Step s1", "kind": "tool_call",
+                    "status": "ready", "depends_on": [], "assigned_agent": null,
+                    "inputs_schema_ref": null, "output_schema_ref": null, "retry_count": 0
+                }],
+                "edges": [], "metadata": {}
+            })
+            .to_string()
+        }
+
+        /// The whole `operala.call` path: the handler resolves the worker's
+        /// tools through the AgentRuntime, hands them to the invoker, the
+        /// scripted model calls one by its wire name, and the flow's result
+        /// reaches the reply's input.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_handler_hands_the_workers_tools_to_the_deep_worker() {
+            use crate::runner::operala_node::{OperalaNodeHandler, RuntimeOperalaNodeHandler};
+
+            let mut agents = HashMap::new();
+            agents.insert(
+                "researcher".to_string(),
+                agent(
+                    "researcher",
+                    json!([{ "extension_id": "flow:lookup", "tool_name": "look_up" }]),
+                ),
+            );
+            let ctx = Arc::new(context(&agents));
+            let wire = greentic_aw_runtime::wire_tool_name("flow:lookup", "look_up");
+            let llm = Arc::new(ScriptedLlm {
+                replies: std::sync::Mutex::new(
+                    vec![
+                        one_step_plan(),
+                        r#"[{"step_id":"s1","action":"execute"}]"#.to_string(),
+                        format!("!tool:{wire}:{{\"q\":\"order 42\"}}"),
+                        "Order 42 was found.".to_string(),
+                        "[]".to_string(),
+                        "Order 42 exists.".to_string(),
+                    ]
+                    .into(),
+                ),
+                offered: std::sync::Mutex::new(Vec::new()),
+            });
+            let scripted = Arc::clone(&llm);
+            let handler = RuntimeOperalaNodeHandler::new("unused".into(), None, None, None)
+                .with_tool_context(Some(ctx))
+                .with_llm_factory(Arc::new(move |_provider: &str, _model: &str| {
+                    Ok(Arc::clone(&scripted) as Arc<dyn greentic_llm::LlmProvider>)
+                }));
+
+            let out = handler
+                .execute(
+                    "acme",
+                    "prod",
+                    "researcher",
+                    "run",
+                    "s-1",
+                    &json!({
+                        "goal": "find order 42",
+                        "llm": { "provider": "openai", "model": "m" },
+                        "deep_worker": { "reflection": false }
+                    }),
+                )
+                .await
+                .expect("operala.call runs");
+
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(out["reply"], "Order 42 exists.");
+            assert_eq!(out["output"]["tool_calls_used"], 1, "{out}");
+            let offered = llm.offered.lock().expect("lock").clone();
+            assert!(
+                offered.iter().any(|names| names == &vec![wire.clone()]),
+                "the deep worker must be offered the agent's tool, got {offered:?}"
             );
         }
     }

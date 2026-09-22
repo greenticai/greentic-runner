@@ -199,15 +199,22 @@ impl ToolSession {
         self
     }
 
-    /// Every tool the model may call, in declaration order.
+    /// Every tool the model may call, in declaration order, each under a
+    /// UNIQUE wire name. A second tool encoding to a name already listed —
+    /// the same tool declared twice, or a digest collision — is left out, so
+    /// the list agrees with the codec, which keeps the first binding.
     #[must_use]
     pub fn schemas(&self) -> Vec<ToolSessionSchema> {
+        let mut seen = std::collections::HashSet::new();
         self.schemas
             .iter()
-            .map(|s| ToolSessionSchema {
-                wire_name: wire_tool_name(&s.extension_id, &s.tool_name),
-                description: s.description.clone(),
-                parameters: s.parameters.clone(),
+            .filter_map(|s| {
+                let wire_name = wire_tool_name(&s.extension_id, &s.tool_name);
+                seen.insert(wire_name.clone()).then(|| ToolSessionSchema {
+                    wire_name,
+                    description: s.description.clone(),
+                    parameters: s.parameters.clone(),
+                })
             })
             .collect()
     }
@@ -439,6 +446,8 @@ mod tests {
         let tenant = TenantContext::new("acme", "prod");
         let tools = vec![
             component_ref(),
+            tool_ref("flow:lookup", "look_up"),
+            // Declared twice: listed once, since names must be unique.
             tool_ref("flow:lookup", "look_up"),
             // Declared but resolvable from no catalog: dropped, as the loop does.
             tool_ref("component:ghost", "nothing"),
