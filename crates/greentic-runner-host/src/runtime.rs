@@ -803,26 +803,16 @@ impl TenantRuntime {
             // Operator config overrides pack-provided agents on collision.
             let merged_agents = merge_agent_sources(pack_agents, config.agents.clone());
 
-            // First-boot ingest of any pack-baked knowledge corpus (W4 4c). Runs
-            // BEFORE the agent runtime mounts its serving knowledge connection:
-            // embedded SurrealDB allows one handle per store directory, so the
-            // temporary ingest connection must open and drop before the serving
-            // mount (inside build_agent_node_handler) opens its own. No-op without
-            // the `knowledge-chronicle` feature or when no pack carries a corpus.
-            #[cfg(feature = "knowledge-chronicle")]
-            {
-                // The expectation comes from the same config `ingest_corpus` will
-                // build its embedder from, so precomputed vectors are validated
-                // against the embedder that actually runs.
-                let expectation = crate::runner::knowledge_mount::embedding_expectation();
-                let corpus = crate::runner::knowledge_corpus::collect(
-                    &pack_runtimes,
-                    expectation.as_ref().map(|(model, dim)| {
-                        crate::runner::knowledge_corpus::EmbeddingExpectation { model, dim: *dim }
-                    }),
-                );
-                crate::runner::knowledge_mount::ingest_corpus(&config.tenant_ctx(), corpus).await;
-            }
+            // First-boot ingest of any pack-baked knowledge corpus (W4 4c), handed
+            // to every registered agent-runtime extension. Runs BEFORE the agent
+            // runtime mounts its serving knowledge connection: embedded SurrealDB
+            // allows one handle per store directory, so the temporary ingest
+            // connection must open and drop before the serving mount (inside
+            // build_agent_node_handler) opens its own. No-op when no extension is
+            // registered or no pack carries a corpus. `runtime_ext`'s
+            // `boot_ingests_before_any_runtime_is_built` pins this order.
+            crate::runner::runtime_ext::ingest_all_corpora(&pack_runtimes, &config.tenant_ctx())
+                .await;
 
             // DwAgent state-store selection. With GREENTIC_AW_REDIS_URL set, use the
             // Redis-backed stores. Without it, a `desktop-agent-ephemeral` build

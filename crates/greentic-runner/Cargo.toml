@@ -94,12 +94,11 @@ session-redis = ["greentic-runner-host/session-redis"]
 component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
 fault-injection = ["greentic-runner-host/fault-injection"]
 legacy-gen-bindings = []
-# Operator-configured Chronicle document-RAG (knowledge tier). Off by default
-# (pulls cross-org git deps + a native RocksDB build); enable for a knowledge
-# build: `--features knowledge-chronicle`.
-knowledge-chronicle = ["greentic-runner-host/knowledge-chronicle"]
-# Long-term episodic memory tier (same Chronicle stack, separate capability).
-long-term-chronicle = ["greentic-runner-host/long-term-chronicle"]
+# The Chronicle knowledge and long-term-memory tiers are not features of this
+# crate any more: a binary registers them through
+# `greentic_runner_host::runner::runtime_ext` and then calls `cli_main()`. The
+# private greentic-biz/greentic-chronicle-ext repository ships that binary as
+# `greentic-runner-full`.
 # No-infra agentic-worker state: process-global in-memory stores when
 # GREENTIC_AW_REDIS_URL is unset, so a single-process runner runs dw.agent turns
 # without Redis. For local/sidecar use (e.g. the designer's loopback test-chat

@@ -1,8 +1,12 @@
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: the CLI moved here from `main.rs` (see `cli_main`) and
+// sets two process environment variables, which is `unsafe` in edition 2024.
+// That one function opts back in; everything else stays denied.
+#![deny(unsafe_code)]
 // The merged `run_http_host` future nests the research agentic-dispatch path and
 // main's revision/fast2flow path in one async body, whose layout exceeds the
-// default query depth (128). 256 covers the combined nesting.
-#![recursion_limit = "256"]
+// default query depth (128). The CLI's `conformance::run()` layout, now compiled
+// here rather than in the binary, needs more still.
+#![recursion_limit = "512"]
 //! Canonical entrypoint for embedding the Greentic runner.
 //!
 //! This crate provides two supported integration paths:
@@ -24,8 +28,34 @@ pub mod desktop {
     pub use greentic_runner_desktop::*;
 }
 
+mod cli;
+mod cli_entry;
 pub mod gen_bindings;
 pub mod info;
+
+/// Run the stock `greentic-runner` command line: parse the process arguments,
+/// run the chosen subcommand (or the host), and on failure report the error and
+/// exit the process with status 1.
+///
+/// This is the whole of the `greentic-runner` binary. It is exposed so a binary
+/// that needs more than the published crates carry can add it and still ship
+/// the identical CLI:
+///
+/// ```ignore
+/// #[greentic_types::telemetry::main(service_name = "greentic-runner")]
+/// async fn main() {
+///     greentic_runner::host::runner::runtime_ext::register_agent_runtime_extension(
+///         std::sync::Arc::new(MyMemoryBackend),
+///     );
+///     greentic_runner::cli_main().await;
+/// }
+/// ```
+///
+/// Call it from inside a Tokio runtime with telemetry initialised, which is
+/// what the `telemetry::main` attribute provides.
+pub async fn cli_main() {
+    cli_entry::run().await;
+}
 
 /// Launch the canonical HTTP host. This is equivalent to running the
 /// `greentic-runner` binary with the provided [`RunnerConfig`].

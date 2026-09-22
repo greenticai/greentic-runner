@@ -89,44 +89,13 @@ desktop-agent-ephemeral = [
 # Split out of `desktop-agent-ephemeral` deliberately: the bypass must be named
 # by whoever wants it, not inherited from a feature about in-memory state.
 dev-allow-unsigned = ["agentic-worker", "greentic-aw-runtime?/dev-allow-unsigned"]
-# Wires an operator-configured native Chronicle (graphiti over Neo4j) long-term
-# memory backend into the agentic worker. Heavy (pulls the Chronicle graph
-# engine); off by default. The operator supplies Neo4j + the LLM and embedding
-# endpoints via GREENTIC_CHRONICLE_* env vars; chronicle is driven through the
-# provider-neutral DW LLM/embedding families (any OpenAI-compatible endpoint —
-# no single-provider lock). Absent the env, long-term stays disabled.
-long-term-chronicle = [
-    "agentic-worker",
-    "dep:greentic-dw-memory-chronicle",
-    "dep:greentic-dw-llm",
-    "dep:greentic-dw-llm-openai-compatible",
-    "dep:greentic-dw-embedding",
-    "dep:greentic-dw-embedding-openai-compatible",
-    # Turns on greentic-dw-providers-common's `pack-manifest-agents` feature so it
-    # emits PackManifest.agents against the greentic-types rev we pin (where that
-    # field is required). Without it the transitive common copy fails to compile.
-    "dep:greentic-dw-providers-common",
-]
-# Wires an operator-configured native Chronicle knowledge (document-RAG / W4)
-# backend into the agentic worker for auto pre-retrieval. Separate tier from
-# long-term-chronicle (own capability + own embedded store) but the same heavy
-# Chronicle stack; off by default. The operator supplies the embedding endpoint
-# via GREENTIC_KNOWLEDGE_EMBED_* and the graph store via GREENTIC_KNOWLEDGE_BACKEND
-# (defaults to embedded SurrealDB — no external graph server). Absent the embedding
-# env, knowledge stays disabled. The runner-host edge builds the SurrealDB driver
-# here (where bindgen / RocksDB live) and injects it into the provider.
-knowledge-chronicle = [
-    "agentic-worker",
-    "dep:greentic-dw-knowledge-chronicle",
-    "dep:greentic-dw-knowledge",
-    "dep:chronicle-core",
-    "dep:chronicle-driver-surreal",
-    "dep:chronicle-driver-neo4j",
-    "dep:chronicle-driver-falkor",
-    # Same greentic-types `agents` skew as long-term-chronicle (the knowledge
-    # crates transitively pull greentic-dw-providers-common).
-    "dep:greentic-dw-providers-common",
-]
+# Long-term memory and knowledge (document RAG) backends are not features of
+# this crate. They live in a private repository, and a published crate cannot
+# name a git dependency even as an optional one, so a binary that wants them
+# registers them at startup through `runner::runtime_ext` (the
+# `long-term-chronicle` / `knowledge-chronicle` features that used to compile
+# them in were removed for that reason; see greentic-runner-full in
+# greentic-biz/greentic-chronicle-ext).
 
 [dependencies]
 async-nats = "0.46"
@@ -138,21 +107,6 @@ base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.3.0-research.0", features = ["serve"], optional = true }
-greentic-dw-memory-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
-greentic-dw-llm = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
-greentic-dw-llm-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
-greentic-dw-embedding = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
-greentic-dw-embedding-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
-# Pulled only to enable its `pack-manifest-agents` feature (see the
-# long-term-chronicle feature). The crate is otherwise a transitive dep of the
-# openai-compatible providers above.
-greentic-dw-providers-common = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true, features = ["pack-manifest-agents"] }
-# Knowledge (document-RAG / W4) tier. The chronicle provider + its core trait/DTOs
-# come from greentic-dw-providers; the SurrealDB driver + GraphDriver trait come
-# from greentic-chronicle-ext and are built at this edge (bindgen / RocksDB live
-# here). All optional, gated by the `knowledge-chronicle` feature.
-greentic-dw-knowledge-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
-greentic-dw-knowledge = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
 # In-process deep-worker runtime for `operala.call` flow nodes (feature
 # `operala-in-process`; `desktop-agent-ephemeral` implies it). Pinned to the
 # SAME greentic-dw rev greentic-aw-runtime pins greentic-dw-manifest to, so the
@@ -165,10 +119,6 @@ greentic-dw-operala-bridge = { git = "https://github.com/greenticai/greentic-dw.
 # workspace; unified with greentic-dw-operala-invoker's own git-tag pin of the
 # same crate via the root `[patch."https://github.com/greenticai/greentic-llm"]`.
 greentic-llm = { version = "=1.3.1-research.0", optional = true }
-chronicle-core = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
-chronicle-driver-surreal = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
-chronicle-driver-neo4j = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
-chronicle-driver-falkor = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "74e5926fc900b260ae805d973aedee887d61313f", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true

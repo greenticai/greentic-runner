@@ -46,7 +46,10 @@ jobs:
   # `ci/local_check.sh`. Test *execution* stays with Nightly Coverage — this job
   # answers "does it build", which is the gap.
   #
-  # If a chronicle dep is ever added to this lane, this job will fail at
+  # Since the Chronicle split (long-term memory and knowledge moved behind
+  # `runner::runtime_ext`, their backends into the private
+  # greentic-biz/greentic-chronicle-ext), no lane of this repo names a PRIVATE
+  # git dependency at all. If one is ever added back, this job will fail at
   # dependency-fetch. That is the signal to provision the cross-org key, not to
   # delete the gate.
   clippy:
