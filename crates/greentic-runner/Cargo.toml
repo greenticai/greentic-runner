@@ -49,8 +49,8 @@ clap.workspace = true
 # `greentic-runner` produces a coherent (agentic-worker-OFF) feature graph
 # without touching any other member's defaults. See the `agentic-worker`
 # feature below, which re-forwards it for the default build.
-greentic-runner-host = { path = "../greentic-runner-host", version = "=1.3.0-research.0", default-features = false }
-greentic-runner-desktop = { path = "../greentic-runner-desktop", version = "=1.3.0-research.0", default-features = false }
+greentic-runner-host = { path = "../greentic-runner-host", version = ">=1.2.0-dev, <1.3.0-0", default-features = false }
+greentic-runner-desktop = { path = "../greentic-runner-desktop", version = ">=1.2.0-dev, <1.3.0-0", default-features = false }
 greentic-interfaces.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true

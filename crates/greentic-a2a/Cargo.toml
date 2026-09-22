@@ -1,9 +1,10 @@
 [package]
 name        = "greentic-a2a"
-version     = "0.1.0"
-edition     = "2024"
-license     = "MIT"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
 description = "A2A (Agent2Agent) v1.0 wire types and agent-card retrieval"
+repository  = "https://github.com/greentic-ai/greentic-runner"
 
 [dependencies]
 anyhow              = { workspace = true }

@@ -24,31 +24,37 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.3.0-research.0"
+version = "1.2.0-dev.0"
 
+# THE LANE. Every greentic dependency is a RANGE over the single `1.2.0-dev`
+# crates.io lane (`>=1.2.0-dev, <1.3.0-0`), because `dev-publish.yml` stamps
+# `1.2.0-dev.<RUN_ID>` on each push to develop and every repo in the chain has
+# to resolve whatever its neighbours published last. Two deliberate exceptions:
+# the designer-SDK crates track their own `1.2.24-dev` series, and
+# greentic-ext-runtime publishes plain `1.2.<RUN_ID>` releases.
+#
+# There is no `[patch.crates-io]` section any more, and nothing here may name a
+# git source: `cargo publish` refuses a dependency with a git source and no
+# registry version, optional or not, so one git dep makes the whole workspace
+# unpublishable.
 [workspace.dependencies]
 arc-swap = "1"
 async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
 futures = "0.3"
-greentic-flow = "=1.3.0-research.5"
-greentic-session = "=1.3.0-research.1"
-greentic-state = "=1.3.0-research.1"
-greentic-config = "=1.3.0-research.1"
-greentic-config-types = "=1.3.0-research.1"
-greentic-secrets-lib = "=1.3.0-research.3"
-greentic-trust = { git = "https://github.com/greenticai/greentic-trust", rev = "725fb4c" }
+greentic-flow = ">=1.2.0-dev, <1.3.0-0"
+greentic-session = ">=1.2.0-dev, <1.3.0-0"
+greentic-state = ">=1.2.0-dev, <1.3.0-0"
+greentic-config = ">=1.2.0-dev, <1.3.0-0"
+greentic-config-types = ">=1.2.0-dev, <1.3.0-0"
+greentic-secrets-lib = ">=1.2.0-dev, <1.3.0-0"
+greentic-trust = "0.2"
 # Additive (from main): runner-host uses `greentic_deploy_spec::ids::{RevisionId,BundleId}`.
-# Pinned to the research line so it unifies with greentic-start/greentic-deployer
-# (which cross deploy-spec types with runner-host) instead of forking a 0.2.x copy.
-#
-# 1.3.0-research.3 (greentic-start#595): greentic-deployer develop's deploy-spec,
-# moved onto the research line — the first research build carrying
-# `blob_base_url` / `resolve_default_bundle` / `DefaultBundleReason`, which
-# greentic-start uses. flow research.5, pack-lib research.13, distributor-client
-# research.4 and secrets-lib research.3 moved with it (see [patch.crates-io]).
-greentic-deploy-spec = "=1.3.0-research.3"
+# The range is what unifies it with greentic-start/greentic-deployer, which
+# cross deploy-spec types with runner-host: every repo in the chain resolves the
+# same dev-lane publish instead of forking a copy of its own.
+greentic-deploy-spec = ">=1.2.0-dev, <1.3.0-0"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
@@ -77,9 +83,9 @@ tempfile = "3"
 tiny_http = "0.12"
 serial_test = "3"
 toml = "1"
-# Floor pinned to the C5.1 publish: `TelemetryCtx::kv()` must include
-# `gt.pack_id` for the C5.4 export path; earlier dev publishes lack it.
-greentic-telemetry = ">=1.1.0-0, <1.2.0-0"
+# `TelemetryCtx::kv()` must include `gt.pack_id` for the C5.4 export path; every
+# 1.2 dev publish carries it (the floor it used to name was on the 1.1 line).
+greentic-telemetry = ">=1.2.0-dev, <1.3.0-0"
 walkdir = "2"
 wasmtime-wasi-http = "45"
 wasmtime-wasi-tls = "45"
@@ -114,13 +120,12 @@ features = [
     "pkcs8",
 ]
 
-# Floor pinned to the M1.4b-ii publish (PR #134): adds
-# `attr_keys::MESSAGING_ENDPOINT_ID` and the `tenant_ctx_to_telemetry` bridge
-# mapping it onto `TelemetryCtx::messaging_endpoint_id`. Earlier dev publishes
-# (incl. M1.1a) lack the const, so `tenant_ctx()` in
-# `engine::runtime::IngressEnvelope` would fail to compile.
+# Needs `attr_keys::MESSAGING_ENDPOINT_ID` and the `tenant_ctx_to_telemetry`
+# bridge mapping it onto `TelemetryCtx::messaging_endpoint_id`; without them
+# `tenant_ctx()` in `engine::runtime::IngressEnvelope` does not compile. Both
+# are on the whole 1.2 dev lane.
 [workspace.dependencies.greentic-types]
-version = "=1.3.0-research.1"
+version = ">=1.2.0-dev, <1.3.0-0"
 default-features = false
 features = [
     "std",
@@ -131,54 +136,54 @@ features = [
 
 [workspace.dependencies.greentic_pack]
 package = "greentic-pack-lib"
-version = "=1.3.0-research.13"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.greentic-distributor-client]
-version = "=1.3.0-research.4"
+version = ">=1.2.0-dev, <1.3.0-0"
 features = [
     "dist-client",
 ]
 
 [workspace.dependencies.greentic-interfaces]
-version = "=1.3.0-research.1"
+version = ">=1.2.0-dev, <1.3.0-0"
 default-features = false
 features = [
     "bindings-rust",
 ]
 
 [workspace.dependencies.greentic-interfaces-guest]
-version = "=1.3.0-research.1"
+version = ">=1.2.0-dev, <1.3.0-0"
 default-features = false
 
 [workspace.dependencies.greentic-interfaces-host]
-version = "=1.3.0-research.1"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.greentic-interfaces-wasmtime]
-version = "=1.3.0-research.1"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.greentic-x-runtime]
-version = "0.4.20"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.greentic-x-types]
-version = "0.4.20"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.greentic-oauth-sdk]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.greentic-oauth-host]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.greentic-runner-host]
 path = "crates/greentic-runner-host"
-version = "=1.3.0-research.0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.greentic-runner-desktop]
 path = "crates/greentic-runner-desktop"
-version = "=1.3.0-research.0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.runner-core]
 path = "crates/runner-core"
-version = "=1.3.0-research.0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [workspace.dependencies.reqwest]
 version = "0.13"
@@ -270,43 +275,3 @@ features = [
 [profile.release.package.echo-secret]
 opt-level = "z"
 strip = true
-
-# SDK 1.2.4-research is git-tagged only (the SDK repo's research line is
-# intentionally not republished to crates.io). Redirect the crates.io
-# requirement from greentic-ext-runtime v1.2.13-research onto the git
-# tag so the workspace can adopt it without waiting on a registry release.
-[patch.crates-io]
-# Research-line chain (greentic-start#595). crates.io publishing is locked
-# fleet-wide, so these research-line builds (each develop's code under a
-# never-published number) exist only in git. greentic-secrets-spec is patched
-# because greentic-deploy-spec requires it from crates.io; without it the graph
-# holds two secrets-spec copies. A patch section does not travel into a
-# published crate; every consumer carries the same set at its own root.
-# TO UNWIND once publishing is restored: delete these lines, `cargo update`.
-greentic-flow = { git = "https://github.com/greenticai/greentic-flow", rev = "348cceb857034ad6533905d747328dca13c1b610" }
-greentic-pack-lib = { git = "https://github.com/greenticai/greentic-pack", rev = "46851ce1477c4b440aad7f7e3032260d63f85109" }
-greentic-distributor-client = { git = "https://github.com/greenticai/greentic-distributor-client", rev = "d594bb896c9722f439bf3c0cb98a3b85afb9b540" }
-greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
-greentic-secrets-spec = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
-greentic-deploy-spec = { git = "https://github.com/greenticai/greentic-deployer", rev = "a706eea6db1e8f20a5460ea7af0470ff9c53f552" }
-greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.5" }
-# greentic-ext-runtime now anchors describe signatures to a TOFU publisher-key
-# store, reusing sdk-registry's `TrustStore` rather than porting it. That pulls
-# -registry (and its -state dep) into this graph; neither is on crates.io, so
-# both need the same tag redirect as -contract above. Keep all three on ONE tag:
-# they are `=`-pinned to each other, so a split resolves two crate instances.
-greentic-extension-sdk-registry = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.5" }
-greentic-extension-sdk-state = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.5" }
-
-# `greentic-dw-operala-invoker` (and its sibling `*-llm` provider crates in
-# greentic-dw) pin `greentic-llm` via a git tag (v1.2.6-research), while this
-# workspace already depends on the same crate published to crates.io
-# (=1.3.1-research.0, pulled transitively through greentic-aw-runtime's
-# `greentic-llm-backend` feature and now also directly by greentic-runner-host
-# for the in-process operala wiring). Without unifying the two, `Arc<dyn
-# greentic_llm::LlmProvider>` built against the registry crate would not type-
-# match `DeepWorkerInvoker::new`, which expects the git crate's trait object.
-# Redirect the git source onto the registry release so both resolve to a
-# single crate instance (reverse of the SDK/mcp-exec patches above).
-[patch."https://github.com/greenticai/greentic-llm"]
-greentic-llm = { version = "=1.3.1-research.0" }

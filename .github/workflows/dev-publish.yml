@@ -41,7 +41,7 @@ jobs:
     uses: greenticai/.github/.github/workflows/dev-publish.yml@main
     with:
       version: ${{ needs.dev-prepare.outputs.version }}
-      crates: "runner-core aw-event-bridge greentic-aw-runtime greentic-runner-host greentic-runner-desktop greentic-runner"
+      crates: "runner-core greentic-a2a aw-event-bridge greentic-aw-runtime greentic-runner-host greentic-runner-desktop greentic-runner"
       binary-version: ${{ needs.dev-prepare.outputs.binary-version }}
       binary-crates: "greentic-runner"
       dual-role-binary-crates: "greentic-runner"
