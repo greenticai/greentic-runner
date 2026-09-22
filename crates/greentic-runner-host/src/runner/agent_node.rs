@@ -1907,9 +1907,15 @@ mod aw {
     /// Returns `None` (so `DwAgent` flow dispatch errors clearly) under any of
     /// these graceful-degradation conditions:
     /// - `merged_agents` is empty (no agents from packs or operator config);
-    /// - `GREENTIC_AW_REDIS_URL` is unset/empty;
+    /// - `GREENTIC_AW_STATE_BACKEND=redis` with `GREENTIC_AW_REDIS_URL`
+    ///   unset/empty;
     /// - the AW Redis connection fails;
     /// - the extension runtime fails to initialise.
+    ///
+    /// An unset `GREENTIC_AW_REDIS_URL` on its own is NOT one of them: the
+    /// state backend then auto-selects the process-global in-memory store
+    /// (`aw_backends::build_aw_backends`), so this server path runs `dw.agent`
+    /// — and hands `operala.call` deep workers their tools — with no Redis.
     ///
     /// `merged_agents` is the result of merging pack-embedded agents (base)
     /// with operator-declared [`HostConfig::agents`] (operator wins on
@@ -2113,8 +2119,8 @@ mod aw {
     /// resolved LLM backend, design extensions, agent config providers, MCP).
     ///
     /// Returns `None` under the same graceful-degradation conditions as the node
-    /// handler: empty agent map, missing/unreachable `GREENTIC_AW_REDIS_URL`, or
-    /// extension-runtime init failure.
+    /// handler: empty agent map, a disabled or unreachable state backend (see
+    /// [`build_agent_node_handler`]), or extension-runtime init failure.
     pub async fn build_agent_runtime(
         merged_agents: HashMap<String, AgentConfig>,
     ) -> Option<Arc<AgentRuntime>> {
@@ -2701,6 +2707,78 @@ mod aw {
                 "in-process dw.agent must consult the billing service; got {wallet_calls} \
                  wallet requests, which means it is still running on NoopBillingMeter \
                  and its LLM spend is never metered"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // State-store prerequisite of the server (non-ephemeral) path
+        // -------------------------------------------------------------------
+
+        /// The SERVER builder — the one greentic-start and the distroless
+        /// image use, since they do not enable `desktop-agent-ephemeral` —
+        /// must build the agent runtime with NO Redis configured.
+        ///
+        /// That runtime is also the tool surface `runtime.rs` hands to
+        /// `operala.call` deep workers (`OperalaToolContext`), so this pins
+        /// both halves of one claim: a Redis-less deployment runs `dw.agent`
+        /// AND gives its deep workers their tools. It was documented as the
+        /// opposite ("no state store: set GREENTIC_AW_REDIS_URL") after
+        /// `build_aw_backends` had already made Redis optional.
+        ///
+        /// The control proves the assertion is about the backend selector,
+        /// not a builder that never returns `None`: naming the redis backend
+        /// without a URL is an honest misconfiguration and disables both.
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn server_builder_wires_the_agent_runtime_without_redis() {
+            let empty_extensions = tempfile::tempdir().expect("tempdir");
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_REDIS_URL");
+                std::env::remove_var("GREENTIC_AW_STATE_BACKEND");
+                std::env::remove_var("GREENTIC_AW_STATE_PATH");
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+                std::env::set_var("GREENTIC_EXTENSIONS_DIR", empty_extensions.path());
+            }
+
+            async fn build() -> Option<AgentNodeWiring> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                build_agent_node_wiring(
+                    agents,
+                    "acme".to_string(),
+                    crate::secrets::default_manager().expect("env secrets manager"),
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+
+            let without_redis = build().await;
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_STATE_BACKEND", "redis");
+            }
+            let explicit_redis_without_url = build().await;
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_STATE_BACKEND");
+                std::env::remove_var("GREENTIC_EXTENSIONS_DIR");
+            }
+
+            assert!(
+                without_redis.is_some(),
+                "with GREENTIC_AW_REDIS_URL unset the server builder must fall back to \
+                 the in-memory state store and build the runtime dw.agent and \
+                 operala.call deep workers share"
+            );
+            assert!(
+                explicit_redis_without_url.is_none(),
+                "GREENTIC_AW_STATE_BACKEND=redis with no URL must disable the runtime"
             );
         }
 

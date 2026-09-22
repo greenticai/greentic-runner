@@ -825,12 +825,15 @@ impl TenantRuntime {
             }
 
             // DwAgent state-store selection. With GREENTIC_AW_REDIS_URL set, use the
-            // Redis-backed stores (production multi-process default). Without it, when
-            // built with `desktop-agent-ephemeral`, fall back to the process-global
-            // in-memory stores so a single-process runner (e.g. the designer's
-            // loopback test-chat sidecar) runs agentic-worker turns with NO external
-            // infra. Otherwise DwAgent nodes stay disabled — unchanged server
-            // behaviour (build_agent_node_handler returns None when Redis is unset).
+            // Redis-backed stores. Without it, a `desktop-agent-ephemeral` build
+            // uses its own process-global in-memory stores; every OTHER build
+            // (greentic-start, the distroless image) goes through
+            // `build_aw_backends`, which with no Redis URL auto-selects the
+            // shared in-memory KV (or redb under GREENTIC_AW_STATE_BACKEND=disk).
+            // So a missing Redis URL does NOT disable dw.agent in any build. The
+            // runtime is absent only when there are no agents, when
+            // GREENTIC_AW_STATE_BACKEND=redis names no URL, when Redis is
+            // unreachable, or when the extension runtime fails to initialise.
             let redis_set = std::env::var("GREENTIC_AW_REDIS_URL")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
@@ -927,10 +930,12 @@ impl TenantRuntime {
                 use crate::runner::operala_tools::OperalaToolContext;
 
                 // Deep workers call their agent's bound tools through the SAME
-                // AgentRuntime dw.agent uses. Without one (no agents, or no
-                // state store: GREENTIC_AW_REDIS_URL unset in a build without
-                // `desktop-agent-ephemeral`) they run tool-less, which an
-                // operator must be able to see.
+                // AgentRuntime dw.agent uses, so the two share one prerequisite.
+                // A missing Redis URL is NOT one (see the state-store selection
+                // above). Without a runtime — an explicit redis backend with no
+                // URL, an unreachable Redis, or a failed extension runtime, all of
+                // which also leave dw.agent unwired — deep workers run tool-less,
+                // which an operator must be able to see.
                 let operala_tools = match operala_agent_runtime {
                     Some(runtime) => Some(Arc::new(OperalaToolContext::new(
                         runtime,
@@ -941,9 +946,11 @@ impl TenantRuntime {
                         if operala_agents.values().any(|agent| !agent.tools.is_empty()) {
                             tracing::warn!(
                                 tenant = %config.tenant,
-                                "no agent runtime was built for this tenant (no state store: \
-                                 set GREENTIC_AW_REDIS_URL); operala.call deep workers will run \
-                                 WITHOUT the tools their agents declare"
+                                "no agent runtime was built for this tenant (dw.agent is \
+                                 unwired too: GREENTIC_AW_STATE_BACKEND=redis without \
+                                 GREENTIC_AW_REDIS_URL, Redis unreachable, or the extension \
+                                 runtime failed; see the earlier log lines); operala.call deep \
+                                 workers will run WITHOUT the tools their agents declare"
                             );
                         }
                         None

@@ -38,7 +38,13 @@ logged and silently skipped (the LLM simply never sees it).
 Prerequisites:
 - The extension is installed in the extension discovery dir
   (`GREENTIC_EXTENSIONS_DIR`, else `~/.greentic/extensions`).
-- `GREENTIC_AW_REDIS_URL` is set (the agent loop persists session state in Redis).
+- A state store. Redis is optional: with `GREENTIC_AW_REDIS_URL` set the agent
+  loop persists session state there; without it the runner uses a
+  process-global in-memory store (state is lost on restart), or redb under
+  `GREENTIC_AW_STATE_BACKEND=disk` (`GREENTIC_AW_STATE_PATH`). This holds for
+  every build, including greentic-start and its distroless image, which do not
+  enable `desktop-agent-ephemeral`. Only `GREENTIC_AW_STATE_BACKEND=redis`
+  without a URL, or an unreachable Redis, disables the agent runtime.
 
 ## Method 2 — manifest overlay
 
@@ -203,9 +209,13 @@ to the agent loop's conversation state. An `operala.call` carries no caller
 block, so extension and component tools receive an anonymous
 (`user_verified: false`) caller stamp.
 
-**When there are none.** Tools need an agent runtime, which needs a state
-store. Without `GREENTIC_AW_REDIS_URL`, and in a build without
-`desktop-agent-ephemeral`, no runtime is built. In that case deep workers run
-tool-less, and at startup the runner logs a `warn` if any agent declares
-tools. Tools are also skipped when the worker's model does not support tool
-calling.
+**When there are none.** Tools come from the unit's agent runtime, the same
+one `dw.agent` runs on, so a deep worker has tools exactly when `dw.agent` is
+wired. Redis is not a prerequisite: without `GREENTIC_AW_REDIS_URL` the runtime
+uses the in-memory (or `disk`) state store described above, in every build.
+No runtime is built when the unit carries no agents, when
+`GREENTIC_AW_STATE_BACKEND=redis` names no URL, when Redis is unreachable, or
+when the extension runtime fails to initialise. `dw.agent` is unwired in each
+of those cases too. Deep workers then run tool-less, and at startup the runner
+logs a `warn` if any agent declares tools. Tools are also skipped when the
+worker's model does not support tool calling.

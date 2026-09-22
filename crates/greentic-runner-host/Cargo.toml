@@ -55,8 +55,11 @@ operala-in-process = [
 ]
 # Adds the ephemeral (in-memory) agent builder for desktop/local runs.
 # Enables the test-mock types from greentic-aw-runtime; must NOT be enabled
-# in the server binary — the server always uses the Redis path. A server that
-# wants in-process `operala.call` enables `operala-in-process` instead.
+# in the server binary. The server does not need it for Redis-free runs:
+# `aw_backends::build_aw_backends` picks the shared in-memory store (or redb
+# under GREENTIC_AW_STATE_BACKEND=disk) when GREENTIC_AW_REDIS_URL is unset.
+# A server that wants in-process `operala.call` enables `operala-in-process`
+# instead.
 desktop-agent-ephemeral = [
     "agentic-worker",
     # dw.agent MUST use the multi-provider in-process backend (GreenticLlmBackend
