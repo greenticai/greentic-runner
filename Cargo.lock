@@ -3427,7 +3427,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-context"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3437,7 +3437,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-context-llm"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "greentic-dw-context",
  "greentic-dw-workspace",
@@ -3448,7 +3448,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-core"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "greentic-dw-manifest",
  "greentic-dw-types",
@@ -3458,7 +3458,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-delegation"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3468,7 +3468,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-delegation-llm"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3507,7 +3507,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-engine"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "greentic-dw-core",
  "greentic-dw-types",
@@ -3576,7 +3576,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-manifest"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-planning",
@@ -3626,7 +3626,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-operala-bridge"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3641,7 +3641,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-operala-invoker"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3669,7 +3669,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-pack"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "greentic-cap-resolver",
  "greentic-cap-schema",
@@ -3683,7 +3683,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-planning"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3694,7 +3694,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-planning-llm"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3726,7 +3726,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-reflection"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3736,7 +3736,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-reflection-llm"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3751,7 +3751,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-runtime"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-context",
@@ -3771,7 +3771,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-types"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "greentic-cap-types",
  "schemars 1.2.1",
@@ -3783,7 +3783,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-workspace"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3793,7 +3793,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-workspace-mem"
 version = "0.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=506036a8266b9f2c456d22c77fdc0b616657db07#506036a8266b9f2c456d22c77fdc0b616657db07"
 dependencies = [
  "blake3",
  "greentic-dw-workspace",
