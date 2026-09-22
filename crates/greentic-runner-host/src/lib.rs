@@ -487,7 +487,9 @@ fn telemetry_from_env(
 ///
 /// Skips with a warning (continuing normal startup) when no agents are
 /// configured; [`serve_agentic`] itself further degrades gracefully when the
-/// runtime cannot be built (no `GREENTIC_AW_REDIS_URL` / LLM key). The spawned
+/// runtime cannot be built (an explicit redis backend with no URL, an
+/// unreachable Redis, or a failed extension runtime; a missing
+/// `GREENTIC_AW_REDIS_URL` alone selects the in-memory store). The spawned
 /// task owns the subscriber for the lifetime of the process.
 #[cfg(feature = "agentic-worker")]
 fn maybe_spawn_inproc_agentic_serve() {
