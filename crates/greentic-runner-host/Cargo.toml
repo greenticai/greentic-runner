@@ -151,9 +151,9 @@ greentic-dw-providers-common = { git = "https://github.com/greenticai/greentic-d
 greentic-dw-knowledge-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
 greentic-dw-knowledge = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272", optional = true }
 # In-process deep-worker runtime for `operala.call` flow nodes (feature
-# `operala-in-process`; `desktop-agent-ephemeral` implies it). Same git source
-# (greentic-dw, branch research) the runner already pulls greentic-dw-manifest
-# from via greentic-aw-runtime, so this reuses the already-locked commit.
+# `operala-in-process`; `desktop-agent-ephemeral` implies it). Pinned to the
+# SAME greentic-dw rev greentic-aw-runtime pins greentic-dw-manifest to, so the
+# graph keeps a single greentic-dw source — move all three together.
 greentic-dw-operala-invoker = { git = "https://github.com/greenticai/greentic-dw.git", rev = "506036a8266b9f2c456d22c77fdc0b616657db07", optional = true }
 greentic-dw-operala-bridge = { git = "https://github.com/greenticai/greentic-dw.git", rev = "506036a8266b9f2c456d22c77fdc0b616657db07", optional = true }
 # Needed directly (not just transitively via greentic-aw-runtime) to build the
