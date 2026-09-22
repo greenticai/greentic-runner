@@ -118,6 +118,7 @@ mod dw {
     use serde_json::Value;
 
     use super::{OperalaNodeHandler, resolve_operala_provider_model};
+    use crate::runner::operala_tools::{DeepWorkerToolsMirror, OperalaToolContext};
 
     /// Production [`OperalaNodeHandler`]: builds the deep-worker's LLM from the
     /// WORKER's own `input.llm` provider/model binding, resolved per dispatch,
@@ -131,6 +132,10 @@ mod dw {
         base_url: Option<String>,
         fallback_provider: Option<String>,
         fallback_model: Option<String>,
+        /// The worker's bound tools. `None` when this `TenantRuntime` built no
+        /// `AgentRuntime` (no agents, or no state store) — the deep worker
+        /// then runs tool-less, as it did before tools existed.
+        tools: Option<Arc<OperalaToolContext>>,
     }
 
     impl RuntimeOperalaNodeHandler {
@@ -145,7 +150,15 @@ mod dw {
                 base_url,
                 fallback_provider,
                 fallback_model,
+                tools: None,
             }
+        }
+
+        /// Give deep workers access to their agent's bound tools.
+        #[must_use]
+        pub fn with_tool_context(mut self, tools: Option<Arc<OperalaToolContext>>) -> Self {
+            self.tools = tools;
+            self
         }
 
         /// Build a [`DeepWorkerInvoker`] whose LLM provider/model come from the
@@ -191,6 +204,23 @@ mod dw {
             input: &Value,
         ) -> Result<Value> {
             let invoker = self.build_invoker(input)?;
+            let deep_worker_tools = match &self.tools {
+                Some(ctx) => {
+                    ctx.tools_for(tenant, env, target, operation, session_id, input)
+                        .await
+                }
+                None => None,
+            };
+            // Resolved through the same AgentRuntime a dw.agent step uses; the
+            // hand-off to the invoker (`with_tools`) lands with the greentic-dw
+            // bump that introduces `DeepWorkerTools`.
+            if let Some(tools) = &deep_worker_tools {
+                tracing::debug!(
+                    target,
+                    tools = tools.list().len(),
+                    "resolved deep-worker tools for operala.call"
+                );
+            }
             let idempotency_key = (!session_id.trim().is_empty()).then_some(session_id);
             let outcome = invoker
                 .invoke(
@@ -244,23 +274,54 @@ mod dw {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Option<String>>,
     {
+        select_operala_handler_with_tools(
+            dispatch_env,
+            resolve_key,
+            base_url,
+            fallback_provider,
+            fallback_model,
+            None,
+        )
+        .await
+    }
+
+    /// [`select_operala_handler`], giving the in-process handler access to the
+    /// deep workers' bound tools through `tools`.
+    pub async fn select_operala_handler_with_tools<F, Fut>(
+        dispatch_env: Option<&str>,
+        resolve_key: F,
+        base_url: Option<String>,
+        fallback_provider: Option<String>,
+        fallback_model: Option<String>,
+        tools: Option<Arc<OperalaToolContext>>,
+    ) -> OperalaSelection
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
         if !super::operala_dispatch_in_process(dispatch_env) {
             return OperalaSelection::Nats;
         }
         match resolve_key().await {
-            Some(api_key) => OperalaSelection::InProcess(Arc::new(RuntimeOperalaNodeHandler::new(
-                api_key,
-                base_url,
-                fallback_provider,
-                fallback_model,
-            ))),
+            Some(api_key) => OperalaSelection::InProcess(Arc::new(
+                RuntimeOperalaNodeHandler::new(
+                    api_key,
+                    base_url,
+                    fallback_provider,
+                    fallback_model,
+                )
+                .with_tool_context(tools),
+            )),
             None => OperalaSelection::NoKey,
         }
     }
 }
 
 #[cfg(feature = "operala-in-process")]
-pub use dw::{OperalaSelection, RuntimeOperalaNodeHandler, select_operala_handler};
+pub use dw::{
+    OperalaSelection, RuntimeOperalaNodeHandler, select_operala_handler,
+    select_operala_handler_with_tools,
+};
 
 #[cfg(test)]
 mod tests {

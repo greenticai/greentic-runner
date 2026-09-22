@@ -1867,7 +1867,7 @@ mod aw {
         audit_sink: Option<AuditSink>,
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
-    ) -> Option<Arc<dyn AgentNodeHandler>> {
+    ) -> Option<AgentNodeWiring> {
         // The deployed unit (`bundle_id`) doubles as the MCP credential scope:
         // the same identity billing attributes this runtime's spend to.
         let runtime = build_runtime_with_stores(
@@ -1882,12 +1882,24 @@ mod aw {
             project_id.clone(),
         )
         .await?;
-        Some(Arc::new(RuntimeAgentNodeHandler::new(
-            runtime,
+        let handler: Arc<dyn AgentNodeHandler> = Arc::new(RuntimeAgentNodeHandler::new(
+            Arc::clone(&runtime),
             audit_sink,
             stream_observers,
             project_id,
-        )))
+        ));
+        Some(AgentNodeWiring { handler, runtime })
+    }
+
+    /// The `dw.agent` handler together with the [`AgentRuntime`] it drives.
+    ///
+    /// The runtime is exposed so other in-process node handlers of the SAME
+    /// `TenantRuntime` — the `operala.call` deep worker — can reuse its tool
+    /// catalogs, secrets scope and ledger instead of building a second,
+    /// divergent runtime.
+    pub struct AgentNodeWiring {
+        pub handler: Arc<dyn AgentNodeHandler>,
+        pub runtime: Arc<AgentRuntime>,
     }
 
     /// Build the production `DwAgent` handler if the environment is configured.
@@ -1937,6 +1949,36 @@ mod aw {
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
+        // Boxed so this wrapper adds no depth to the caller's future layout:
+        // the runner-desktop `run_pack_async` future already sits close to
+        // rustc's query-depth limit.
+        Box::pin(build_agent_node_wiring(
+            merged_agents,
+            tenant,
+            secrets,
+            ext_llm_port,
+            packs,
+            audit_sink,
+            stream_observers,
+            project_id,
+        ))
+        .await
+        .map(|wiring| wiring.handler)
+    }
+
+    /// [`build_agent_node_handler`], also returning the [`AgentRuntime`] the
+    /// handler drives (see [`AgentNodeWiring`]). Same `None` conditions.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_agent_node_wiring(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+        audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
+    ) -> Option<AgentNodeWiring> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
         if merged_agents.is_empty() {
@@ -1990,6 +2032,37 @@ mod aw {
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
+        // Boxed so this wrapper adds no depth to the caller's future layout:
+        // the runner-desktop `run_pack_async` future already sits close to
+        // rustc's query-depth limit.
+        Box::pin(build_agent_node_wiring_ephemeral(
+            merged_agents,
+            tenant,
+            secrets,
+            ext_llm_port,
+            packs,
+            audit_sink,
+            stream_observers,
+            project_id,
+        ))
+        .await
+        .map(|wiring| wiring.handler)
+    }
+
+    /// [`build_agent_node_handler_ephemeral`], also returning the
+    /// [`AgentRuntime`] the handler drives (see [`AgentNodeWiring`]).
+    #[cfg(feature = "desktop-agent-ephemeral")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_agent_node_wiring_ephemeral(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+        audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
+    ) -> Option<AgentNodeWiring> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
         use std::sync::OnceLock;
@@ -2595,7 +2668,8 @@ mod aw {
                 None,
             )
             .await
-            .expect("handler should build from mock stores");
+            .expect("handler should build from mock stores")
+            .handler;
 
             let _ = handler
                 .execute(
@@ -4230,13 +4304,13 @@ pub fn dw_agent_dispatch_mode(get_env: impl Fn(&str) -> Option<String>) -> DwAge
 
 #[cfg(feature = "agentic-worker")]
 pub use aw::{
-    HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
-    build_agent_node_handler, build_agent_runtime, load_process_agent_configs, merge_agent_sources,
-    merge_sidecar_into, serve_agentic,
+    AgentNodeWiring, HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
+    build_agent_node_handler, build_agent_node_wiring, build_agent_runtime,
+    load_process_agent_configs, merge_agent_sources, merge_sidecar_into, serve_agentic,
 };
 
 #[cfg(feature = "desktop-agent-ephemeral")]
-pub use aw::build_agent_node_handler_ephemeral;
+pub use aw::{build_agent_node_handler_ephemeral, build_agent_node_wiring_ephemeral};
 
 #[cfg(feature = "agentic-worker")]
 pub(crate) use aw::{
