@@ -1053,11 +1053,18 @@ impl TenantRuntime {
                 graphs.insert(graph_id, graph_config);
             }
 
+            // Tenant, secrets manager and deployed unit are the same three
+            // values the `dw.agent` handler above receives, so a graph turn's
+            // `a2a:` tools resolve the same credentials a single-turn worker's
+            // would.
             if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(
                 graphs,
                 agent_audit_sink.clone(),
                 Arc::new(pack_runtimes.clone()),
                 graph_agents,
+                config.tenant.clone(),
+                Arc::clone(&secrets_manager),
+                agent_project_id.clone(),
             )
             .await
             {
