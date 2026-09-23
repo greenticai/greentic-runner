@@ -3,6 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use greentic_session::inmemory::InMemorySessionStore;
 use greentic_session::{SessionData, SessionKey as StoreSessionKey, SessionStore};
@@ -18,28 +19,42 @@ use crate::engine::host::{
     OutboxKey, SessionCursor, SessionHost, SessionKey, SessionOutboxEntry, SessionSnapshot,
     WaitState,
 };
+use crate::storage::config::SessionBackend;
+use crate::storage::offload::{Offloaded, StoreKind};
 
 pub type DynSessionStore = Arc<dyn SessionStore>;
 
 /// Adapter that backs the runner session host with a greentic-session store.
+///
+/// The store is held behind [`Offloaded`], so every call reaches it through
+/// `spawn_blocking` — `SessionStore` is a synchronous trait and its Redis
+/// implementation blocks on a socket.
 pub struct SessionStoreHost {
-    store: DynSessionStore,
+    store: Offloaded<dyn SessionStore>,
 }
 
 impl SessionStoreHost {
     pub fn new(store: DynSessionStore) -> Self {
-        Self { store }
+        Self {
+            store: Offloaded::new(store, StoreKind::Session),
+        }
     }
 
-    fn lookup_entry(&self, key: &SessionKey) -> GResult<Option<StoreEntry>> {
+    async fn lookup_entry(&self, key: &SessionKey) -> GResult<Option<StoreEntry>> {
         let base_ctx = tenant_ctx_from_key(key)?;
         let user = user_id_from_key(key)?;
         let ctx = base_ctx.clone().with_user(Some(user.clone()));
-        #[allow(deprecated)]
-        let result = self
-            .store
-            .find_by_user(&ctx, &user)
-            .map_err(map_store_error)?;
+        let result = {
+            let ctx = ctx.clone();
+            let user = user.clone();
+            self.store
+                .call(move |store| {
+                    #[allow(deprecated)]
+                    store.find_by_user(&ctx, &user)
+                })
+                .await
+                .map_err(map_store_error)?
+        };
         if let Some((store_key, data)) = result {
             let snapshot = decode_snapshot(&data)?;
             if snapshot.key.tenant_key != key.tenant_key
@@ -60,30 +75,28 @@ impl SessionStoreHost {
         }
     }
 
-    fn upsert(
+    async fn upsert(
         &self,
         snapshot: &SessionSnapshot,
         ctx: TenantCtx,
         user: &UserId,
     ) -> GResult<StoreSessionKey> {
         let data = encode_snapshot(snapshot, ctx.clone(), user)?;
-        #[allow(deprecated)]
-        let existing = self
-            .store
-            .find_by_user(&ctx, user)
-            .map_err(map_store_error)?;
-        match existing {
-            Some((store_key, _)) => {
-                self.store
-                    .update_session(&store_key, data)
-                    .map_err(map_store_error)?;
-                Ok(store_key)
-            }
-            None => self
-                .store
-                .create_session(&ctx, data)
-                .map_err(map_store_error),
-        }
+        let user = user.clone();
+        self.store
+            .call(move |store| {
+                #[allow(deprecated)]
+                let existing = store.find_by_user(&ctx, &user)?;
+                match existing {
+                    Some((store_key, _)) => {
+                        store.update_session(&store_key, data)?;
+                        Ok(store_key)
+                    }
+                    None => store.create_session(&ctx, data),
+                }
+            })
+            .await
+            .map_err(map_store_error)
     }
 }
 
@@ -98,6 +111,64 @@ pub fn new_session_store() -> DynSessionStore {
     Arc::new(InMemorySessionStore::new())
 }
 
+/// Build the session store named by `backend`.
+///
+/// The Redis arm goes through `greentic_session::create_session_store` rather
+/// than naming `RedisSessionStore`: that type lives in a private `backends`
+/// module, so the factory is the only public door to it.
+pub fn store_from_config(backend: &SessionBackend) -> Result<DynSessionStore> {
+    match backend {
+        SessionBackend::InMemory => Ok(new_session_store()),
+        SessionBackend::Redis { url, namespace } => redis_store(url, namespace),
+    }
+}
+
+#[cfg(feature = "session-redis")]
+fn redis_store(url: &str, namespace: &str) -> Result<DynSessionStore> {
+    use anyhow::Context;
+    use greentic_session::{SessionBackendConfig, create_session_store};
+
+    let store = create_session_store(SessionBackendConfig::RedisUrlWithNamespace {
+        url: url.to_string(),
+        namespace: namespace.to_string(),
+    })
+    .map_err(|err| anyhow!("{err}"))
+    .with_context(|| format!("failed to open the Redis session store under '{namespace}'"))?;
+    let store: DynSessionStore = Arc::from(store);
+    probe(&store, namespace)?;
+    Ok(store)
+}
+
+#[cfg(not(feature = "session-redis"))]
+fn redis_store(_url: &str, namespace: &str) -> Result<DynSessionStore> {
+    // Refuse rather than fall back: a host asked for durable sessions and this
+    // build cannot provide them, so starting with in-memory ones would be a
+    // deployment that silently restarts every conversation.
+    Err(anyhow!(
+        "a Redis session store was configured (namespace '{namespace}') but this build of          greentic-runner-host lacks the `session-redis` feature; rebuild with it enabled          rather than starting on in-memory sessions"
+    ))
+}
+
+/// Force a connection so an unreachable backend fails here rather than in front
+/// of a user.
+///
+/// `redis::Client::open` parses the URL and opens no socket, so construction
+/// alone proves nothing. This reads one key that is never written; both a hit
+/// and a miss are success, and only a transport failure is an error.
+#[cfg(feature = "session-redis")]
+fn probe(store: &DynSessionStore, namespace: &str) -> Result<()> {
+    use anyhow::Context;
+
+    let probe_key = StoreSessionKey::new("greentic-runner-host::startup-probe");
+    store
+        .get_session(&probe_key)
+        .map(|_| ())
+        .map_err(|err| anyhow!("{err}"))
+        .with_context(|| {
+            format!("the configured Redis session store (namespace '{namespace}') is unreachable")
+        })
+}
+
 pub fn session_host_from(store: DynSessionStore) -> Arc<dyn SessionHost> {
     Arc::new(SessionStoreHost::new(store))
 }
@@ -105,14 +176,14 @@ pub fn session_host_from(store: DynSessionStore) -> Arc<dyn SessionHost> {
 #[async_trait]
 impl SessionHost for SessionStoreHost {
     async fn get(&self, key: &SessionKey) -> GResult<Option<SessionSnapshot>> {
-        Ok(self.lookup_entry(key)?.map(|entry| entry.snapshot))
+        Ok(self.lookup_entry(key).await?.map(|entry| entry.snapshot))
     }
 
     async fn put(&self, snapshot: SessionSnapshot) -> GResult<()> {
         let base_ctx = tenant_ctx_from_key(&snapshot.key)?;
         let user = user_id_from_key(&snapshot.key)?;
         let ctx = base_ctx.with_user(Some(user.clone()));
-        self.upsert(&snapshot, ctx, &user)?;
+        self.upsert(&snapshot, ctx, &user).await?;
         Ok(())
     }
 
@@ -121,30 +192,31 @@ impl SessionHost for SessionStoreHost {
         mut snapshot: SessionSnapshot,
         expected_revision: u64,
     ) -> GResult<bool> {
-        let Some(entry) = self.lookup_entry(&snapshot.key)? else {
+        let Some(entry) = self.lookup_entry(&snapshot.key).await? else {
             return Ok(false);
         };
         if entry.snapshot.revision != expected_revision {
             return Ok(false);
         }
         snapshot.revision = expected_revision.saturating_add(1);
-        self.upsert(&snapshot, entry.ctx, &entry.user)?;
+        self.upsert(&snapshot, entry.ctx, &entry.user).await?;
         Ok(true)
     }
 
     async fn delete(&self, key: &SessionKey) -> GResult<()> {
-        if let Some(entry) = self.lookup_entry(key)? {
+        if let Some(entry) = self.lookup_entry(key).await? {
             self.store
-                .remove_session(&entry.key)
+                .call(move |store| store.remove_session(&entry.key))
+                .await
                 .map_err(map_store_error)?;
         }
         Ok(())
     }
 
     async fn touch(&self, key: &SessionKey, ttl: Duration) -> GResult<()> {
-        if let Some(mut entry) = self.lookup_entry(key)? {
+        if let Some(mut entry) = self.lookup_entry(key).await? {
             entry.snapshot.ttl = ttl;
-            self.upsert(&entry.snapshot, entry.ctx, &entry.user)?;
+            self.upsert(&entry.snapshot, entry.ctx, &entry.user).await?;
         }
         Ok(())
     }

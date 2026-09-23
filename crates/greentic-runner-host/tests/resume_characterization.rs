@@ -338,11 +338,11 @@ fn flow_pauses_at_wait_then_resumes_to_completion() -> Result<()> {
     // ---- Persist + reload the snapshot via the production resume store. ----
     let envelope = ingress_envelope();
     let resume_store = FlowResumeStore::new(new_session_store());
-    let _reply_scope = resume_store
-        .save(&envelope, &wait)
+    let _reply_scope = rt
+        .block_on(resume_store.save(&envelope, &wait))
         .context("resume store should persist the wait snapshot")?;
-    let loaded: FlowSnapshot = resume_store
-        .fetch(&envelope)
+    let loaded: FlowSnapshot = rt
+        .block_on(resume_store.fetch(&envelope))
         .context("resume store fetch failed")?
         .context("snapshot should be retrievable after save")?;
     assert_eq!(loaded.next_node, wait.snapshot.next_node);
@@ -363,11 +363,10 @@ fn flow_pauses_at_wait_then_resumes_to_completion() -> Result<()> {
 
     // After completion, the resume store entry is no longer needed; clearing it
     // mirrors what `PackFlowAdapter::call` does on `FlowStatus::Completed`.
-    resume_store
-        .clear(&envelope)
+    rt.block_on(resume_store.clear(&envelope))
         .context("clear after completion")?;
     assert!(
-        resume_store.fetch(&envelope)?.is_none(),
+        rt.block_on(resume_store.fetch(&envelope))?.is_none(),
         "snapshot should be gone after clear"
     );
 

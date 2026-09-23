@@ -11,8 +11,20 @@ keywords = ["greentic", "runner", "wasmtime", "mcp", "flows"]
 categories = ["asynchronous", "api-bindings", "command-line-utilities"]
 
 [features]
-default = ["verify", "agentic-worker", "state-disk"]
+default = ["verify", "agentic-worker", "state-disk", "session-redis"]
 verify = []
+# Redis-backed parked-flow sessions (`storage::SessionBackend::Redis`).
+#
+# ON by default since the durable-storage work, and the cost of that is nil:
+# `greentic-state` already enables `redis` in ITS defaults, so the `redis`
+# crate is in this graph whether or not this feature is on. Leaving it off
+# would have meant the only way to get a durable session store into a
+# deployed worker was a downstream Cargo edit in greentic-start.
+#
+# With the feature off, `storage::SessionBackend::Redis` still EXISTS — the
+# config type does not change shape with features, because greentic-start
+# compiles against it — and asking for it is a loud build-time refusal rather
+# than a quiet fall back to in-memory sessions.
 session-redis = ["greentic-session/redis"]
 fault-injection = []
 component-v0-6-introspection = []

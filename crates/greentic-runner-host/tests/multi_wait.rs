@@ -54,8 +54,8 @@ fn wait_for(next_node: &str) -> FlowWait {
     }
 }
 
-#[test]
-fn reply_scope_routes_waits_independently() -> GResult<()> {
+#[tokio::test]
+async fn reply_scope_routes_waits_independently() -> GResult<()> {
     let store = FlowResumeStore::new(new_session_store());
     let envelope_a = envelope_for("conv-a");
     let envelope_b = envelope_for("conv-b");
@@ -63,16 +63,16 @@ fn reply_scope_routes_waits_independently() -> GResult<()> {
     let wait_a = wait_for("node-a");
     let wait_b = wait_for("node-b");
 
-    let _ = store.save(&envelope_a, &wait_a)?;
-    let _ = store.save(&envelope_b, &wait_b)?;
+    let _ = store.save(&envelope_a, &wait_a).await?;
+    let _ = store.save(&envelope_b, &wait_b).await?;
 
-    let snapshot_a = store.fetch(&envelope_a)?.expect("snapshot A missing");
-    let snapshot_b = store.fetch(&envelope_b)?.expect("snapshot B missing");
+    let snapshot_a = store.fetch(&envelope_a).await?.expect("snapshot A missing");
+    let snapshot_b = store.fetch(&envelope_b).await?.expect("snapshot B missing");
 
     assert_eq!(snapshot_a.next_node, "node-a");
     assert_eq!(snapshot_b.next_node, "node-b");
 
-    store.clear(&envelope_a)?;
-    store.clear(&envelope_b)?;
+    store.clear(&envelope_a).await?;
+    store.clear(&envelope_b).await?;
     Ok(())
 }

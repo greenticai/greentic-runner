@@ -417,7 +417,7 @@ async fn sorla_call_resumes_via_external_nats_bridge() {
     //    (Note: a fast external bridge could in principle resume before this
     //    check runs; the load-bearing assertion is the consumption poll below,
     //    so we only warn rather than fail if the wait is already gone.)
-    match observe_store.fetch(&envelope) {
+    match observe_store.fetch(&envelope).await {
         Ok(Some(_)) => { /* paused as expected */ }
         Ok(None) => eprintln!(
             "note: wait already consumed before the pause assertion \
@@ -431,7 +431,7 @@ async fn sorla_call_resumes_via_external_nats_bridge() {
     //    the flow. Fail with a clear message if it never consumes in time.
     let consumed = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            match observe_store.fetch(&envelope) {
+            match observe_store.fetch(&envelope).await {
                 Ok(None) => break,
                 Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(150)).await,
                 Err(error) => panic!("failed to inspect the saved wait while polling: {error}"),
@@ -600,7 +600,7 @@ async fn sorla_call_resumes_via_real_sorx_deployment() {
     //    real listener + resumer resumed + completed the flow off the real reply.
     let consumed = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            match observe_store.fetch(&envelope) {
+            match observe_store.fetch(&envelope).await {
                 Ok(None) => break,
                 Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(150)).await,
                 Err(error) => panic!("failed to inspect the saved wait while polling: {error}"),
@@ -760,7 +760,7 @@ async fn operala_call_resumes_via_real_operax_deployment() {
     //    real listener + resumer resumed + completed the flow off the real reply.
     let consumed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match observe_store.fetch(&envelope) {
+            match observe_store.fetch(&envelope).await {
                 Ok(None) => break,
                 Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(150)).await,
                 Err(error) => panic!("failed to inspect the saved wait while polling: {error}"),

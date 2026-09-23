@@ -80,6 +80,52 @@ jobs:
       - name: Clippy (host, operala-in-process without desktop-agent-ephemeral)
         run: cargo clippy -p greentic-runner-host --all-targets --features operala-in-process --locked -- -D warnings
 
+  # Durable-storage gate. The rest of this workflow answers "does it build";
+  # this one answers "does a parked conversation actually survive the process",
+  # which is the only question the Redis-backed stores exist to answer and the
+  # one a compile check cannot reach.
+  #
+  # It runs on every PR rather than in Nightly Coverage on purpose: these tests
+  # skip themselves when REDIS_URL is absent, and a durability gate that skips
+  # silently is worse than none — it reads green. GREENTIC_REDIS_TESTS_REQUIRED
+  # turns that skip into a failure, so removing the service block below breaks
+  # the job loudly instead of quietly disarming it.
+  redis-storage:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-wasip2
+
+      - name: Install wasm32-wasip2 target
+        run: rustup target add wasm32-wasip2 --toolchain 1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Durable session and flow-state stores
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+          GREENTIC_REDIS_TESTS_REQUIRED: "1"
+        run: |
+          cargo test -p greentic-runner-host --test redis_lb_safety --locked
+          cargo test -p greentic-runner-host --test storage_config --locked
+          cargo test -p greentic-runner-host --lib storage:: --locked
+
   fmt:
     runs-on: ubuntu-latest
     steps:

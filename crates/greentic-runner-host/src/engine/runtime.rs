@@ -40,6 +40,18 @@ use crate::trace::{PackTraceInfo, TraceContext, TraceMode, TraceRecorder};
 const DEFAULT_ENV: &str = "local";
 const PACK_FLOW_ADAPTER: &str = "pack_flow";
 
+/// Reads and writes the parked-flow wait that makes a conversation resumable.
+///
+/// Every method is `async` because the backing `SessionStore` may be Redis, and
+/// `SessionStore` is a SYNCHRONOUS trait whose Redis implementation blocks on a
+/// socket. The store round-trips run on [`tokio::task::spawn_blocking`]; the key
+/// derivation around them is pure and stays on the caller's thread.
+///
+/// These three were synchronous before durable storage was configurable, which
+/// was harmless while the only backend was an in-process `HashMap`. It is not
+/// harmless now: this is the hot path of every parked turn, so leaving it
+/// blocking would park one tokio worker per concurrent resume — invisible in a
+/// test and a throughput collapse in a deployment.
 #[derive(Clone)]
 pub struct FlowResumeStore {
     store: DynSessionStore,
@@ -50,7 +62,7 @@ impl FlowResumeStore {
         Self { store }
     }
 
-    pub fn fetch(&self, envelope: &IngressEnvelope) -> GResult<Option<FlowSnapshot>> {
+    pub async fn fetch(&self, envelope: &IngressEnvelope) -> GResult<Option<FlowSnapshot>> {
         let (mut ctx, user, _, scope) = build_store_ctx(envelope)?;
         ctx = ctx.with_user(Some(user.clone()));
 
@@ -61,39 +73,36 @@ impl FlowResumeStore {
             scopes.push(base);
         }
 
-        for lookup in scopes {
-            if let Some(key) = self
-                .store
-                .find_wait_by_scope(&ctx, &user, &lookup)
-                .map_err(map_store_error)?
-            {
-                let Some(data) = self.store.get_session(&key).map_err(map_store_error)? else {
+        let expected_pack = envelope.pack_id.clone();
+        let store = Arc::clone(&self.store);
+        offload(move || {
+            for lookup in scopes {
+                let Some(key) = store.find_wait_by_scope(&ctx, &user, &lookup)? else {
+                    continue;
+                };
+                let Some(data) = store.get_session(&key)? else {
                     continue;
                 };
                 let record: FlowResumeRecord =
                     serde_json::from_str(&data.context_json).map_err(|err| {
-                        RunnerError::Session {
-                            reason: format!("failed to decode flow resume snapshot: {err}"),
-                        }
+                        decode_failure(format!("failed to decode flow resume snapshot: {err}"))
                     })?;
-                if let Some(pack_id) = envelope.pack_id.as_deref()
+                if let Some(pack_id) = expected_pack.as_deref()
                     && record.snapshot.pack_id != pack_id
                 {
-                    return Err(RunnerError::Session {
-                        reason: format!(
-                            "resume pack mismatch: expected {pack_id}, found {}",
-                            record.snapshot.pack_id
-                        ),
-                    });
+                    return Err(decode_failure(format!(
+                        "resume pack mismatch: expected {pack_id}, found {}",
+                        record.snapshot.pack_id
+                    )));
                 }
                 return Ok(Some(record.snapshot));
             }
-        }
-
-        Ok(None)
+            Ok(None)
+        })
+        .await
     }
 
-    pub fn save(&self, envelope: &IngressEnvelope, wait: &FlowWait) -> GResult<ReplyScope> {
+    pub async fn save(&self, envelope: &IngressEnvelope, wait: &FlowWait) -> GResult<ReplyScope> {
         let (ctx, user, hint, scope) = build_store_ctx(envelope)?;
         let record = FlowResumeRecord {
             snapshot: wait.snapshot.clone(),
@@ -107,13 +116,13 @@ impl FlowResumeStore {
         let mut store_scope = scope;
         store_scope.correlation = None;
         let session_key = StoreSessionKey::new(format!("{hint}::{}", store_scope.scope_hash()));
-        self.store
-            .register_wait(&ctx, &user, &store_scope, &session_key, data, None)
-            .map_err(map_store_error)?;
+        let store = Arc::clone(&self.store);
+        offload(move || store.register_wait(&ctx, &user, &store_scope, &session_key, data, None))
+            .await?;
         Ok(reply_scope)
     }
 
-    pub fn clear(&self, envelope: &IngressEnvelope) -> GResult<()> {
+    pub async fn clear(&self, envelope: &IngressEnvelope) -> GResult<()> {
         let (ctx, user, _, scope) = build_store_ctx(envelope)?;
         let mut scopes = vec![scope.clone()];
         if scope.correlation.is_some() {
@@ -121,12 +130,14 @@ impl FlowResumeStore {
             base.correlation = None;
             scopes.push(base);
         }
-        for lookup in scopes {
-            self.store
-                .clear_wait(&ctx, &user, &lookup)
-                .map_err(map_store_error)?;
-        }
-        Ok(())
+        let store = Arc::clone(&self.store);
+        offload(move || {
+            for lookup in scopes {
+                store.clear_wait(&ctx, &user, &lookup)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Returns the `(tenant_ctx, user_id)` pair this store derives from
@@ -212,6 +223,34 @@ fn map_store_error(err: GreenticError) -> RunnerError {
     }
 }
 
+/// A decode/consistency failure raised from inside an offloaded closure.
+///
+/// The closure's error channel is the store's own `GreenticError`, so a reason
+/// that did not come from the store still travels as one and is mapped back to
+/// `RunnerError::Session` by [`offload`] — the same variant the caller saw when
+/// these methods were synchronous.
+fn decode_failure(reason: impl Into<String>) -> GreenticError {
+    GreenticError::new(greentic_types::ErrorCode::Internal, reason)
+}
+
+/// Run a blocking session-store call on the blocking pool.
+///
+/// `spawn_blocking` rather than `block_in_place`: the latter panics on a
+/// `current_thread` runtime and inside a `LocalSet`, and this is a library —
+/// the embedder picks the runtime flavour, not us.
+async fn offload<F, T>(f: F) -> GResult<T>
+where
+    F: FnOnce() -> Result<T, GreenticError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result.map_err(map_store_error),
+        Err(err) => Err(RunnerError::Session {
+            reason: format!("session store call panicked or was cancelled: {err}"),
+        }),
+    }
+}
+
 fn generate_correlation_id() -> String {
     let mut bytes = [0u8; 16];
     rng().fill(&mut bytes);
@@ -282,53 +321,53 @@ mod tests {
         assert!(a.as_str().starts_with("sess"));
     }
 
-    #[test]
-    fn resume_store_roundtrip() -> GResult<()> {
+    #[tokio::test]
+    async fn resume_store_roundtrip() -> GResult<()> {
         let store = FlowResumeStore::new(new_session_store());
         let envelope = sample_envelope();
-        assert!(store.fetch(&envelope)?.is_none());
+        assert!(store.fetch(&envelope).await?.is_none());
 
         let wait = sample_wait();
-        let _ = store.save(&envelope, &wait)?;
-        let snapshot = store.fetch(&envelope)?.expect("snapshot missing");
+        let _ = store.save(&envelope, &wait).await?;
+        let snapshot = store.fetch(&envelope).await?.expect("snapshot missing");
         assert_eq!(snapshot.flow_id, wait.snapshot.flow_id);
         assert_eq!(snapshot.next_node, wait.snapshot.next_node);
 
-        store.clear(&envelope)?;
-        assert!(store.fetch(&envelope)?.is_none());
+        store.clear(&envelope).await?;
+        assert!(store.fetch(&envelope).await?.is_none());
         Ok(())
     }
 
-    #[test]
-    fn resume_store_overwrites_existing() -> GResult<()> {
+    #[tokio::test]
+    async fn resume_store_overwrites_existing() -> GResult<()> {
         let store = FlowResumeStore::new(new_session_store());
         let envelope = sample_envelope();
         let mut wait = sample_wait();
-        let _ = store.save(&envelope, &wait)?;
+        let _ = store.save(&envelope, &wait).await?;
 
         wait.snapshot.next_node = "node-3".into();
         wait.reason = Some("retry".into());
-        let _ = store.save(&envelope, &wait)?;
+        let _ = store.save(&envelope, &wait).await?;
 
-        let snapshot = store.fetch(&envelope)?.expect("snapshot missing");
+        let snapshot = store.fetch(&envelope).await?.expect("snapshot missing");
         assert_eq!(snapshot.next_node, "node-3");
-        store.clear(&envelope)?;
+        store.clear(&envelope).await?;
         Ok(())
     }
 
-    #[test]
-    fn resume_store_uses_snapshot_even_if_envelope_flow_differs() -> GResult<()> {
+    #[tokio::test]
+    async fn resume_store_uses_snapshot_even_if_envelope_flow_differs() -> GResult<()> {
         let store = FlowResumeStore::new(new_session_store());
         let envelope = sample_envelope();
         let wait = sample_wait();
-        let _ = store.save(&envelope, &wait)?;
+        let _ = store.save(&envelope, &wait).await?;
 
         let mut redirected = envelope.clone();
         redirected.flow_id = "flow.other".into();
-        let snapshot = store.fetch(&redirected)?.expect("snapshot missing");
+        let snapshot = store.fetch(&redirected).await?.expect("snapshot missing");
         assert_eq!(snapshot.flow_id, wait.snapshot.flow_id);
 
-        store.clear(&envelope)?;
+        store.clear(&envelope).await?;
         Ok(())
     }
 
@@ -802,7 +841,7 @@ impl Adapter for PackFlowAdapter {
         let provider_owned = envelope.provider.clone();
         let payload = envelope.payload.clone();
         let retry_config = self.config.retry_config().into();
-        let resume_snapshot = self.resume.fetch(&envelope)?;
+        let resume_snapshot = self.resume.fetch(&envelope).await?;
         let resume_flow_id = resume_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.next_flow.clone())
@@ -957,11 +996,11 @@ impl Adapter for PackFlowAdapter {
         } = execution;
         match status {
             FlowStatus::Completed => {
-                self.resume.clear(&envelope)?;
+                self.resume.clear(&envelope).await?;
                 Ok((output, node_outputs))
             }
             FlowStatus::Waiting(wait) => {
-                let reply_scope = self.resume.save(&envelope, &wait)?;
+                let reply_scope = self.resume.save(&envelope, &wait).await?;
                 let outcome = json!({
                     "status": "pending",
                     "reason": wait.reason,
