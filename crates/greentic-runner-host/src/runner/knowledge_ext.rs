@@ -322,7 +322,8 @@ impl Knowledge for ExtensionKnowledge {
     }
 }
 
-/// The first backend in the runtime's wrapper chain that is NOT this adapter —
+/// The first backend in the runtime's wrapper chain that is NOT this adapter
+/// or the Chronicle-index wrapper (`knowledge_index`) mounted beneath it —
 /// i.e. the corpus backend, if one was mounted underneath.
 ///
 /// Walks the whole chain rather than unwrapping one layer:
@@ -341,7 +342,8 @@ pub fn corpus_backend(runtime: &AgentRuntime) -> Option<Arc<dyn Knowledge>> {
 fn corpus_in_chain(top: Option<Arc<dyn Knowledge>>) -> Option<Arc<dyn Knowledge>> {
     let mut current = top;
     while let Some(backend) = current {
-        if backend.backend_id() != BACKEND_ID {
+        let id = backend.backend_id();
+        if id != BACKEND_ID && id != crate::runner::knowledge_index::BACKEND_ID {
             return Some(backend);
         }
         current = backend.wrapped_backend();
@@ -803,6 +805,40 @@ mod tests {
         );
     }
 
+    /// Every production site mounts the Chronicle-index wrapper directly
+    /// beneath this adapter, so the corpus sits two delegating layers down.
+    /// The walk must pass BOTH, or the in-process `dw.agent` guard would read
+    /// the index wrapper as a corpus and a worker with no corpus as having one.
+    #[test]
+    fn corpus_backend_skips_the_index_wrapper() {
+        let corpus: Arc<dyn Knowledge> = Arc::new(RecordingInner {
+            ingested: std::sync::Mutex::new(Vec::new()),
+        });
+        let index: Arc<dyn Knowledge> = Arc::new(
+            crate::runner::knowledge_index::ChronicleIndexKnowledge::new(
+                Some(corpus.clone()),
+                None,
+                None,
+            ),
+        );
+        let top: Arc<dyn Knowledge> = Arc::new(adapter(Some(index.clone())));
+
+        let found = corpus_in_chain(Some(top)).expect("the corpus is underneath");
+        assert!(
+            Arc::ptr_eq(&found, &corpus),
+            "found `{}` instead of the corpus",
+            found.backend_id()
+        );
+
+        let bare: Arc<dyn Knowledge> = Arc::new(adapter(Some(Arc::new(
+            crate::runner::knowledge_index::ChronicleIndexKnowledge::new(None, None, None),
+        ))));
+        assert!(
+            corpus_in_chain(Some(bare)).is_none(),
+            "the index wrapper alone is not a corpus"
+        );
+    }
+
     #[tokio::test]
     async fn with_nothing_wrapped_a_foreign_binding_is_not_configured() {
         let chronicle = binding("provider.knowledge.chronicle", serde_json::json!({}));
@@ -860,6 +896,9 @@ mod call_site_ratchet {
     const EXTENSION_MOUNT: &str = "knowledge_ext::attach(";
     /// Every runtime construction, mounted or not.
     const CONSTRUCTOR: &str = "AgentRuntime::new(";
+    /// The Chronicle-index mount, in its two spellings: the direct call, and the
+    /// graph lane's pre-built mount context.
+    const INDEX_MOUNTS: &[&str] = &["knowledge_index::attach(", "index_mount.attach("];
 
     /// Files that construct an `AgentRuntime` WITHOUT mounting this adapter, and
     /// how many such constructions each is allowed.
@@ -905,6 +944,13 @@ mod call_site_ratchet {
             "one test constructor: the seam's own unit tests need a runtime with \
              nothing mounted, so every backend in the result is the extensions' \
              doing",
+        ),
+        (
+            "src/runner/knowledge_index/tests.rs",
+            1,
+            "one test constructor: proves the graph lane's `IndexMount` reads \
+             credentials under the tenant it captured, over a runtime with \
+             nothing else mounted",
         ),
         (
             "src/runner/engine.rs",
@@ -1027,6 +1073,64 @@ mod call_site_ratchet {
         );
     }
 
+    fn is_code(line: &str) -> bool {
+        let t = line.trim_start();
+        !t.starts_with("//") && !t.starts_with('*')
+    }
+
+    fn starts_fn(line: &str) -> bool {
+        let mut t = line.trim_start();
+        for prefix in ["pub(crate) ", "pub(super) ", "pub ", "async ", "unsafe "] {
+            t = t.strip_prefix(prefix).unwrap_or(t);
+        }
+        t.starts_with("fn ")
+    }
+
+    fn names_index_mount(line: &str) -> bool {
+        is_code(line) && INDEX_MOUNTS.iter().any(|m| line.contains(m))
+    }
+
+    /// Every `knowledge_ext::attach(` call, as `(path, line)`, that no
+    /// Chronicle-index mount precedes within the same function.
+    fn unindexed_mounts() -> Vec<String> {
+        let mut out = Vec::new();
+        for site in sites().into_iter().filter(|s| s.extension > 0) {
+            let Ok(text) = std::fs::read_to_string(&site.path) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !is_code(line) || !line.contains(EXTENSION_MOUNT) {
+                    continue;
+                }
+                let covered = lines[..=i]
+                    .iter()
+                    .rev()
+                    .take_while(|l| !starts_fn(l))
+                    .any(|l| names_index_mount(l));
+                if !covered {
+                    out.push(format!("{}:{}", site.path, i + 1));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every production knowledge mount carries the Chronicle-index wrapper
+    /// too: a site with only `knowledge_ext` would silently answer a
+    /// `provider.knowledge.chronicle-index` binding with `NotConfigured`, and
+    /// the worker would retrieve nothing on that lane alone.
+    #[test]
+    fn every_extension_mount_also_mounts_the_index() {
+        let offenders = unindexed_mounts();
+        assert!(
+            offenders.is_empty(),
+            "these mount `knowledge_ext::attach` without a Chronicle-index mount \
+             (`knowledge_index::attach(` or `index_mount.attach(`) earlier in the \
+             same function: {offenders:#?}"
+        );
+    }
+
     /// Guards the guards. Both scans are textual, so a rename would leave them
     /// passing vacuously over a file set of zero — and an `EXEMPT` entry for a
     /// path that no longer constructs anything is debt hiding the next
@@ -1038,6 +1142,17 @@ mod call_site_ratchet {
         let mounts: usize = sites.iter().map(|s| s.extension).sum();
         let corpora: usize = sites.iter().map(|s| s.chronicle).sum();
         let constructors: usize = sites.iter().map(|s| s.constructors).sum();
+        let index_mounts: usize = sites
+            .iter()
+            .filter_map(|s| std::fs::read_to_string(&s.path).ok())
+            .map(|text| text.lines().filter(|l| names_index_mount(l)).count())
+            .sum();
+        assert!(
+            index_mounts >= 3,
+            "expected the Chronicle-index mount beside each of the three \
+             `knowledge_ext::attach` sites; found {index_mounts} — has \
+             `knowledge_index::attach` or `index_mount.attach` been renamed?"
+        );
         assert!(
             mounts >= 3,
             "expected the in-process `dw.agent`, out-of-process serve and \

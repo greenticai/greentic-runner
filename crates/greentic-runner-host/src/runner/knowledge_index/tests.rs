@@ -470,3 +470,66 @@ async fn secrets_are_read_under_the_team_then_default() {
         .unwrap();
     assert_eq!(got[0].text, "team hit");
 }
+
+/// A runtime with nothing mounted, so the only backend after `attach` is ours.
+fn bare_runtime() -> greentic_aw_runtime::AgentRuntime {
+    use greentic_aw_runtime::cost::MockTokenMeter;
+    use greentic_aw_runtime::mock::{
+        MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, NoopToolLedger,
+    };
+    greentic_aw_runtime::AgentRuntime::new(
+        Arc::new(MockConfigProvider::new()),
+        Arc::new(MockAgentStateStore::new()),
+        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().expect("ext runtime")),
+        Arc::new(MockLlmBackend::new(Vec::new())),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    )
+}
+
+/// The graph lane hands `search_bound` a synthetic tenant (`graph`), not the
+/// runtime's. The mount captured the real one when the handler was built, and
+/// that is the tenant the credentials must be read under — reading under the
+/// synthetic one finds nothing and the index is never searched.
+#[tokio::test]
+async fn graph_mount_reads_secrets_under_the_real_tenant() {
+    let server = MockServer::start().await;
+    mount_embeddings(&server, &[1.0]).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/indexes/kb1/search"))
+        .and(header(
+            "authorization",
+            format!("Bearer {INDEX_KEY}").as_str(),
+        ))
+        .respond_with(chunks(json!([
+            {"text": "graph hit", "score": 0.5, "document_id": "d", "chunk_index": 0},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mount = super::IndexMount {
+        secrets: Some(both_keys()),
+        secret_tenant: Some("default".to_string()),
+    };
+    let runtime = mount.attach(bare_runtime());
+    let backend = runtime
+        .knowledge_backend()
+        .expect("the mount installs a backend");
+
+    let graph_tenant = TenantCtx::new(
+        greentic_types::EnvId::try_from("dev").unwrap(),
+        greentic_types::TenantId::try_from("graph").unwrap(),
+    );
+    let got = backend
+        .search_bound(
+            &graph_tenant,
+            query("q", 2),
+            Some(&index_binding(&server, &["kb1"], None)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got[0].text, "graph hit");
+}

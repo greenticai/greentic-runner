@@ -2002,6 +2002,14 @@ mod aw {
         // feature-gated (see `knowledge_ext`): it wraps whatever corpus backend
         // an extension above left in place and acts only on a worker whose knowledge
         // binding names `provider.knowledge.extension`.
+        // Beneath it, retrieval from a Greentic-operated Chronicle index server
+        // (`provider.knowledge.chronicle-index`), whose credentials resolve
+        // through the same manager and tenant as the worker's MCP credentials.
+        let base = crate::runner::knowledge_index::attach(
+            base,
+            Some(mcp_secrets_manager(&secrets)),
+            Some(tenant.clone()),
+        );
         let base = crate::runner::knowledge_ext::attach(base, ext_runtime);
 
         // Billing metering, identical to the `build_agent_runtime` serve path.
@@ -2461,6 +2469,14 @@ mod aw {
         // serve path's copy of the mount above. See `knowledge_ext` for why the
         // adapter reads its target per turn rather than per runtime: THIS is the
         // path that serves many agents from one runtime.
+        // Chronicle-index retrieval beneath it. This path has no injected
+        // secrets manager or tenant, so credentials resolve through the
+        // environment's manager under each turn's own tenant.
+        let base = crate::runner::knowledge_index::attach(
+            base,
+            crate::runner::mcp_node::aw::secrets_from_env(),
+            None,
+        );
         let base = crate::runner::knowledge_ext::attach(base, ext_runtime.clone());
         let runtime = Arc::new(base);
 

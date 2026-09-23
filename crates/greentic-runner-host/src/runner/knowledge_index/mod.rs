@@ -87,6 +87,26 @@ pub fn attach(
     )))
 }
 
+/// What the graph lane needs to mount this backend on each agent turn,
+/// captured once where its handler is built.
+///
+/// The graph lane runs each turn under a synthetic `TenantCtx` (`graph`), so
+/// the tenant the host's secrets are scoped by has to be captured here rather
+/// than read from the turn.
+#[derive(Clone, Default)]
+pub struct IndexMount {
+    pub secrets: Option<DynSecretsManager>,
+    pub secret_tenant: Option<String>,
+}
+
+impl IndexMount {
+    /// [`attach`] with the captured secrets and tenant.
+    #[must_use]
+    pub fn attach(&self, base: AgentRuntime) -> AgentRuntime {
+        attach(base, self.secrets.clone(), self.secret_tenant.clone())
+    }
+}
+
 /// Retrieval from the Chronicle indexes named in the agent's binding.
 pub struct ChronicleIndexKnowledge {
     /// The backend mounted before this one. Every binding that is not

@@ -54,6 +54,7 @@ mod aw {
     use greentic_ext_runtime::ExtensionRuntime;
     use serde_json::{Value, json};
 
+    use crate::runner::knowledge_index::IndexMount;
     use crate::trace::agent_audit::AgentAuditObserver;
     use crate::trace::audit_sink::AuditSink;
 
@@ -338,8 +339,9 @@ mod aw {
     /// `tenant`, `secrets` and `unit` are the values the `dw.agent` handler of
     /// the same `TenantRuntime` receives (`unit` is the deployed unit's
     /// `bundle_id`, `None` on the legacy tenant-only path). They feed only the
-    /// pack-carried A2A tool source ([`graph_a2a_source`]); the rest of this
-    /// path keeps its env-only secrets, as before.
+    /// pack-carried A2A tool source ([`graph_a2a_source`]) and, `tenant` and
+    /// `secrets` only, the Chronicle-index knowledge mount ([`IndexMount`]);
+    /// the rest of this path keeps its env-only secrets, as before.
     #[allow(clippy::too_many_arguments)]
     pub async fn build_graph_node_handler(
         graphs: HashMap<String, GraphConfig>,
@@ -398,6 +400,12 @@ mod aw {
         };
 
         let a2a_source = graph_a2a_source(&packs, &tenant, &secrets, unit.as_deref());
+        // Chronicle-index retrieval for `agent_ref` turns. Captured here, with
+        // the real tenant, because each turn runs under a synthetic one.
+        let index_mount = IndexMount {
+            secrets: Some(super::super::agent_node::mcp_secrets_manager(&secrets)),
+            secret_tenant: Some(tenant.clone()),
+        };
         let handler = RuntimeGraphNodeHandler::from_parts(
             provider,
             checkpoint,
@@ -411,6 +419,7 @@ mod aw {
             packs,
             Arc::new(merged_agents),
             a2a_source,
+            index_mount,
         );
 
         tracing::info!(graph_count, "AW graph runtime constructed");
@@ -514,6 +523,9 @@ mod aw {
         /// threaded into [`run_one_agent_turn`] so a graph node's `agent_ref`
         /// resolves to that agent's full [`AgentConfig`] at turn time.
         merged_agents: Arc<HashMap<String, AgentConfig>>,
+        /// Chronicle-index knowledge mount for `agent_ref` turns, carrying the
+        /// real tenant's secrets (see [`build_graph_node_handler`]).
+        index_mount: IndexMount,
     }
 
     impl TurnEffectSource for RuntimeTurnSource {
@@ -533,6 +545,7 @@ mod aw {
                 self.a2a_source.clone(),
                 self.packs.clone(),
                 self.merged_agents.clone(),
+                self.index_mount.clone(),
                 audit_sink,
                 real_tenant,
             )
@@ -632,6 +645,7 @@ mod aw {
             packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
             merged_agents: Arc<HashMap<String, AgentConfig>>,
             a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+            index_mount: IndexMount,
         ) -> Self {
             // The Tool node and the agent turns share one A2A source, so an
             // `a2a:` ref resolves identically whichever of the two dispatches it.
@@ -653,6 +667,7 @@ mod aw {
                 a2a_source,
                 packs,
                 merged_agents,
+                index_mount,
             });
             // NOTE: the real `ApprovalFn` is designer-provided (it wires the
             // `greentic.approval.request.v1` / `.response.v1` NATS round trip
@@ -1003,6 +1018,7 @@ mod aw {
         a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
         merged_agents: Arc<HashMap<String, AgentConfig>>,
+        index_mount: IndexMount,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
     ) -> AgentTurnFn {
@@ -1019,6 +1035,7 @@ mod aw {
             let merged_agents = merged_agents.clone();
             let audit_sink = audit_sink.clone();
             let real_tenant = real_tenant.clone();
+            let index_mount = index_mount.clone();
             Box::pin(async move {
                 run_one_agent_turn(
                     req,
@@ -1034,6 +1051,7 @@ mod aw {
                     merged_agents,
                     audit_sink.as_ref(),
                     &real_tenant,
+                    &index_mount,
                 )
                 .await
             }) as BoxFut<'static, Result<AgentTurnResult, GraphExecError>>
@@ -1219,6 +1237,7 @@ mod aw {
         merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
+        index_mount: &IndexMount,
     ) -> Result<AgentTurnResult, GraphExecError> {
         // The request carries no tenant/graph/session — they live on the
         // GraphRunState's seeded session. The executor seeds the run state with
@@ -1307,6 +1326,10 @@ mod aw {
             // extension above left in place. Inside the `agent_ref.is_some()` arm with the rest
             // of the full-fidelity attachment sequence, so the `agent_ref: None`
             // inline path stays byte-unchanged.
+            // Chronicle-index retrieval beneath it, reading its credentials
+            // under the real tenant the mount captured — `tenant` above is
+            // the synthetic `graph` one.
+            runtime = index_mount.attach(runtime);
             runtime = crate::runner::knowledge_ext::attach(runtime, ext_runtime.clone());
         }
 
@@ -2943,6 +2966,7 @@ mod aw {
                 Arc::new(HashMap::new()),
                 None,
                 &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
             )
             .await
             .expect("turn should succeed");
@@ -2978,6 +3002,7 @@ mod aw {
                 Arc::new(HashMap::new()),
                 Some(&sink),
                 &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
             )
             .await
             .expect("turn should succeed");
@@ -3020,6 +3045,7 @@ mod aw {
                 Arc::new(HashMap::new()),
                 None,
                 &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
             )
             .await
             .expect("turn should succeed even with a declared-but-unregistered tool");
@@ -3164,6 +3190,7 @@ mod aw {
                 Arc::new(merged),
                 None,
                 &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
             )
             .await
             .expect("turn should succeed");
@@ -3212,6 +3239,7 @@ mod aw {
                 Arc::new(merged),
                 None,
                 &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
             )
             .await
             .expect("turn should succeed");
@@ -3246,6 +3274,7 @@ mod aw {
                 Arc::new(HashMap::new()),
                 None,
                 &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
             )
             .await
             .expect_err("must error when agent_ref doesn't resolve");
@@ -3731,6 +3760,7 @@ mod aw {
                     "worker".to_string(),
                     worker_with_a2a_tool(),
                 )])),
+                index_mount: crate::runner::knowledge_index::IndexMount::default(),
             };
             let real_tenant = greentic_types::TenantCtx::new(
                 greentic_types::EnvId::try_from("prod").unwrap(),
