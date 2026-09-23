@@ -25,6 +25,45 @@ const CARD_TTL: Duration = Duration::from_secs(5 * 60);
 /// probe would need.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The A2A protocol extensions this client implements.
+///
+/// **Empty, and that is the fact the check below turns on.** We implement
+/// none, so every extension an agent marks `required` is one we cannot
+/// honour. The list exists rather than the check being hardcoded to "refuse
+/// any required extension" so that implementing one is an entry here and
+/// nothing else.
+const SUPPORTED_EXTENSIONS: &[&str] = &[];
+
+/// Why this agent may not be used, when its card requires an extension we do
+/// not implement.
+///
+/// `required` means the client "must understand and comply with the
+/// extension's requirements". An agent declaring one has said its wire
+/// behaviour is not the plain protocol, so calling it as though it were is a
+/// violation it warned us about in advance — and one that would surface as
+/// wrong answers rather than as an error, since the request is well-formed
+/// plain A2A and the agent may well reply to it.
+///
+/// Both the catalogue build and [`Transport::call`] go through this, so an
+/// agent cannot be withheld from the tool list and still be callable. The
+/// catalogue's own entry is advisory: `A2aToolCatalog::dispatch` deliberately
+/// attempts a call for any CONFIGURED agent, including one that had no entry,
+/// so the listing alone would not have stopped the call.
+fn unsupported_required_extensions(card: &greentic_a2a::card::AgentCard) -> Option<String> {
+    let missing: Vec<&str> = card
+        .capabilities
+        .required_extension_uris()
+        .into_iter()
+        .filter(|uri| !SUPPORTED_EXTENSIONS.contains(uri))
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "requires protocol extension(s) this client does not implement: {}",
+            missing.join(", ")
+        )
+    })
+}
+
 /// The A2A agents one worker may call, plus the transport to reach them.
 ///
 /// Holds the configured [`A2aRoute`]s, a [`CardCache`] (which enforces the
@@ -143,14 +182,24 @@ impl Transport {
         let mut errors = HashMap::new();
         for (agent_id, result) in fetched {
             match result {
-                Ok(card) => {
-                    tools.insert(
-                        agent_id.clone(),
-                        A2aToolEntry {
-                            description: card.description.clone(),
-                        },
-                    );
-                }
+                Ok(card) => match unsupported_required_extensions(&card) {
+                    Some(reason) => {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            reason = %reason,
+                            "a2a agent requires an unimplemented protocol extension"
+                        );
+                        errors.insert(agent_id.clone(), reason);
+                    }
+                    None => {
+                        tools.insert(
+                            agent_id.clone(),
+                            A2aToolEntry {
+                                description: card.description.clone(),
+                            },
+                        );
+                    }
+                },
                 Err(err) => {
                     tracing::warn!(agent = %agent_id, error = %err, "a2a agent card unavailable");
                     errors.insert(agent_id.clone(), err.to_string());
@@ -174,6 +223,10 @@ impl Transport {
     /// `SendMessage` POST is the only request that carries the credential.
     /// The interface's `tenant`, when the card set one, is echoed into
     /// `SendMessageParams.tenant`; the A2A spec makes that a MUST for clients.
+    ///
+    /// An agent requiring a protocol extension we do not implement is refused
+    /// HERE as well as withheld from the catalogue, because a dispatch is
+    /// attempted for every configured agent whether it had an entry or not.
     pub(super) async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
         let route = self
             .agents
@@ -185,6 +238,10 @@ impl Transport {
             .get(&route.base_url)
             .await
             .map_err(|err| format!("fetching card for a2a agent {agent_id} failed: {err}"))?;
+
+        if let Some(reason) = unsupported_required_extensions(&card) {
+            return Err(format!("a2a agent {agent_id} {reason}"));
+        }
 
         let interface = card
             .supported_interfaces

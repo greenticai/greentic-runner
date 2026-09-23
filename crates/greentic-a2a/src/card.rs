@@ -86,6 +86,51 @@ pub struct AgentCapabilities {
     pub push_notifications: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extended_agent_card: Option<bool>,
+    /// Protocol extensions the agent supports, some of which it may REQUIRE
+    /// its callers to implement. See [`AgentExtension`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<AgentExtension>,
+}
+
+impl AgentCapabilities {
+    /// The URIs of every extension the agent requires its CALLER to implement.
+    ///
+    /// A client that does not implement one of these may not simply carry on:
+    /// `required` means the agent's behaviour is not the plain protocol, so
+    /// calling it as though it were is a protocol violation the agent has
+    /// explicitly warned about. Deciding what to do about that is the caller's
+    /// — this type only reports what the card said.
+    pub fn required_extension_uris(&self) -> Vec<&str> {
+        self.extensions
+            .iter()
+            .filter(|extension| extension.required)
+            .map(|extension| extension.uri.as_str())
+            .collect()
+    }
+}
+
+/// A protocol extension an agent declares.
+///
+/// **`required` is the load-bearing field.** When it is true the client "must
+/// understand and comply with the extension's requirements" (proto,
+/// `AgentExtension.required`), so an agent declaring one is telling us its
+/// wire behaviour is not the plain protocol. `required` is a bare proto3
+/// `bool`, so a FALSE one is omitted from the JSON entirely — which is why it
+/// defaults to `false` here and why an absent field means optional, never
+/// unknown.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentExtension {
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+    /// Extension-specific configuration, `google.protobuf.Struct` in the
+    /// proto and therefore an arbitrary JSON object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
 }
 
 /// An ability the agent claims. **There is no input schema here** — that is
@@ -293,6 +338,8 @@ pub struct HttpAuthSecurityScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serde_json::json;
 
     /// A card in the shape a real agent serves, including the security-scheme
     /// trap: the JSON has NO `type` field — the member name discriminates.
@@ -521,6 +568,63 @@ mod tests {
         );
     }
 
+    // --- capability extensions ---------------------------------------------
+
+    #[test]
+    fn only_a_required_extension_is_reported_as_required() {
+        let json = r#"{
+          "streaming": true,
+          "extensions": [
+            { "uri": "https://example.com/opt", "description": "nice to have" },
+            { "uri": "https://example.com/off", "required": false },
+            { "uri": "https://example.com/must", "required": true, "params": { "k": 1 } }
+          ]
+        }"#;
+        let capabilities: AgentCapabilities = serde_json::from_str(json).expect("parses");
+
+        assert_eq!(
+            capabilities.required_extension_uris(),
+            vec!["https://example.com/must"],
+            "an absent or false `required` means optional, never unknown"
+        );
+        assert_eq!(capabilities.extensions.len(), 3, "all three are kept");
+        assert_eq!(capabilities.extensions[2].params, Some(json!({ "k": 1 })));
+    }
+
+    #[test]
+    fn a_card_declaring_no_extensions_requires_none() {
+        // proto3 omits an empty repeated field, so most cards carry no
+        // `extensions` key at all. That must read as "requires nothing", which
+        // is what keeps the refusal downstream from firing on every agent.
+        let card: AgentCard = serde_json::from_str(CARD).expect("parses");
+        assert!(card.capabilities.required_extension_uris().is_empty());
+    }
+
+    #[test]
+    fn an_extension_round_trips_without_inventing_a_false_required() {
+        // `required` is a bare proto3 bool, so false is omitted on the wire.
+        // Emitting `"required": false` would be harmless but wrong; emitting
+        // it for a TRUE one is not optional.
+        let optional = AgentExtension {
+            uri: "https://example.com/opt".into(),
+            ..AgentExtension::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&optional).expect("serialises"),
+            json!({ "uri": "https://example.com/opt" })
+        );
+
+        let required = AgentExtension {
+            uri: "https://example.com/must".into(),
+            required: true,
+            ..AgentExtension::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&required).expect("serialises"),
+            json!({ "uri": "https://example.com/must", "required": true })
+        );
+    }
+
     // --- tolerance ---------------------------------------------------------
 
     #[test]
@@ -618,6 +722,12 @@ mod tests {
                 streaming: Some(false),
                 push_notifications: Some(false),
                 extended_agent_card: Some(false),
+                extensions: vec![AgentExtension {
+                    uri: "https://example.com/ext".into(),
+                    description: "an extension".into(),
+                    required: true,
+                    params: Some(json!({ "k": 1 })),
+                }],
             },
             default_input_modes: vec!["text/plain".into()],
             default_output_modes: vec!["text/plain".into()],
