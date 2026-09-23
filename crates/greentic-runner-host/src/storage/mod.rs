@@ -13,7 +13,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::engine::host::{SessionHost, StateHost};
-pub use config::{SessionBackend, StateBackend, StorageConfig, StorageConfigError};
+pub use config::{
+    DEFAULT_WAIT_TTL, SessionBackend, StateBackend, StorageConfig, StorageConfigError,
+};
 pub use session::DynSessionStore;
 pub use state::DynStateStore;
 

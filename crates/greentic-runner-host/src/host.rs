@@ -167,7 +167,32 @@ impl HostBuilder {
             .map(|(tenant, cfg)| (tenant, Arc::new(cfg)))
             .collect();
         let (session_store, state_store) = stores_from_config(&self.storage)?;
-        let session_host = session_host_from(Arc::clone(&session_store));
+        // `SessionStoreHost` is deliberately NOT pointed at a durable store.
+        //
+        // It is write-only by construction: `put` goes through
+        // `SessionStore::create_session`, which does not add the row to the
+        // per-user wait index — and `get` reads exactly that index, via
+        // `find_by_user`. Both backends behave this way, so `get` never returns
+        // what `put` wrote, `state_machine::step`'s `is_new` is always true, and
+        // every turn writes a fresh row under a random UUID.
+        //
+        // In memory that is a bounded-by-process-lifetime map nobody reads. On
+        // Redis it would be one permanent key PER TURN — `create_session` takes
+        // no TTL argument, so there is no expiry to attach and the
+        // `DefaultWaitTtl` decorator cannot reach it — growing without bound
+        // while buying nothing, because nothing can read it back.
+        //
+        // The parked-flow snapshot, which is what durability is for, does NOT
+        // travel this path: `FlowResumeStore` uses `register_wait` /
+        // `find_wait_by_scope` and gets `session_store` below. Closing the
+        // write-only behaviour itself is an upstream change in greentic-session.
+        let session_host = if self.storage.session.is_durable() {
+            session_host_from(crate::storage::new_session_store())
+        } else {
+            // Unchanged for every caller that names no storage: one store,
+            // shared, exactly as before.
+            session_host_from(Arc::clone(&session_store))
+        };
         let state_host = state_host_from(Arc::clone(&state_store));
         if self.storage.is_durable() {
             // Names, never the configured values: a Redis URL may carry

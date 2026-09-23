@@ -23,11 +23,12 @@ mod redis_lb {
     use greentic_runner_host::engine::runtime::{FlowResumeStore, IngressEnvelope};
     use greentic_runner_host::runner::engine::{ExecutionState, FlowSnapshot, FlowWait};
     use greentic_runner_host::storage::{
-        DynStateStore, SessionBackend, StateBackend, StorageConfig, session_store_from_config,
-        state_host_from, state_store_from_config,
+        DEFAULT_WAIT_TTL, DynStateStore, SessionBackend, StateBackend, StorageConfig,
+        session_store_from_config, state_host_from, state_store_from_config,
     };
     use greentic_types::{EnvId, ReplyScope, TenantCtx, TenantId};
     use serde_json::json;
+    use std::time::Duration;
 
     /// A namespace nothing else in this file or in production uses, so a run
     /// against a shared Redis cannot collide with another.
@@ -112,6 +113,15 @@ mod redis_lb {
 
     fn resume_store(url: &str, namespace: &str) -> Result<FlowResumeStore> {
         let backend = SessionBackend::redis(url, namespace)?;
+        Ok(FlowResumeStore::new(session_store_from_config(&backend)?))
+    }
+
+    fn resume_store_with_ttl(
+        url: &str,
+        namespace: &str,
+        wait_ttl: Option<Duration>,
+    ) -> Result<FlowResumeStore> {
+        let backend = SessionBackend::redis_with_ttl(url, namespace, wait_ttl)?;
         Ok(FlowResumeStore::new(session_store_from_config(&backend)?))
     }
 
@@ -272,6 +282,96 @@ mod redis_lb {
 
         host.del(&acme).await?;
         host.del(&umbrella).await?;
+        Ok(())
+    }
+
+    /// A parked wait must not outlive its TTL. Redis is the only place this is
+    /// observable: with an in-memory store the wait died with the process, so
+    /// `register_wait(.., None)` was harmless and nothing here had a reason to
+    /// pass a lifetime.
+    ///
+    /// Asserted by elapsed time rather than by reading `PTTL`, because this
+    /// crate has no Redis client of its own and adding one to prove a property
+    /// about the store would be testing the client. A 1 s TTL and a 1.6 s wait
+    /// is the shortest pair that is not flaky.
+    #[tokio::test]
+    async fn a_parked_wait_expires_once_its_ttl_elapses() -> Result<()> {
+        let Some(url) = redis_url() else {
+            return Ok(());
+        };
+        let namespace = namespace("ttl-expires");
+        let envelope = envelope();
+
+        let store = resume_store_with_ttl(&url, &namespace, Some(Duration::from_secs(1)))?;
+        let _ = store.save(&envelope, &wait_snapshot("node-a")).await?;
+        assert!(
+            store.fetch(&envelope).await?.is_some(),
+            "the wait must be readable before its TTL elapses, or this test \
+             would pass for the wrong reason"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+
+        assert!(
+            store.fetch(&envelope).await?.is_none(),
+            "the parked wait outlived its TTL; an abandoned conversation is a \
+             permanent key"
+        );
+        Ok(())
+    }
+
+    /// The control for the test above: with expiry disabled the same wait is
+    /// still there after the same elapsed time. Without this pair, an expiry
+    /// test passes if the wait was never written, or was cleared by something
+    /// else.
+    #[tokio::test]
+    async fn disabling_the_ttl_leaves_the_wait_in_place() -> Result<()> {
+        let Some(url) = redis_url() else {
+            return Ok(());
+        };
+        let namespace = namespace("ttl-disabled");
+        let envelope = envelope();
+
+        let store = resume_store_with_ttl(&url, &namespace, None)?;
+        let _ = store.save(&envelope, &wait_snapshot("node-a")).await?;
+
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+
+        assert!(
+            store.fetch(&envelope).await?.is_some(),
+            "expiry was disabled, so the wait must survive"
+        );
+        store.clear(&envelope).await?;
+        Ok(())
+    }
+
+    /// What a deployment that names no TTL anywhere is configured with.
+    ///
+    /// Named for what it checks and no more: this is a CONFIG assertion. It
+    /// survives a mutation that stops the decorator applying the default — the
+    /// test that catches that one is
+    /// `a_parked_wait_expires_once_its_ttl_elapses`, and the two are a pair.
+    /// The default is 24 h, far too long to wait out in a test, so proving the
+    /// mechanism and proving the number are necessarily different assertions.
+    #[tokio::test]
+    async fn the_default_config_carries_the_documented_wait_bound() -> Result<()> {
+        let Some(url) = redis_url() else {
+            return Ok(());
+        };
+        let namespace = namespace("ttl-default");
+        let envelope = envelope();
+
+        // The plain constructor, i.e. `StorageConfig::redis(..)`, i.e. what an
+        // operator gets without naming a TTL anywhere.
+        let store = resume_store(&url, &namespace)?;
+        let _ = store.save(&envelope, &wait_snapshot("node-a")).await?;
+        assert!(store.fetch(&envelope).await?.is_some());
+
+        let backend = SessionBackend::redis(&url, &namespace)?;
+        assert_eq!(backend.wait_ttl(), Some(DEFAULT_WAIT_TTL));
+        assert!(DEFAULT_WAIT_TTL <= Duration::from_secs(7 * 24 * 60 * 60));
+
+        store.clear(&envelope).await?;
         Ok(())
     }
 

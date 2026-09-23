@@ -47,6 +47,7 @@
 //! [`find_wait_by_scope`]: greentic_session::SessionStore::find_wait_by_scope
 
 use std::fmt;
+use std::time::Duration;
 
 /// Environment variable naming the session backend (`memory` | `redis`).
 pub const ENV_SESSION_BACKEND: &str = "GREENTIC_RUNNER_SESSION_BACKEND";
@@ -59,6 +60,29 @@ pub const ENV_SESSION_NAMESPACE: &str = "GREENTIC_RUNNER_SESSION_NAMESPACE";
 /// Environment variable naming the deployment environment, used to derive a
 /// session namespace when [`ENV_SESSION_NAMESPACE`] is unset.
 pub const ENV_GREENTIC_ENV: &str = "GREENTIC_ENV";
+/// Environment variable overriding how long a parked wait survives, in seconds.
+/// `0` disables expiry — see [`SessionBackend::redis`].
+pub const ENV_SESSION_WAIT_TTL_SECS: &str = "GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS";
+
+/// How long a parked wait survives on a durable session store when nothing says
+/// otherwise.
+///
+/// Twenty-four hours, and the number is a judgement rather than a measurement.
+/// Two bounds set it:
+///
+/// * **Long enough that the feature works.** The conversation this store exists
+///   to preserve is one a human parked. Someone who answers the next morning
+///   must still resume; an hour — the in-process
+///   [`SessionSnapshot::new`](crate::engine::host::SessionSnapshot) default —
+///   would silently drop exactly the case a durable store was added for. That
+///   default governs a session the process would lose on restart anyway, so it
+///   is not a precedent for one whose whole point is surviving a restart.
+/// * **Short enough that abandonment is bounded.** Without an expiry every
+///   parked-and-never-resumed conversation is a permanent key. A deployment
+///   accumulates them for as long as it runs, and nothing reports it.
+///
+/// Override with [`ENV_SESSION_WAIT_TTL_SECS`] when a deployment knows better.
+pub const DEFAULT_WAIT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A storage backend was asked for and could not be honoured.
 ///
@@ -112,6 +136,9 @@ pub enum SessionBackend {
         url: String,
         /// Keyspace prefix every key of this store is written under.
         namespace: String,
+        /// How long a parked wait survives. `None` means no expiry, which is an
+        /// operator's deliberate choice to grow the keyspace without bound.
+        wait_ttl: Option<Duration>,
     },
 }
 
@@ -138,6 +165,20 @@ impl SessionBackend {
         url: impl Into<String>,
         namespace: impl Into<String>,
     ) -> Result<Self, StorageConfigError> {
+        Self::redis_with_ttl(url, namespace, Some(DEFAULT_WAIT_TTL))
+    }
+
+    /// Redis-backed sessions with an explicit wait lifetime.
+    ///
+    /// `wait_ttl: None` disables expiry. That is a real choice — a deployment
+    /// that archives its own keys may want it — but it is not the default,
+    /// because the failure it produces is invisible: every parked-and-abandoned
+    /// conversation becomes a permanent key and nothing reports the growth.
+    pub fn redis_with_ttl(
+        url: impl Into<String>,
+        namespace: impl Into<String>,
+        wait_ttl: Option<Duration>,
+    ) -> Result<Self, StorageConfigError> {
         let url = url.into();
         let namespace = namespace.into();
         if url.trim().is_empty() {
@@ -146,15 +187,37 @@ impl SessionBackend {
         if namespace.trim().is_empty() {
             return Err(StorageConfigError::MissingSessionNamespace);
         }
-        Ok(Self::Redis { url, namespace })
+        // A zero duration would expire the key before the turn that wrote it
+        // could resume against it, which reads as "durable storage does not
+        // work". Treat it as the disable it plainly means.
+        let wait_ttl = wait_ttl.filter(|ttl| !ttl.is_zero());
+        Ok(Self::Redis {
+            url,
+            namespace,
+            wait_ttl,
+        })
     }
 
     /// The conventional keyspace for `env`: `greentic:session:<env>`.
     ///
-    /// Environment is the only scope the crate's own session entry key omits;
-    /// tenant, pack and conversation are already inside the key, and two
-    /// deployments of one environment SHOULD share them — that sharing is what
-    /// makes a conversation survive a revision rollout.
+    /// Environment is the scope the crate's own session entry key omits, so it
+    /// is the minimum a namespace must carry.
+    ///
+    /// **It is not automatically sufficient.** The namespace has to be unique
+    /// per ISOLATION DOMAIN, and an embedding host may have a finer one than
+    /// the environment. greentic-start is the case in point: `revision_boot`
+    /// gives every pack REVISION its own session store on purpose, so that two
+    /// revisions serving the same tenant/user/conversation cannot resume each
+    /// other's snapshot against a different flow graph (its own
+    /// `shared_revision_store_leaks_across_revisions` test calls that "the
+    /// bug"). A host like that must fold its revision key into the namespace;
+    /// one environment-wide keyspace would re-create exactly what its
+    /// per-revision stores prevent.
+    ///
+    /// Durability and that isolation are not in tension — they answer different
+    /// questions. A per-revision namespace still survives a process restart and
+    /// a cold start, which is what a durable store is for; what it does not do
+    /// is carry a half-finished conversation onto a different flow graph.
     pub fn namespace_for_env(env: &str) -> Result<String, StorageConfigError> {
         let env = env.trim();
         if env.is_empty() {
@@ -169,6 +232,14 @@ impl SessionBackend {
         matches!(self, Self::Redis { .. })
     }
 
+    /// How long a parked wait survives, or `None` for no expiry.
+    pub fn wait_ttl(&self) -> Option<Duration> {
+        match self {
+            Self::InMemory => None,
+            Self::Redis { wait_ttl, .. } => *wait_ttl,
+        }
+    }
+
     /// A log-safe description: the backend name and, for Redis, the keyspace.
     ///
     /// Never the URL. A Redis URL may carry `redis://user:password@host`, and
@@ -177,7 +248,17 @@ impl SessionBackend {
     pub fn describe(&self) -> String {
         match self {
             Self::InMemory => "in-memory".to_string(),
-            Self::Redis { namespace, .. } => format!("redis (namespace '{namespace}')"),
+            Self::Redis {
+                namespace,
+                wait_ttl,
+                ..
+            } => {
+                let ttl = match wait_ttl {
+                    Some(ttl) => format!("{}s", ttl.as_secs()),
+                    None => "none".to_string(),
+                };
+                format!("redis (namespace '{namespace}', wait ttl {ttl})")
+            }
         }
     }
 }
@@ -233,9 +314,19 @@ impl StorageConfig {
         url: impl Into<String>,
         namespace: impl Into<String>,
     ) -> Result<Self, StorageConfigError> {
+        Self::redis_with_ttl(url, namespace, Some(DEFAULT_WAIT_TTL))
+    }
+
+    /// Both stores on one Redis, with an explicit wait lifetime. See
+    /// [`SessionBackend::redis_with_ttl`].
+    pub fn redis_with_ttl(
+        url: impl Into<String>,
+        namespace: impl Into<String>,
+        wait_ttl: Option<Duration>,
+    ) -> Result<Self, StorageConfigError> {
         let url = url.into();
         Ok(Self {
-            session: SessionBackend::redis(url.clone(), namespace)?,
+            session: SessionBackend::redis_with_ttl(url.clone(), namespace, wait_ttl)?,
             state: StateBackend::redis(url)?,
         })
     }
@@ -261,6 +352,7 @@ impl StorageConfig {
             std::env::var(ENV_REDIS_URL).ok().as_deref(),
             std::env::var(ENV_SESSION_NAMESPACE).ok().as_deref(),
             std::env::var(ENV_GREENTIC_ENV).ok().as_deref(),
+            std::env::var(ENV_SESSION_WAIT_TTL_SECS).ok().as_deref(),
         )
     }
 
@@ -272,8 +364,17 @@ impl StorageConfig {
         redis_url: Option<&str>,
         session_namespace: Option<&str>,
         greentic_env: Option<&str>,
+        wait_ttl_secs: Option<&str>,
     ) -> Result<Self, StorageConfigError> {
         let url = redis_url.map(str::trim).filter(|value| !value.is_empty());
+        // An unparseable value falls back to the default rather than refusing:
+        // a typo in a tuning knob must not stop a worker booting, and the
+        // default is safe. `0` is a legitimate value meaning "no expiry".
+        let wait_ttl = match named(wait_ttl_secs).and_then(|raw| raw.parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(secs) => Some(Duration::from_secs(secs)),
+            None => Some(DEFAULT_WAIT_TTL),
+        };
 
         let session = match named(session_backend) {
             None | Some("memory") => SessionBackend::InMemory,
@@ -285,7 +386,7 @@ impl StorageConfig {
                         named(greentic_env).ok_or(StorageConfigError::MissingSessionNamespace)?,
                     )?,
                 };
-                SessionBackend::redis(url, namespace)?
+                SessionBackend::redis_with_ttl(url, namespace, wait_ttl)?
             }
             Some(other) => {
                 return Err(StorageConfigError::UnknownBackend {
@@ -339,29 +440,31 @@ mod tests {
         // Deliberately unlike `aw_backends::select_state_backend`, which
         // auto-selects Redis from a bare URL. A URL appearing in the
         // environment for some other reason must not move a host's sessions.
-        let config = StorageConfig::from_vars(None, None, Some("redis://x"), None, Some("prod"))
-            .expect("resolve");
+        let config =
+            StorageConfig::from_vars(None, None, Some("redis://x"), None, Some("prod"), None)
+                .expect("resolve");
         assert_eq!(config, StorageConfig::in_memory());
     }
 
     #[test]
     fn explicit_redis_without_a_url_is_refused_not_disabled() {
-        let err = StorageConfig::from_vars(Some("redis"), None, None, Some("ns"), None)
+        let err = StorageConfig::from_vars(Some("redis"), None, None, Some("ns"), None, None)
             .expect_err("must refuse");
         assert_eq!(
             err,
             StorageConfigError::MissingRedisUrl { store: "session" }
         );
 
-        let err = StorageConfig::from_vars(None, Some("redis"), None, None, None)
+        let err = StorageConfig::from_vars(None, Some("redis"), None, None, None, None)
             .expect_err("must refuse");
         assert_eq!(err, StorageConfigError::MissingRedisUrl { store: "state" });
     }
 
     #[test]
     fn an_empty_url_reads_as_absent_rather_than_as_a_host_named_nothing() {
-        let err = StorageConfig::from_vars(Some("redis"), None, Some("   "), Some("ns"), None)
-            .expect_err("must refuse");
+        let err =
+            StorageConfig::from_vars(Some("redis"), None, Some("   "), Some("ns"), None, None)
+                .expect_err("must refuse");
         assert_eq!(
             err,
             StorageConfigError::MissingRedisUrl { store: "session" }
@@ -370,21 +473,29 @@ mod tests {
 
     #[test]
     fn a_session_redis_backend_without_a_resolvable_namespace_is_refused() {
-        let err = StorageConfig::from_vars(Some("redis"), None, Some("redis://x"), None, None)
-            .expect_err("must refuse");
+        let err =
+            StorageConfig::from_vars(Some("redis"), None, Some("redis://x"), None, None, None)
+                .expect_err("must refuse");
         assert_eq!(err, StorageConfigError::MissingSessionNamespace);
     }
 
     #[test]
     fn the_namespace_falls_back_to_the_environment_name() {
-        let config =
-            StorageConfig::from_vars(Some("redis"), None, Some("redis://x"), None, Some("prod"))
-                .expect("resolve");
+        let config = StorageConfig::from_vars(
+            Some("redis"),
+            None,
+            Some("redis://x"),
+            None,
+            Some("prod"),
+            None,
+        )
+        .expect("resolve");
         assert_eq!(
             config.session,
             SessionBackend::Redis {
                 url: "redis://x".into(),
                 namespace: "greentic:session:prod".into(),
+                wait_ttl: Some(DEFAULT_WAIT_TTL),
             }
         );
     }
@@ -397,6 +508,7 @@ mod tests {
             Some("redis://x"),
             Some("acme:sessions"),
             Some("prod"),
+            None,
         )
         .expect("resolve");
         assert_eq!(
@@ -404,6 +516,7 @@ mod tests {
             SessionBackend::Redis {
                 url: "redis://x".into(),
                 namespace: "acme:sessions".into(),
+                wait_ttl: Some(DEFAULT_WAIT_TTL),
             }
         );
     }
@@ -417,7 +530,7 @@ mod tests {
 
     #[test]
     fn an_unknown_backend_name_is_refused_rather_than_guessed() {
-        let err = StorageConfig::from_vars(Some("cassandra"), None, None, None, None)
+        let err = StorageConfig::from_vars(Some("cassandra"), None, None, None, None, None)
             .expect_err("must refuse");
         assert_eq!(
             err,
@@ -441,6 +554,88 @@ mod tests {
 
         let state = StateBackend::redis("redis://user:hunter2@redis:6379").expect("cfg");
         assert!(!state.describe().contains("hunter2"));
+    }
+
+    #[test]
+    fn a_redis_session_backend_is_bounded_unless_an_operator_says_otherwise() {
+        // The default is what a deployment that sets no TTL variable gets, and
+        // it must not be "keep every abandoned conversation forever".
+        let backend = SessionBackend::redis("redis://x", "ns").expect("cfg");
+        assert_eq!(backend.wait_ttl(), Some(DEFAULT_WAIT_TTL));
+        assert!(
+            DEFAULT_WAIT_TTL >= Duration::from_secs(60 * 60),
+            "a default under an hour would drop conversations a human parked"
+        );
+
+        let config = StorageConfig::from_vars(
+            Some("redis"),
+            None,
+            Some("redis://x"),
+            Some("ns"),
+            None,
+            None,
+        )
+        .expect("resolve");
+        assert_eq!(config.session.wait_ttl(), Some(DEFAULT_WAIT_TTL));
+    }
+
+    #[test]
+    fn the_wait_ttl_is_overridable_and_zero_disables_it() {
+        let config = StorageConfig::from_vars(
+            Some("redis"),
+            None,
+            Some("redis://x"),
+            Some("ns"),
+            None,
+            Some("90"),
+        )
+        .expect("resolve");
+        assert_eq!(config.session.wait_ttl(), Some(Duration::from_secs(90)));
+
+        let disabled = StorageConfig::from_vars(
+            Some("redis"),
+            None,
+            Some("redis://x"),
+            Some("ns"),
+            None,
+            Some("0"),
+        )
+        .expect("resolve");
+        assert_eq!(disabled.session.wait_ttl(), None);
+    }
+
+    #[test]
+    fn an_unparseable_ttl_falls_back_to_the_bounded_default() {
+        // A typo in a tuning knob must not boot an unbounded store, and must
+        // not stop the worker booting either.
+        let config = StorageConfig::from_vars(
+            Some("redis"),
+            None,
+            Some("redis://x"),
+            Some("ns"),
+            None,
+            Some("ten minutes"),
+        )
+        .expect("resolve");
+        assert_eq!(config.session.wait_ttl(), Some(DEFAULT_WAIT_TTL));
+    }
+
+    #[test]
+    fn a_zero_duration_reads_as_disabled_rather_than_as_instant_expiry() {
+        // `Some(0)` through the typed door means the same as `0` through the
+        // env door. Honouring it literally would expire a wait before the turn
+        // that wrote it could resume, which reads as "durable storage is broken".
+        let backend =
+            SessionBackend::redis_with_ttl("redis://x", "ns", Some(Duration::ZERO)).expect("cfg");
+        assert_eq!(backend.wait_ttl(), None);
+    }
+
+    #[test]
+    fn the_description_reports_the_ttl_so_an_operator_can_see_it() {
+        let bounded = SessionBackend::redis("redis://x", "ns").expect("cfg");
+        assert!(bounded.describe().contains("86400s"));
+        let unbounded = SessionBackend::redis_with_ttl("redis://x", "ns", None).expect("cfg");
+        assert!(unbounded.describe().contains("none"));
     }
 
     #[test]
