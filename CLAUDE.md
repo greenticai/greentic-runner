@@ -235,10 +235,14 @@ per-chunk/total character budgets as `knowledge_ext` (`MAX_CHUNK_CHARS` 4 000,
 `MAX_TOTAL_CHARS` 24 000).
 
 This backend is mounted at the same three production sites that mount
-`knowledge_ext` — two in `agent_node.rs` (single-turn and deep-worker agent
-construction) and one in `graph_node.rs` (the agent-graph lane, which runs each
-turn under a synthetic `TenantCtx` and so captures the real runtime tenant once,
-in `IndexMount`, rather than reading it off that synthetic context).
+`knowledge_ext`: the in-process `dw.agent`/`agentic.call` construction
+(`agent_node::build_runtime_with_stores`), the out-of-process NATS serve path
+(`agent_node::build_agent_runtime`, used by `serve_agentic`), and the
+agent-graph lane (`graph_node.rs`, which runs each turn under a synthetic
+`TenantCtx` and so captures the real runtime tenant once, in `IndexMount`,
+rather than reading it off that synthetic context). A deep worker
+(`operala.call`) mounts nothing of its own — it borrows the in-process
+runtime that `agent_node` already built.
 
 **Server contract**: `POST {endpoint}/v1/indexes/{index_id}/search`, served by
 `greentic-chronicle-ext`'s `chronicle-index-server`.
