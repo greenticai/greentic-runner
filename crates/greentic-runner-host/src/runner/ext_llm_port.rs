@@ -24,17 +24,17 @@ use greentic_ext_runtime::host_ports::{
 };
 
 /// An extension-runtime LLM port over the worker's own resolved backend.
-// Not yet constructed outside tests — wiring `AgentLlmPort::from_agents` into
-// `build_ext_runtime`'s fallback chain as the tier-2 port is a later task.
-#[allow(dead_code)]
 pub(crate) struct AgentLlmPort {
     backend: Arc<dyn greentic_aw_runtime::llm::LlmBackend>,
     provider: String,
     model: String,
+    // Read only by the `#[cfg(test)]` accessor below, which the
+    // deterministic-tie-break tests use to assert WHICH agent won — never
+    // read by `LlmPort::complete`, so a non-test lib build sees it as unread.
+    #[allow(dead_code)]
     agent_id: String,
 }
 
-#[allow(dead_code)] // from_agents: consumed once the wiring task lands
 impl AgentLlmPort {
     /// Build a port over `backend`, taking provider and model from the agent
     /// this runtime serves.

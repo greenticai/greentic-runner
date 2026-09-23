@@ -1132,9 +1132,20 @@ mod aw {
         }
     }
 
+    /// Pick the extension runtime's LLM port. Pure so the tier order is testable:
+    /// the bug this exists to prevent was a wrong tier being chosen silently.
+    fn select_ext_llm_port(
+        host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        env_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+    ) -> Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> {
+        host_llm_port.or(agent_llm_port).or(env_llm_port)
+    }
+
     pub(crate) fn build_ext_runtime(
         secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend>,
         host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: &[Arc<crate::pack::PackRuntime>],
     ) -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
         use greentic_ext_runtime::{
@@ -1151,49 +1162,66 @@ mod aw {
         // process-level serve paths pass the env-only backend.
         //
         // `llm_port` powers tool extensions that call `host.llm.complete()`
-        // internally (e.g. adaptive-cards `generate_card`). Resolution order:
+        // internally (e.g. adaptive-cards `generate_card`). The tier order is
+        // decided by `select_ext_llm_port`, kept pure and unit-tested so a
+        // wrong tier being chosen silently — the bug this whole change exists
+        // to fix — cannot creep back in unnoticed:
         //   1. A `host_llm_port` injected by the embedding host (e.g. the
-        //      designer demo) — its own per-tenant, admin-backed path. NOT
+        //      designer) — its own per-tenant, admin-backed, metered path. NOT
         //      feature-gated: a host can inject a port regardless of features.
-        //   2. Otherwise, the env-keyed `EnvLlmPort` (standalone runners), only
-        //      when the `greentic-llm-backend` feature is on AND an LLM key is
-        //      present in env.
-        //   3. Otherwise `None`, so the ext-runtime keeps returning "llm not
+        //   2. The WORKER's own resolved backend, when this runtime serves
+        //      agents (`agent_llm_port`, built by the caller via
+        //      `AgentLlmPort::from_agents`). This is the model the operator
+        //      actually selected. It exists because `build_ext_runtime` used
+        //      to run BEFORE the worker's backend was resolved, so every
+        //      deployed lane fell straight through to tier 3's env-keyed
+        //      default (or tier 4's refusal) instead.
+        //   3. Otherwise, the env-keyed `EnvLlmPort` — the call sites that
+        //      serve no agents at all (`runner/mod.rs`, `graph_node.rs`, the
+        //      ephemeral desktop path), only when the `greentic-llm-backend`
+        //      feature is on AND an LLM key is present in env.
+        //   4. Otherwise `None`, so the ext-runtime keeps returning "llm not
         //      configured for this runtime" (unchanged no-key behaviour).
-        let llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> =
-            match host_llm_port {
-                Some(port) => {
-                    tracing::info!("extension runtime LLM port wired (host-provided ext LLM)");
-                    Some(port)
-                }
-                None => {
-                    #[cfg(feature = "greentic-llm-backend")]
-                    {
-                        match EnvLlmPort::from_env() {
-                            Some(port) => {
-                                tracing::info!(
-                                    "extension runtime LLM port wired (env ext LLM, env-keyed greentic-llm)"
-                                );
-                                Some(Arc::new(port)
-                                    as Arc<dyn greentic_ext_runtime::host_ports::LlmPort>)
-                            }
-                            None => {
-                                tracing::info!(
-                                    "extension runtime LLM port not configured (no host port, no env key)"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "greentic-llm-backend"))]
-                    {
-                        tracing::info!(
-                            "extension runtime LLM port not configured (no host port; greentic-llm-backend off)"
-                        );
-                        None
-                    }
-                }
-            };
+        let env_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> = {
+            #[cfg(feature = "greentic-llm-backend")]
+            {
+                EnvLlmPort::from_env().map(|port| {
+                    Arc::new(port) as Arc<dyn greentic_ext_runtime::host_ports::LlmPort>
+                })
+            }
+            #[cfg(not(feature = "greentic-llm-backend"))]
+            {
+                None
+            }
+        };
+
+        // Logging stays here, beside the candidates, rather than inside
+        // `select_ext_llm_port` — that function stays pure (no side effects)
+        // so its tier order is unit-testable without an `ExtensionRuntime` or
+        // any env state. `AgentLlmPort::from_agents` already logs its own
+        // `info` line naming the agent, so tier 2 does not log again here.
+        match (
+            host_llm_port.is_some(),
+            agent_llm_port.is_some(),
+            env_llm_port.is_some(),
+        ) {
+            (true, _, _) => {
+                tracing::info!("extension runtime LLM port wired (host-provided ext LLM)");
+            }
+            (false, true, _) => {}
+            (false, false, true) => {
+                tracing::info!(
+                    "extension runtime LLM port wired (env ext LLM, env-keyed greentic-llm)"
+                );
+            }
+            (false, false, false) => {
+                tracing::info!(
+                    "extension runtime LLM port not configured (no host port, no agent port, no env key)"
+                );
+            }
+        }
+
+        let llm_port = select_ext_llm_port(host_llm_port, agent_llm_port, env_llm_port);
 
         let overrides = HostOverrides {
             secrets_backend,
@@ -1693,16 +1721,35 @@ mod aw {
         let secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend> = Arc::new(
             StoreToolSecretsBackend::new(secrets.clone(), tenant.clone(), unit.clone()),
         );
-        let ext_runtime = build_ext_runtime(secrets_backend, ext_llm_port, &packs)?;
 
-        // When the LLM bridge extension is configured, resolve credentials
-        // per-tenant from the secrets broker rather than from global env vars.
-        // The env-keyed OpenAI fallback is preserved for both branches.
-        let llm: Arc<dyn LlmBackend> = match std::env::var("GREENTIC_AW_LLM_EXTENSION")
+        // Resolving `llm` and building `ext_runtime` have a circular
+        // dependency in exactly one case: the LLM-bridge-extension branch
+        // below dispatches through `ext_runtime` itself, so it cannot run
+        // until `build_ext_runtime` returns. The zero-env branch has no such
+        // dependency, so when no bridge extension is configured it is
+        // resolved FIRST and fed into `build_ext_runtime` as tier 2 of the
+        // extension LLM port (see `select_ext_llm_port`) — this is the actual
+        // fix: `build_ext_runtime` used to always run before this
+        // resolution, so tier 2 was unreachable in every deployed lane. The
+        // bridge branch keeps exactly the order and construction it had
+        // before this change — tier 2 is `None` for that one case, and
+        // `build_ext_runtime` falls through to tier 3 (env) or tier 4 (none)
+        // for it, same as always.
+        let bridge_extension_id = std::env::var("GREENTIC_AW_LLM_EXTENSION")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-        {
+            .filter(|s| !s.trim().is_empty());
+
+        let (ext_runtime, llm): (
+            Arc<greentic_ext_runtime::ExtensionRuntime>,
+            Arc<dyn LlmBackend>,
+        ) = match bridge_extension_id {
             Some(ext_id) => {
+                // Bridge extension configured: `llm` must dispatch through
+                // `ext_runtime`, so build the runtime first with no
+                // agent-backed tier 2 — there is no worker backend yet to
+                // wire, and there never was for this branch.
+                let ext_runtime = build_ext_runtime(secrets_backend, ext_llm_port, None, &packs)?;
+
                 use greentic_aw_runtime::llm_credential::SecretsBackedCredentialResolver;
                 let resolver = Arc::new(SecretsBackedCredentialResolver::new(
                     secrets.clone(),
@@ -1713,7 +1760,7 @@ mod aw {
                     tenant = %tenant,
                     "AW LLM via bridge (per-tenant creds)"
                 );
-                Arc::new(RetryingLlmBackend::new(
+                let llm: Arc<dyn LlmBackend> = Arc::new(RetryingLlmBackend::new(
                     ExtensionLlmBackend::with_resolver_runtime(
                         ext_runtime.clone(),
                         ext_id,
@@ -1721,7 +1768,8 @@ mod aw {
                     ),
                     3,
                     Duration::from_millis(250),
-                ))
+                ));
+                (ext_runtime, llm)
             }
             None => {
                 // Zero-env LLM: with no bridge extension and no env key, resolve
@@ -1751,7 +1799,35 @@ mod aw {
                 // This path DOES see the agent configs, so a worker that
                 // declares a keyless provider (Ollama) reaches the
                 // multi-provider backend even with no key anywhere.
-                in_process_llm_backend_with_key(store_key, configured_llm_provider(&merged_agents))
+                let llm = in_process_llm_backend_with_key(
+                    store_key,
+                    configured_llm_provider(&merged_agents),
+                );
+
+                // Tier 2 of the extension LLM port: the worker's own resolved
+                // backend, so `host.llm.complete()` inside an extension runs
+                // on the provider the operator actually selected instead of
+                // falling through to the env-keyed default.
+                let agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> = {
+                    #[cfg(feature = "greentic-llm-backend")]
+                    {
+                        crate::runner::ext_llm_port::AgentLlmPort::from_agents(
+                            llm.clone(),
+                            &merged_agents,
+                        )
+                        .map(|port| {
+                            Arc::new(port) as Arc<dyn greentic_ext_runtime::host_ports::LlmPort>
+                        })
+                    }
+                    #[cfg(not(feature = "greentic-llm-backend"))]
+                    {
+                        None
+                    }
+                };
+
+                let ext_runtime =
+                    build_ext_runtime(secrets_backend, ext_llm_port, agent_llm_port, &packs)?;
+                (ext_runtime, llm)
             }
         };
 
@@ -2187,7 +2263,7 @@ mod aw {
         // pack-backed MCP fallback (see the `mcp_source_from_env` call below):
         // it is the process-level serve path, its agents come from
         // `GREENTIC_AGENT_MANIFESTS_DIR`, and it holds no `PackRuntime` at all.
-        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, &[])?;
+        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, &[])?;
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
@@ -4320,6 +4396,92 @@ mod aw {
                 // Unknown role falls back to a user turn.
                 assert!(matches!(llm_request.history[3], ChatMessage::User { .. }));
             });
+        }
+
+        /// A marker `LlmPort` whose only job is to be distinguishable by
+        /// `Arc::ptr_eq` — these tests assert WHICH tier's candidate was
+        /// returned, never anything about a port's behaviour.
+        struct MarkerLlmPort;
+
+        impl greentic_ext_runtime::host_ports::LlmPort for MarkerLlmPort {
+            fn complete(
+                &self,
+                _extension_id: &str,
+                _ctx: &greentic_ext_runtime::host_ports::HostCallContext,
+                _role: &str,
+                _request: greentic_ext_runtime::host_ports::LlmPortRequest,
+            ) -> Result<
+                greentic_ext_runtime::host_ports::LlmPortResponse,
+                greentic_ext_runtime::host_ports::LlmPortError,
+            > {
+                unreachable!("marker port for tier-selection tests; never invoked")
+            }
+        }
+
+        fn marker_port() -> Arc<dyn greentic_ext_runtime::host_ports::LlmPort> {
+            Arc::new(MarkerLlmPort)
+        }
+
+        /// Tier 1: the host-injected port wins over both the agent and env
+        /// candidates. This is the designer's own per-tenant, admin-backed
+        /// path, and it must never be shadowed by anything this crate builds.
+        #[test]
+        fn select_ext_llm_port_host_wins_over_agent_and_env() {
+            let host = marker_port();
+            let agent = marker_port();
+            let env = marker_port();
+
+            let picked = super::select_ext_llm_port(Some(host.clone()), Some(agent), Some(env));
+
+            assert!(
+                Arc::ptr_eq(&picked.expect("host tier present"), &host),
+                "tier 1 (host) must win when present"
+            );
+        }
+
+        /// Tier 2: the agent's own resolved backend wins once the host tier
+        /// is absent. This is the whole point of the change — a wrong tier
+        /// being chosen silently is exactly the bug this test exists to
+        /// catch coming back.
+        #[test]
+        fn select_ext_llm_port_agent_wins_when_host_is_absent() {
+            let agent = marker_port();
+            let env = marker_port();
+
+            let picked = super::select_ext_llm_port(None, Some(agent.clone()), Some(env));
+
+            assert!(
+                Arc::ptr_eq(&picked.expect("agent tier present"), &agent),
+                "tier 2 (agent) must win when tier 1 (host) is absent"
+            );
+        }
+
+        /// Tier 3: the env-keyed port is the last resort, reached only when
+        /// neither the host nor the agent supplied one. Removing this tier
+        /// would take the LLM away from every call site that serves no
+        /// agents at all.
+        #[test]
+        fn select_ext_llm_port_env_wins_when_host_and_agent_are_both_absent() {
+            let env = marker_port();
+
+            let picked = super::select_ext_llm_port(None, None, Some(env.clone()));
+
+            assert!(
+                Arc::ptr_eq(&picked.expect("env tier present"), &env),
+                "tier 3 (env) must win when tiers 1 and 2 are both absent"
+            );
+        }
+
+        /// Tier 4: with nothing to offer at any tier, the ext-runtime keeps
+        /// its "llm not configured for this runtime" refusal.
+        #[test]
+        fn select_ext_llm_port_none_when_all_three_are_absent() {
+            let picked = super::select_ext_llm_port(None, None, None);
+
+            assert!(
+                picked.is_none(),
+                "no tier present must yield None, not a port that fails on every call"
+            );
         }
     }
 }

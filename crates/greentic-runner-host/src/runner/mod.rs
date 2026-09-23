@@ -129,6 +129,7 @@ impl HostServer {
             ext_runtime: crate::runner::agent_node::build_ext_runtime(
                 std::sync::Arc::new(crate::runner::agent_node::EnvSecretsBackend),
                 None,
+                None,
                 &[],
             ),
             host,
