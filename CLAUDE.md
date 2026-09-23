@@ -184,6 +184,65 @@ into whatever turn is parked at that moment, producing a bogus timeout reply mid
 A correct bounded deadline needs a per-dispatch correlation nonce plus watchdog cancellation
 (likely shared with `sorla.call`); tracked as a follow-up, not yet implemented.
 
+### Knowledge retrieval backends
+
+An agent's `Knowledge` implementation is a chain of wrappers around whatever is
+mounted first (the pack-shipped `knowledge_corpus` backend, or none). Each
+wrapper delegates to the one before it for a binding it does not own — and for
+every `ingest` call, unconditionally, so a boot-ingested corpus keeps working
+underneath. Two such wrappers exist:
+
+- `knowledge_ext` (provider id `provider.knowledge.extension`) routes a bound
+  agent's retrieval to a customer's own HTTP service through a design
+  extension's tool (`<extension_id>/<tool_name>`).
+- `knowledge_index` (`crates/greentic-runner-host/src/runner/knowledge_index/`,
+  provider id **`provider.knowledge.chronicle-index`**) routes retrieval to a
+  Greentic-operated Chronicle index server instead — the worker's documents
+  live in one or more named indexes built by the designer's sync, not in the
+  pack and not behind a customer's own service.
+
+**Binding params**, every key prefixed `provider.knowledge.chronicle-index.`:
+`endpoint` (the index server's base URL), `tenant` (the DESIGNER tenant slug,
+sent as the `X-Greentic-Tenant` header on every server call), `team` (sent as
+`X-Greentic-Team`; blank/absent defaults to `general` on the wire),
+`index_ids` (non-empty array — every index is searched and the hits merged),
+`embedding_provider` (only `openai` is supported today), `embedding_model`,
+and `embedding_base_url` (optional, defaults to `https://api.openai.com/v1`).
+
+**Secrets** are sealed under category `knowledge` as `chronicle_index_key`
+(bearer for the index server) and `embedding_key` (bearer for the embedding
+API), read via `scoped_secrets::read_secret_for_unit` team-first-then-`_` —
+**never** unit-scoped. Both are read under the RUNTIME tenant (the tenant the
+host's own secrets are scoped by), not the binding's `tenant` param, which
+names the designer tenant and is only ever sent to the index server. There is
+no unit-scoped candidate because the deployed secret stores (greentic-deployer's
+dev-store writer, greentic-start's reader) canonicalise the secret name to
+`[a-z0-9_]` for every category except `mcp`/`a2a`, so a `<key>.unit-<id>` name
+could never be written or found there — this is also why the key names use
+`_` rather than `-`.
+
+**Per-call timeout** is `GREENTIC_KNOWLEDGE_INDEX_TIMEOUT_MS` (milliseconds,
+must be a positive integer or the 5000 ms default applies).
+
+**Failure is always `KnowledgeError::Backend`** — the turn loop already warns,
+records a failed retrieval trace step, and runs the turn without knowledge.
+One index among several failing is only a `tracing::warn!`; the other
+indexes' hits are still returned. Only when every bound index fails does the
+whole retrieval become a `Backend` error. Error messages never carry a
+credential, the query vector, or chunk text. Hits from every index are merged
+by score (best first), truncated to the query's limit, and capped by the same
+per-chunk/total character budgets as `knowledge_ext` (`MAX_CHUNK_CHARS` 4 000,
+`MAX_TOTAL_CHARS` 24 000).
+
+This backend is mounted at the same three production sites that mount
+`knowledge_ext` — two in `agent_node.rs` (single-turn and deep-worker agent
+construction) and one in `graph_node.rs` (the agent-graph lane, which runs each
+turn under a synthetic `TenantCtx` and so captures the real runtime tenant once,
+in `IndexMount`, rather than reading it off that synthetic context).
+
+**Server contract**: `POST {endpoint}/v1/indexes/{index_id}/search`, served by
+`greentic-chronicle-ext`'s `chronicle-index-server`.
+
 ### Async runtime dispatch (`sorla.call` node)
 
 A native flow node `sorla.call` (component `sorla.call`, operation = the sorx target)
