@@ -1349,6 +1349,24 @@ mod aw {
             .filter(|provider| !provider.trim().is_empty())
     }
 
+    /// The agent whose LLM configuration represents this runtime, chosen
+    /// deterministically: sorted id order, first agent declaring a non-empty
+    /// `llm.provider`. `None` when no agent declares one.
+    ///
+    /// Sorted, not `HashMap` order: this decides which provider the agent backend
+    /// is built for AND (in the next task) which provider an extension's host LLM
+    /// call resolves to, so an unstable pick means a worker that answers on a
+    /// different provider after a restart.
+    pub(super) fn first_declared_llm_agent(
+        agents: &HashMap<String, AgentConfig>,
+    ) -> Option<(&String, &AgentConfig)> {
+        let mut ids: Vec<&String> = agents.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| agents.get(id).map(|agent| (id, agent)))
+            .find(|(_, agent)| !agent.llm.provider.trim().is_empty())
+    }
+
     /// The provider to judge keylessness by: the env override first (it is the
     /// deployment's explicit statement), then the first agent that declares
     /// one. The in-process backend carries a single key, so a single provider
@@ -1356,10 +1374,7 @@ mod aw {
     /// [`in_process_llm_backend_with_key`].
     pub(super) fn configured_llm_provider(agents: &HashMap<String, AgentConfig>) -> Option<String> {
         env_llm_provider().or_else(|| {
-            agents
-                .values()
-                .map(|agent| agent.llm.provider.trim().to_string())
-                .find(|provider| !provider.is_empty())
+            first_declared_llm_agent(agents).map(|(_, agent)| agent.llm.provider.trim().to_string())
         })
     }
 
@@ -3250,6 +3265,31 @@ mod aw {
                     Some("ollama")
                 );
                 assert_eq!(super::configured_llm_provider(&HashMap::new()), None);
+            }
+        }
+
+        /// `configured_llm_provider` iterated a HashMap, so a worker declaring
+        /// several agents with different providers got a provider chosen by hash
+        /// order — a different one across process starts, with nothing
+        /// reporting it. The pick must be stable.
+        #[test]
+        fn configured_llm_provider_is_stable_across_hashmap_orderings() {
+            if super::env_llm_provider().is_some() {
+                // The env leg wins by design; this test is about the agent leg.
+                return;
+            }
+            for _ in 0..50 {
+                let mut agents = HashMap::new();
+                for (id, provider) in [("zz", "ollama"), ("aa", "anthropic"), ("mm", "groq")] {
+                    let mut agent = sample_agent_config(id);
+                    agent.llm.provider = provider.into();
+                    agents.insert(id.to_string(), agent);
+                }
+                assert_eq!(
+                    super::configured_llm_provider(&agents).as_deref(),
+                    Some("anthropic"),
+                    "the sorted-first agent id must decide the provider"
+                );
             }
         }
 
