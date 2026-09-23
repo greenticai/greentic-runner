@@ -97,6 +97,31 @@ impl AgentLlmPort {
             %model,
             "extension runtime LLM port wired (the worker's own agent LLM)"
         );
+
+        // A graph worker's coordinator plus specialists is the common shape
+        // with more than one agent, and every extension call on this runtime
+        // uses THIS ONE agent's provider regardless of what the others
+        // declare. Warn when another agent disagrees, so an operator can see
+        // that an extension's completions are not necessarily running on
+        // every agent's own choice — today nothing else says so.
+        let other_providers: std::collections::BTreeSet<&str> = agents
+            .values()
+            .filter_map(|other| {
+                let other_provider = other.llm.provider.trim();
+                (!other_provider.is_empty() && other_provider != provider).then_some(other_provider)
+            })
+            .collect();
+        if !other_providers.is_empty() {
+            tracing::warn!(
+                agent_id = %id,
+                %provider,
+                other_providers = ?other_providers,
+                "extension runtime LLM port: other agents in this runtime declare a \
+                 different provider; every host.llm.complete call still uses this \
+                 one agent's provider"
+            );
+        }
+
         Some(Self {
             backend,
             provider: provider.to_string(),
@@ -260,5 +285,23 @@ mod tests {
     #[test]
     fn no_agents_at_all_builds_no_port() {
         assert!(AgentLlmPort::from_agents(fake_backend(), &HashMap::new()).is_none());
+    }
+
+    /// A graph worker's coordinator plus specialists is the common shape
+    /// with more than one agent declaring a provider. The port still builds
+    /// over the sorted-first one's declaration — the disagreement is only
+    /// warned about (see `from_agents`), never refused.
+    #[test]
+    fn agents_disagreeing_on_provider_still_builds_over_the_sorted_first_one() {
+        let mut agents = HashMap::new();
+        agents.insert("aa".to_string(), agent_with("anthropic", "claude-x"));
+        agents.insert("bb".to_string(), agent_with("groq", "llama-fast"));
+        agents.insert("cc".to_string(), agent_with("ollama", "llama3"));
+
+        let port = AgentLlmPort::from_agents(fake_backend(), &agents)
+            .expect("aa sorts first and declares a provider");
+        assert_eq!(port.provider(), "anthropic");
+        assert_eq!(port.model(), "claude-x");
+        assert_eq!(port.agent_id(), "aa");
     }
 }
