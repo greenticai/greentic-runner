@@ -20,8 +20,8 @@ use crate::runner::engine::FlowEngine;
 use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::secrets::{DynSecretsManager, default_manager};
 use crate::storage::{
-    DynSessionStore, DynStateStore, new_session_store, new_state_store, session_host_from,
-    state_host_from,
+    DynSessionStore, DynStateStore, StorageConfig, session_host_from, state_host_from,
+    stores_from_config,
 };
 use crate::wasi::RunnerWasiPolicy;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
@@ -57,6 +57,7 @@ pub struct HostBuilder {
     telemetry: Option<TelemetryCfg>,
     wasi_policy: RunnerWasiPolicy,
     secrets: Option<DynSecretsManager>,
+    storage: StorageConfig,
     #[cfg(feature = "agentic-worker")]
     ext_llm_port: Option<ExtLlmPort>,
     #[cfg(feature = "agentic-worker")]
@@ -70,6 +71,7 @@ impl HostBuilder {
             telemetry: None,
             wasi_policy: RunnerWasiPolicy::default(),
             secrets: None,
+            storage: StorageConfig::default(),
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: None,
             #[cfg(feature = "agentic-worker")]
@@ -94,6 +96,34 @@ impl HostBuilder {
 
     pub fn with_secrets_manager(mut self, manager: DynSecretsManager) -> Self {
         self.secrets = Some(manager);
+        self
+    }
+
+    /// Choose where this host keeps its sessions and flow state.
+    ///
+    /// Unset means [`StorageConfig::default`] — both stores in memory, which is
+    /// what every caller got before this method existed. A parked flow then
+    /// dies with the process: correct for a desktop run, wrong for a deployed
+    /// worker, where a revision rollout or a cold start silently restarts the
+    /// conversation.
+    ///
+    /// A configured-but-unreachable backend makes [`HostBuilder::build`] fail.
+    /// It never degrades to memory — a host that quietly forgets every parked
+    /// conversation looks healthy from every angle except the user's.
+    ///
+    /// ```no_run
+    /// # use greentic_runner_host::{HostBuilder, HostConfig};
+    /// # use greentic_runner_host::storage::StorageConfig;
+    /// # fn main() -> anyhow::Result<()> {
+    /// # let config: HostConfig = unimplemented!();
+    /// let storage = StorageConfig::redis("redis://redis:6379", "greentic:session:prod")?;
+    /// let host = HostBuilder::new().with_config(config).with_storage(storage).build()?;
+    /// # let _ = host;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_storage(mut self, storage: StorageConfig) -> Self {
+        self.storage = storage;
         self
     }
 
@@ -136,10 +166,44 @@ impl HostBuilder {
             .into_iter()
             .map(|(tenant, cfg)| (tenant, Arc::new(cfg)))
             .collect();
-        let session_store = new_session_store();
-        let session_host = session_host_from(Arc::clone(&session_store));
-        let state_store = new_state_store();
+        let (session_store, state_store) = stores_from_config(&self.storage)?;
+        // `SessionStoreHost` is deliberately NOT pointed at a durable store.
+        //
+        // It is write-only by construction: `put` goes through
+        // `SessionStore::create_session`, which does not add the row to the
+        // per-user wait index — and `get` reads exactly that index, via
+        // `find_by_user`. Both backends behave this way, so `get` never returns
+        // what `put` wrote, `state_machine::step`'s `is_new` is always true, and
+        // every turn writes a fresh row under a random UUID.
+        //
+        // In memory that is a bounded-by-process-lifetime map nobody reads. On
+        // Redis it would be one permanent key PER TURN — `create_session` takes
+        // no TTL argument, so there is no expiry to attach and the
+        // `DefaultWaitTtl` decorator cannot reach it — growing without bound
+        // while buying nothing, because nothing can read it back.
+        //
+        // The parked-flow snapshot, which is what durability is for, does NOT
+        // travel this path: `FlowResumeStore` uses `register_wait` /
+        // `find_wait_by_scope` and gets `session_store` below. Closing the
+        // write-only behaviour itself is an upstream change in greentic-session.
+        let session_host = if self.storage.session.is_durable() {
+            session_host_from(crate::storage::new_session_store())
+        } else {
+            // Unchanged for every caller that names no storage: one store,
+            // shared, exactly as before.
+            session_host_from(Arc::clone(&session_store))
+        };
         let state_host = state_host_from(Arc::clone(&state_store));
+        if self.storage.is_durable() {
+            // Names, never the configured values: a Redis URL may carry
+            // `redis://user:password@host`, and a startup log line is the last
+            // place a credential should land.
+            tracing::info!(
+                session = self.storage.session.describe(),
+                state = self.storage.state.describe(),
+                "runner host using durable storage; parked flows survive a restart"
+            );
+        }
         let secrets = match self.secrets {
             Some(manager) => manager,
             None => default_manager().context("failed to initialise default secrets backend")?,
@@ -767,7 +831,8 @@ impl RunnerHost {
             &mut envelope,
             welcome_flow_hint.as_ref(),
             hint_flow_type,
-        )?;
+        )
+        .await?;
 
         Ok(Prepared::Run(Box::new(envelope)))
     }
@@ -863,6 +928,8 @@ impl RunnerHost {
     /// `POST /agent/chat` handler tests exercise.
     #[cfg(test)]
     pub(crate) fn for_test() -> Arc<Self> {
+        use crate::storage::{new_session_store, new_state_store};
+
         use crate::config::{
             FlowRetryConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
             WebhookPolicy,
@@ -1004,7 +1071,10 @@ impl TenantHandle {
 /// `session_store` + `hint_flow_type` are passed as primitives so the logic
 /// is unit-testable without a `TenantRuntime`; the caller does the engine
 /// lookup that produces `hint_flow_type`.
-fn apply_welcome_flow_override(
+///
+/// `async` because both probes are session-store round-trips, and that store
+/// may be Redis — see [`FlowResumeStore`].
+async fn apply_welcome_flow_override(
     session_store: &DynSessionStore,
     envelope: &mut IngressEnvelope,
     hint: Option<&WelcomeFlowHint>,
@@ -1017,13 +1087,14 @@ fn apply_welcome_flow_override(
         return Ok(());
     }
 
-    if !try_mark_welcome_first_contact(session_store, envelope)? {
+    if !try_mark_welcome_first_contact(session_store, envelope).await? {
         return Ok(());
     }
 
     let resume = FlowResumeStore::new(Arc::clone(session_store));
     let snapshot = resume
         .fetch(envelope)
+        .await
         .map_err(|err| anyhow!("welcome-flow first-contact probe failed: {err}"))?;
     if snapshot.is_some() {
         return Ok(());
@@ -1047,7 +1118,7 @@ fn apply_welcome_flow_override(
 /// welcome once — bounded harm, mitigated by the wait-snapshot safety net
 /// in [`apply_welcome_flow_override`]. A real atomic primitive
 /// (`register_wait_if_absent`) is Phase D.
-fn try_mark_welcome_first_contact(
+async fn try_mark_welcome_first_contact(
     store: &DynSessionStore,
     envelope: &IngressEnvelope,
 ) -> Result<bool> {
@@ -1057,20 +1128,29 @@ fn try_mark_welcome_first_contact(
     let (ctx, user) = FlowResumeStore::contact_identity(envelope)
         .map_err(|e| anyhow!("welcome marker identity probe failed: {e}"))?;
 
-    if store
-        .find_wait_by_scope(&ctx, &user, &scope)
-        .map_err(|e| anyhow!("welcome marker probe failed: {e}"))?
-        .is_some()
-    {
-        return Ok(false);
-    }
+    // One offload, not two: check and mark are already documented as a
+    // non-atomic pair, and splitting them across two blocking hops would widen
+    // the race window for nothing.
+    let store = Arc::clone(store);
+    let marked = tokio::task::spawn_blocking(move || -> Result<bool> {
+        if store
+            .find_wait_by_scope(&ctx, &user, &scope)
+            .map_err(|e| anyhow!("welcome marker probe failed: {e}"))?
+            .is_some()
+        {
+            return Ok(false);
+        }
 
-    let data = marker_session_data(&ctx, &user);
-    let session_key = marker_session_key(&ctx, &user, &scope);
-    store
-        .register_wait(&ctx, &user, &scope, &session_key, data, None)
-        .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
-    Ok(true)
+        let data = marker_session_data(&ctx, &user);
+        let session_key = marker_session_key(&ctx, &user, &scope);
+        store
+            .register_wait(&ctx, &user, &scope, &session_key, data, None)
+            .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
+        Ok(true)
+    })
+    .await
+    .map_err(|err| anyhow!("welcome marker probe panicked or was cancelled: {err}"))??;
+    Ok(marked)
 }
 
 /// Stable, identity-scoped session key for the welcome marker.
@@ -1386,7 +1466,7 @@ mod welcome_flow_tests {
         }
     }
 
-    fn seed_resume(store: &DynSessionStore, envelope: &IngressEnvelope) {
+    async fn seed_resume(store: &DynSessionStore, envelope: &IngressEnvelope) {
         // Plant a snapshot in the exact bucket `fetch` would query so the
         // next call resolves to a resume — proves the override skips when a
         // session already exists.
@@ -1408,37 +1488,40 @@ mod welcome_flow_tests {
                 state,
             },
         };
-        resume.save(envelope, &wait).expect("seed save");
+        resume.save(envelope, &wait).await.expect("seed save");
     }
 
-    #[test]
-    fn override_is_no_op_when_hint_absent() {
+    #[tokio::test]
+    async fn override_is_no_op_when_hint_absent() {
         // Pre-M1.5 producers don't attach a hint — flow resolution must
         // stay exactly the same.
         let store = new_session_store();
         let mut envelope = sample_envelope(Some("teams-legal"));
         let before = envelope.clone();
-        apply_welcome_flow_override(&store, &mut envelope, None, None).expect("ok");
+        apply_welcome_flow_override(&store, &mut envelope, None, None)
+            .await
+            .expect("ok");
         assert_eq!(envelope.pack_id, before.pack_id);
         assert_eq!(envelope.flow_id, before.flow_id);
         assert_eq!(envelope.flow_type, before.flow_type);
     }
 
-    #[test]
-    fn override_is_no_op_when_endpoint_id_absent() {
+    #[tokio::test]
+    async fn override_is_no_op_when_endpoint_id_absent() {
         // Non-messaging traffic carries no endpoint id and must never hit
         // the welcome-flow path even if the hint is somehow set.
         let store = new_session_store();
         let mut envelope = sample_envelope(None);
         let before = envelope.clone();
         apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("ok");
         assert_eq!(envelope.pack_id, before.pack_id);
         assert_eq!(envelope.flow_id, before.flow_id);
     }
 
-    #[test]
-    fn override_swaps_pack_flow_and_threads_flow_type_through() {
+    #[tokio::test]
+    async fn override_swaps_pack_flow_and_threads_flow_type_through() {
         // Both axes covered: when the caller pre-resolved the welcome
         // flow's type, it lands on the envelope; when the resolver
         // returned None (unknown flow in engine), it lands as None and
@@ -1452,6 +1535,7 @@ mod welcome_flow_tests {
                 Some(&hint()),
                 hint_flow_type.clone(),
             )
+            .await
             .expect("ok");
             assert_eq!(envelope.pack_id.as_deref(), Some("pack.welcome"));
             assert_eq!(envelope.flow_id, "flow.welcome");
@@ -1459,25 +1543,26 @@ mod welcome_flow_tests {
         }
     }
 
-    #[test]
-    fn override_is_no_op_on_repeat_turn_with_existing_session() {
+    #[tokio::test]
+    async fn override_is_no_op_on_repeat_turn_with_existing_session() {
         // Resume path: an already-active session in the same bucket means
         // this isn't first contact. The user must continue on the resumed
         // flow, NOT be redirected to the welcome flow.
         let store = new_session_store();
         let envelope_template = sample_envelope(Some("teams-legal"));
-        seed_resume(&store, &envelope_template);
+        seed_resume(&store, &envelope_template).await;
 
         let mut envelope = envelope_template.clone();
         apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("ok");
         assert_eq!(envelope.pack_id, envelope_template.pack_id);
         assert_eq!(envelope.flow_id, envelope_template.flow_id);
         assert_eq!(envelope.flow_type, envelope_template.flow_type);
     }
 
-    #[test]
-    fn override_is_no_op_post_completion_when_marker_present() {
+    #[tokio::test]
+    async fn override_is_no_op_post_completion_when_marker_present() {
         // POST-COMPLETION REGRESSION GUARD (Codex #201): the welcome-seen
         // marker is durable and survives flow completion. After welcome
         // fires once + the flow finishes (wait cleared), the next turn
@@ -1486,6 +1571,7 @@ mod welcome_flow_tests {
         let store = new_session_store();
         let mut first = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut first, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("first turn ok");
         assert_eq!(
             first.pack_id.as_deref(),
@@ -1498,13 +1584,17 @@ mod welcome_flow_tests {
         // marker must NOT be in the wait scope, so this clear has no
         // effect on the marker.
         let resume = FlowResumeStore::new(Arc::clone(&store));
-        resume.clear(&first).expect("clear post-completion wait");
+        resume
+            .clear(&first)
+            .await
+            .expect("clear post-completion wait");
 
         // Second turn arrives — producer still attaches the hint (it
         // does not know flow-completion happened). The marker keeps the
         // override off.
         let mut second = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut second, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("second turn ok");
         assert_eq!(
             second.pack_id.as_deref(),
@@ -1514,19 +1604,21 @@ mod welcome_flow_tests {
         assert_eq!(second.flow_id, "flow.default");
     }
 
-    #[test]
-    fn override_is_no_op_on_second_turn_after_marker_set() {
+    #[tokio::test]
+    async fn override_is_no_op_on_second_turn_after_marker_set() {
         // No-wait variant of the post-completion test: a welcome flow
         // without `session.wait` leaves no snapshot AT ALL. Marker is the
         // only thing standing between turn 2 and a welcome re-fire.
         let store = new_session_store();
         let mut first = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut first, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("first turn ok");
         assert_eq!(first.pack_id.as_deref(), Some("pack.welcome"));
 
         let mut second = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut second, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("second turn ok");
         assert_eq!(
             second.pack_id.as_deref(),
@@ -1535,8 +1627,8 @@ mod welcome_flow_tests {
         );
     }
 
-    #[test]
-    fn override_partitions_marker_per_endpoint() {
+    #[tokio::test]
+    async fn override_partitions_marker_per_endpoint() {
         // The marker is keyed by `(tenant, env, eid, user)` — a user
         // marked seen on `teams-legal` is still first contact on
         // `teams-accounting`. Welcome must fire independently on each
@@ -1544,6 +1636,7 @@ mod welcome_flow_tests {
         let store = new_session_store();
         let mut legal = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut legal, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("legal first turn ok");
         assert_eq!(legal.pack_id.as_deref(), Some("pack.welcome"));
 
@@ -1554,6 +1647,7 @@ mod welcome_flow_tests {
             Some(&hint()),
             Some("welcome".into()),
         )
+        .await
         .expect("accounting first turn ok");
         assert_eq!(
             accounting.pack_id.as_deref(),
@@ -1562,8 +1656,8 @@ mod welcome_flow_tests {
         );
     }
 
-    #[test]
-    fn override_partitions_marker_per_user_on_same_endpoint() {
+    #[tokio::test]
+    async fn override_partitions_marker_per_user_on_same_endpoint() {
         // Codex adversarial review of #382 (high): a session-key derived
         // only from the eid collapses every user on that endpoint onto one
         // store row — in-memory rejects User B's first turn with a hard
@@ -1578,12 +1672,14 @@ mod welcome_flow_tests {
         // User A's first turn
         let mut a1 = sample_envelope_for_user(Some("teams-legal"), "user-a");
         apply_welcome_flow_override(&store, &mut a1, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("user-a first ok");
         assert_eq!(a1.pack_id.as_deref(), Some("pack.welcome"));
 
         // User B's first turn — must independently fire welcome, NOT error.
         let mut b1 = sample_envelope_for_user(Some("teams-legal"), "user-b");
         apply_welcome_flow_override(&store, &mut b1, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("user-b first must not collide with user-a marker");
         assert_eq!(
             b1.pack_id.as_deref(),
@@ -1594,6 +1690,7 @@ mod welcome_flow_tests {
         // User A's second turn — marker still intact, no re-fire.
         let mut a2 = sample_envelope_for_user(Some("teams-legal"), "user-a");
         apply_welcome_flow_override(&store, &mut a2, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("user-a second ok");
         assert_eq!(
             a2.pack_id.as_deref(),
@@ -1604,12 +1701,13 @@ mod welcome_flow_tests {
         // User B's second turn — same.
         let mut b2 = sample_envelope_for_user(Some("teams-legal"), "user-b");
         apply_welcome_flow_override(&store, &mut b2, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("user-b second ok");
         assert_eq!(b2.pack_id.as_deref(), Some("pack.default"));
     }
 
-    #[test]
-    fn marker_is_not_written_when_hint_absent() {
+    #[tokio::test]
+    async fn marker_is_not_written_when_hint_absent() {
         // Marker writes are gated on the hint+eid preconditions — a
         // pre-M1.5 turn (no hint) MUST NOT leak a marker, otherwise a
         // producer that later enables welcome would treat that user as
@@ -1620,10 +1718,13 @@ mod welcome_flow_tests {
         // This test only guards the no-hint gate.
         let store = new_session_store();
         let mut envelope = sample_envelope(Some("teams-legal"));
-        apply_welcome_flow_override(&store, &mut envelope, None, None).expect("ok");
+        apply_welcome_flow_override(&store, &mut envelope, None, None)
+            .await
+            .expect("ok");
 
         let mut next = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut next, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("ok");
         assert_eq!(
             next.pack_id.as_deref(),
@@ -1636,6 +1737,7 @@ mod welcome_flow_tests {
 #[cfg(test)]
 mod identify_endpoints_tests {
     use super::*;
+    use crate::storage::{new_session_store, new_state_store};
 
     fn dummy_runner_host() -> RunnerHost {
         let session_store = new_session_store();
