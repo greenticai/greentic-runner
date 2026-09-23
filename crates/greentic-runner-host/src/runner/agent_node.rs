@@ -3300,7 +3300,16 @@ mod aw {
         /// several agents with different providers got a provider chosen by hash
         /// order — a different one across process starts, with nothing
         /// reporting it. The pick must be stable.
+        ///
+        /// `#[serial_test::serial]` because this test reads `GREENTIC_LLM_PROVIDER`
+        /// (via the `env_llm_provider().is_some()` guard below) and several
+        /// `EnvLlmPort` tests in this module set that same process-global env var
+        /// under their own `#[serial_test::serial]` — without joining that group,
+        /// a parallel run could observe the var mid-mutation between the guard
+        /// check and the assertions, failing for a reason that has nothing to do
+        /// with the sort this test actually exercises.
         #[test]
+        #[serial_test::serial]
         fn configured_llm_provider_is_stable_across_hashmap_orderings() {
             if super::env_llm_provider().is_some() {
                 // The env leg wins by design; this test is about the agent leg.
