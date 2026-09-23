@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use base64::Engine as _;
 use greentic_aw_runtime::config::MemoryProviderRef;
 use greentic_aw_runtime::knowledge::{
     IngestOutcome, Knowledge, KnowledgeChunk, KnowledgeError, KnowledgeQuery, KnowledgeResult,
@@ -145,15 +144,6 @@ fn query(text: &str, limit: usize) -> KnowledgeQuery {
     }
 }
 
-fn vector_b64(vector: &[f32]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(
-        vector
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect::<Vec<u8>>(),
-    )
-}
-
 async fn mount_embeddings(server: &MockServer, vector: &[f32]) {
     Mock::given(method("POST"))
         .and(path("/v1/embeddings"))
@@ -257,7 +247,8 @@ async fn searches_the_index_with_the_embedded_query() {
         .and(body_partial_json(json!({
             "query": "refund policy",
             "limit": 3,
-            "vector_b64": vector_b64(&[0.5, -1.0]),
+            // [0.5, -1.0] as little-endian f32 bytes, standard base64.
+            "vector_b64": "AAAAPwAAgL8=",
         })))
         .respond_with(chunks(json!([
             {"text": "refunds within 30 days", "score": 0.9, "document_id": "refunds", "chunk_index": 2},
@@ -532,4 +523,98 @@ async fn graph_mount_reads_secrets_under_the_real_tenant() {
         .await
         .unwrap();
     assert_eq!(got[0].text, "graph hit");
+}
+
+#[tokio::test]
+async fn no_secrets_manager_is_a_backend_error() {
+    let server = MockServer::start().await;
+    let err = ChronicleIndexKnowledge::new(None, None, None)
+        .search_bound(
+            &tenant(),
+            query("q", 5),
+            Some(&index_binding(&server, &["kb1"], None)),
+        )
+        .await
+        .expect_err("no secrets manager");
+    let message = backend_message(err);
+    assert!(message.contains("no secrets manager"), "{message}");
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(requests.is_empty(), "nothing is called without secrets");
+}
+
+/// The per-call timeout bounds each index on its own: a slow index is one
+/// failed index, and only when it is the only one does retrieval fail.
+#[tokio::test]
+async fn a_slow_index_times_out_as_a_per_index_failure() {
+    let server = MockServer::start().await;
+    mount_embeddings(&server, &[1.0]).await;
+    mount_index(
+        &server,
+        "slow",
+        chunks(json!([{"text": "late", "score": 0.9, "document_id": "s", "chunk_index": 0}]))
+            .set_delay(std::time::Duration::from_millis(2_000)),
+    )
+    .await;
+    mount_index(
+        &server,
+        "fast",
+        chunks(json!([{"text": "on time", "score": 0.1, "document_id": "f", "chunk_index": 0}])),
+    )
+    .await;
+
+    let http = super::build_client(std::time::Duration::from_millis(300)).unwrap();
+    let adapter = ChronicleIndexKnowledge::with_client(None, Some(both_keys()), None, http);
+
+    let got = adapter
+        .search_bound(
+            &tenant(),
+            query("q", 5),
+            Some(&index_binding(&server, &["slow", "fast"], None)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].text, "on time");
+
+    let message = backend_message(
+        adapter
+            .search_bound(
+                &tenant(),
+                query("q", 5),
+                Some(&index_binding(&server, &["slow"], None)),
+            )
+            .await
+            .expect_err("the only index timed out"),
+    );
+    assert!(
+        message.contains("every knowledge index search failed"),
+        "{message}"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+#[allow(unsafe_code)]
+fn timeout_env_parses_positive_integers_only() {
+    let set = |value: Option<&str>| {
+        // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(super::TIMEOUT_ENV, v),
+                None => std::env::remove_var(super::TIMEOUT_ENV),
+            }
+        }
+    };
+    let default = std::time::Duration::from_millis(super::DEFAULT_TIMEOUT_MS);
+    set(Some("250"));
+    assert_eq!(
+        super::timeout_from_env(),
+        std::time::Duration::from_millis(250)
+    );
+    for bad in ["0", "-5", "soon"] {
+        set(Some(bad));
+        assert_eq!(super::timeout_from_env(), default, "{bad}");
+    }
+    set(None);
+    assert_eq!(super::timeout_from_env(), default);
 }

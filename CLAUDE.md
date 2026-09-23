@@ -222,7 +222,12 @@ could never be written or found there — this is also why the key names use
 `_` rather than `-`.
 
 **Per-call timeout** is `GREENTIC_KNOWLEDGE_INDEX_TIMEOUT_MS` (milliseconds,
-must be a positive integer or the 5000 ms default applies).
+must be a positive integer or the 5000 ms default applies). It is read ONCE,
+when the process-wide HTTP client is built on the first bound search — every
+instance shares that client, because the graph lane mounts a fresh backend on
+every agent turn and building a client per turn would put TLS setup on each
+one. A client that cannot be built makes every bound search a `Backend`
+error; it never falls back to an untimed client.
 
 **Failure is always `KnowledgeError::Backend`** — the turn loop already warns,
 records a failed retrieval trace step, and runs the turn without knowledge.

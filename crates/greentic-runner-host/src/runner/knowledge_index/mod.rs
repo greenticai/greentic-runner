@@ -24,7 +24,7 @@
 
 mod client;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use greentic_aw_runtime::AgentRuntime;
@@ -67,6 +67,27 @@ const DEFAULT_LIMIT: usize = 5;
 /// Per-HTTP-call timeout override, in milliseconds.
 const TIMEOUT_ENV: &str = "GREENTIC_KNOWLEDGE_INDEX_TIMEOUT_MS";
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+
+/// The one HTTP client every [`ChronicleIndexKnowledge`] shares, built on the
+/// first bound search. The graph lane mounts a fresh instance on every agent
+/// turn, so building a client (TLS roots and all) per instance would put that
+/// cost on every turn, bound or not.
+static SHARED_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+/// The shared client, or why it could not be built. Never falls back to
+/// `reqwest::Client::new()`: that can panic, and it drops the timeout.
+fn shared_client() -> Result<reqwest::Client, String> {
+    SHARED_CLIENT
+        .get_or_init(|| build_client(timeout_from_env()))
+        .clone()
+}
+
+fn build_client(timeout: Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())
+}
 
 /// Mount Chronicle-index knowledge retrieval, wrapping whatever backend is
 /// already mounted.
@@ -114,25 +135,53 @@ pub struct ChronicleIndexKnowledge {
     inner: Option<Arc<dyn Knowledge>>,
     secrets: Option<DynSecretsManager>,
     secret_tenant: Option<String>,
-    http: reqwest::Client,
+    /// `None` uses the process-wide [`shared_client`]; tests inject their own.
+    http: Option<reqwest::Client>,
 }
 
 impl ChronicleIndexKnowledge {
+    /// Does no I/O and no TLS setup: the HTTP client is the process-wide one,
+    /// built on the first bound search.
     #[must_use]
     pub fn new(
         inner: Option<Arc<dyn Knowledge>>,
         secrets: Option<DynSecretsManager>,
         secret_tenant: Option<String>,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(timeout_from_env())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             inner,
             secrets,
             secret_tenant,
-            http,
+            http: None,
+        }
+    }
+
+    /// [`Self::new`] with a caller-supplied client instead of the shared one,
+    /// so a test can set its own timeout without racing the process-wide
+    /// client's first initialisation.
+    #[cfg(test)]
+    pub(crate) fn with_client(
+        inner: Option<Arc<dyn Knowledge>>,
+        secrets: Option<DynSecretsManager>,
+        secret_tenant: Option<String>,
+        http: reqwest::Client,
+    ) -> Self {
+        Self {
+            inner,
+            secrets,
+            secret_tenant,
+            http: Some(http),
+        }
+    }
+
+    fn http(&self) -> KnowledgeResult<reqwest::Client> {
+        match &self.http {
+            Some(http) => Ok(http.clone()),
+            None => shared_client().map_err(|reason| {
+                KnowledgeError::Backend(format!(
+                    "knowledge index HTTP client could not be built: {reason}"
+                ))
+            }),
         }
     }
 
@@ -234,10 +283,11 @@ impl Knowledge for ChronicleIndexKnowledge {
         let index_key = Self::read_key(secrets, secret_tenant, team, INDEX_KEY).await?;
         let embedding_key = Self::read_key(secrets, secret_tenant, team, EMBEDDING_KEY).await?;
 
-        let vector = client::embed(&self.http, &index, &embedding_key, &query.query).await?;
+        let http = self.http()?;
+        let vector = client::embed(&http, &index, &embedding_key, &query.query).await?;
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).max(1);
         let hits = client::search_all(
-            &self.http,
+            &http,
             &index,
             &index_key,
             &query.query,
