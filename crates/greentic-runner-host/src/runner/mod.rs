@@ -28,6 +28,8 @@ pub mod invocation;
 pub mod knowledge_corpus;
 #[cfg(feature = "agentic-worker")]
 pub mod knowledge_ext;
+#[cfg(feature = "agentic-worker")]
+pub mod knowledge_index;
 pub mod mcp_node;
 pub mod mcp_pack_routes;
 #[cfg(feature = "agentic-worker")]

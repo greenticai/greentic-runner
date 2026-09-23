@@ -71,7 +71,7 @@ pub const TOOL_NAME_PARAM: &str = "provider.knowledge.extension.tool_name";
 const DEFAULT_LIMIT: usize = 5;
 
 /// Characters kept from any single chunk.
-const MAX_CHUNK_CHARS: usize = 4_000;
+pub(crate) const MAX_CHUNK_CHARS: usize = 4_000;
 
 /// Characters kept across all chunks of one retrieval.
 ///
@@ -88,7 +88,7 @@ const MAX_CHUNK_CHARS: usize = 4_000;
 /// these constants do not touch. Neither introduced here nor fixable here — it
 /// needs a cap on the host's HTTP port — but the distinction has to be written
 /// down, because a reader who takes these for a memory guard will not go looking.
-const MAX_TOTAL_CHARS: usize = 24_000;
+pub(crate) const MAX_TOTAL_CHARS: usize = 24_000;
 
 /// Identifies this backend within a wrapper chain.
 ///
@@ -434,7 +434,7 @@ fn parse_chunks(raw: &str, limit: usize) -> KnowledgeResult<Vec<RetrievedChunk>>
 
 /// Truncate on a character boundary. Byte slicing would panic mid-codepoint on
 /// any non-ASCII corpus, which is most of them.
-fn truncate_chars(text: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
