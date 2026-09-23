@@ -4682,10 +4682,18 @@ pub(crate) use aw::resolve_in_process_llm_key;
 // flow_source_from_packs is used only inside the aw module (build_runtime_handler_with_stores
 // + tests) so it stays pub(crate) there without a top-level re-export.
 
-/// Test-only helpers other `runner` submodules' tests reuse rather than
-/// re-implementing (e.g. `ext_llm_port`'s tests need an agent config to vary
-/// the provider/model on).
-#[cfg(all(test, feature = "agentic-worker"))]
+// Test-only helpers other `runner` submodules' tests reuse rather than
+// re-implementing. Its only consumer today is `ext_llm_port`'s test module
+// (which needs an agent config to vary the provider/model on), and that
+// module is itself gated on `greentic-llm-backend` (it uses
+// `greentic_llm::ProviderKind` directly) — so this module must carry the
+// same gate, not just `agentic-worker`, or an `agentic-worker`-only build
+// (the crate's own DEFAULT feature set) sees `sample_agent_config` re-exported
+// to nobody and trips `unused_imports`. Introduced in the task that added
+// `ext_llm_port`; missing this gate broke `cargo clippy --all-targets
+// --features agentic-worker -- -D warnings` from that point on, invisible
+// until someone actually built test targets in that configuration.
+#[cfg(all(test, feature = "agentic-worker", feature = "greentic-llm-backend"))]
 pub(crate) mod test_support {
     pub(crate) use super::aw::tests::sample_agent_config;
 }
