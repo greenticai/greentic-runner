@@ -262,12 +262,12 @@ impl Knowledge for ExtensionKnowledge {
         // runtime-level config. So on the out-of-process serve path — the very
         // path that serves many agents from one runtime, and the reason the
         // binding has to travel per turn — the runtime is built with
-        // `build_ext_runtime(Arc::new(EnvSecretsBackend), None)`
-        // (`agent_node.rs:1736`) and EVERY tenant's retrieval resolves the same
-        // env credential. Passing the tenant is correct and free once the port
-        // grows tenant awareness; today it is not a multi-tenancy guarantee, and
-        // a comment claiming otherwise is what would stop the next reader
-        // checking.
+        // `build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, &[])`
+        // (`agent_node.rs`, inside `build_agent_runtime`) and EVERY tenant's
+        // retrieval resolves the same env credential. Passing the tenant is
+        // correct and free once the port grows tenant awareness; today it is
+        // not a multi-tenancy guarantee, and a comment claiming otherwise is
+        // what would stop the next reader checking.
         let ctx = HostCallContext {
             tenant: Some(tenant.tenant.as_str().to_string()),
             user_email: None,
