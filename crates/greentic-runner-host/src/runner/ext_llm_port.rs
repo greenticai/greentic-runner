@@ -41,14 +41,26 @@ impl AgentLlmPort {
     ///
     /// The agent is chosen deterministically by
     /// [`crate::runner::agent_node::first_declared_llm_agent`] — sorted id
-    /// order, first one declaring a non-empty provider — the SAME rule that
-    /// decides which provider the in-process agent backend is built for, so
-    /// this port and that backend cannot resolve two different providers on
-    /// one boot. This layers only one further check on top: the declared
-    /// provider must be one [`greentic_llm::ProviderKind`] can parse.
-    /// Returns `None` when no agent qualifies, so the caller falls through
-    /// to the env-keyed port rather than getting a port that fails on every
-    /// call.
+    /// order, first one declaring a non-empty provider — the same
+    /// agent-selection rule (`configured_llm_provider` also builds on it, to
+    /// decide keylessness rather than the per-request provider).
+    ///
+    /// Only that ONE candidate is ever examined — this does not fall through
+    /// to a later agent when the first one fails a check below. That is
+    /// deliberate: it is what keeps this port and the in-process agent
+    /// backend looking at the same agent's declaration, rather than this
+    /// port silently picking a second, differently-configured agent behind
+    /// the backend's back. So an unparseable provider or a missing model on
+    /// the sorted-first agent yields no port at all, even when a later agent
+    /// would have qualified.
+    ///
+    /// Two checks on top of that selection, either of which returns `None`:
+    /// the declared provider must be one [`greentic_llm::ProviderKind`] can
+    /// parse, and the declared model must be non-empty (`first_declared_llm_agent`
+    /// only guarantees a non-empty PROVIDER — an empty model would build
+    /// exactly the kind of port that first check exists to prevent: one that
+    /// fails on every call). In every `None` case the caller falls back to
+    /// the env-keyed port instead of getting one that fails on every call.
     pub(crate) fn from_agents(
         backend: Arc<dyn greentic_aw_runtime::llm::LlmBackend>,
         agents: &HashMap<String, AgentConfig>,
@@ -62,11 +74,24 @@ impl AgentLlmPort {
             tracing::warn!(
                 agent_id = %id,
                 %provider,
-                "extension runtime LLM port: agent declares an unknown provider; skipping"
+                "extension runtime LLM port: agent declares an unknown provider; \
+                 no worker-backed ext LLM port (falling back to the env-keyed port)"
             );
             return None;
         }
         let model = agent.llm.model.trim();
+        if model.is_empty() {
+            // Same failure mode as an unparseable provider: a port with an
+            // empty model is exactly the opaque-failure-on-every-call shape
+            // the provider check above exists to prevent.
+            tracing::warn!(
+                agent_id = %id,
+                %provider,
+                "extension runtime LLM port: agent declares a provider but no model; \
+                 no worker-backed ext LLM port (falling back to the env-keyed port)"
+            );
+            return None;
+        }
         tracing::info!(
             agent_id = %id,
             %provider,
@@ -117,9 +142,6 @@ impl LlmPort for AgentLlmPort {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greentic_aw_runtime::AgentConfig;
-    use std::collections::HashMap;
-    use std::sync::Arc;
 
     fn agent_with(provider: &str, model: &str) -> AgentConfig {
         let mut agent = crate::runner::agent_node::test_support::sample_agent_config("a");
@@ -192,6 +214,36 @@ mod tests {
             AgentLlmPort::from_agents(fake_backend(), &agents).is_none(),
             "a provider the backend cannot parse must not produce a port that \
              fails on every call instead"
+        );
+    }
+
+    #[test]
+    fn an_agent_declaring_a_provider_but_no_model_builds_no_port() {
+        let mut agents = HashMap::new();
+        agents.insert("aa".to_string(), agent_with("anthropic", ""));
+
+        assert!(
+            AgentLlmPort::from_agents(fake_backend(), &agents).is_none(),
+            "a provider without a model must not produce a port that fails on \
+             every call instead — first_declared_llm_agent only guarantees a \
+             non-empty provider, not a non-empty model"
+        );
+    }
+
+    #[test]
+    fn only_the_sorted_first_agent_is_ever_examined() {
+        let mut agents = HashMap::new();
+        // "aa" sorts first and declares a provider ProviderKind cannot parse;
+        // "bb" would qualify on its own. The port must not fall through to
+        // "bb" — that would let this port disagree with whichever agent the
+        // in-process backend was built for.
+        agents.insert("aa".to_string(), agent_with("not-a-real-provider", "m"));
+        agents.insert("bb".to_string(), agent_with("anthropic", "claude-x"));
+
+        assert!(
+            AgentLlmPort::from_agents(fake_backend(), &agents).is_none(),
+            "a disqualified sorted-first candidate must not fall through to a \
+             later, otherwise-qualifying agent"
         );
     }
 
