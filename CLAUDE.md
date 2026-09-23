@@ -208,6 +208,18 @@ sent as the `X-Greentic-Tenant` header on every server call), `team` (sent as
 `index_ids` (non-empty array — every index is searched and the hits merged),
 `embedding_provider` (only `openai` is supported today), `embedding_model`,
 and `embedding_base_url` (optional, defaults to `https://api.openai.com/v1`).
+`tenant` and `team` must match `[A-Za-z0-9_-]{1,64}` (they become headers).
+Any param that is missing or invalid is a `Backend` error naming its full key.
+
+**Credential destinations.** The index key goes to `endpoint` and the
+embedding key goes to `embedding_base_url` — hosts the pack's binding names,
+which is the same trust boundary as the A2A contract §9 (the pack is trusted
+input and chooses where a credential is sent). That is why both must be
+absolute URLs with a host and scheme `https`; plain `http` is accepted only
+for a loopback host (`localhost`, `127.0.0.1`, `::1`), so a key never crosses
+a network in cleartext. The index server must be served at the endpoint's
+ROOT: the request path is always `/v1/indexes/{index_id}/search`, so any base
+path in `endpoint` (and its query/fragment) is dropped.
 
 **Secrets** are sealed under category `knowledge` as `chronicle_index_key`
 (bearer for the index server) and `embedding_key` (bearer for the embedding

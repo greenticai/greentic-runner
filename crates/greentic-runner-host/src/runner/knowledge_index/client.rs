@@ -56,7 +56,7 @@ pub(super) async fn embed(
 ) -> KnowledgeResult<Vec<f32>> {
     let url = format!(
         "{}/embeddings",
-        binding.embedding_base_url.trim_end_matches('/')
+        binding.embedding_base_url.as_str().trim_end_matches('/')
     );
     let response = http
         .post(&url)

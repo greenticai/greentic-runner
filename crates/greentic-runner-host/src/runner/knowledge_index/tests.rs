@@ -618,3 +618,83 @@ fn timeout_env_parses_positive_integers_only() {
     set(None);
     assert_eq!(super::timeout_from_env(), default);
 }
+
+/// Parse `binding` and return the malformed-param message, or `None` if it parsed.
+fn parse_error(binding: &MemoryProviderRef) -> Option<String> {
+    super::IndexBinding::parse(binding)
+        .err()
+        .map(backend_message)
+}
+
+#[tokio::test]
+async fn credential_destinations_must_be_https_or_loopback_http() {
+    let server = MockServer::start().await;
+    let with = |name: &str, value: &str| {
+        let mut b = index_binding(&server, &["kb1"], None);
+        b.params.insert(p(name), json!(value));
+        b
+    };
+
+    for name in ["endpoint", "embedding_base_url"] {
+        for refused in [
+            "http://index.example.com",
+            "http://10.0.0.5:8080",
+            "ftp://index.example.com",
+            "/relative/path",
+            "https://",
+        ] {
+            let message = parse_error(&with(name, refused))
+                .unwrap_or_else(|| panic!("{name} = {refused} should be refused"));
+            assert!(
+                message.contains(&format!("provider.knowledge.chronicle-index.{name}")),
+                "{message}"
+            );
+        }
+        for accepted in [
+            "https://index.example.com",
+            "http://localhost:9000",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+        ] {
+            assert_eq!(
+                parse_error(&with(name, accepted)),
+                None,
+                "{name} = {accepted}"
+            );
+        }
+    }
+
+    // Absent embedding_base_url takes the https default.
+    let mut b = index_binding(&server, &["kb1"], None);
+    b.params.remove(&p("embedding_base_url"));
+    assert_eq!(parse_error(&b), None);
+}
+
+#[tokio::test]
+async fn tenant_and_team_must_be_header_safe_slugs() {
+    let server = MockServer::start().await;
+    let with = |name: &str, value: &str| {
+        let mut b = index_binding(&server, &["kb1"], Some("sales"));
+        b.params.insert(p(name), json!(value));
+        b
+    };
+    let too_long = "a".repeat(65);
+    for name in ["tenant", "team"] {
+        for refused in [
+            "acme corp",
+            "acme\nX-Injected: 1",
+            "acme.co",
+            too_long.as_str(),
+        ] {
+            let message = parse_error(&with(name, refused))
+                .unwrap_or_else(|| panic!("{name} = {refused:?} should be refused"));
+            assert!(
+                message.contains(&format!("provider.knowledge.chronicle-index.{name}")),
+                "{message}"
+            );
+        }
+        assert_eq!(parse_error(&with(name, "Acme_team-01")), None);
+    }
+    // A blank team still means "no team".
+    assert_eq!(parse_error(&with("team", "  ")), None);
+}

@@ -35,7 +35,7 @@ use greentic_aw_runtime::knowledge::{
 };
 use greentic_aw_runtime::scoped_secrets::read_secret_for_unit;
 use greentic_types::TenantCtx;
-use url::Url;
+use url::{Host, Url};
 
 use crate::secrets::DynSecretsManager;
 
@@ -315,7 +315,7 @@ struct IndexBinding {
     team: Option<String>,
     index_ids: Vec<String>,
     embedding_model: String,
-    embedding_base_url: String,
+    embedding_base_url: Url,
 }
 
 impl IndexBinding {
@@ -333,10 +333,22 @@ impl IndexBinding {
         };
 
         let endpoint = read("endpoint")
-            .and_then(|raw| Url::parse(&raw).ok())
-            .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+            .as_deref()
+            .and_then(credential_destination)
             .ok_or_else(|| malformed("endpoint"))?;
-        let tenant = read("tenant").ok_or_else(|| malformed("tenant"))?;
+        let embedding_base_url = match read("embedding_base_url") {
+            Some(raw) => credential_destination(&raw),
+            None => credential_destination(DEFAULT_EMBEDDING_BASE_URL),
+        }
+        .ok_or_else(|| malformed("embedding_base_url"))?;
+        let tenant = read("tenant")
+            .filter(|t| is_scope_slug(t))
+            .ok_or_else(|| malformed("tenant"))?;
+        let team = match read("team") {
+            Some(team) if is_scope_slug(&team) => Some(team),
+            Some(_) => return Err(malformed("team")),
+            None => None,
+        };
         let index_ids = binding
             .params
             .get(&key("index_ids"))
@@ -365,13 +377,38 @@ impl IndexBinding {
         Ok(Self {
             endpoint,
             tenant,
-            team: read("team"),
+            team,
             index_ids,
             embedding_model,
-            embedding_base_url: read("embedding_base_url")
-                .unwrap_or_else(|| DEFAULT_EMBEDDING_BASE_URL.to_string()),
+            embedding_base_url,
         })
     }
+}
+
+/// A URL a bearer credential may be sent to: absolute, with a host, and
+/// `https` — or plain `http` only to a loopback host. The binding is pack
+/// content, so it chooses where the index and embedding keys go; refusing
+/// cleartext off-loopback keeps a key from crossing a network unencrypted.
+fn credential_destination(raw: &str) -> Option<Url> {
+    let url = Url::parse(raw).ok()?;
+    let loopback = match url.host()? {
+        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(ip) => ip == std::net::Ipv4Addr::LOCALHOST,
+        Host::Ipv6(ip) => ip == std::net::Ipv6Addr::LOCALHOST,
+    };
+    match url.scheme() {
+        "https" => Some(url),
+        "http" if loopback => Some(url),
+        _ => None,
+    }
+}
+
+/// `[A-Za-z0-9_-]{1,64}` — what a tenant or team slug sent as a header may be.
+fn is_scope_slug(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// `GREENTIC_KNOWLEDGE_INDEX_TIMEOUT_MS` when it is a positive integer, else
