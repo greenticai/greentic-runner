@@ -1132,14 +1132,37 @@ mod aw {
         }
     }
 
-    /// Pick the extension runtime's LLM port. Pure so the tier order is testable:
-    /// the bug this exists to prevent was a wrong tier being chosen silently.
+    /// Which tier of `select_ext_llm_port`'s precedence produced the chosen
+    /// port. Returned alongside the port so the tracing line naming which
+    /// tier won is DERIVED from this same decision — never a second,
+    /// hand-kept `match` re-expressing the same precedence, which could
+    /// silently drift from the real one if either copy were edited alone.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ExtLlmTier {
+        Host,
+        Agent,
+        Env,
+    }
+
+    /// Pick the extension runtime's LLM port. Pure so the tier order is
+    /// testable: the bug this exists to prevent was a wrong tier being
+    /// chosen silently. Returns the winning tier alongside the port for the
+    /// same reason.
     fn select_ext_llm_port(
         host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         env_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
-    ) -> Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> {
-        host_llm_port.or(agent_llm_port).or(env_llm_port)
+    ) -> Option<(
+        ExtLlmTier,
+        Arc<dyn greentic_ext_runtime::host_ports::LlmPort>,
+    )> {
+        if let Some(port) = host_llm_port {
+            return Some((ExtLlmTier::Host, port));
+        }
+        if let Some(port) = agent_llm_port {
+            return Some((ExtLlmTier::Agent, port));
+        }
+        env_llm_port.map(|port| (ExtLlmTier::Env, port))
     }
 
     pub(crate) fn build_ext_runtime(
@@ -1163,9 +1186,12 @@ mod aw {
         //
         // `llm_port` powers tool extensions that call `host.llm.complete()`
         // internally (e.g. adaptive-cards `generate_card`). The tier order is
-        // decided by `select_ext_llm_port`, kept pure and unit-tested so a
-        // wrong tier being chosen silently — the bug this whole change exists
-        // to fix — cannot creep back in unnoticed:
+        // decided by `select_ext_llm_port`, which also reports WHICH tier won
+        // as an `ExtLlmTier` — kept pure and unit-tested so a wrong tier
+        // being chosen silently — the bug this whole change exists to fix —
+        // cannot creep back in unnoticed, and so the tracing line below can
+        // be derived from that single decision rather than a second copy of
+        // it:
         //   1. A `host_llm_port` injected by the embedding host (e.g. the
         //      designer) — its own per-tenant, admin-backed, metered path. NOT
         //      feature-gated: a host can inject a port regardless of features.
@@ -1195,33 +1221,31 @@ mod aw {
             }
         };
 
-        // Logging stays here, beside the candidates, rather than inside
-        // `select_ext_llm_port` — that function stays pure (no side effects)
-        // so its tier order is unit-testable without an `ExtensionRuntime` or
-        // any env state. `AgentLlmPort::from_agents` already logs its own
-        // `info` line naming the agent, so tier 2 does not log again here.
-        match (
-            host_llm_port.is_some(),
-            agent_llm_port.is_some(),
-            env_llm_port.is_some(),
-        ) {
-            (true, _, _) => {
+        // The tracing line is derived from the tier `select_ext_llm_port`
+        // actually chose, rather than a second `match` re-deciding the same
+        // precedence from the three `is_some()`s — that second copy is
+        // exactly what let the log claim "host-provided" while a different
+        // tier's port was the one actually wired. `AgentLlmPort::from_agents`
+        // already logs its own `info` line naming the agent, so tier 2 does
+        // not log again here.
+        let selected = select_ext_llm_port(host_llm_port, agent_llm_port, env_llm_port);
+        match &selected {
+            Some((ExtLlmTier::Host, _)) => {
                 tracing::info!("extension runtime LLM port wired (host-provided ext LLM)");
             }
-            (false, true, _) => {}
-            (false, false, true) => {
+            Some((ExtLlmTier::Agent, _)) => {}
+            Some((ExtLlmTier::Env, _)) => {
                 tracing::info!(
                     "extension runtime LLM port wired (env ext LLM, env-keyed greentic-llm)"
                 );
             }
-            (false, false, false) => {
+            None => {
                 tracing::info!(
                     "extension runtime LLM port not configured (no host port, no agent port, no env key)"
                 );
             }
         }
-
-        let llm_port = select_ext_llm_port(host_llm_port, agent_llm_port, env_llm_port);
+        let llm_port = selected.map(|(_, port)| port);
 
         let overrides = HostOverrides {
             secrets_backend,
@@ -1807,23 +1831,30 @@ mod aw {
                 // Tier 2 of the extension LLM port: the worker's own resolved
                 // backend, so `host.llm.complete()` inside an extension runs
                 // on the provider the operator actually selected instead of
-                // falling through to the env-keyed default.
-                let agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> = {
-                    #[cfg(feature = "greentic-llm-backend")]
-                    {
-                        crate::runner::ext_llm_port::AgentLlmPort::from_agents(
-                            llm.clone(),
-                            &merged_agents,
-                        )
-                        .map(|port| {
-                            Arc::new(port) as Arc<dyn greentic_ext_runtime::host_ports::LlmPort>
-                        })
-                    }
-                    #[cfg(not(feature = "greentic-llm-backend"))]
-                    {
+                // falling through to the env-keyed default. Built only when
+                // the host has not already injected its own port:
+                // `select_ext_llm_port` prefers the host port regardless, so
+                // building this one anyway would have `AgentLlmPort::from_agents`
+                // log as if it were in play while it is silently discarded.
+                let agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> =
+                    if ext_llm_port.is_none() {
+                        #[cfg(feature = "greentic-llm-backend")]
+                        {
+                            crate::runner::ext_llm_port::AgentLlmPort::from_agents(
+                                llm.clone(),
+                                &merged_agents,
+                            )
+                            .map(|port| {
+                                Arc::new(port) as Arc<dyn greentic_ext_runtime::host_ports::LlmPort>
+                            })
+                        }
+                        #[cfg(not(feature = "greentic-llm-backend"))]
+                        {
+                            None
+                        }
+                    } else {
                         None
-                    }
-                };
+                    };
 
                 let ext_runtime =
                     build_ext_runtime(secrets_backend, ext_llm_port, agent_llm_port, &packs)?;
@@ -4422,66 +4453,62 @@ mod aw {
             Arc::new(MarkerLlmPort)
         }
 
-        /// Tier 1: the host-injected port wins over both the agent and env
-        /// candidates. This is the designer's own per-tenant, admin-backed
-        /// path, and it must never be shadowed by anything this crate builds.
+        /// Table-driven over all eight `(host, agent, env)` presence
+        /// combinations, asserting both WHICH TIER won (via the returned
+        /// `ExtLlmTier`) and which candidate's pointer came back. A test that
+        /// only ever supplies one candidate at a time (the earlier shape of
+        /// this test) cannot discriminate the precedence order at all — with
+        /// a single candidate present, every permutation of `.or()` returns
+        /// it regardless of order. Every row here has at least the winning
+        /// candidate plus, for every row but the all-absent one, a losing
+        /// candidate the function must reject in favour of it.
         #[test]
-        fn select_ext_llm_port_host_wins_over_agent_and_env() {
-            let host = marker_port();
-            let agent = marker_port();
-            let env = marker_port();
+        fn select_ext_llm_port_precedence_table() {
+            use super::ExtLlmTier;
 
-            let picked = super::select_ext_llm_port(Some(host.clone()), Some(agent), Some(env));
+            let cases: &[(bool, bool, bool, Option<ExtLlmTier>)] = &[
+                (true, true, true, Some(ExtLlmTier::Host)),
+                (true, true, false, Some(ExtLlmTier::Host)),
+                (true, false, true, Some(ExtLlmTier::Host)),
+                (true, false, false, Some(ExtLlmTier::Host)),
+                (false, true, true, Some(ExtLlmTier::Agent)),
+                (false, true, false, Some(ExtLlmTier::Agent)),
+                (false, false, true, Some(ExtLlmTier::Env)),
+                (false, false, false, None),
+            ];
 
-            assert!(
-                Arc::ptr_eq(&picked.expect("host tier present"), &host),
-                "tier 1 (host) must win when present"
-            );
-        }
+            for &(host_present, agent_present, env_present, expected_tier) in cases {
+                let host = host_present.then(marker_port);
+                let agent = agent_present.then(marker_port);
+                let env = env_present.then(marker_port);
 
-        /// Tier 2: the agent's own resolved backend wins once the host tier
-        /// is absent. This is the whole point of the change — a wrong tier
-        /// being chosen silently is exactly the bug this test exists to
-        /// catch coming back.
-        #[test]
-        fn select_ext_llm_port_agent_wins_when_host_is_absent() {
-            let agent = marker_port();
-            let env = marker_port();
+                let expected_port = match expected_tier {
+                    Some(ExtLlmTier::Host) => host.clone(),
+                    Some(ExtLlmTier::Agent) => agent.clone(),
+                    Some(ExtLlmTier::Env) => env.clone(),
+                    None => None,
+                };
 
-            let picked = super::select_ext_llm_port(None, Some(agent.clone()), Some(env));
+                let picked = super::select_ext_llm_port(host.clone(), agent.clone(), env.clone());
 
-            assert!(
-                Arc::ptr_eq(&picked.expect("agent tier present"), &agent),
-                "tier 2 (agent) must win when tier 1 (host) is absent"
-            );
-        }
-
-        /// Tier 3: the env-keyed port is the last resort, reached only when
-        /// neither the host nor the agent supplied one. Removing this tier
-        /// would take the LLM away from every call site that serves no
-        /// agents at all.
-        #[test]
-        fn select_ext_llm_port_env_wins_when_host_and_agent_are_both_absent() {
-            let env = marker_port();
-
-            let picked = super::select_ext_llm_port(None, None, Some(env.clone()));
-
-            assert!(
-                Arc::ptr_eq(&picked.expect("env tier present"), &env),
-                "tier 3 (env) must win when tiers 1 and 2 are both absent"
-            );
-        }
-
-        /// Tier 4: with nothing to offer at any tier, the ext-runtime keeps
-        /// its "llm not configured for this runtime" refusal.
-        #[test]
-        fn select_ext_llm_port_none_when_all_three_are_absent() {
-            let picked = super::select_ext_llm_port(None, None, None);
-
-            assert!(
-                picked.is_none(),
-                "no tier present must yield None, not a port that fails on every call"
-            );
+                match (picked, expected_tier, expected_port) {
+                    (Some((tier, port)), Some(expected), Some(expected_port)) => {
+                        assert_eq!(
+                            tier, expected,
+                            "host={host_present} agent={agent_present} env={env_present}: wrong tier won"
+                        );
+                        assert!(
+                            Arc::ptr_eq(&port, &expected_port),
+                            "host={host_present} agent={agent_present} env={env_present}:                              wrong candidate for the winning tier"
+                        );
+                    }
+                    (None, None, None) => {}
+                    (picked, _, _) => panic!(
+                        "host={host_present} agent={agent_present} env={env_present}:                          expected {expected_tier:?}, got {:?}",
+                        picked.map(|(tier, _)| tier)
+                    ),
+                }
+            }
         }
     }
 }

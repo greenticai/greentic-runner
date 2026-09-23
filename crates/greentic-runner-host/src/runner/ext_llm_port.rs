@@ -28,10 +28,9 @@ pub(crate) struct AgentLlmPort {
     backend: Arc<dyn greentic_aw_runtime::llm::LlmBackend>,
     provider: String,
     model: String,
-    // Read only by the `#[cfg(test)]` accessor below, which the
-    // deterministic-tie-break tests use to assert WHICH agent won — never
-    // read by `LlmPort::complete`, so a non-test lib build sees it as unread.
-    #[allow(dead_code)]
+    // Named in `LlmPort::complete`'s tracing line below, and by the
+    // `#[cfg(test)]` accessor the deterministic-tie-break tests use to
+    // assert WHICH agent won.
     agent_id: String,
 }
 
@@ -125,11 +124,22 @@ impl AgentLlmPort {
 impl LlmPort for AgentLlmPort {
     fn complete(
         &self,
-        _extension_id: &str,
+        extension_id: &str,
         _ctx: &HostCallContext,
-        _role: &str,
+        role: &str,
         request: LlmPortRequest,
     ) -> Result<LlmPortResponse, LlmPortError> {
+        // The single most useful diagnostic this port can offer: which
+        // agent's declaration decided the provider an extension's
+        // completion actually ran on.
+        tracing::debug!(
+            agent_id = %self.agent_id,
+            extension_id = %extension_id,
+            role = %role,
+            provider = %self.provider,
+            model = %self.model,
+            "extension runtime LLM port: dispatching to the worker's own agent LLM"
+        );
         let llm_request = crate::runner::agent_node::port_request_to_llm_request(
             request,
             &self.provider,
