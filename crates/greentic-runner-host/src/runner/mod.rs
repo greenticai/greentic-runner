@@ -12,6 +12,12 @@ pub mod contract_cache;
 pub mod contract_introspection;
 pub mod dispatch_listener;
 pub mod engine;
+// `ext_llm_port` uses `greentic_llm::ProviderKind` directly (not just the
+// agentic-worker types), and `greentic-llm` is an optional dependency pulled
+// in only by the `greentic-llm-backend` feature — mirroring the gate on
+// `agent_node::EnvLlmPort`, which this module wraps as tier 2.
+#[cfg(all(feature = "agentic-worker", feature = "greentic-llm-backend"))]
+pub(crate) mod ext_llm_port;
 pub mod flow_adapter;
 #[cfg(feature = "agentic-worker")]
 pub mod flow_invoker;
@@ -122,6 +128,7 @@ impl HostServer {
             #[cfg(feature = "agentic-worker")]
             ext_runtime: crate::runner::agent_node::build_ext_runtime(
                 std::sync::Arc::new(crate::runner::agent_node::EnvSecretsBackend),
+                None,
                 None,
                 &[],
             ),
