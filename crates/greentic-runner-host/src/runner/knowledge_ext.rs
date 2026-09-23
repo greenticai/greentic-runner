@@ -21,8 +21,8 @@
 //!
 //! ## Why this wraps rather than replaces
 //!
-//! `with_knowledge` overwrites the runtime's backend. A Chronicle mount
-//! (`knowledge_mount`, behind `knowledge-chronicle`) and this one would
+//! `with_knowledge` overwrites the runtime's backend. A corpus mount (a
+//! registered agent-runtime extension, see `runtime_ext`) and this one would
 //! otherwise each disable the other depending on call order, silently. So
 //! [`attach`] takes whatever is already mounted and delegates to it for every
 //! binding that is not this provider — including `ingest`, which is how a
@@ -30,7 +30,8 @@
 //!
 //! ## No cargo feature
 //!
-//! Unlike `knowledge_mount`, this is not feature-gated. It drags nothing: the
+//! Unlike a corpus backend, this is built in rather than registered by the host
+//! binary. It drags nothing: the
 //! `ExtensionRuntime` it invokes is already mandatory on this path
 //! (`agent_node::build_ext_runtime` returning `None` disables `dw.agent` nodes
 //! outright). Gating it would force an operator who wants a customer's own
@@ -119,7 +120,7 @@ pub fn attach(base: AgentRuntime, ext: Arc<ExtensionRuntime>) -> AgentRuntime {
 ///
 /// - default build (nothing wrapped) it reached `NotConfigured`, logged at
 ///   `debug`, and the worker answered ungrounded;
-/// - with `knowledge-chronicle` on it reached `KnowledgeBridge`, which ignores
+/// - with a Chronicle corpus extension registered it reached `KnowledgeBridge`, which ignores
 ///   the binding entirely and searches its own env-configured corpus — so the
 ///   worker retrieved from **the wrong source** and reported success.
 ///
@@ -844,15 +845,17 @@ mod tests {
 ///   `dw_test_chat/mcp_source.rs`, which anchors on the constructor with an
 ///   exemption list precisely so that each site is a decision rather than an
 ///   inference.
-/// - [`mount_anchor`] — a file that mounts a Chronicle corpus must mount this
+/// - [`mount_anchor`] — a file that runs the registered corpus extensions must mount this
 ///   adapter too. This catches the likelier near-term regression: a knowledge
 ///   mount copied to a new site with only half the pair.
 #[cfg(test)]
 mod call_site_ratchet {
     use std::path::Path;
 
-    /// The Chronicle mount, whose call sites are the corpus mount sites.
-    const CHRONICLE_MOUNT: &str = "knowledge_mount::attach(";
+    /// The registered-extension mount (`runtime_ext`), whose call sites are the
+    /// corpus mount sites. It was `knowledge_mount::attach(` while the Chronicle
+    /// backend was compiled into this crate.
+    const CHRONICLE_MOUNT: &str = "runtime_ext::attach_all(";
     /// This module's mount.
     const EXTENSION_MOUNT: &str = "knowledge_ext::attach(";
     /// Every runtime construction, mounted or not.
@@ -888,6 +891,20 @@ mod call_site_ratchet {
              sidecar reaches the LLM and the agent; it exercises no retrieval, \
              and the production path it models (`build_runtime_with_stores`) \
              mounts",
+        ),
+        (
+            "src/runner/operala_tools.rs",
+            1,
+            "one test constructor for the deep-worker tool context (#785); it \
+             dispatches tools and answers from no corpus, and the production \
+             runtime it borrows is built by `agent_node`, which mounts",
+        ),
+        (
+            "src/runner/runtime_ext.rs",
+            1,
+            "one test constructor: the seam's own unit tests need a runtime with \
+             nothing mounted, so every backend in the result is the extensions' \
+             doing",
         ),
         (
             "src/runner/engine.rs",
@@ -987,8 +1004,8 @@ mod call_site_ratchet {
 
     /// The anchor that catches half a copied pair: a corpus mount without this
     /// adapter beside it. One-directional on purpose — the reverse (this
-    /// adapter alone) is the DEFAULT build's shape, since the Chronicle mount is
-    /// feature-gated and this one is not.
+    /// adapter alone) is harmless: this adapter is unconditional, while which
+    /// corpus extensions exist is the host binary's choice.
     #[test]
     fn mount_anchor() {
         let offenders: Vec<_> = sites()
@@ -1028,8 +1045,8 @@ mod call_site_ratchet {
         );
         assert!(
             corpora >= 3,
-            "expected three Chronicle mounts beside them; found {corpora} — has \
-             `knowledge_mount::attach` been renamed?"
+            "expected three corpus-extension mounts beside them; found {corpora} — \
+             has `runtime_ext::attach_all` been renamed?"
         );
         assert!(
             constructors >= mounts,

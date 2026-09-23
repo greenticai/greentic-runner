@@ -1298,17 +1298,12 @@ mod aw {
                 .with_short_term_memory(Arc::new(
                     greentic_aw_runtime::memory::InMemoryMemoryProvider::new(),
                 ));
-            #[cfg(feature = "long-term-chronicle")]
-            {
-                runtime = crate::runner::long_term_memory::attach(runtime).await;
-            }
-            #[cfg(feature = "knowledge-chronicle")]
-            {
-                runtime = crate::runner::knowledge_mount::attach(runtime).await;
-            }
+            // Long-term memory and corpus knowledge from every registered
+            // agent-runtime extension (see `runtime_ext`).
+            runtime = crate::runner::runtime_ext::attach_all(runtime).await;
             // Knowledge delegated to a design-extension tool. Not feature-gated
-            // (see `knowledge_ext`); it wraps whatever the Chronicle mount above
-            // left in place. Inside the `agent_ref.is_some()` arm with the rest
+            // (see `knowledge_ext`); it wraps whatever corpus backend an
+            // extension above left in place. Inside the `agent_ref.is_some()` arm with the rest
             // of the full-fidelity attachment sequence, so the `agent_ref: None`
             // inline path stays byte-unchanged.
             runtime = crate::runner::knowledge_ext::attach(runtime, ext_runtime.clone());

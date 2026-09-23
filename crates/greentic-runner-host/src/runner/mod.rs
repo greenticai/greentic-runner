@@ -18,14 +18,10 @@ pub mod flow_invoker;
 pub mod graph_node;
 pub mod i18n;
 pub mod invocation;
-#[cfg(feature = "knowledge-chronicle")]
+#[cfg(feature = "agentic-worker")]
 pub mod knowledge_corpus;
 #[cfg(feature = "agentic-worker")]
 pub mod knowledge_ext;
-#[cfg(feature = "knowledge-chronicle")]
-pub mod knowledge_mount;
-#[cfg(feature = "long-term-chronicle")]
-pub mod long_term_memory;
 pub mod mcp_node;
 pub mod mcp_pack_routes;
 #[cfg(feature = "agentic-worker")]
@@ -38,6 +34,8 @@ pub mod operator;
 #[cfg(feature = "agentic-worker")]
 pub mod pack_extensions;
 pub mod remote_dispatch;
+#[cfg(feature = "agentic-worker")]
+pub mod runtime_ext;
 pub mod runtime_session_resumer;
 pub mod schema_validator;
 #[cfg(feature = "agentic-worker")]

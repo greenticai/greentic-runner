@@ -1,6 +1,6 @@
 //! Reads the knowledge corpus baked into a pack (W5) and turns it into
-//! [`KnowledgeChunk`]s for first-boot ingest (W4 4c). Compiled only with the
-//! `knowledge-chronicle` feature.
+//! [`KnowledgeChunk`]s for first-boot ingest (W4 4c), handed to every registered
+//! agent-runtime extension by `runtime_ext::ingest_all_corpora`.
 //!
 //! The designer bakes a `knowledge_corpus.json` annotation at the pack root plus
 //! the raw document text as `assets/knowledge/*.txt`. The annotation is NOT

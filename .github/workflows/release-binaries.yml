@@ -40,5 +40,5 @@ jobs:
       # older aw-runtime was already on crates.io, which breaks the moment a
       # release has runner-host calling a newly added aw-runtime API (v1.1.10:
       # `TenantContext::with_project_id` -> E0599, partial release).
-      crates: "runner-core aw-event-bridge greentic-aw-runtime greentic-runner-host greentic-runner-desktop greentic-runner"
+      crates: "runner-core greentic-a2a aw-event-bridge greentic-aw-runtime greentic-runner-host greentic-runner-desktop greentic-runner"
     secrets: inherit

@@ -1785,21 +1785,17 @@ mod aw {
         // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
         // `dw.agent` workers ground on the ingested corpus exactly as the
         // out-of-process NATS serve path does (see [`build_agent_runtime`], which
-        // makes the identical pair of calls). Both attach helpers are env-driven
-        // and fail-open: with the feature off (default) or the operator env unset
-        // they are no-ops that leave `base` unchanged, so this cannot break the
-        // non-knowledge build or hard-fail boot. Without these calls the
-        // in-process handler's `runtime.knowledge` stayed `None`, so
-        // `knowledge_active()` was false and `search_knowledge` was never invoked
-        // — the model hallucinated instead of retrieving from the corpus that had
-        // already been ingested at boot.
-        #[cfg(feature = "long-term-chronicle")]
-        let base = crate::runner::long_term_memory::attach(base).await;
-        #[cfg(feature = "knowledge-chronicle")]
-        let base = crate::runner::knowledge_mount::attach(base).await;
+        // makes the identical call). The backends come from the agent-runtime
+        // extensions the binary registered (see `runtime_ext`); with none
+        // registered, or the operator env unset, this leaves `base` unchanged.
+        // Without this call the in-process handler's `runtime.knowledge` stayed
+        // `None`, so `knowledge_active()` was false and `search_knowledge` was
+        // never invoked — the model hallucinated instead of retrieving from the
+        // corpus that had already been ingested at boot.
+        let base = crate::runner::runtime_ext::attach_all(base).await;
         // Knowledge delegated to a design-extension tool. Unconditional and not
-        // feature-gated (see `knowledge_ext`): it wraps whatever the Chronicle
-        // mount above left in place and acts only on a worker whose knowledge
+        // feature-gated (see `knowledge_ext`): it wraps whatever corpus backend
+        // an extension above left in place and acts only on a worker whose knowledge
         // binding names `provider.knowledge.extension`.
         let base = crate::runner::knowledge_ext::attach(base, ext_runtime);
 
@@ -2234,16 +2230,10 @@ mod aw {
             } else {
                 base
             };
-        // Optionally attach an operator-configured native long-term memory
-        // backend. With the `long-term-chronicle` feature off (default) this is
-        // a no-op and `base` is wrapped unchanged.
-        #[cfg(feature = "long-term-chronicle")]
-        let base = crate::runner::long_term_memory::attach(base).await;
-        // Optionally attach an operator-configured Chronicle knowledge (document
-        // RAG) backend for auto pre-retrieval. No-op with the `knowledge-chronicle`
-        // feature off (default).
-        #[cfg(feature = "knowledge-chronicle")]
-        let base = crate::runner::knowledge_mount::attach(base).await;
+        // Optionally attach operator-configured long-term memory and knowledge
+        // (document RAG) backends from the registered agent-runtime extensions
+        // (see `runtime_ext`). With none registered `base` passes unchanged.
+        let base = crate::runner::runtime_ext::attach_all(base).await;
         // Knowledge delegated to a design-extension tool — the out-of-process
         // serve path's copy of the mount above. See `knowledge_ext` for why the
         // adapter reads its target per turn rather than per runtime: THIS is the
@@ -3578,45 +3568,55 @@ mod aw {
         ///
         /// Before the fix `build_runtime_with_stores` built the in-process
         /// [`AgentRuntime`] via `AgentRuntime::new(...)` and returned it WITHOUT
-        /// calling [`crate::runner::knowledge_mount::attach`], so
-        /// `runtime.knowledge` stayed `None`, `knowledge_active()` was false and
-        /// `search_knowledge` was never invoked — the in-process `dw.agent`
-        /// worker hallucinated instead of grounding on the ingested corpus. This
-        /// proves the in-process path now mounts the knowledge seam exactly like
-        /// the NATS serve path ([`build_agent_runtime`]).
+        /// mounting the corpus backend, so `runtime.knowledge` stayed `None`,
+        /// `knowledge_active()` was false and `search_knowledge` was never
+        /// invoked — the in-process `dw.agent` worker hallucinated instead of
+        /// grounding on the ingested corpus. The corpus backend now comes from a
+        /// registered [`crate::runner::runtime_ext::AgentRuntimeExtension`] (the
+        /// Chronicle one lives in a private crate), so this proves the in-process
+        /// path calls every registered extension, and does so BEFORE the
+        /// extension-delegated adapter wraps the result.
         ///
-        /// Uses the `surreal-memory` graph backend so attach needs no on-disk
-        /// lock and no network: `KnowledgeChronicle::from_config` only constructs
-        /// the embedder/LLM clients (their endpoint is consulted at call time),
-        /// so the seam mounts without any live embedding API call.
-        ///
-        /// Asserted through [`greentic_aw_runtime::knowledge::Knowledge::wrapped_backend`]
+        /// Asserted through [`crate::runner::knowledge_ext::corpus_backend`]
         /// rather than `has_knowledge()`, and that is not cosmetic:
         /// [`crate::runner::knowledge_ext::attach`] mounts unconditionally, so
-        /// `has_knowledge()` is now true on this path whether the Chronicle mount
-        /// ran or not. Left as it was, this guard would have passed forever over
-        /// a deleted `knowledge_mount::attach` — which is precisely the failure
-        /// it was written to catch.
-        #[cfg(feature = "knowledge-chronicle")]
+        /// `has_knowledge()` is true on this path whether the extension ran or
+        /// not. Asserting it would pass forever over a deleted
+        /// `runtime_ext::attach_all` — which is precisely the failure this was
+        /// written to catch. And a backend mounted AFTER the adapter would sit on
+        /// top of it and replace it, which `corpus_backend` would still find but
+        /// the adapter check below would not.
+        ///
+        /// The extension is process-global once registered, so it acts only
+        /// inside this test's task-local scope and leaves every other test's
+        /// runtime untouched.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[serial_test::serial]
-        #[allow(unsafe_code)]
-        async fn in_process_runtime_mounts_knowledge_seam() {
+        async fn in_process_runtime_attaches_registered_extensions() {
             use greentic_aw_runtime::cost::MockTokenMeter;
-            use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+            use greentic_aw_runtime::mock::{MockAgentStateStore, MockKnowledge, NoopToolLedger};
 
-            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
-            // so no concurrent test observes a torn env.
-            unsafe {
-                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
-                std::env::set_var("GREENTIC_KNOWLEDGE_BACKEND", "surreal-memory");
-                std::env::set_var(
-                    "GREENTIC_KNOWLEDGE_EMBED_BASE_URL",
-                    "https://embeddings.invalid/v1",
-                );
-                std::env::set_var("GREENTIC_KNOWLEDGE_EMBED_API_KEY", "sk-test");
-                std::env::set_var("GREENTIC_KNOWLEDGE_EMBED_MODEL", "text-embedding-3-small");
+            tokio::task_local! {
+                static IN_THIS_TEST: ();
             }
+
+            struct CorpusExtension;
+
+            #[async_trait::async_trait]
+            impl crate::runner::runtime_ext::AgentRuntimeExtension for CorpusExtension {
+                async fn attach(&self, rt: AgentRuntime) -> AgentRuntime {
+                    if IN_THIS_TEST.try_with(|_| ()).is_err() {
+                        return rt;
+                    }
+                    rt.with_knowledge(Arc::new(MockKnowledge::new(Vec::new())))
+                }
+            }
+
+            static REGISTER: std::sync::Once = std::sync::Once::new();
+            REGISTER.call_once(|| {
+                crate::runner::runtime_ext::register_agent_runtime_extension(Arc::new(
+                    CorpusExtension,
+                ));
+            });
 
             // Build the in-process runtime through the SAME shared tail both
             // in-process handlers use (Redis + ephemeral), with cheap mock stores.
@@ -3645,38 +3645,32 @@ mod aw {
                 .await
             }
 
-            /// Is a CORPUS backend mounted under the always-present extension
-            /// adapter? `has_knowledge()` cannot tell — see the doc comment.
-            fn corpus_backend_mounted(runtime: &AgentRuntime) -> bool {
-                crate::runner::knowledge_ext::corpus_backend(runtime).is_some()
-            }
-
-            // Embedding env present + surreal-memory backend => knowledge mounts.
-            let runtime = build_runtime().await.expect("runtime should build");
-            assert!(
-                corpus_backend_mounted(&runtime),
-                "in-process dw.agent runtime must mount a knowledge CORPUS backend \
-                 under the extension adapter, so an ingested corpus is retrievable"
-            );
-
-            // Control: with the embedding endpoint unset the operator has opted
-            // out, so the corpus seam stays unmounted — proving the positive case
-            // is the attach call doing its job, not a tautology.
-            unsafe {
-                std::env::remove_var("GREENTIC_KNOWLEDGE_EMBED_BASE_URL");
-                std::env::remove_var("GREENTIC_KNOWLEDGE_EMBED_API_KEY");
-                std::env::remove_var("GREENTIC_KNOWLEDGE_EMBED_MODEL");
-            }
+            // Control: the extension declines outside the scope, so no corpus
+            // backend may be mounted — proving the positive case below is the
+            // extension doing its job, not a tautology.
             let runtime_optout = build_runtime().await.expect("runtime should build");
             assert!(
-                !corpus_backend_mounted(&runtime_optout),
-                "no corpus backend may be mounted when the embedding endpoint env \
-                 is unset"
+                crate::runner::knowledge_ext::corpus_backend(&runtime_optout).is_none(),
+                "no corpus backend may be mounted when no extension provides one"
             );
 
-            unsafe {
-                std::env::remove_var("GREENTIC_KNOWLEDGE_BACKEND");
-            }
+            let runtime = IN_THIS_TEST
+                .scope((), build_runtime())
+                .await
+                .expect("runtime should build");
+            assert!(
+                crate::runner::knowledge_ext::corpus_backend(&runtime).is_some(),
+                "in-process dw.agent runtime must mount a registered extension's \
+                 corpus backend, so an ingested corpus is retrievable"
+            );
+            let top = runtime
+                .knowledge_backend()
+                .expect("the extension adapter is always mounted");
+            assert!(
+                top.wrapped_backend().is_some(),
+                "the extension-delegated adapter must be the OUTER layer, wrapping \
+                 the extension's corpus backend rather than being replaced by it"
+            );
         }
 
         /// In-memory `SecretsManager` for backend tests: returns seeded values,

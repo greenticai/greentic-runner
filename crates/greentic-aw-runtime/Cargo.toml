@@ -4,7 +4,7 @@ version     = { workspace = true }
 edition     = { workspace = true }
 license     = { workspace = true }
 description = "Enterprise Agentic Worker runtime — Plan-Act-Observe loop, Redis state, tool dispatch via greentic-ext-runtime"
-publish     = false
+repository  = "https://github.com/greentic-ai/greentic-runner"
 
 [features]
 default   = ["state-disk"]
@@ -34,7 +34,7 @@ required-features = ["serve", "test-mock"]
 anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
 async-nats          = { version = "0.46", optional = true }
-aw-event-bridge     = { path = "../aw-event-bridge", optional = true }
+aw-event-bridge     = { path = "../aw-event-bridge", version = ">=1.2.0-dev, <1.3.0-0", optional = true }
 # Store-pull + verify (Task 2): download a .gtxpack, verify sha256 + the Ed25519
 # signature on its describe.json, extract extension.wasm into the local cache.
 # Versions track the runner workspace lock (zip 8, ed25519-dalek 2, sha2 0.11,
@@ -48,34 +48,48 @@ dashmap             = { workspace = true }
 futures             = { workspace = true }
 # A2A (Agent2Agent) wire types and agent-card retrieval, for the a2a: tool
 # source (letting an agentic worker call an external A2A agent as a tool).
-greentic-a2a        = { path = "../greentic-a2a" }
-greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", rev = "506036a8266b9f2c456d22c77fdc0b616657db07" }
+greentic-a2a        = { path = "../greentic-a2a", version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-dw-manifest = ">=1.2.0-dev, <1.3.0-0"
 # Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
-greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", rev = "38fbfee25f72a70fde6c5ab2e8592842c50d2272" }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "74e5926fc900b260ae805d973aedee887d61313f" }
-greentic-extension-sdk-contract = "=1.3.0-research.5"
+greentic-dw-memory-long-term = ">=1.2.0-dev, <1.3.0-0"
+greentic-ext-runtime = ">=1.2.0, <1.3.0"
+greentic-extension-sdk-contract = ">=1.2.24-dev, <1.2.25"
 # Multi-provider LLM door (rig-core under the hood). Optional — see the
 # `greentic-llm-backend` feature.
-greentic-llm = { version = "=1.3.1-research.0", optional = true }
+# The range is the PLAIN lane one, and the lane form is the right one here.
+# Recorded because it was got wrong once: greentic-llm briefly carried a
+# `1.2.7-dev.0` base, and following it to `>=1.2.7-dev, <1.2.8` stops this
+# workspace RESOLVING at all. A comparator admits prereleases only at its OWN
+# major.minor.patch, so the published `greentic-dw-operala-invoker` -- which
+# asks for `>=1.2.0-dev, <1.3.0-0` -- can select `1.2.0-*` and nothing else,
+# and the two requirements are then disjoint: `failed to select a version for
+# greentic-llm`. That base bump was the mistake and was reverted
+# (greentic-llm#41); dw's plain range was always correct. Do not re-raise this
+# one to chase a base bump -- fix the base instead.
+greentic-llm = { version = ">=1.2.0-dev, <1.3.0-0", optional = true }
 greentic-secrets-lib = { workspace = true }
 greentic-types       = { workspace = true }
 # MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
 #
-# `-research.4` is the first release that keeps a tool's `title`
-# (greentic-mcp-client#11). `map_tools_list` read four fields and that was
-# not one of them, so a human label the server DID advertise was discarded
-# at that boundary and no consumer could recover it — greentic-designer's
-# tool picker was listing 60-character identifiers.
+# Keeping a tool's `title` (greentic-mcp-client#11) is load-bearing here:
+# `map_tools_list` read four fields and that was not one of them, so a human
+# label the server DID advertise was discarded at that boundary and no consumer
+# could recover it — greentic-designer's tool picker was listing 60-character
+# identifiers. Every 1.2 dev publish carries it, which is why this is a range
+# rather than the exact pin it was on the research line.
 #
-# This pin is EXACT, and greentic-designer pins the same crate exactly, so
-# the two cannot differ: cargo refuses to resolve two distinct `=` versions
-# of one crate in a single graph. That is why this crate moves FIRST and the
-# designer follows the rev — never the other way round.
-greentic-mcp-client = { version = "=1.3.0-research.4", features = ["native"] }
+# The base is 1.2.1-dev, NOT the lane's 1.2.0-dev, and that is load-bearing:
+# a prerelease sorts by ASCII, so `1.2.0-research` OUTRANKS every
+# `1.2.0-dev.<RUN_ID>` and a plain `>=1.2.0-dev, <1.3.0-0` resolved to it --
+# a build whose `McpToolDef` has neither `title` nor `output_schema`, i.e.
+# exactly the regression the paragraph above exists to prevent, and the
+# workspace failed to compile. Raising the BASE past the stray prerelease is
+# the fix; an `=` pin would instead freeze this crate off the lane.
+greentic-mcp-client = { version = ">=1.2.1-dev, <1.2.2", features = ["native"] }
 # Local (in-process) wasix:mcp executor for the local-wasm transport (Task 3).
-greentic-mcp-exec = { version = "=1.3.0-research.3" }
+greentic-mcp-exec = { version = ">=1.2.0-dev, <1.3.0-0" }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
 greentic-trust      = { workspace = true }

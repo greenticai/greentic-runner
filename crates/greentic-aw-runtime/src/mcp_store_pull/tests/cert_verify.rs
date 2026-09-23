@@ -54,6 +54,9 @@ async fn mount_did_document(server: &MockServer, did: &str, root: &SigningKey) {
     let doc = greentic_trust::ceremony::build_document(
         &DidWeb::parse(did).expect("did parses"),
         &[root.verifying_key()],
+        // greentic-trust 0.2 takes the service entries here; this document
+        // needs none.
+        &[],
     )
     .expect("document builds");
     Mock::given(method("GET"))
