@@ -979,7 +979,7 @@ mod aw {
     /// would panic.
     #[cfg(feature = "greentic-llm-backend")]
     pub(crate) struct EnvLlmPort {
-        backend: Arc<greentic_aw_runtime::GreenticLlmBackend>,
+        backend: Arc<dyn greentic_aw_runtime::llm::LlmBackend>,
         provider: String,
         model: String,
     }
@@ -1025,43 +1025,94 @@ mod aw {
                 model,
             })
         }
+    }
 
-        /// Map the port request into an AW [`LlmRequest`]. Tool-calling is not
-        /// exposed to extension-internal completions, so `tools` is empty; the
-        /// port's `response_format` has no greentic-llm counterpart at this layer
-        /// (JSON coercion, when requested, is the extension's own concern), so it
-        /// is not forwarded.
-        fn to_llm_request(
-            &self,
-            request: greentic_ext_runtime::host_ports::LlmPortRequest,
-        ) -> greentic_aw_runtime::llm::LlmRequest {
-            use greentic_aw_runtime::state::ChatMessage;
+    /// Map a port request onto an AW request for `provider`/`model`.
+    ///
+    /// Tool-calling is not exposed to extension-internal completions, so
+    /// `tools` is empty; the port's `response_format` has no greentic-llm
+    /// counterpart at this layer (JSON coercion, when requested, is the
+    /// extension's own concern), so it is not forwarded. `credential_ref` is
+    /// `None` because the backend already holds the resolved key.
+    ///
+    /// Shared by every [`greentic_ext_runtime::host_ports::LlmPort`]
+    /// implementation in this crate (`EnvLlmPort` and
+    /// `crate::runner::ext_llm_port::AgentLlmPort`) so the mapping cannot
+    /// drift between them.
+    #[cfg(feature = "greentic-llm-backend")]
+    pub(crate) fn port_request_to_llm_request(
+        request: greentic_ext_runtime::host_ports::LlmPortRequest,
+        provider: &str,
+        model: &str,
+    ) -> greentic_aw_runtime::llm::LlmRequest {
+        use greentic_aw_runtime::state::ChatMessage;
 
-            let history = request
-                .messages
-                .into_iter()
-                .map(|(role, content)| match role.as_str() {
-                    "assistant" => ChatMessage::Assistant {
-                        content,
-                        tool_calls: Vec::new(),
-                    },
-                    "system" => ChatMessage::System { content },
-                    // Any non-assistant/non-system role (notably "user") maps to a
-                    // user turn — the safe default for a chat completion.
-                    _ => ChatMessage::User { content },
-                })
-                .collect();
-            greentic_aw_runtime::llm::LlmRequest {
-                system_prompt: request.system_prompt,
-                history,
-                tools: Vec::new(),
-                provider: greentic_aw_runtime::config::LlmProviderRef {
-                    provider: self.provider.clone(),
-                    model: self.model.clone(),
-                    credential_ref: None,
+        let history = request
+            .messages
+            .into_iter()
+            .map(|(role, content)| match role.as_str() {
+                "assistant" => ChatMessage::Assistant {
+                    content,
+                    tool_calls: Vec::new(),
                 },
-            }
+                "system" => ChatMessage::System { content },
+                // Any non-assistant/non-system role (notably "user") maps to a
+                // user turn — the safe default for a chat completion.
+                _ => ChatMessage::User { content },
+            })
+            .collect();
+
+        greentic_aw_runtime::llm::LlmRequest {
+            system_prompt: request.system_prompt,
+            history,
+            tools: Vec::new(),
+            provider: greentic_aw_runtime::config::LlmProviderRef {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                credential_ref: None,
+            },
         }
+    }
+
+    /// Drive an async completion on a dedicated OS thread with its own
+    /// current-thread runtime. The ext-runtime may call a port from inside the
+    /// async runner, where a nested `block_on` panics. Same bridge as
+    /// `StoreToolSecretsBackend::get`.
+    ///
+    /// Shared by every [`greentic_ext_runtime::host_ports::LlmPort`]
+    /// implementation in this crate so the thread bridge exists in exactly one
+    /// place.
+    #[cfg(feature = "greentic-llm-backend")]
+    pub(crate) fn complete_on_thread(
+        backend: Arc<dyn greentic_aw_runtime::llm::LlmBackend>,
+        request: greentic_aw_runtime::llm::LlmRequest,
+    ) -> Result<
+        greentic_ext_runtime::host_ports::LlmPortResponse,
+        greentic_ext_runtime::host_ports::LlmPortError,
+    > {
+        use greentic_ext_runtime::host_ports::{LlmPortError, LlmPortResponse};
+
+        let result = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| LlmPortError::Backend(error.to_string()))?;
+            runtime
+                .block_on(backend.complete(request))
+                .map_err(|error| LlmPortError::Backend(error.to_string()))
+        })
+        .join()
+        .map_err(|_| LlmPortError::Backend("llm completion thread panicked".to_string()))??;
+
+        let content = result.content.unwrap_or_default();
+        let total_tokens = result
+            .tokens_in
+            .checked_add(result.tokens_out)
+            .filter(|&total| total > 0);
+        Ok(LlmPortResponse {
+            content,
+            total_tokens,
+        })
     }
 
     #[cfg(feature = "greentic-llm-backend")]
@@ -1076,36 +1127,8 @@ mod aw {
             greentic_ext_runtime::host_ports::LlmPortResponse,
             greentic_ext_runtime::host_ports::LlmPortError,
         > {
-            use greentic_aw_runtime::llm::LlmBackend;
-            use greentic_ext_runtime::host_ports::{LlmPortError, LlmPortResponse};
-
-            let llm_request = self.to_llm_request(request);
-            let backend = self.backend.clone();
-            // Drive the async completion on a dedicated OS thread with its own
-            // current-thread runtime: the ext-runtime may call this from inside the
-            // async runner, where a nested `block_on` panics. Same bridge as
-            // `StoreToolSecretsBackend::get`.
-            let result = std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| LlmPortError::Backend(error.to_string()))?;
-                runtime
-                    .block_on(backend.complete(llm_request))
-                    .map_err(|error| LlmPortError::Backend(error.to_string()))
-            })
-            .join()
-            .map_err(|_| LlmPortError::Backend("llm completion thread panicked".to_string()))??;
-
-            let content = result.content.unwrap_or_default();
-            let total_tokens = result
-                .tokens_in
-                .checked_add(result.tokens_out)
-                .filter(|&total| total > 0);
-            Ok(LlmPortResponse {
-                content,
-                total_tokens,
-            })
+            let llm_request = port_request_to_llm_request(request, &self.provider, &self.model);
+            complete_on_thread(self.backend.clone(), llm_request)
         }
     }
 
@@ -1353,11 +1376,16 @@ mod aw {
     /// deterministically: sorted id order, first agent declaring a non-empty
     /// `llm.provider`. `None` when no agent declares one.
     ///
-    /// Sorted, not `HashMap` order: this decides which provider the agent backend
-    /// is built for AND (in the next task) which provider an extension's host LLM
-    /// call resolves to, so an unstable pick means a worker that answers on a
-    /// different provider after a restart.
-    pub(super) fn first_declared_llm_agent(
+    /// Sorted, not `HashMap` order: this decides both which provider the
+    /// in-process agent backend is built for
+    /// ([`configured_llm_provider`]) and which provider
+    /// `crate::runner::ext_llm_port::AgentLlmPort` resolves an extension's
+    /// `host.llm.complete()` call to. An unstable pick means a worker that
+    /// answers on a different provider after every restart — and, since both
+    /// callers iterate the same map independently, a hash-order pick could
+    /// also let the agent's own reasoning LLM and its extensions' LLM calls
+    /// silently disagree with each other on the same boot.
+    pub(crate) fn first_declared_llm_agent(
         agents: &HashMap<String, AgentConfig>,
     ) -> Option<(&String, &AgentConfig)> {
         let mut ids: Vec<&String> = agents.keys().collect();
@@ -2407,7 +2435,7 @@ mod aw {
     }
 
     #[cfg(test)]
-    mod tests {
+    pub(crate) mod tests {
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -2422,7 +2450,7 @@ mod aw {
 
         use super::*;
 
-        fn sample_agent_config(agent_id: &str) -> AgentConfig {
+        pub(crate) fn sample_agent_config(agent_id: &str) -> AgentConfig {
             AgentConfig {
                 agent_id: agent_id.into(),
                 system_prompt: "sys".into(),
@@ -4268,7 +4296,8 @@ mod aw {
                     response_format: LlmPortResponseFormat::Json,
                 };
                 // Pure mapping — no provider is built, no network call.
-                let llm_request = port.to_llm_request(request);
+                let llm_request =
+                    super::port_request_to_llm_request(request, &port.provider, &port.model);
                 assert_eq!(llm_request.system_prompt, "be a card generator");
                 assert!(llm_request.tools.is_empty(), "tools not exposed to ext LLM");
                 assert_eq!(llm_request.provider.provider, "deepseek");
@@ -4430,6 +4459,21 @@ pub(crate) use aw::{
     mcp_secrets_manager, mcp_source_from_env,
 };
 
+// `first_declared_llm_agent` itself needs only `agentic-worker`, but its only
+// consumer outside this module is `ext_llm_port`, which is gated on
+// `greentic-llm-backend` too — so re-exporting it unconditionally under plain
+// `agentic-worker` would trip `unused_imports` on a build that has
+// `agentic-worker` without `greentic-llm-backend`.
+//
+// Shared by every `LlmPort` impl in this crate — `EnvLlmPort` here and
+// `crate::runner::ext_llm_port::AgentLlmPort` — so the request mapping and the
+// dedicated-thread completion bridge exist in exactly one place. Both need
+// `greentic-llm-backend` regardless of who calls them: `EnvLlmPort` already
+// does, and `ext_llm_port` is gated on it too (it also needs
+// `greentic_llm::ProviderKind`, which is only pulled in by that feature).
+#[cfg(feature = "greentic-llm-backend")]
+pub(crate) use aw::{complete_on_thread, first_declared_llm_agent, port_request_to_llm_request};
+
 // Only consumed by `runtime.rs`'s in-process operala.call wiring, which is
 // itself gated behind `operala-in-process` — re-exporting unconditionally
 // under plain `agentic-worker` would trip `unused_imports` on builds that have
@@ -4439,3 +4483,11 @@ pub(crate) use aw::resolve_in_process_llm_key;
 
 // flow_source_from_packs is used only inside the aw module (build_runtime_handler_with_stores
 // + tests) so it stays pub(crate) there without a top-level re-export.
+
+/// Test-only helpers other `runner` submodules' tests reuse rather than
+/// re-implementing (e.g. `ext_llm_port`'s tests need an agent config to vary
+/// the provider/model on).
+#[cfg(all(test, feature = "agentic-worker"))]
+pub(crate) mod test_support {
+    pub(crate) use super::aw::tests::sample_agent_config;
+}
