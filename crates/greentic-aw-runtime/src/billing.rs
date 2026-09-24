@@ -6,6 +6,10 @@
 //! `GREENTIC_BILLING_SERVICE_SECRET` in the environment; the runner host calls
 //! [`HttpBillingMeter::from_env`] and installs it via
 //! [`crate::AgentRuntime::with_billing_meter`].
+//!
+//! A deployed env-canvas unit instead records its usage at the admin's
+//! per-unit ingest door through [`WorkerUsageMeter`], which the embedding host
+//! constructs from the unit's staged metering block (see [`worker_usage`]).
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -15,6 +19,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::tenant::TenantContext;
+
+pub mod worker_usage;
+pub use worker_usage::{WorkerUsageError, WorkerUsageMeter, WorkerUsageTarget};
 
 const BUDGET_TTL: Duration = Duration::from_secs(30);
 

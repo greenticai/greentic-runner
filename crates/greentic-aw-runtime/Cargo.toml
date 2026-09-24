@@ -108,6 +108,9 @@ tokio               = { version = "1", features = ["rt-multi-thread", "macros", 
 tracing             = { workspace = true }
 url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
+# ULID event ids for the worker-usage ingest door (the admin keys a
+# time-ordered table on them; greentic-start's interop reporter does the same).
+ulid                = "1"
 
 [dev-dependencies]
 greentic-trust = { workspace = true, features = ["testing"] }

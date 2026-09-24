@@ -423,6 +423,110 @@ impl TenantRuntime {
         runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
         runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
     ) -> Result<Arc<Self>> {
+        Self::load_revision_impl(
+            pack_refs,
+            config,
+            mocks,
+            wasi_policy,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            deployment_id,
+            bundle_id,
+            revision_id,
+            customer_id,
+            runtime_configs_by_pack_id,
+            runtime_refs_by_pack_id,
+            runtime_ref_resolver,
+            #[cfg(feature = "agentic-worker")]
+            None,
+        )
+        .await
+    }
+
+    /// [`load_revision`](Self::load_revision), with the billing sink the
+    /// embedding HOST chose for this one unit.
+    ///
+    /// `billing_meter` is installed on every agentic-worker path this runtime
+    /// builds — `dw.agent`, agent-graph turns and in-process deep workers —
+    /// in place of the env-configured cloud-commerce sink. greentic-start
+    /// passes a [`greentic_aw_runtime::billing::WorkerUsageMeter`] built from
+    /// the unit's staged `metering` block, so the spend is recorded at the
+    /// admin's per-unit ingest door. `None` is exactly [`load_revision`]:
+    /// the env-configured sink when `GREENTIC_BILLING_*` is set, else none.
+    ///
+    /// It is a per-REVISION argument rather than a `HostBuilder` setting on
+    /// purpose: one greentic-start process serves every unit of an
+    /// environment, and each unit has its own worker-usage token.
+    ///
+    /// [`load_revision`]: Self::load_revision
+    #[cfg(feature = "agentic-worker")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_revision_with_billing_meter(
+        pack_refs: &[RevisionPackRef],
+        config: Arc<HostConfig>,
+        mocks: Option<Arc<MockLayer>>,
+        wasi_policy: Arc<RunnerWasiPolicy>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        customer_id: Option<String>,
+        runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+        runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
+        runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+    ) -> Result<Arc<Self>> {
+        Self::load_revision_impl(
+            pack_refs,
+            config,
+            mocks,
+            wasi_policy,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            deployment_id,
+            bundle_id,
+            revision_id,
+            customer_id,
+            runtime_configs_by_pack_id,
+            runtime_refs_by_pack_id,
+            runtime_ref_resolver,
+            billing_meter,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn load_revision_impl(
+        pack_refs: &[RevisionPackRef],
+        config: Arc<HostConfig>,
+        mocks: Option<Arc<MockLayer>>,
+        wasi_policy: Arc<RunnerWasiPolicy>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        customer_id: Option<String>,
+        runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+        runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
+        runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+        #[cfg(feature = "agentic-worker")] billing_meter: Option<
+            Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
+        >,
+    ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
                 "revision runtime for tenant {} requires at least one pack",
@@ -521,6 +625,8 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             None,
             rollout,
+            #[cfg(feature = "agentic-worker")]
+            billing_meter,
         )
         .await
     }
@@ -637,6 +743,9 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             stream_observers,
             RolloutIds::default(),
+            // The tenant-only path has no unit, so no host-chosen meter.
+            #[cfg(feature = "agentic-worker")]
+            None,
         )
         .await
     }
@@ -661,6 +770,9 @@ impl TenantRuntime {
             crate::http::agent_stream::StreamObserverRegistry,
         >,
         rollout: RolloutIds,
+        #[cfg(feature = "agentic-worker")] installed_billing_meter: Option<
+            Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
+        >,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
@@ -846,8 +958,14 @@ impl TenantRuntime {
             // `operala-in-process` block after the DwAgent wiring).
             #[cfg(feature = "operala-in-process")]
             let operala_agents = merged_agents.clone();
+            // ONE billing sink for this unit, shared by dw.agent, agent-graph
+            // turns and in-process deep workers: the meter the embedding host
+            // installed (a deployed unit's `WorkerUsageMeter`), else the
+            // env-configured cloud-commerce sink, else none.
+            let billing_meter =
+                crate::runner::agent_node::resolve_billing_meter(installed_billing_meter);
             let agent_handler = if redis_set {
-                crate::runner::agent_node::build_agent_node_wiring(
+                crate::runner::agent_node::build_agent_node_wiring_metered(
                     merged_agents,
                     config.tenant.clone(),
                     Arc::clone(&secrets_manager),
@@ -856,12 +974,13 @@ impl TenantRuntime {
                     agent_audit_sink.clone(),
                     stream_observers.clone(),
                     agent_project_id.clone(),
+                    billing_meter.clone(),
                 )
                 .await
             } else {
                 #[cfg(feature = "desktop-agent-ephemeral")]
                 {
-                    crate::runner::agent_node::build_agent_node_wiring_ephemeral(
+                    crate::runner::agent_node::build_agent_node_wiring_ephemeral_metered(
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
@@ -870,12 +989,13 @@ impl TenantRuntime {
                         agent_audit_sink.clone(),
                         stream_observers.clone(),
                         agent_project_id.clone(),
+                        billing_meter.clone(),
                     )
                     .await
                 }
                 #[cfg(not(feature = "desktop-agent-ephemeral"))]
                 {
-                    crate::runner::agent_node::build_agent_node_wiring(
+                    crate::runner::agent_node::build_agent_node_wiring_metered(
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
@@ -884,6 +1004,7 @@ impl TenantRuntime {
                         agent_audit_sink.clone(),
                         stream_observers.clone(),
                         agent_project_id.clone(),
+                        billing_meter.clone(),
                     )
                     .await
                 }
@@ -915,7 +1036,7 @@ impl TenantRuntime {
             #[cfg(feature = "operala-in-process")]
             {
                 use crate::runner::operala_node::{
-                    OPERALA_DISPATCH_ENV, OperalaSelection, select_operala_handler_with_tools,
+                    OPERALA_DISPATCH_ENV, OperalaSelection, select_operala_handler_metered,
                 };
                 use crate::runner::operala_tools::OperalaToolContext;
 
@@ -1003,13 +1124,17 @@ impl TenantRuntime {
                 };
 
                 let dispatch_env = std::env::var(OPERALA_DISPATCH_ENV).ok();
-                match select_operala_handler_with_tools(
+                match select_operala_handler_metered(
                     dispatch_env.as_deref(),
                     resolve_key,
                     base_url,
                     fallback_provider,
                     fallback_model,
                     operala_tools,
+                    // The deep worker's OWN loop bills through the same sink
+                    // as dw.agent, attributed to the same unit.
+                    billing_meter.clone(),
+                    agent_project_id.clone(),
                 )
                 .await
                 {
@@ -1086,7 +1211,7 @@ impl TenantRuntime {
             // values the `dw.agent` handler above receives, so a graph turn's
             // `a2a:` tools resolve the same credentials a single-turn worker's
             // would.
-            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(
+            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler_metered(
                 graphs,
                 agent_audit_sink.clone(),
                 Arc::new(pack_runtimes.clone()),
@@ -1094,6 +1219,7 @@ impl TenantRuntime {
                 config.tenant.clone(),
                 Arc::clone(&secrets_manager),
                 agent_project_id.clone(),
+                billing_meter.clone(),
             )
             .await
             {

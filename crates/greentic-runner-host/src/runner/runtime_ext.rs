@@ -344,8 +344,8 @@ mod tests {
             .find("runtime_ext::ingest_all_corpora(")
             .expect("runtime.rs must run the boot corpus ingest");
         let first_build = [
-            "build_agent_node_wiring(",
-            "build_agent_node_wiring_ephemeral(",
+            "build_agent_node_wiring_metered(",
+            "build_agent_node_wiring_ephemeral_metered(",
         ]
         .iter()
         .filter_map(|needle| source.find(needle))

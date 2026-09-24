@@ -190,3 +190,89 @@ async fn loop_forwards_no_project_id_when_the_pack_identity_is_unknown() {
     );
     assert_eq!(agent_id, "a");
 }
+
+/// A deployed env-canvas unit's host installs a `WorkerUsageMeter`. Driven
+/// through the real Plan-Act-Observe loop, one LLM iteration must reach the
+/// admin's per-unit ingest door as exactly one designer-spec §4.1 event —
+/// carrying the configured model and the unit the METER was built for, never
+/// the runtime tenant/env the step ran under.
+#[tokio::test]
+async fn an_installed_worker_usage_meter_posts_one_turn_event_per_iteration() {
+    use greentic_aw_runtime::billing::{WorkerUsageMeter, WorkerUsageTarget};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/ingest/worker-usage"))
+        .and(header("authorization", "Bearer wut_unit_token"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+
+    let meter = WorkerUsageMeter::new(WorkerUsageTarget {
+        endpoint: format!("{}/api/v1/ingest/worker-usage", server.uri()),
+        token: "wut_unit_token".into(),
+        tenant_slug: "acme".into(),
+        deployment_id: "dep-1".into(),
+        bundle_id: "support-bot".into(),
+    })
+    .expect("meter builds for a loopback endpoint");
+
+    // The runtime tenant/env every remote deployment runs under.
+    let tenant = TenantContext::new("default", "local").with_project_id(Some("support-bot".into()));
+    let cp = MockConfigProvider::new();
+    cp.insert(&tenant, "a", cfg("gpt-4o-mini"));
+    let runtime = AgentRuntime::new(
+        Arc::new(cp),
+        Arc::new(MockAgentStateStore::new()),
+        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
+        Arc::new(MockLlmBackend::new(vec![Ok(final_reply("hi"))])),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    )
+    .with_billing_meter(Arc::new(meter));
+
+    let out = runtime
+        .step(
+            tenant,
+            "s",
+            "a",
+            AgentInput {
+                text: "hello".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .expect("the meter never fails a step");
+    assert_eq!(out.reply, "hi");
+
+    // The POST is fire-and-forget: poll for it.
+    let mut requests = Vec::new();
+    for _ in 0..60 {
+        requests = server.received_requests().await.unwrap_or_default();
+        if !requests.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(requests.len(), 1, "one LLM iteration → one ingest POST");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["surface"], "turn");
+    assert_eq!(body["model"], "gpt-4o-mini");
+    assert_eq!(body["agent_id"], "a");
+    assert_eq!(body["tokens_in"], 7);
+    assert_eq!(body["tokens_out"], 3);
+    assert_eq!(
+        body["tenant_slug"], "acme",
+        "the workspace, not the runtime tenant"
+    );
+    assert_eq!(body["bundle_id"], "support-bot");
+    assert_eq!(body["deployment_id"], "dep-1");
+    assert!(
+        body.get("env_id").is_none(),
+        "the token pins the canvas env server-side"
+    );
+}
