@@ -151,7 +151,12 @@ impl A2aOutcome {
 /// `failed` says the remote agent decided something; `error` says we could
 /// not ask it. Collapsing them would tell an operator to go and look at the
 /// wrong system.
-pub(super) fn call_error_value(agent_id: &str, reason: &str) -> Value {
+/// Public because a caller may not reach a catalogue at all — the `a2a` FLOW
+/// node in greentic-runner-host has no source to build one from when its pack
+/// carries no `assets/a2a-routes.json`. That is the same fact ("we could not
+/// ask the agent"), so it must render as the same value rather than as a
+/// second, privately-invented shape the routing rules would not recognise.
+pub fn call_error_value(agent_id: &str, reason: &str) -> Value {
     json!({
         "status": "error",
         "agent": agent_id,

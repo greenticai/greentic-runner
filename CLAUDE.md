@@ -321,6 +321,119 @@ closing the latter means teaching the graph executor's checkpoint to carry
 the map. `ToolSession` (the in-process deep worker behind `operala.call`)
 keeps one in memory for the life of the session only.
 
+### A plain flow can call an A2A agent too (`component == "a2a"`)
+
+Everything above is the WORKER lane: `a2a:<agent_id>` is a tool an agentic
+worker's model may choose. A plain flow had no way to ask an external agent at
+all — there was no flow-node executor for one. There is now, and it is
+deliberately the same shape the `mcp` flow node already solved once
+(`runner/mcp_node.rs`): a native node the engine dispatches itself, with the
+node's own payload as the source of truth.
+
+**LOCKED ENCODING v1**, `component == "a2a"`, payload/config:
+
+```yaml
+nodes:
+  ask_recipe:
+    a2a:
+      agent: 8d2f0c1e-recipe     # the admin row id, as the sidecar names it
+      message: "{{ entry.text }}"
+      output: answer             # optional state key to bind the result under
+    routing: [ ... ]
+```
+
+`agent` is read from the payload; `operation: "<agent_id>"` and an
+`a2a:<agent_id>` component ref are the fallbacks, exactly as the `mcp` node's
+legacy `operation`/`mcp:` forms are. `output` binds the result under that key
+(`{{node.ask_recipe.answer.reply}}`), absent binds it as the node payload.
+Both nodes go through one `bind_node_result`, so they cannot answer `output:`
+differently. `a2a` is in `flow_adapter::NATIVE_OP_KEYS` and `a2a:` is one of
+`is_native_op_key`'s prefixes — without both, the loader wraps the node as a
+generic component and the engine arm becomes unreachable, silently.
+
+**The node sends ONE message and completes. It never parks.** Implementation:
+`runner/a2a_node.rs` plus `FlowEngine::execute_a2a`.
+
+Four things decide how it behaves, and each fails silently if changed:
+
+- **Nothing here classifies an outcome.** `A2aToolCatalog::dispatch_in_conversation`
+  is called verbatim, so the flow lane and the worker lane render a remote
+  task's state through the same code — including **`reply` appears if and only
+  if `status` is `completed`**, pinned by the one test
+  (`a2a_source::outcome::tests::only_a_completed_outcome_carries_a_reply`) plus
+  its flow-lane twin in `tests/a2a_flow_node.rs`. A second classifier here is
+  how a flow and a worker would start disagreeing about what `input-required`
+  means. The node's value always carries `status`, one of `completed`,
+  `input_required`, `working`, `failed` (the remote decided) or `error` (we
+  could not ask it) — a flow ROUTES on it, because a flow cannot stop
+  mid-node to ask a human.
+- **The continuation is per `(tenant, env, session, FLOW, agent)`**, held as
+  the same [`A2aContinuations`] map the worker keeps in its
+  `ConversationState` — the type, not a copy of its rules, so the idle TTL, the
+  LRU cap and the tenant/env re-check are shared. It lives in the flow's own
+  durable state store under prefix `runner-a2a`, deliberately NOT
+  `STATE_PREFIX`: a flow author owns every key `state.set` writes, so sharing
+  that namespace would let an ordinary `state.set` read or overwrite a remote
+  task reference. Every call ONE FLOW makes to one agent in one session
+  therefore continues the same remote conversation, which is the only shape in
+  which a flow can use `input-required` at all — route the question to a card,
+  come back to the node, and the remote's own question gets ANSWERED instead of
+  re-asked.
+
+  **The flow is in the key for CORRECTNESS, not for confidentiality.** Two
+  flows in one session are the same tenant, the same end user and the same
+  remote agent, which has already seen both — there is nothing to disclose.
+  What there is, is a wrong answer: a support flow and a billing flow sharing
+  one remote thread would have the billing flow's question answered conditioned
+  on the support flow's turns. Nothing the `input-required` loop needs survives
+  across flows, so the continuity buys nothing to set against that.
+
+  **The cost, stated rather than left to be found: a `flow.goto` hand-over
+  starts a fresh remote context.** An exchange mid-`input_required` when the
+  turn is handed to another flow cannot be resumed there — the receiving flow
+  asks the agent from scratch. Carrying it across would mean keying on
+  something the two flows share, which is the cross-flow bleed above.
+
+  The key is `continuations/<flow_id>/<session hint>` and its two segments
+  cannot be confused: a `FlowId` is `[A-Za-z0-9._-]+`, so the flow segment can
+  never contain the `/` that ends it, and `execute_a2a` has already resolved
+  the flow through `pack_for_flow` before the key is built. A test pins that
+  charset rule, so a relaxation upstream reports itself rather than letting
+  `("a/b", "c")` and `("a", "b/c")` collide.
+
+  **A run with no session hint gets no continuation** (each call is its own
+  context, nothing is stored), and so does a runtime with no state store. Both
+  are degradations to "a fresh remote context", never a node failure.
+- **A missing credential fails loudly and sends nothing.** A route with
+  `requires_auth` and no resolvable token refuses in
+  `a2a_source::auth::CredentialScope::header_for` — before anything is sent,
+  naming the agent and every `secrets://…/a2a/<agent_id>` scope it tried.
+  There is no unauthenticated retry and no empty reply.
+- **The agents come from THIS flow's pack**, not from every pack the runtime
+  loaded. An agent the pack does not declare is an error naming it, never a
+  fallback to another agent — the same fail-closed rule
+  `operala_tools::resolve_tool_agent` applies to a deep worker's agent id.
+  `GREENTIC_AW_A2A=0` disables the flow node as well as the worker tools: an
+  operator who turned outbound A2A off must not have it re-enabled by a pack.
+
+**Only the two `error`-carrying statuses mark the node failed**, and only when
+it has an error route to send the failure down — the gate `mcp_node_output`
+already applies, for the same reason (a routing array that matches none of its
+conditions PARKS the run, which is worse than a value the flow can still read).
+`failed` becomes `a2a_agent_failed` and `error` becomes `a2a_call_failed`,
+because the two send an operator to different systems. `completed`,
+`input_required` and `working` are never errors. The envelope is built by
+`normalize_mcp_tool_error`, the single definition of what a failed node's
+`{errors}` output looks like, so the `output:` binding key and `status` survive
+beside it.
+
+**Still needed before an operator can use this:** nothing in greentic-designer
+emits an `a2a` node yet — no palette entry, no config panel — and the
+`assets/a2a-routes.json` sidecar a flow pack needs is written today only for
+packs that carry a WORKER binding an `a2a:` tool. A flow-only pack gets no
+sidecar, so every `a2a` node in it refuses with the "declares no agents"
+message. That is the designer half, and it is a separate change.
+
 ### Async runtime dispatch (`sorla.call` node)
 
 **A route document is the primary transport, and NATS is now the fallback (amendment
@@ -624,7 +737,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_AGENTIC_SERVE_INPROC` | Opt-in (default OFF): co-host the agentic-worker NATS service in-process; truthy (`1`/`true`/`yes`/`on`) + `GREENTIC_EVENTS_NATS_URL` set |
 | `GREENTIC_AGENT_MANIFESTS_DIR` | Dir of `<agent_id>.json` full `AgentConfig` files; process-level agent source for in-proc serve |
 | `GREENTIC_AW_PACK_EXTENSIONS` | Set to `0` to ignore design extensions carried inside a `.gtpack` (`extensions/*.gtxpack`) and keep the on-disk scan as the only source. Mirrors `GREENTIC_AW_MCP` / `GREENTIC_AW_COMPONENT_TOOLS` / `GREENTIC_AW_FLOW_TOOLS`. |
-| `GREENTIC_AW_A2A` | Set to `0` to ignore the `assets/a2a-routes.json` sidecar a `.gtpack` carries, so a worker's `a2a:` tools resolve to nothing. Mirrors `GREENTIC_AW_MCP`. A route with `requires_auth` reads its token per call from `secrets://default/<tenant>/<auth_team\|_>/a2a/<agent_id>` (unit-scoped `<agent_id>.unit-<segment>` first). |
+| `GREENTIC_AW_A2A` | Set to `0` to ignore the `assets/a2a-routes.json` sidecar a `.gtpack` carries, so a worker's `a2a:` tools AND every `component == "a2a"` flow node resolve to nothing. Mirrors `GREENTIC_AW_MCP`. A route with `requires_auth` reads its token per call from `secrets://default/<tenant>/<auth_team\|_>/a2a/<agent_id>` (unit-scoped `<agent_id>.unit-<segment>` first). |
 | `GREENTIC_AW_STATE_BACKEND` | AW state backend selector: `redis` \| `memory` \| `disk`. Unset → `redis` if `GREENTIC_AW_REDIS_URL` is set, else `memory` (ephemeral, in-process). `memory`/`disk` give single-process locking only — multi-instance HA needs `redis`. |
 | `GREENTIC_AW_STATE_PATH` | On-disk (redb) file path when `GREENTIC_AW_STATE_BACKEND=disk` (default `~/.greentic/aw-state.redb`, falling back to `/var/lib/greentic/aw-state.redb`). |
 | `GREENTIC_AW_REDIS_URL` | Agentic-worker Redis state store. **Optional** — the worker defaults to an in-memory backend when unset; set this (or `GREENTIC_AW_STATE_BACKEND=disk`) for durable / multi-instance state. |

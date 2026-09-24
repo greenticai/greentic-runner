@@ -66,6 +66,7 @@ const NATIVE_OP_KEYS: &[&str] = &[
     "telco-x.call",
     "approval.call",
     "mcp",
+    "a2a",
 ];
 
 /// Whether `key` is a runner-native flow op-key that the engine dispatches
@@ -73,9 +74,12 @@ const NATIVE_OP_KEYS: &[&str] = &[
 /// a `component.exec` node).
 ///
 /// Covers the exact [`NATIVE_OP_KEYS`] plus the `emit.*` builtin family and the
-/// self-contained `mcp:<server>/<tool>` ref form.
+/// self-contained `mcp:<server>/<tool>` and `a2a:<agent_id>` ref forms.
 pub(crate) fn is_native_op_key(key: &str) -> bool {
-    key.starts_with("emit.") || key.starts_with("mcp:") || NATIVE_OP_KEYS.contains(&key)
+    key.starts_with("emit.")
+        || key.starts_with("mcp:")
+        || key.starts_with("a2a:")
+        || NATIVE_OP_KEYS.contains(&key)
 }
 
 pub fn flow_doc_to_ir(doc: FlowDoc) -> Result<FlowIR> {
