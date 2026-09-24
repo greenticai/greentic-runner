@@ -161,6 +161,9 @@ pub struct PackRuntime {
     /// Lazily-parsed `assets/a2a-routes.json` sidecar — see
     /// [`PackRuntime::a2a_routes`]. Twin of `mcp_routes`, read on first use.
     a2a_routes: std::sync::OnceLock<Option<crate::runner::a2a_pack_routes::PackA2aRoutes>>,
+    /// Lazily-parsed `assets/sorla-routes.json` sidecar — see
+    /// [`PackRuntime::sorla_routes`]. Twin of `mcp_routes`, read on first use.
+    sorla_routes: std::sync::OnceLock<Option<crate::runner::sorla_pack_routes::PackSorlaRoutes>>,
     /// The deployed unit this pack instance belongs to — the revision's
     /// `bundle_id`, set by [`TenantRuntime::load_revision`] through
     /// [`set_unit_id`](Self::set_unit_id).
@@ -2253,6 +2256,7 @@ impl PackRuntime {
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
+            sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
     }
@@ -3433,6 +3437,25 @@ impl PackRuntime {
             .as_ref()
     }
 
+    /// SoR requirements from the optional `assets/sorla-routes.json` sidecar.
+    ///
+    /// `None` when the pack carries none — a pack built before the feature,
+    /// or one with no `sorla.call` nodes and no worker tools bound to a SoR.
+    /// Parsed at most once per `PackRuntime`; a hot reload allocates a fresh
+    /// one.
+    pub fn sorla_routes(&self) -> Option<&crate::runner::sorla_pack_routes::PackSorlaRoutes> {
+        self.sorla_routes
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::sorla_pack_routes::SORLA_ROUTES_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::sorla_pack_routes::PackSorlaRoutes::from_sidecar_bytes(
+                            &bytes,
+                        )
+                    })
+            })
+            .as_ref()
+    }
+
     /// Raw agent-config blobs from the optional `dw-agents.json` sidecar.
     ///
     /// Designer-built packs (old greentic-pack, which cannot populate
@@ -3785,6 +3808,7 @@ impl PackRuntime {
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
+            sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
     }
@@ -5890,6 +5914,7 @@ pub(crate) mod tests {
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
+            sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
             cache,
         }

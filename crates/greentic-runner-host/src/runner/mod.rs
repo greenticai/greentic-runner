@@ -46,6 +46,7 @@ pub mod remote_dispatch;
 pub mod runtime_ext;
 pub mod runtime_session_resumer;
 pub mod schema_validator;
+pub mod sorla_pack_routes;
 #[cfg(feature = "agentic-worker")]
 pub mod sorx_invoker;
 pub mod templating;
