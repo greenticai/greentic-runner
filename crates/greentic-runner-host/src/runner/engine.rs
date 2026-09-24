@@ -2216,6 +2216,11 @@ impl FlowEngine {
                 source: source.as_ref(),
                 store: store.as_ref(),
                 state_ctx: state_ctx.as_ref(),
+                // From the CONTEXT, so the flow that owns the node owns the
+                // remote context. `pack_for_flow` above has already resolved
+                // this id against the loaded flows, which is what makes it a
+                // safe key segment (see `a2a_node::aw::continuation_key`).
+                flow_id: ctx.flow_id,
                 session_id: ctx.session_id.filter(|hint| !hint.is_empty()),
                 tenant: ctx.tenant,
                 env: &self.default_env,

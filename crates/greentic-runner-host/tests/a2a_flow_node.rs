@@ -23,8 +23,10 @@
 //! * a `requires_auth` route with no resolvable credential fails loudly,
 //!   naming the agent and the secret address, and sends NOTHING;
 //! * an agent the pack does not declare is refused rather than substituted;
-//! * the continuation rule, both directions: a second call in one session
-//!   continues the same remote task, and a call with no session hint does not.
+//! * the continuation rule, in every direction: a second call by one flow in
+//!   one session continues the same remote task, while a call with no session
+//!   hint, a call from another session, and a call from another FLOW in the
+//!   same session each start their own.
 
 #![cfg(feature = "agentic-worker")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -59,6 +61,11 @@ use zip::write::FileOptions;
 const RUNTIME_FLOW_EXTENSION_ID: &str = "greentic.pack.runtime_flow";
 const PACK_ID: &str = "a2a.flow.node.test";
 const FLOW_ID: &str = "a2a.flow";
+/// A SECOND flow in the same pack, identical to the first. Only
+/// [`two_flows_in_one_session_never_share_a_remote_context`] runs it: the
+/// continuation key is per flow, and an identical twin is the cleanest way to
+/// show that it is the FLOW and nothing else that separates them.
+const OTHER_FLOW_ID: &str = "a2a.flow.other";
 const SESSION_HINT: &str = "demo:provider:chan:conv:user";
 /// A hyphenated id, as the admin mints them. Used verbatim in the sidecar,
 /// in the node config and in the secret name.
@@ -260,12 +267,19 @@ fn build_a2a_pack(pack_path: &Path, node_input: Value, sidecar: Option<&str>) ->
         }),
     );
 
-    let runtime_flow = json!({
-        "id": FLOW_ID,
-        "flow_type": "messaging",
-        "start": "ask",
-        "nodes": Value::Object(nodes),
-    });
+    // Two IDENTICAL flows, so a test can run the same node under two flow ids
+    // and see only the continuation key differ.
+    let flows: Vec<Value> = [FLOW_ID, OTHER_FLOW_ID]
+        .into_iter()
+        .map(|flow_id| {
+            json!({
+                "id": flow_id,
+                "flow_type": "messaging",
+                "start": "ask",
+                "nodes": Value::Object(nodes.clone()),
+            })
+        })
+        .collect();
 
     let mut extensions = BTreeMap::new();
     extensions.insert(
@@ -275,7 +289,7 @@ fn build_a2a_pack(pack_path: &Path, node_input: Value, sidecar: Option<&str>) ->
             version: "2.0.0".into(),
             digest: None,
             location: None,
-            inline: Some(ExtensionInline::Other(json!({ "flows": [runtime_flow] }))),
+            inline: Some(ExtensionInline::Other(json!({ "flows": flows }))),
         },
     );
 
@@ -356,12 +370,13 @@ fn build_engine(
 fn flow_ctx<'a>(
     config: &'a HostConfig,
     pack_id: &'a str,
+    flow_id: &'a str,
     session_id: Option<&'a str>,
 ) -> FlowContext<'a> {
     FlowContext {
         tenant: config.tenant.as_str(),
         pack_id,
-        flow_id: FLOW_ID,
+        flow_id,
         node_id: None,
         tool: None,
         action: Some("messaging"),
@@ -441,11 +456,16 @@ impl Harness {
         })
     }
 
-    /// Run the flow once with `text` as the inbound message, asserting the
-    /// flow COMPLETES (an A2A node never parks) and returning the bound value.
+    /// Run [`FLOW_ID`] once with `text` as the inbound message.
     fn run(&self, text: &str, session_id: Option<&str>) -> Result<Value> {
+        self.run_flow(FLOW_ID, text, session_id)
+    }
+
+    /// Run `flow_id` once with `text` as the inbound message, asserting the
+    /// flow COMPLETES (an A2A node never parks) and returning the bound value.
+    fn run_flow(&self, flow_id: &str, text: &str, session_id: Option<&str>) -> Result<Value> {
         let pack_id = self.pack.metadata().pack_id.to_string();
-        let ctx = flow_ctx(&self.config, &pack_id, session_id);
+        let ctx = flow_ctx(&self.config, &pack_id, flow_id, session_id);
         let execution = RUNTIME
             .block_on(self.engine.execute(ctx, json!({ "text": text })))
             .context("a2a flow run")?;
@@ -758,6 +778,54 @@ fn without_a_session_hint_every_call_is_its_own_remote_context() -> Result<()> {
             "call {index} carried a continuation it cannot own: {body}"
         );
     }
+    Ok(())
+}
+
+/// The FLOW half of the continuation key. Two flows in ONE session, against
+/// one agent, must not land in one remote thread.
+///
+/// This is CORRECTNESS, not confidentiality: same tenant, same end user, same
+/// remote agent, which has already seen both. What it prevents is a wrong
+/// answer — a billing flow's question answered conditioned on a support
+/// flow's turns — and nothing the `input-required` loop needs survives across
+/// flows, so there is no benefit to weigh against it.
+///
+/// The known cost this pins by implication: a `flow.goto` hand-over starts a
+/// fresh remote context, so an exchange mid-`input_required` when the turn is
+/// handed over cannot be resumed by the receiving flow.
+#[test]
+fn two_flows_in_one_session_never_share_a_remote_context() -> Result<()> {
+    let _guard = env_guard();
+    clear_env();
+    let agent = RUNTIME.block_on(agent_answering(task_reply(
+        "TASK_STATE_INPUT_REQUIRED",
+        Some("Which city?"),
+        None,
+    )));
+    let harness = Harness::new(Some(&sidecar(AGENT_ID, &agent.uri(), false)), None)?;
+
+    harness.run_flow(FLOW_ID, "book me a table", Some(SESSION_HINT))?;
+    harness.run_flow(OTHER_FLOW_ID, "Jakarta", Some(SESSION_HINT))?;
+
+    let bodies = RUNTIME.block_on(send_message_bodies(&agent));
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        bodies[1]["params"]["message"].get("contextId").is_none()
+            && bodies[1]["params"]["message"].get("taskId").is_none(),
+        "another flow's remote context must not be reused: {}",
+        bodies[1]
+    );
+
+    // The control: the SAME second call, from the same flow as the first,
+    // does continue it. Without this the assertion above would also pass if
+    // the continuation had simply stopped working.
+    harness.run_flow(FLOW_ID, "Jakarta", Some(SESSION_HINT))?;
+    let bodies = RUNTIME.block_on(send_message_bodies(&agent));
+    assert_eq!(
+        bodies[2]["params"]["message"]["contextId"], "ctx-1",
+        "the originating flow must still continue its own exchange: {}",
+        bodies[2]
+    );
     Ok(())
 }
 

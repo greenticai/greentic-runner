@@ -109,11 +109,23 @@ pub mod aw {
     /// `state.set` overwrite — or read — this node's remote references.
     pub const CONTINUATION_PREFIX: &str = "runner-a2a";
 
-    /// The store key one session's continuations live at. The tenant and env
-    /// are not in it: [`greentic_state::fqn`] already scopes every key by
-    /// both.
-    fn continuation_key(session_id: &str) -> StateKey {
-        StateKey::new(format!("continuations/{session_id}"))
+    /// The store key one flow's continuations for one session live at. The
+    /// tenant and env are not in it: [`greentic_state::fqn`] already scopes
+    /// every key by both.
+    ///
+    /// The flow is a segment of its own so two flows in one session cannot
+    /// land in one remote thread — see the module docs for why that is a
+    /// correctness rule and not a confidentiality one.
+    ///
+    /// **The two segments cannot be confused**, even though a session hint
+    /// carries `:` and may carry `/`: a `FlowId` is `[A-Za-z0-9._-]+`, so the
+    /// flow segment can never contain the `/` that ends it. `execute_a2a`
+    /// resolves the flow through `pack_for_flow` BEFORE building this key, so
+    /// by here the id is one a loaded pack declared, and therefore one that
+    /// parsed as a `FlowId`. Pinned by
+    /// `tests::a_flow_id_can_never_contain_the_separator_that_ends_its_segment`.
+    fn continuation_key(flow_id: &str, session_id: &str) -> StateKey {
+        StateKey::new(format!("continuations/{flow_id}/{session_id}"))
     }
 
     /// The A2A agents THIS pack declares, or `None`.
@@ -151,17 +163,14 @@ pub mod aw {
     fn load_continuations(
         store: Option<&DynStateStore>,
         state_ctx: Option<&TenantCtx>,
+        flow_id: &str,
         session_id: Option<&str>,
     ) -> A2aContinuations {
         let (Some(store), Some(ctx), Some(session)) = (store, state_ctx, session_id) else {
             return A2aContinuations::default();
         };
-        let stored = match store.get_json(
-            ctx,
-            CONTINUATION_PREFIX,
-            &continuation_key(session),
-            None,
-        ) {
+        let key = continuation_key(flow_id, session);
+        let stored = match store.get_json(ctx, CONTINUATION_PREFIX, &key, None) {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(
@@ -199,6 +208,7 @@ pub mod aw {
     fn save_continuations(
         store: Option<&DynStateStore>,
         state_ctx: Option<&TenantCtx>,
+        flow_id: &str,
         session_id: Option<&str>,
         continuations: &A2aContinuations,
     ) {
@@ -216,7 +226,7 @@ pub mod aw {
         if let Err(error) = store.set_json(
             ctx,
             CONTINUATION_PREFIX,
-            &continuation_key(session),
+            &continuation_key(flow_id, session),
             None,
             &value,
             ttl,
@@ -242,6 +252,9 @@ pub mod aw {
         pub store: Option<&'a DynStateStore>,
         /// The scope that store is keyed by. `None` disables continuation.
         pub state_ctx: Option<&'a TenantCtx>,
+        /// The flow this node belongs to. A segment of the continuation key,
+        /// so two flows in one session never share a remote context.
+        pub flow_id: &'a str,
         /// The session hint this run belongs to. `None` disables continuation.
         pub session_id: Option<&'a str>,
         /// The runtime tenant and env, for the credential scope and for the
@@ -279,7 +292,8 @@ pub mod aw {
 
         let catalog = source.catalog().await;
         let tenant_ctx = TenantContext::new(call.tenant, call.env);
-        let mut continuations = load_continuations(call.store, call.state_ctx, call.session_id);
+        let mut continuations =
+            load_continuations(call.store, call.state_ctx, call.flow_id, call.session_id);
         let before = continuations.clone();
 
         let result = catalog
@@ -295,7 +309,13 @@ pub mod aw {
         // Only on a change: an agent that neither opened nor closed anything
         // would otherwise make every turn of every flow a store write.
         if continuations != before {
-            save_continuations(call.store, call.state_ctx, call.session_id, &continuations);
+            save_continuations(
+                call.store,
+                call.state_ctx,
+                call.flow_id,
+                call.session_id,
+                &continuations,
+            );
         }
 
         // Every failure travels as a value, and a node with no error route
@@ -337,9 +357,35 @@ pub mod aw {
         #[test]
         fn the_key_is_per_session_so_two_sessions_never_share_a_remote_context() {
             assert_ne!(
-                continuation_key("demo:web:c1:u1").as_str(),
-                continuation_key("demo:web:c2:u1").as_str()
+                continuation_key("support", "demo:web:c1:u1").as_str(),
+                continuation_key("support", "demo:web:c2:u1").as_str()
             );
+        }
+
+        /// The coordinator's ruling: two flows in ONE session must not land in
+        /// one remote thread. A correctness rule, not a confidentiality one —
+        /// same tenant, same end user, same agent — but a billing flow whose
+        /// question is answered conditioned on a support flow's turns is a
+        /// wrong answer, and nothing the `input-required` loop needs survives
+        /// across flows.
+        #[test]
+        fn the_key_is_per_flow_so_two_flows_in_one_session_never_share_a_remote_context() {
+            assert_ne!(
+                continuation_key("support", "demo:web:c1:u1").as_str(),
+                continuation_key("billing", "demo:web:c1:u1").as_str()
+            );
+        }
+
+        /// The key puts the flow first and the session last, so it is
+        /// unambiguous only while a flow id cannot contain the `/` that ends
+        /// its segment. `FlowId` forbids one; this is the ratchet on that
+        /// assumption, so a relaxation upstream says so here rather than
+        /// silently letting `("a/b", "c")` and `("a", "b/c")` collide.
+        #[test]
+        fn a_flow_id_can_never_contain_the_separator_that_ends_its_segment() {
+            use std::str::FromStr;
+            assert!(greentic_types::FlowId::from_str("a/b").is_err());
+            assert!(greentic_types::FlowId::from_str("support.v2_1-a").is_ok());
         }
 
         /// With no store, no scope or no session there is nothing to read and
@@ -347,10 +393,10 @@ pub mod aw {
         /// panic or error.
         #[test]
         fn without_a_session_there_is_no_continuation_and_nothing_is_stored() {
-            let empty = load_continuations(None, None, None);
+            let empty = load_continuations(None, None, "support", None);
             assert!(empty.is_empty());
             // A no-op rather than a panic; there is no store to observe.
-            save_continuations(None, None, None, &empty);
+            save_continuations(None, None, "support", None, &empty);
         }
     }
 }

@@ -367,17 +367,40 @@ Four things decide how it behaves, and each fails silently if changed:
   `input_required`, `working`, `failed` (the remote decided) or `error` (we
   could not ask it) — a flow ROUTES on it, because a flow cannot stop
   mid-node to ask a human.
-- **The continuation is per `(tenant, env, session, agent)`**, held as the same
-  [`A2aContinuations`] map the worker keeps in its `ConversationState` — the
-  type, not a copy of its rules, so the idle TTL, the LRU cap and the
-  tenant/env re-check are shared. It lives in the flow's own durable state
-  store under prefix `runner-a2a`, deliberately NOT `STATE_PREFIX`: a flow
-  author owns every key `state.set` writes, so sharing that namespace would let
-  an ordinary `state.set` read or overwrite a remote task reference. Every call
-  this session makes to one agent therefore continues the same remote
-  conversation, which is the only shape in which a flow can use
-  `input-required` at all — route the question to a card, come back to the
-  node, and the remote's own question gets ANSWERED instead of re-asked.
+- **The continuation is per `(tenant, env, session, FLOW, agent)`**, held as
+  the same [`A2aContinuations`] map the worker keeps in its
+  `ConversationState` — the type, not a copy of its rules, so the idle TTL, the
+  LRU cap and the tenant/env re-check are shared. It lives in the flow's own
+  durable state store under prefix `runner-a2a`, deliberately NOT
+  `STATE_PREFIX`: a flow author owns every key `state.set` writes, so sharing
+  that namespace would let an ordinary `state.set` read or overwrite a remote
+  task reference. Every call ONE FLOW makes to one agent in one session
+  therefore continues the same remote conversation, which is the only shape in
+  which a flow can use `input-required` at all — route the question to a card,
+  come back to the node, and the remote's own question gets ANSWERED instead of
+  re-asked.
+
+  **The flow is in the key for CORRECTNESS, not for confidentiality.** Two
+  flows in one session are the same tenant, the same end user and the same
+  remote agent, which has already seen both — there is nothing to disclose.
+  What there is, is a wrong answer: a support flow and a billing flow sharing
+  one remote thread would have the billing flow's question answered conditioned
+  on the support flow's turns. Nothing the `input-required` loop needs survives
+  across flows, so the continuity buys nothing to set against that.
+
+  **The cost, stated rather than left to be found: a `flow.goto` hand-over
+  starts a fresh remote context.** An exchange mid-`input_required` when the
+  turn is handed to another flow cannot be resumed there — the receiving flow
+  asks the agent from scratch. Carrying it across would mean keying on
+  something the two flows share, which is the cross-flow bleed above.
+
+  The key is `continuations/<flow_id>/<session hint>` and its two segments
+  cannot be confused: a `FlowId` is `[A-Za-z0-9._-]+`, so the flow segment can
+  never contain the `/` that ends it, and `execute_a2a` has already resolved
+  the flow through `pack_for_flow` before the key is built. A test pins that
+  charset rule, so a relaxation upstream reports itself rather than letting
+  `("a/b", "c")` and `("a", "b/c")` collide.
+
   **A run with no session hint gets no continuation** (each call is its own
   context, nothing is stored), and so does a runtime with no state store. Both
   are degradations to "a fresh remote context", never a node failure.
