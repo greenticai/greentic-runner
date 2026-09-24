@@ -16,10 +16,6 @@
 #![cfg(feature = "agentic-worker")]
 
 mod http;
-// `pub(crate)`, not re-exported: nothing in this crate builds a
-// `SorxRoutedInvoker` yet (that lands with its agent-node wiring), so a
-// `use routed::SorxRoutedInvoker;` re-export here would be an unused import
-// until that caller exists. Reach it as `sorx_invoker::routed::SorxRoutedInvoker`.
 pub(crate) mod routed;
 #[cfg(test)]
 mod tests;
@@ -28,6 +24,12 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub(crate) use http::SorxHttpInvoker;
+// Re-exported so a sibling module (e.g. `sorla_pack_source`'s tests) can
+// reuse these `GET /admin/v1/capabilities` fixtures instead of duplicating
+// them; `http` itself stays private to this module.
+#[cfg(test)]
+pub(crate) use http::fixtures;
+pub(crate) use routed::SorxRoutedInvoker;
 
 /// Caller identity stamped on every capability invocation. SP1 has no
 /// per-agent caller identity to thread through `SorxInvoker::invoke` (the

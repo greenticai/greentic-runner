@@ -82,6 +82,17 @@ pub use routing::RoutingConfig;
 use routing::TenantRouting;
 pub use runner::HostServer;
 
+/// Build a worker's sorla tool source over exactly the given SoRs, each
+/// resolved through its own route document at
+/// `secrets://default/<tenant>/<team|_>/sorla/<sor>`. Re-exported for the
+/// designer's in-process Test chat, which knows a worker's bound SoRs
+/// directly and has no `PackRuntime` of its own to read a
+/// `assets/sorla-routes.json` sidecar from — see
+/// `runner::sorla_pack_source` for the pack-routed counterpart this crate
+/// uses internally.
+#[cfg(feature = "agentic-worker")]
+pub use runner::sorla_pack_source::sorla_source_for_sors;
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;

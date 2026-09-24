@@ -24,10 +24,10 @@ use crate::secrets::DynSecretsManager;
 /// `SorxInvoker` over every SoR named in `sors`, each resolved through its
 /// own route document at `secrets://default/<tenant>/<team|_>/sorla/<sor>`.
 ///
-/// `#[allow(dead_code)]`: exercised today only by [`super::tests`]. Nothing
-/// outside this module constructs one yet — that lands with its agent-node
-/// wiring — so the plain (non-test) build sees no caller.
-#[allow(dead_code)]
+/// Constructed by `sorla_pack_source::sorla_source_for_sors`, both for the
+/// runner's own pack-routed agent-node wiring and for the designer's
+/// in-process Test chat (via the crate's public
+/// `sorla_source_for_sors` re-export).
 pub(crate) struct SorxRoutedInvoker {
     client: reqwest::Client,
     secrets: DynSecretsManager,
@@ -37,7 +37,6 @@ pub(crate) struct SorxRoutedInvoker {
     cap_by_key: HashMap<(String, String), String>,
 }
 
-#[allow(dead_code)]
 impl SorxRoutedInvoker {
     /// Resolve and discover every SoR in `sors`. A SoR whose route document
     /// is missing or invalid is skipped — logged by name and reason, never
