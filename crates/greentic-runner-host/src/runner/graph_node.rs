@@ -342,6 +342,9 @@ mod aw {
     /// pack-carried A2A tool source ([`graph_a2a_source`]) and, `tenant` and
     /// `secrets` only, the Chronicle-index knowledge mount ([`IndexMount`]);
     /// the rest of this path keeps its env-only secrets, as before.
+    ///
+    /// Bills every turn through `agent_node::resolve_billing_meter(None)` (the
+    /// env-configured sink, or none); see [`build_graph_node_handler_metered`].
     #[allow(clippy::too_many_arguments)]
     pub async fn build_graph_node_handler(
         graphs: HashMap<String, GraphConfig>,
@@ -351,6 +354,33 @@ mod aw {
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
         unit: Option<String>,
+    ) -> Option<Arc<dyn GraphNodeHandler>> {
+        build_graph_node_handler_metered(
+            graphs,
+            audit_sink,
+            packs,
+            merged_agents,
+            tenant,
+            secrets,
+            unit,
+            super::super::agent_node::resolve_billing_meter(None),
+        )
+        .await
+    }
+
+    /// [`build_graph_node_handler`] with the `TenantRuntime`'s already-resolved
+    /// billing sink, shared with its `dw.agent` runtime. Every agent and
+    /// supervisor turn bills through it, attributed to `unit` as `project_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_graph_node_handler_metered(
+        graphs: HashMap<String, GraphConfig>,
+        audit_sink: Option<AuditSink>,
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        unit: Option<String>,
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
     ) -> Option<Arc<dyn GraphNodeHandler>> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
         use greentic_aw_runtime::OtelTelemetry;
@@ -401,7 +431,8 @@ mod aw {
 
         let a2a_source = graph_a2a_source(&packs, &tenant, &secrets, unit.as_deref());
         // Chronicle-index retrieval for `agent_ref` turns. Captured here, with
-        // the real tenant, because each turn runs under a synthetic one.
+        // the runtime's own secrets tenant, so the mount does not depend on the
+        // tenant each turn happens to run under.
         let index_mount = IndexMount {
             secrets: Some(super::super::agent_node::mcp_secrets_manager(&secrets)),
             secret_tenant: Some(tenant.clone()),
@@ -420,7 +451,8 @@ mod aw {
             Arc::new(merged_agents),
             a2a_source,
             index_mount,
-        );
+        )
+        .with_billing(billing_meter, unit);
 
         tracing::info!(graph_count, "AW graph runtime constructed");
         Some(Arc::new(handler))
@@ -484,12 +516,46 @@ mod aw {
             &self,
             audit_sink: Option<AuditSink>,
             real_tenant: greentic_types::TenantCtx,
+            billing: TurnBilling,
         ) -> AgentTurnFn;
         fn supervisor(
             &self,
             audit_sink: Option<AuditSink>,
             real_tenant: greentic_types::TenantCtx,
+            billing: TurnBilling,
         ) -> SupervisorFn;
+    }
+
+    /// How a graph turn's LLM spend is billed: the `TenantRuntime`'s shared
+    /// billing sink (`agent_node::resolve_billing_meter` — the host-installed
+    /// per-unit meter, else the env-configured one, else none) and the deployed
+    /// unit (`bundle_id`) the spend is attributed to as `project_id`.
+    ///
+    /// Before this existed every graph turn ran on the per-visit runtime's
+    /// default `NoopBillingMeter` under a synthetic `("graph", "run")` tenant,
+    /// so agent-graph workers emitted no usage at all.
+    #[derive(Clone, Default)]
+    pub(crate) struct TurnBilling {
+        pub(crate) meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        pub(crate) project_id: Option<String>,
+    }
+
+    impl TurnBilling {
+        /// The [`TenantContext`] a graph turn runs (and bills) under: the REAL
+        /// tenant/env the flow node was dispatched with, plus the unit.
+        fn turn_tenant(&self, real_tenant: &greentic_types::TenantCtx) -> TenantContext {
+            TenantContext::new(real_tenant.tenant_id.as_str(), real_tenant.env.as_str())
+                .with_project_id(self.project_id.clone())
+        }
+
+        /// Install the shared sink on a per-visit runtime; no sink leaves the
+        /// runtime's `NoopBillingMeter` in place.
+        fn install(&self, runtime: AgentRuntime) -> AgentRuntime {
+            match &self.meter {
+                Some(meter) => runtime.with_billing_meter(Arc::clone(meter)),
+                None => runtime,
+            }
+        }
     }
 
     /// Production [`TurnEffectSource`]: holds the constituent runtime Arcs
@@ -533,6 +599,7 @@ mod aw {
             &self,
             audit_sink: Option<AuditSink>,
             real_tenant: greentic_types::TenantCtx,
+            billing: TurnBilling,
         ) -> AgentTurnFn {
             build_agent_turn(
                 self.state_store.clone(),
@@ -548,6 +615,7 @@ mod aw {
                 self.index_mount.clone(),
                 audit_sink,
                 real_tenant,
+                billing,
             )
         }
 
@@ -555,6 +623,7 @@ mod aw {
             &self,
             audit_sink: Option<AuditSink>,
             real_tenant: greentic_types::TenantCtx,
+            billing: TurnBilling,
         ) -> SupervisorFn {
             build_supervisor(
                 self.state_store.clone(),
@@ -566,6 +635,7 @@ mod aw {
                 self.merged_agents.clone(),
                 audit_sink,
                 real_tenant,
+                billing,
             )
         }
     }
@@ -586,6 +656,7 @@ mod aw {
             &self,
             _audit_sink: Option<AuditSink>,
             _real_tenant: greentic_types::TenantCtx,
+            _billing: TurnBilling,
         ) -> AgentTurnFn {
             self.agent_turn.clone()
         }
@@ -594,6 +665,7 @@ mod aw {
             &self,
             _audit_sink: Option<AuditSink>,
             _real_tenant: greentic_types::TenantCtx,
+            _billing: TurnBilling,
         ) -> SupervisorFn {
             self.supervisor.clone()
         }
@@ -617,9 +689,26 @@ mod aw {
         /// `run_agent_step` seam then stays on the plain `.step()` path,
         /// byte-identical regardless of this field's value.
         audit_sink: Option<AuditSink>,
+        /// Billing sink + unit for every agent and supervisor turn (see
+        /// [`TurnBilling`]). Default: no sink, no unit — set by
+        /// [`RuntimeGraphNodeHandler::with_billing`].
+        billing: TurnBilling,
     }
 
     impl RuntimeGraphNodeHandler {
+        /// Bill every agent and supervisor turn through `meter`, attributed to
+        /// the deployed unit `project_id` (the revision's `bundle_id`). `None`
+        /// keeps the per-visit runtimes on `NoopBillingMeter`.
+        #[must_use]
+        pub fn with_billing(
+            mut self,
+            meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+            project_id: Option<String>,
+        ) -> Self {
+            self.billing = TurnBilling { meter, project_id };
+            self
+        }
+
         /// Build a handler from the runtime's constituent parts.
         ///
         /// **Deviation from the Task-7 `from_runtime(runtime: Arc<AgentRuntime>, …)`
@@ -687,6 +776,7 @@ mod aw {
                 tool,
                 approval,
                 audit_sink,
+                billing: TurnBilling::default(),
             }
         }
 
@@ -717,6 +807,7 @@ mod aw {
                 tool,
                 approval,
                 audit_sink: None,
+                billing: TurnBilling::default(),
             }
         }
 
@@ -873,20 +964,24 @@ mod aw {
             };
 
             // The real tenant/env `execute` already received — the same one
-            // driving executor/checkpoint/run-id above. (The synthetic
-            // `"graph"`/`"run"` tenant is built *inside* the turn functions,
-            // for per-visit AgentRuntime *state* only.) Rebuilt fresh on
+            // driving executor/checkpoint/run-id above. (The turn functions
+            // build their per-visit `TenantContext` from it plus the unit —
+            // see `TurnBilling::turn_tenant`.) Rebuilt fresh on
             // every call — see `TurnEffectSource` — so the sink + real tenant
             // reach `run_one_agent_turn`/`run_one_supervisor_turn`, which feed
             // them into the shared `run_agent_step` seam that builds the
             // `AgentAuditObserver` (EPIC-B B-3b Task 2).
             let real_tenant = tenant_ctx_for_audit(tenant_id, env_id);
-            let agent_turn = self
-                .turn_source
-                .agent_turn(self.audit_sink.clone(), real_tenant.clone());
-            let supervisor = self
-                .turn_source
-                .supervisor(self.audit_sink.clone(), real_tenant);
+            let agent_turn = self.turn_source.agent_turn(
+                self.audit_sink.clone(),
+                real_tenant.clone(),
+                self.billing.clone(),
+            );
+            let supervisor = self.turn_source.supervisor(
+                self.audit_sink.clone(),
+                real_tenant,
+                self.billing.clone(),
+            );
 
             let executor = GraphExecutor::new(
                 self.checkpoint.clone(),
@@ -1021,6 +1116,7 @@ mod aw {
         index_mount: IndexMount,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
+        billing: TurnBilling,
     ) -> AgentTurnFn {
         Arc::new(move |req: AgentTurnRequest| {
             let state_store = state_store.clone();
@@ -1036,6 +1132,7 @@ mod aw {
             let audit_sink = audit_sink.clone();
             let real_tenant = real_tenant.clone();
             let index_mount = index_mount.clone();
+            let billing = billing.clone();
             Box::pin(async move {
                 run_one_agent_turn(
                     req,
@@ -1052,6 +1149,7 @@ mod aw {
                     audit_sink.as_ref(),
                     &real_tenant,
                     &index_mount,
+                    &billing,
                 )
                 .await
             }) as BoxFut<'static, Result<AgentTurnResult, GraphExecError>>
@@ -1064,13 +1162,11 @@ mod aw {
     /// [`run_one_agent_turn`] and [`run_one_supervisor_turn`] so the
     /// audit-injection seam is defined exactly once.
     ///
-    /// `tenant`/`session_id`/`agent_id` are the per-visit SYNTHETIC state
-    /// identifiers (`TenantContext::new("graph", "run")` + the derived
-    /// session/agent ids) — unchanged by this wiring, since the
-    /// `AgentRuntime`'s state store must keep using them for per-visit
-    /// durability. `real_tenant` is used ONLY to build the audit observer's
-    /// `TenantCtx`, so audit events publish under the real tenant while turn
-    /// state stays keyed under "graph"/"run".
+    /// `tenant`/`session_id`/`agent_id` are the per-visit state identifiers
+    /// (`TurnBilling::turn_tenant` — the real tenant/env plus the unit — and
+    /// the derived session/agent ids); `tenant` is also what the billing sink
+    /// attributes the turn to. `real_tenant` is used ONLY to build the audit
+    /// observer's `TenantCtx`, unchanged by the billing wiring.
     ///
     /// Off by default: when `audit_sink` is `None` (no NATS audit client
     /// configured), this is exactly `runtime.step(...)` — byte-identical to
@@ -1238,13 +1334,18 @@ mod aw {
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
         index_mount: &IndexMount,
+        billing: &TurnBilling,
     ) -> Result<AgentTurnResult, GraphExecError> {
         // The request carries no tenant/graph/session — they live on the
         // GraphRunState's seeded session. The executor seeds the run state with
-        // the tenant-scoped messages, so we reconstruct a turn-scoped tenant +
-        // session purely for the per-visit runtime. Conversation durability is
-        // owned by the graph checkpoint, not this ephemeral store.
-        let tenant = TenantContext::new("graph", "run");
+        // the tenant-scoped messages, so we reconstruct a turn-scoped session
+        // purely for the per-visit runtime. Conversation durability is owned by
+        // the graph checkpoint, not this ephemeral store.
+        //
+        // The tenant is the REAL one the node was dispatched with (plus the
+        // deployed unit), not a synthetic `("graph", "run")`: it is also the
+        // tenant the billing sink attributes this turn's LLM spend to.
+        let tenant = billing.turn_tenant(real_tenant);
         let session_id = format!("graph__{}", req.node_id);
         let agent_id = format!("graph.{}", req.node_id);
 
@@ -1276,8 +1377,7 @@ mod aw {
         // Component tool source: unlike `mcp_source` (built once, reused across
         // every graph-agent visit), the component source is tenant-pinned, so it
         // is rebuilt PER TURN from the in-memory `packs` list — cheap, and keeps
-        // a `component:<ref>` tool ref scoped to the real tenant rather than the
-        // synthetic "graph"/"run" state tenant used above.
+        // a `component:<ref>` tool ref scoped to the real tenant.
         let component_source = super::super::agent_node::component_source_from_packs(
             &packs,
             real_tenant.tenant_id.as_str(),
@@ -1297,6 +1397,7 @@ mod aw {
         // for inline, inheriting and referenced agents alike — exactly what
         // the single-turn `dw.agent` runtime attaches.
         .with_a2a_source(a2a_source);
+        runtime = billing.install(runtime);
 
         // Full fidelity ONLY for a referenced agent — mirrors
         // `agent_node::build_agent_runtime`'s guardrail/short-term-memory/
@@ -1327,8 +1428,7 @@ mod aw {
             // of the full-fidelity attachment sequence, so the `agent_ref: None`
             // inline path stays byte-unchanged.
             // Chronicle-index retrieval beneath it, reading its credentials
-            // under the real tenant the mount captured — `tenant` above is
-            // the synthetic `graph` one.
+            // under the secrets tenant the mount captured at construction.
             runtime = index_mount.attach(runtime);
             runtime = crate::runner::knowledge_ext::attach(runtime, ext_runtime.clone());
         }
@@ -1383,6 +1483,7 @@ mod aw {
         merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
+        billing: TurnBilling,
     ) -> SupervisorFn {
         Arc::new(move |req: SupervisorRequest| {
             let merged_agents = merged_agents.clone();
@@ -1394,6 +1495,7 @@ mod aw {
             let ledger = ledger.clone();
             let audit_sink = audit_sink.clone();
             let real_tenant = real_tenant.clone();
+            let billing = billing.clone();
             Box::pin(async move {
                 run_one_supervisor_turn(
                     req,
@@ -1406,6 +1508,7 @@ mod aw {
                     merged_agents,
                     audit_sink.as_ref(),
                     &real_tenant,
+                    &billing,
                 )
                 .await
             }) as BoxFut<'static, Result<SupervisorResult, GraphExecError>>
@@ -1475,8 +1578,10 @@ mod aw {
         merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
+        billing: &TurnBilling,
     ) -> Result<SupervisorResult, GraphExecError> {
-        let tenant = TenantContext::new("graph", "run");
+        // Real tenant + unit, as for an agent turn: routing is an LLM call too.
+        let tenant = billing.turn_tenant(real_tenant);
         let session_id = format!("graph__{}_sup", req.node_id);
         let agent_id = format!("graph.{}.supervisor", req.node_id);
 
@@ -1518,7 +1623,7 @@ mod aw {
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
-        let runtime = AgentRuntime::new(
+        let runtime = billing.install(AgentRuntime::new(
             Arc::new(provider),
             state_store,
             ext_runtime,
@@ -1529,7 +1634,7 @@ mod aw {
             // Supervisor routing runs with an empty tool list; MCP tools are
             // never offered on this path.
             None,
-        );
+        ));
 
         let input = AgentInput {
             text: String::new(),
@@ -2974,6 +3079,7 @@ mod aw {
                 None,
                 &real_tenant,
                 &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
             )
             .await
             .expect("turn should succeed");
@@ -3010,6 +3116,7 @@ mod aw {
                 Some(&sink),
                 &real_tenant,
                 &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
             )
             .await
             .expect("turn should succeed");
@@ -3053,6 +3160,7 @@ mod aw {
                 None,
                 &real_tenant,
                 &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
             )
             .await
             .expect("turn should succeed even with a declared-but-unregistered tool");
@@ -3198,6 +3306,7 @@ mod aw {
                 None,
                 &real_tenant,
                 &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
             )
             .await
             .expect("turn should succeed");
@@ -3247,6 +3356,7 @@ mod aw {
                 None,
                 &real_tenant,
                 &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
             )
             .await
             .expect("turn should succeed");
@@ -3282,6 +3392,7 @@ mod aw {
                 None,
                 &real_tenant,
                 &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
             )
             .await
             .expect_err("must error when agent_ref doesn't resolve");
@@ -3469,6 +3580,7 @@ mod aw {
                 Arc::new(HashMap::new()),
                 None,
                 &real_tenant,
+                &TurnBilling::default(),
             )
             .await
             .expect("supervisor turn should succeed");
@@ -3513,6 +3625,7 @@ mod aw {
                 Arc::new(HashMap::new()),
                 Some(&sink),
                 &real_tenant,
+                &TurnBilling::default(),
             )
             .await
             .expect("supervisor turn should succeed");
@@ -3522,6 +3635,195 @@ mod aw {
                 rx.try_recv().is_err(),
                 "no tool call happens on this path, so no audit event is expected"
             );
+        }
+
+        // -------------------------------------------------------------------
+        // Billing of graph turns
+        // -------------------------------------------------------------------
+
+        /// (tenant_id, env_id, project_id, agent_id, model) per `emit`.
+        type GraphEmit = (String, String, Option<String>, String, String);
+
+        #[derive(Default)]
+        struct RecordingGraphMeter {
+            calls: std::sync::Mutex<Vec<GraphEmit>>,
+        }
+
+        impl greentic_aw_runtime::billing::BillingMeter for RecordingGraphMeter {
+            fn emit<'a>(
+                &'a self,
+                tenant: &'a TenantContext,
+                _input_tokens: u64,
+                _output_tokens: u64,
+                agent_id: &'a str,
+                model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(), greentic_aw_runtime::billing::BillingError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                self.calls.lock().expect("lock").push((
+                    tenant.tenant_id.clone(),
+                    tenant.env_id.clone(),
+                    tenant.project_id.clone(),
+                    agent_id.to_string(),
+                    model.to_string(),
+                ));
+                Box::pin(async { Ok(()) })
+            }
+
+            fn over_budget<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                Box::pin(std::future::ready(false))
+            }
+        }
+
+        fn unit_billing(meter: &Arc<RecordingGraphMeter>) -> TurnBilling {
+            TurnBilling {
+                meter: Some(
+                    Arc::clone(meter) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>
+                ),
+                project_id: Some("support-bot".to_string()),
+            }
+        }
+
+        /// An agent-graph turn bills through the unit's installed sink, under
+        /// the REAL tenant/env the node was dispatched with and the deployed
+        /// unit — not the synthetic `("graph", "run")` tenant every graph turn
+        /// used to run under, which also meant no sink at all.
+        #[tokio::test]
+        async fn a_graph_agent_turn_bills_the_real_tenant_and_the_unit() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+            let meter = Arc::new(RecordingGraphMeter::default());
+
+            run_one_agent_turn(
+                agent_turn_request("triage", "You triage."),
+                state_store,
+                ext_runtime,
+                plain_reply_llm("routed [[RESOLVED]]"),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(HashMap::new()),
+                None,
+                &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &unit_billing(&meter),
+            )
+            .await
+            .expect("turn succeeds");
+
+            let calls = meter.calls.lock().expect("lock");
+            assert_eq!(calls.len(), 1, "one LLM iteration → one billing emit");
+            assert_eq!(
+                calls[0],
+                (
+                    "acme".to_string(),
+                    "prod".to_string(),
+                    Some("support-bot".to_string()),
+                    "graph.triage".to_string(),
+                    "gpt-4o-mini".to_string(),
+                )
+            );
+        }
+
+        /// Supervisor routing is an LLM call too, and bills the same way.
+        #[tokio::test]
+        async fn a_supervisor_routing_turn_is_billed() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+            let meter = Arc::new(RecordingGraphMeter::default());
+            let req = SupervisorRequest {
+                node_id: "router".to_string(),
+                system_prompt: "Route the user.".to_string(),
+                model: "claude-3-haiku".to_string(),
+                routes: vec![SupervisorRoute {
+                    branch: "billing".into(),
+                    description: "Billing questions".into(),
+                }],
+                state: GraphRunState::default(),
+                provider: None,
+                agent_ref: None,
+            };
+
+            run_one_supervisor_turn(
+                req,
+                state_store,
+                ext_runtime,
+                plain_reply_llm("[[ROUTE:billing]]"),
+                telemetry,
+                token_meter,
+                ledger,
+                Arc::new(HashMap::new()),
+                None,
+                &real_tenant,
+                &unit_billing(&meter),
+            )
+            .await
+            .expect("supervisor turn succeeds");
+
+            let calls = meter.calls.lock().expect("lock");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, "acme");
+            assert_eq!(calls[0].1, "prod");
+            assert_eq!(calls[0].2.as_deref(), Some("support-bot"));
+            assert_eq!(calls[0].3, "graph.router.supervisor");
+            assert_eq!(calls[0].4, "claude-3-haiku");
+        }
+
+        /// No installed sink leaves the turn exactly as unbilled as before —
+        /// and it still runs.
+        #[tokio::test]
+        async fn a_graph_turn_without_a_sink_still_runs() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+            let result = run_one_agent_turn(
+                agent_turn_request("triage", "You triage."),
+                state_store,
+                ext_runtime,
+                plain_reply_llm("hello"),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(HashMap::new()),
+                None,
+                &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
+            )
+            .await
+            .expect("turn succeeds with no sink");
+            assert_eq!(result.reply, "hello");
+        }
+
+        #[test]
+        fn with_billing_sets_the_sink_and_unit_on_the_handler() {
+            let handler = handler_with(
+                Arc::new(InMemoryGraphProvider::new(HashMap::new())),
+                agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1),
+                tool_fn_ok(),
+            );
+            assert!(handler.billing.meter.is_none());
+            let meter = Arc::new(RecordingGraphMeter::default());
+            let handler = handler.with_billing(
+                Some(meter as Arc<dyn greentic_aw_runtime::billing::BillingMeter>),
+                Some("support-bot".to_string()),
+            );
+            assert!(handler.billing.meter.is_some());
+            assert_eq!(handler.billing.project_id.as_deref(), Some("support-bot"));
         }
     }
 
@@ -3773,7 +4075,7 @@ mod aw {
                 greentic_types::EnvId::try_from("prod").unwrap(),
                 greentic_types::TenantId::try_from(TENANT).unwrap(),
             );
-            let turn = source.agent_turn(None, real_tenant);
+            let turn = source.agent_turn(None, real_tenant, super::TurnBilling::default());
             let result = turn(AgentTurnRequest {
                 node_id: "specialist".into(),
                 system_prompt: "You suggest recipes.".into(),
@@ -3907,3 +4209,6 @@ pub use aw::{
     GraphConfigSource, InMemoryGraphProvider, LayeredGraphProvider, RuntimeGraphNodeHandler,
     build_graph_node_handler, graph_config_from_sidecar,
 };
+
+#[cfg(feature = "agentic-worker")]
+pub(crate) use aw::build_graph_node_handler_metered;

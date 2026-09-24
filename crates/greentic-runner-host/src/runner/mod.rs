@@ -38,6 +38,9 @@ pub mod mocks;
 pub mod operala_node;
 #[cfg(feature = "operala-in-process")]
 pub mod operala_tools;
+// Bills an in-process deep worker's own reasoning-loop LLM calls.
+#[cfg(feature = "operala-in-process")]
+pub(crate) mod metered_llm;
 pub mod operator;
 #[cfg(feature = "agentic-worker")]
 pub mod pack_extensions;

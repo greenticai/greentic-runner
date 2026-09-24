@@ -142,6 +142,11 @@ mod dw {
         /// `AgentRuntime` (no agents, or no state store) — the deep worker
         /// then runs tool-less, as it did before tools existed.
         tools: Option<Arc<OperalaToolContext>>,
+        /// The `TenantRuntime`'s shared billing sink. `None` leaves the deep
+        /// worker's own reasoning-loop calls unmetered (as before this field).
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        /// The deployed unit (`bundle_id`) those calls are attributed to.
+        project_id: Option<String>,
     }
 
     impl RuntimeOperalaNodeHandler {
@@ -159,7 +164,24 @@ mod dw {
                 fallback_provider,
                 fallback_model,
                 tools: None,
+                billing_meter: None,
+                project_id: None,
             }
+        }
+
+        /// Bill every LLM call a deep worker's own loop makes (plan, execute,
+        /// reflect, reply) through `meter`, attributed to the deployed unit
+        /// `project_id`. The invoker exposes no usage itself, so the handler
+        /// wraps the provider it hands it — see [`crate::runner::metered_llm`].
+        #[must_use]
+        pub fn with_billing_meter(
+            mut self,
+            meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+            project_id: Option<String>,
+        ) -> Self {
+            self.billing_meter = meter;
+            self.project_id = project_id;
+            self
         }
 
         /// Replace the LLM construction, for tests that script the model.
@@ -179,15 +201,52 @@ mod dw {
         /// Build a [`DeepWorkerInvoker`] whose LLM provider/model come from the
         /// dispatched node's `input.llm` (else the env fallback). Errors when
         /// neither is present rather than guessing a provider.
-        fn build_invoker(&self, input: &Value) -> Result<DeepWorkerInvoker> {
+        fn build_invoker(
+            &self,
+            input: &Value,
+            scope: &DispatchScope<'_>,
+        ) -> Result<DeepWorkerInvoker> {
             let (provider, model) = resolve_operala_provider_model(
                 input,
                 self.fallback_provider.as_deref(),
                 self.fallback_model.as_deref(),
             )?;
             let llm = (self.llm_factory)(&provider, &model)?;
-            Ok(DeepWorkerInvoker::new(llm))
+            Ok(DeepWorkerInvoker::new(self.metered(llm, input, scope)))
         }
+
+        /// Wrap the worker's LLM so every completed call is billed, when a
+        /// billing sink is installed; otherwise hand it back untouched.
+        pub(crate) fn metered(
+            &self,
+            llm: Arc<dyn greentic_llm::LlmProvider>,
+            input: &Value,
+            scope: &DispatchScope<'_>,
+        ) -> Arc<dyn greentic_llm::LlmProvider> {
+            let Some(meter) = &self.billing_meter else {
+                return llm;
+            };
+            let tenant = greentic_aw_runtime::tenant::TenantContext::new(scope.tenant, scope.env)
+                .with_project_id(self.project_id.clone());
+            Arc::new(crate::runner::metered_llm::MeteredLlmProvider::new(
+                llm,
+                Arc::clone(meter),
+                tenant,
+                crate::runner::metered_llm::deep_worker_agent_id(
+                    input,
+                    scope.target,
+                    scope.operation,
+                ),
+            ))
+        }
+    }
+
+    /// Who an `operala.call` dispatch runs for, as far as billing cares.
+    pub(crate) struct DispatchScope<'a> {
+        pub(crate) tenant: &'a str,
+        pub(crate) env: &'a str,
+        pub(crate) target: &'a str,
+        pub(crate) operation: &'a str,
     }
 
     /// The production LLM: a `greentic_llm::RigBackend` for the worker's
@@ -229,7 +288,15 @@ mod dw {
             session_id: &str,
             input: &Value,
         ) -> Result<Value> {
-            let invoker = self.build_invoker(input)?;
+            let invoker = self.build_invoker(
+                input,
+                &DispatchScope {
+                    tenant,
+                    env,
+                    target,
+                    operation,
+                },
+            )?;
             let deep_worker_tools = match &self.tools {
                 Some(ctx) => ctx.tools_for(tenant, env, target, operation, input).await,
                 None => None,
@@ -322,6 +389,38 @@ mod dw {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Option<String>>,
     {
+        select_operala_handler_metered(
+            dispatch_env,
+            resolve_key,
+            base_url,
+            fallback_provider,
+            fallback_model,
+            tools,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// [`select_operala_handler_with_tools`], also billing the deep worker's
+    /// own reasoning-loop calls through `billing_meter`, attributed to the
+    /// deployed unit `project_id` (see
+    /// [`RuntimeOperalaNodeHandler::with_billing_meter`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn select_operala_handler_metered<F, Fut>(
+        dispatch_env: Option<&str>,
+        resolve_key: F,
+        base_url: Option<String>,
+        fallback_provider: Option<String>,
+        fallback_model: Option<String>,
+        tools: Option<Arc<OperalaToolContext>>,
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        project_id: Option<String>,
+    ) -> OperalaSelection
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
         if !super::operala_dispatch_in_process(dispatch_env) {
             return OperalaSelection::Nats;
         }
@@ -333,7 +432,8 @@ mod dw {
                     fallback_provider,
                     fallback_model,
                 )
-                .with_tool_context(tools),
+                .with_tool_context(tools)
+                .with_billing_meter(billing_meter, project_id),
             )),
             None => OperalaSelection::NoKey,
         }
@@ -345,6 +445,12 @@ pub use dw::{
     OperalaSelection, RuntimeOperalaNodeHandler, select_operala_handler,
     select_operala_handler_with_tools,
 };
+
+#[cfg(feature = "operala-in-process")]
+pub(crate) use dw::select_operala_handler_metered;
+
+#[cfg(all(test, feature = "operala-in-process"))]
+pub(crate) use dw::DispatchScope;
 
 #[cfg(test)]
 mod tests {
