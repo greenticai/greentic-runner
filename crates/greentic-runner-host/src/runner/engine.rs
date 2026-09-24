@@ -687,6 +687,16 @@ impl FlowEngine {
         self.remote_dispatch_handler = Some(handler);
     }
 
+    /// Whether a [`RemoteDispatchHandler`] (e.g. NATS) is configured on this
+    /// engine. `execute_sorla_call` reads this to decide, once a route
+    /// document has failed to resolve, whether to fall back to remote
+    /// dispatch or fail outright with `sorla_route_missing`.
+    ///
+    /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    fn remote_dispatch_configured(&self) -> bool {
+        self.remote_dispatch_handler.is_some()
+    }
+
     /// Set the handler that bridges `operala.call` flow nodes into an
     /// in-process deep-worker runtime. Constructed by the runner binary
     /// (`runtime.rs`, `operala-in-process` feature, unless
@@ -1646,7 +1656,16 @@ impl FlowEngine {
                 .execute_dw_agent_graph(ctx, graph_id, payload)
                 .await
                 .map(DispatchOutcome::complete),
-            NodeKind::SorlaCall { target } => self.execute_sorla_call(ctx, target, payload).await,
+            NodeKind::SorlaCall { target } => {
+                self.execute_sorla_call(
+                    ctx,
+                    node_id,
+                    target,
+                    payload,
+                    node_has_error_route(&node.routing),
+                )
+                .await
+            }
             NodeKind::OperalaCall { target } => {
                 self.execute_operala_call(ctx, target, payload).await
             }
@@ -1726,31 +1745,96 @@ impl FlowEngine {
         )
     }
 
-    /// Dispatch a `sorla.call` flow node to the configured
-    /// [`RemoteDispatchHandler`], publishing the work to a separate runtime.
+    /// Dispatch a `sorla.call` flow node.
     ///
-    /// Input payload contract (JSON):
+    /// Amendment A1: **a route document always wins over NATS.** If a route
+    /// document resolves for `target`
+    /// ([`crate::runner::sorla_node::execute_sorla_http`]), the call runs
+    /// SYNCHRONOUSLY over HTTP and the node completes (or fails) in this same
+    /// step — no publish, no wait, no [`RemoteDispatchHandler`] involved.
+    ///
+    /// Only when no route document exists does the node fall back to the
+    /// historical publish-to-a-separate-runtime path, and only when a
+    /// [`RemoteDispatchHandler`] is actually configured
+    /// ([`Self::remote_dispatch_configured`]); with neither, the node fails
+    /// with `sorla_route_missing`.
+    ///
+    /// The NATS fallback keeps its original input payload contract (JSON):
     /// `{ "await": bool (default true), "operation": str, "deadline_ms": u64?,
-    ///    "input": any }`.
-    ///
-    /// The correlation id is the canonical session hint (`ctx.session_id`)
-    /// suffixed with `::pack=<pack_id>::flow=<flow_id>` markers. The bare hint
-    /// already encodes the conversation; the markers let the resume path
-    /// (`RuntimeSessionResumer`) route the response back to a registered
-    /// `(pack_id, flow_id)` and re-derive the store key. The markers are the
-    /// exact inverse of the resumer's parsing (`::flow=` then `::pack=`,
-    /// split off the trailing end).
-    ///
-    /// - `await=true`  -> publish + PAUSE the flow ([`DispatchOutcome::wait`]).
-    /// - `await=false` -> publish + complete immediately with
-    ///   `{ "dispatched": true, "correlation_id": <marked hint> }`.
+    ///    "input": any }`, and the same correlation-id/session-hint behaviour
+    /// documented on [`Self::execute_remote_dispatch`].
     ///
     /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    #[cfg(feature = "agentic-worker")]
     async fn execute_sorla_call(
         &self,
         ctx: &FlowContext<'_>,
+        node_id: &str,
         target: &str,
         payload: Value,
+        has_error_route: bool,
+    ) -> Result<DispatchOutcome> {
+        // Caller identity for a route-document call (never sent over NATS):
+        // `flow:<flow id>/<node id>`, mirroring the shape SP1's fixed
+        // `dw-agent` caller id uses for the agent-tool path.
+        let caller = format!("flow:{}/{node_id}", ctx.flow_id);
+        let http_result = match self.mcp_secrets_for_dispatch() {
+            Some(secrets) => {
+                crate::runner::sorla_node::execute_sorla_http(
+                    &*secrets,
+                    ctx.tenant,
+                    self.mcp_credential_unit(),
+                    target,
+                    &payload,
+                    &caller,
+                )
+                .await
+            }
+            // No secrets manager configured at all: a route document can
+            // never resolve, which is exactly the "no route document" case.
+            None => Ok(None),
+        };
+        match http_result {
+            Ok(Some(result)) => {
+                let bound = match payload.get("output").and_then(Value::as_str) {
+                    Some(key) if !key.is_empty() => json!({ key: result.clone() }),
+                    _ => result.clone(),
+                };
+                Ok(DispatchOutcome::complete(mcp_node_output(
+                    bound,
+                    &result,
+                    has_error_route,
+                )))
+            }
+            Ok(None) if self.remote_dispatch_configured() => {
+                self.execute_remote_dispatch(ctx, "sorla", target, payload, false)
+                    .await
+            }
+            Ok(None) => sorla_failure(
+                format!(
+                    "sorla_route_missing: no route document for SoR `{target}` and no NATS configured"
+                ),
+                has_error_route,
+            ),
+            Err(e) => sorla_failure(e, has_error_route),
+        }
+    }
+
+    /// Compile-time fallback for `sorla.call` when the `agentic-worker`
+    /// feature (which carries `sorla_route`/`sorx_invoker`, and therefore all
+    /// HTTP route resolution) is disabled. Dispatches through the
+    /// [`RemoteDispatchHandler`] exactly as `sorla.call` always did before
+    /// this task.
+    ///
+    /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    #[cfg(not(feature = "agentic-worker"))]
+    async fn execute_sorla_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        _node_id: &str,
+        target: &str,
+        payload: Value,
+        _has_error_route: bool,
     ) -> Result<DispatchOutcome> {
         self.execute_remote_dispatch(ctx, "sorla", target, payload, false)
             .await
@@ -3858,6 +3942,27 @@ fn mcp_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeO
     ))
 }
 
+/// Turn a `sorla.call` HTTP failure (a malformed route document, an unknown
+/// action, or the SoR request itself failing) into a `DispatchOutcome`: a
+/// structured `{"error": msg}` node output when the node has an error route
+/// to send it down, else a hard `Err` that aborts the flow. Mirrors the
+/// `has_error_route` gate `execute_mcp` (via [`mcp_node_output`]) already
+/// uses for a component failure, for the same reason: a node with no error
+/// route has nowhere to send a failure, so it keeps the pre-existing hard
+/// fail rather than silently reporting `ok: true`.
+// Gated like its only caller, `execute_sorla_call` (agentic-worker).
+#[cfg(feature = "agentic-worker")]
+fn sorla_failure(msg: impl Into<String>, has_error_route: bool) -> Result<DispatchOutcome> {
+    let msg = msg.into();
+    if has_error_route {
+        Ok(DispatchOutcome::complete(NodeOutput::errored(json!({
+            "error": msg
+        }))))
+    } else {
+        Err(anyhow!(msg))
+    }
+}
+
 fn extract_wait_reason(payload: &Value) -> Option<String> {
     match payload {
         Value::String(s) => Some(s.clone()),
@@ -5647,6 +5752,232 @@ mod tests {
         // Keeps `native_op_key_for` live: its exhaustiveness is the guard.
         assert_eq!(native_op_key_for(&NodeKind::FlowGoto), Some("flow.goto"));
     }
+
+    // ── `sorla.call`: a route document wins over NATS (Task A5) ────────────
+    //
+    // The three-way `execute_sorla_http` unit tests (route resolves + a
+    // matching capability, no route document, an unknown action) live beside
+    // `execute_sorla_http` itself in `sorla_node.rs`. These two exercise the
+    // ENGINE's choice between the HTTP path and NATS around it.
+
+    #[cfg(feature = "agentic-worker")]
+    struct PanicIfDispatchedHandler;
+
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::remote_dispatch::RemoteDispatchHandler for PanicIfDispatchedHandler {
+        async fn dispatch(
+            &self,
+            _request: crate::runner::remote_dispatch::RemoteDispatch,
+        ) -> anyhow::Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+            panic!(
+                "a route document resolved for this SoR; NATS must never be reached \
+                 (amendment A1: a route document always wins over NATS)"
+            );
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    fn sorla_call_node(routing: Routing) -> HostNode {
+        HostNode {
+            kind: NodeKind::SorlaCall {
+                target: "landlord".to_string(),
+            },
+            component: "sorla.call".into(),
+            component_id: "sorla.call".into(),
+            operation_name: None,
+            operation_in_mapping: None,
+            payload_expr: Value::Null,
+            routing,
+            vars_out: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    fn sorla_call_ctx() -> FlowContext<'static> {
+        FlowContext {
+            tenant: "acme",
+            pack_id: "test-pack",
+            flow_id: "f",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+            caller: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    async fn a_route_document_wins_over_nats() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/admin/v1/capabilities"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                crate::runner::sorx_invoker::fixtures::caps_response_one_business_action(),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/admin/v1/capabilities/invoke"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok": true, "result": {"id": "pay-1"}})),
+            )
+            .mount(&server)
+            .await;
+
+        let secrets = crate::runner::sorla_route::test_secrets::Handle::with(&[(
+            "secrets://default/acme/_/sorla/landlord",
+            &format!(r#"{{"url":"{}","tenant":"acme"}}"#, server.uri()),
+        )])
+        .manager();
+
+        let mut engine = minimal_engine();
+        engine.mcp_secrets = Some(secrets);
+        engine.remote_dispatch_handler = Some(Arc::new(PanicIfDispatchedHandler));
+
+        let ctx = sorla_call_ctx();
+        let node = sorla_call_node(Routing::End);
+        let mut state = ExecutionState::new(Value::Null);
+        let payload = json!({
+            "await": true,
+            "operation": "record_rent_payment",
+            "input": {"amount": 5},
+        });
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "call",
+            node: &node,
+            payload: &payload,
+        };
+
+        let outcome = engine
+            .dispatch_node(&ctx, "call", &node, &mut state, payload.clone(), &event)
+            .await
+            .expect("a resolved route document must dispatch over HTTP, never NATS");
+
+        assert!(outcome.output.ok);
+        assert_eq!(
+            outcome.output.payload,
+            json!({"id": "pay-1"}),
+            "the node output must be the HTTP result"
+        );
+    }
+
+    /// A secrets BACKEND failure (as opposed to a genuine miss) must never
+    /// read as "no route document" and fall back to NATS — the backend
+    /// failing to answer says nothing about whether a route document
+    /// exists. `PanicIfDispatchedHandler` proves NATS is never touched.
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    async fn a_backend_failure_never_falls_back_to_nats() {
+        let secrets = crate::runner::sorla_route::test_secrets::Handle::with(&[]);
+        secrets.fail(
+            "secrets://default/acme/_/sorla/landlord",
+            "connection refused",
+        );
+
+        let mut engine = minimal_engine();
+        engine.mcp_secrets = Some(secrets.manager());
+        engine.remote_dispatch_handler = Some(Arc::new(PanicIfDispatchedHandler));
+
+        let ctx = sorla_call_ctx();
+        let node = sorla_call_node(Routing::End);
+        let mut state = ExecutionState::new(Value::Null);
+        let payload = json!({
+            "await": true,
+            "operation": "record_rent_payment",
+            "input": {},
+        });
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "call",
+            node: &node,
+            payload: &payload,
+        };
+
+        let result = engine
+            .dispatch_node(&ctx, "call", &node, &mut state, payload.clone(), &event)
+            .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("a backend failure must fail the node, not silently succeed"),
+        };
+        assert!(err.to_string().contains("could not be read"), "got: {err}");
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    async fn no_route_and_no_nats_fails_with_sorla_route_missing() {
+        // `minimal_engine()` sets neither `mcp_secrets` nor
+        // `remote_dispatch_handler`, so no route document can ever resolve and
+        // there is no NATS fallback either.
+        let engine = minimal_engine();
+        let ctx = sorla_call_ctx();
+        let payload = json!({
+            "await": true,
+            "operation": "record_rent_payment",
+            "input": {},
+        });
+
+        // No `on_error` route: a hard `Err`.
+        let node = sorla_call_node(Routing::End);
+        let mut state = ExecutionState::new(Value::Null);
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "call",
+            node: &node,
+            payload: &payload,
+        };
+        let result = engine
+            .dispatch_node(&ctx, "call", &node, &mut state, payload.clone(), &event)
+            .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("no route document and no NATS handler must fail the node"),
+        };
+        assert!(
+            err.to_string().contains("sorla_route_missing"),
+            "got: {err}"
+        );
+
+        // An `on_error` route: `ok: false` naming `sorla_route_missing`, never
+        // a hard `Err` — mirrors `mcp_node_output`'s `has_error_route` gate.
+        let node = sorla_call_node(Routing::Custom(json!([
+            { "condition": "event == \"on_success\"", "to": "n" },
+            { "condition": "event == \"on_error\"", "to": "e" },
+        ])));
+        let mut state = ExecutionState::new(Value::Null);
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "call",
+            node: &node,
+            payload: &payload,
+        };
+        let outcome = engine
+            .dispatch_node(&ctx, "call", &node, &mut state, payload.clone(), &event)
+            .await
+            .expect("an error-routed node must complete, not hard-fail");
+        assert!(!outcome.output.ok);
+        let message = outcome
+            .output
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(message.contains("sorla_route_missing"), "got: {message}");
+    }
+
     use crate::validate::{ValidationConfig, ValidationMode};
     use greentic_types::{
         Flow, FlowComponentRef, FlowId, FlowKind, FlowMetadata, InputMapping, Node, NodeId,

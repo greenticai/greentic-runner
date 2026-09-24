@@ -1973,7 +1973,18 @@ mod aw {
         )
         .with_component_source(component_source_from_packs(&packs, &tenant))
         .with_flow_source(flow_source_from_packs(&packs, &tenant))
-        .with_sorla_source(sorla_source_from_env().await)
+        .with_sorla_source(match sorla_source_from_env().await {
+            Some(env) => Some(env),
+            None => {
+                crate::runner::sorla_pack_source::sorla_source_from_packs(
+                    &packs,
+                    &tenant,
+                    Some(remote_tool_secrets.clone()),
+                    unit.as_deref(),
+                )
+                .await
+            }
+        })
         // Pack-only: there is no admin A2A source to prefer. This site covers
         // deployed dw.agent units, the desktop runner and the designer's
         // test-chat sidecar; `graph_node::graph_a2a_source` builds the graph

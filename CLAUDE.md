@@ -266,8 +266,97 @@ runtime that `agent_node` already built.
 
 ### Async runtime dispatch (`sorla.call` node)
 
-A native flow node `sorla.call` (component `sorla.call`, operation = the sorx target)
-dispatches work to the separate `greentic-sorx` runtime over NATS pub/sub. Node input:
+**A route document is the primary transport, and NATS is now the fallback (amendment
+A1).** The transport rule, verbatim: *if the route document resolves, use HTTP,
+synchronously. If it does not and NATS is configured, use NATS as before. If neither, the
+node fails with `sorla_route_missing`. A route document always wins over NATS.*
+`runner/engine.rs::execute_sorla_call` always tries
+`runner/sorla_node.rs::execute_sorla_http` first: `Ok(Some(result))` completes the node in
+this same step (no publish, no wait, no `RemoteDispatchHandler`); `Ok(None)` means no route
+document exists at all for the SoR, and only THAT case falls through to the NATS path below
+(and only when `RemoteDispatchHandler` is actually configured — otherwise the node fails
+with ``sorla_route_missing: no route document for SoR `<sor>` and no NATS configured``);
+`Err(_)` (a malformed document, or the secrets backend itself failing to answer) is a hard
+failure and never falls through to NATS.
+
+#### Route documents (`secrets://…/sorla/<sor>`)
+
+Each SoR is addressed by a route document read from the secrets manager at
+`secrets://default/<tenant>/<team|_>/sorla/<sor>` — never carried in a pack, never cached on
+an invoker, and re-read on EVERY call (`runner/sorla_route.rs::resolve_route`,
+`crates/greentic-aw-runtime/src/scoped_secrets.rs::secret_uri_candidates` for the
+unit-then-team-then-tenant candidate order), so a restarted local SoR child on a new port,
+or a redeployed service, is followed without rebuilding anything. The document is UTF-8
+JSON:
+
+```json
+{ "url": "https://…", "token": "…", "tenant": "…" }
+```
+
+`token` is optional. An absent or blank `token` resolves to `None`, and a call built from
+that document sends **no** `Authorization` header — never `Bearer ` with an empty value.
+`resolve_route` distinguishes three outcomes, and only one of them means "no route
+document, try NATS": `SorlaRouteError::Missing` (`NotFound` at every scope tried),
+`SorlaRouteError::Invalid` (a document exists but is malformed — its value is never echoed,
+since it may carry a token), and `SorlaRouteError::Unavailable` (the secrets backend itself
+could not answer — denied, unreachable, ...). Only `Missing` reads as "no route document";
+`Invalid` and `Unavailable` are hard errors, because a backend that cannot answer says
+nothing about whether a route document exists — folding either into "no route" would let a
+SoR with a real, unreadable route silently fall back to NATS (or misreport
+`sorla_route_missing`).
+
+**The SoR key is the capability-URI pack segment** — the `<pack>` in `sorla:<pack>` and in
+`cap://greentic/business-functions/<pack>/<action>/v<ver>` (also
+`cap://greentic/agent-endpoints/<pack>/<id>/v<ver>`) — **never** the
+`sorla_deployments.pack_id` column (e.g. `supplier-sor-0.1.0`). Discovery
+(`sorx_invoker::routed::SorxRoutedInvoker::discover_all`, and the single-call
+`sorla_node::execute_sorla_http`) drops any offer whose `cap://` pack segment does not match
+the SoR it was discovered through — logged by SoR and offered pack, never by token or
+document value — so a shared or misbehaving SoR cannot leak another pack's operations
+through this SoR's route document/credential.
+
+#### `assets/sorla-routes.json` — requirements only, never an address
+
+A pack declares the SoRs its flows and workers need in `assets/sorla-routes.json`
+(`runner/sorla_pack_routes.rs::PackSorlaRoutes`), a JSON array of records:
+
+```json
+[{ "sor": "landlord", "actions": ["record_rent_payment"] }]
+```
+
+`actions` is informational and defaults to `[]`. **This sidecar never carries a URL, a
+token, or a secrets URI** — only which SoRs and (optionally) which of their actions a pack
+uses; the address and credential are resolved at call time from each SoR's own route
+document, so one pack build runs unchanged in every environment. A record that fails to
+parse, or names a blank SoR, is dropped; a duplicate SoR keeps the first record; a document
+that is not a JSON array at all parses to `None`.
+
+#### Worker sorla tool source: the env override wins
+
+A worker's sorla tool source is built as
+`sorla_source_from_env().or_else(|| sorla_source_from_packs(&packs, &tenant, secrets,
+unit))` (`agent_node.rs`). The single-SoR `GREENTIC_AW_SORX_URL` development override —
+token-less, tenant from `GREENTIC_AW_SORX_TENANT` (default `"default"`) — **wins whenever
+it is set, for worker tools only**; only when it is unset does the source come from the
+loaded packs' `assets/sorla-routes.json` sidecars, each declared SoR resolved through its
+own route document via `SorxRoutedInvoker` (one discovery fetch per bound SoR at
+construction, re-resolved and re-discovered per `invoke` call — never cached — so a
+restarted SoR child is followed the same way `sorla.call` is). `sorla_source_for_sors` is
+the same seam, re-exported as `greentic_runner_host::sorla_source_for_sors` for a caller
+that already knows a worker's bound SoRs directly and has no `PackRuntime` to read a
+sidecar from — the designer's in-process Test chat. `GREENTIC_AW_SORLA_TOOLS=0` disables
+both the env-URL and the pack-routed path.
+
+Note the `sorla.call` flow-node transport rule above and this worker-tool precedence are
+two different mechanisms reached from two different call sites — a flow node always prefers
+its own route document over NATS regardless of `GREENTIC_AW_SORX_URL`; that env var only
+ever substitutes for a worker's whole pack-routed tool catalog.
+
+#### The historical NATS transport (fallback only)
+
+A native flow node `sorla.call` (component `sorla.call`, operation = the sorx target) can
+still dispatch work to the separate `greentic-sorx` runtime over NATS pub/sub, when no route
+document resolves for the named SoR. Node input:
 `{ "await": true|false, "operation": "<op>", "deadline_ms": <u64?>, "input": {...} }`.
 `await: true` PAUSES the flow (reuses `FlowResumeStore`/ingress resume) and resumes when the
 runtime's response arrives; `await: false` continues immediately. Implemented natively
