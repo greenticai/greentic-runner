@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use wiremock::matchers::{header, method, path};
@@ -100,7 +101,9 @@ fn debug_never_prints_the_token() {
 #[test]
 fn the_body_carries_the_ingest_fields_and_nothing_else() {
     let meter = WorkerUsageMeter::new(target("https://admin.example/ingest")).unwrap();
-    let body = meter.build_event(120, 30, "assistant", "gpt-4o-mini");
+    let body = meter
+        .build_event(120, 30, "assistant", "gpt-4o-mini")
+        .unwrap();
     let value = serde_json::to_value(&body).unwrap();
     let mut keys: Vec<&str> = value
         .as_object()
@@ -149,8 +152,8 @@ fn the_body_carries_the_ingest_fields_and_nothing_else() {
 #[test]
 fn every_event_gets_its_own_id() {
     let meter = WorkerUsageMeter::new(target("https://admin.example/ingest")).unwrap();
-    let a = meter.build_event(1, 1, "a", "m");
-    let b = meter.build_event(1, 1, "a", "m");
+    let a = meter.build_event(1, 1, "a", "m").unwrap();
+    let b = meter.build_event(1, 1, "a", "m").unwrap();
     assert_ne!(
         a.event_id, b.event_id,
         "event_id is the admin's idempotency key"
@@ -162,7 +165,7 @@ fn a_blank_model_is_omitted_rather_than_sent_empty() {
     // The admin records an absent model as "unknown"; an empty string would
     // become a bogus grouping bucket of its own.
     let meter = WorkerUsageMeter::new(target("https://admin.example/ingest")).unwrap();
-    let value = serde_json::to_value(meter.build_event(1, 1, "a", "  ")).unwrap();
+    let value = serde_json::to_value(meter.build_event(1, 1, "a", "  ").unwrap()).unwrap();
     assert!(value.get("model").is_none(), "{value}");
 }
 
@@ -171,7 +174,7 @@ fn the_bundle_comes_from_the_constructor_not_the_tenant_context() {
     // The token pins (tenant, env, unit) server-side; the runtime's own
     // TenantContext (tenant "default", env "local") must not leak in.
     let meter = WorkerUsageMeter::new(target("https://admin.example/ingest")).unwrap();
-    let value = serde_json::to_value(meter.build_event(1, 1, "a", "m")).unwrap();
+    let value = serde_json::to_value(meter.build_event(1, 1, "a", "m").unwrap()).unwrap();
     assert_eq!(value["bundle_id"], "support-bot");
     assert_eq!(value["tenant_slug"], "acme");
 }
@@ -224,7 +227,8 @@ async fn a_rejected_or_unreachable_post_never_fails_the_turn() {
     let dead = WorkerUsageMeter::new(target("http://127.0.0.1:1/ingest")).unwrap();
     assert!(dead.emit(&tenant, 1, 1, "a", "m").await.is_ok());
     assert_eq!(
-        dead.deliver(dead.build_event(1, 1, "a", "m")).await,
+        dead.deliver(dead.build_event(1, 1, "a", "m").unwrap())
+            .await,
         Delivery::Failed
     );
 }
@@ -256,13 +260,17 @@ async fn a_refused_token_suspends_further_posts() {
     let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
 
     assert_eq!(
-        meter.deliver(meter.build_event(1, 1, "a", "m")).await,
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
         Delivery::Failed
     );
     // A second event inside the suspension window is dropped without a
     // request: a revoked token is not fixed by asking again every iteration.
     assert_eq!(
-        meter.deliver(meter.build_event(1, 1, "a", "m")).await,
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
         Delivery::Suspended
     );
 }
@@ -277,13 +285,226 @@ async fn a_rate_limit_honours_retry_after() {
         .await;
     let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
     assert_eq!(
-        meter.deliver(meter.build_event(1, 1, "a", "m")).await,
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
         Delivery::Failed
     );
     assert_eq!(
-        meter.deliver(meter.build_event(1, 1, "a", "m")).await,
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
         Delivery::Suspended
     );
+    let window = meter.suspended_for().expect("suspended");
+    assert!(
+        window > Duration::from_secs(110) && window <= Duration::from_secs(120),
+        "the window is Retry-After's 120 s, not the 60 s default: {window:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_retry_after_falls_back_to_the_default_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "soon"))
+        .mount(&server)
+        .await;
+    let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
+    meter
+        .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+        .await;
+    let window = meter.suspended_for().expect("suspended");
+    assert!(
+        window > Duration::from_secs(50) && window <= Duration::from_secs(60),
+        "{window:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_huge_retry_after_is_capped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "86400"))
+        .mount(&server)
+        .await;
+    let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
+    meter
+        .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+        .await;
+    assert!(meter.suspended_for().expect("suspended") <= Duration::from_secs(300));
+}
+
+#[tokio::test]
+async fn concurrent_failures_extend_one_suspension_and_never_shorten_it() {
+    let meter = WorkerUsageMeter::new(target("http://127.0.0.1:9/ingest")).unwrap();
+    meter.inner.suspend(Duration::from_secs(120), "first");
+    // A second, shorter failure inside the running window must not cut it.
+    meter.inner.suspend(Duration::from_secs(30), "second");
+    let window = meter.suspended_for().expect("suspended");
+    assert!(window > Duration::from_secs(110), "{window:?}");
+}
+
+#[tokio::test]
+async fn simultaneous_429s_produce_one_suspension() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "120")
+                .set_delay(Duration::from_millis(200)),
+        )
+        .mount(&server)
+        .await;
+    let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
+    // All in flight before the first answer arrives.
+    let outcomes = futures::future::join_all(
+        (0..4).map(|_| meter.deliver(meter.build_event(1, 1, "a", "m").unwrap())),
+    )
+    .await;
+    assert!(
+        outcomes.iter().all(|o| *o == Delivery::Failed),
+        "{outcomes:?}"
+    );
+    // One window, the Retry-After one — not re-armed and not reset.
+    let window = meter.suspended_for().expect("suspended");
+    assert!(window > Duration::from_secs(110), "{window:?}");
+    // The dropped counter was reported by the first warning only; later
+    // arrivals leave it alone rather than zeroing it.
+    assert_eq!(
+        meter.inner.dropped_while_suspended.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
+        Delivery::Suspended
+    );
+    assert_eq!(
+        meter.inner.dropped_while_suspended.load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn repeated_bad_requests_suspend_the_endpoint_with_backoff() {
+    // An admin that predates `surface: "turn"` refuses every event with a 400.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(5)
+        .mount(&server)
+        .await;
+    let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
+    for _ in 0..5 {
+        assert_eq!(
+            meter
+                .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+                .await,
+            Delivery::Rejected
+        );
+    }
+    let window = meter.suspended_for().expect("the fifth 400 suspends");
+    assert!(
+        window > Duration::from_secs(50) && window <= Duration::from_secs(60),
+        "{window:?}"
+    );
+    assert_eq!(
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
+        Delivery::Suspended,
+        "no sixth request while suspended"
+    );
+}
+
+#[tokio::test]
+async fn an_accepted_event_resets_the_rejection_streak() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .up_to_n_times(4)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
+    for _ in 0..4 {
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await;
+    }
+    assert_eq!(
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
+        Delivery::Accepted
+    );
+    assert_eq!(meter.inner.rejected_streak.load(Ordering::Relaxed), 0);
+    assert!(meter.suspended_for().is_none());
+}
+
+#[tokio::test]
+async fn emit_drops_and_counts_past_the_in_flight_bound() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_millis(500)))
+        .mount(&server)
+        .await;
+    let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
+    let tenant = TenantContext::new("default", "local");
+    for _ in 0..(MAX_IN_FLIGHT + 5) {
+        assert!(meter.emit(&tenant, 1, 1, "a", "m").await.is_ok());
+    }
+    assert_eq!(meter.inner.dropped_saturated.load(Ordering::Relaxed), 5);
+    let requests = wait_for_requests(&server, MAX_IN_FLIGHT).await;
+    assert_eq!(
+        requests.len(),
+        MAX_IN_FLIGHT,
+        "never more than the bound in flight"
+    );
+}
+
+// ── ids the admin would refuse are never sent ──────────────────────────────
+
+#[test]
+fn an_empty_or_oversized_id_is_refused_not_truncated() {
+    let meter = WorkerUsageMeter::new(target("https://admin.example/ingest")).unwrap();
+    assert!(meter.build_event(1, 1, "   ", "m").is_err());
+    let long = "x".repeat(MAX_FIELD_BYTES + 1);
+    assert!(meter.build_event(1, 1, &long, "m").is_err());
+    assert!(meter.build_event(1, 1, "a", &long).is_err());
+    let exact = "y".repeat(MAX_FIELD_BYTES);
+    let event = meter
+        .build_event(1, 1, &exact, &exact)
+        .expect("256 bytes is allowed");
+    assert_eq!(event.agent_id, exact);
+}
+
+#[tokio::test]
+async fn emit_skips_an_invalid_event_without_a_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
+    let tenant = TenantContext::new("default", "local");
+    assert!(meter.emit(&tenant, 1, 1, "", "m").await.is_ok());
+    assert_eq!(meter.inner.skipped_invalid.load(Ordering::Relaxed), 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[test]
+fn an_oversized_constructor_id_is_refused() {
+    let mut t = target("https://admin.example/ingest");
+    t.bundle_id = "b".repeat(MAX_FIELD_BYTES + 1);
+    let err = WorkerUsageMeter::new(t).expect_err("too long");
+    assert!(err.to_string().contains("bundle_id"), "{err}");
 }
 
 #[tokio::test]
@@ -296,11 +517,15 @@ async fn a_bad_request_drops_that_event_only() {
         .await;
     let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
     assert_eq!(
-        meter.deliver(meter.build_event(1, 1, "a", "m")).await,
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
         Delivery::Rejected
     );
     assert_eq!(
-        meter.deliver(meter.build_event(1, 1, "a", "m")).await,
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
         Delivery::Rejected,
         "a 400 is about this event, not the endpoint"
     );
@@ -318,7 +543,9 @@ async fn an_accepted_duplicate_is_a_success() {
         .await;
     let meter = WorkerUsageMeter::new(target(&ingest_url(&server))).unwrap();
     assert_eq!(
-        meter.deliver(meter.build_event(1, 1, "a", "m")).await,
+        meter
+            .deliver(meter.build_event(1, 1, "a", "m").unwrap())
+            .await,
         Delivery::Accepted
     );
 }

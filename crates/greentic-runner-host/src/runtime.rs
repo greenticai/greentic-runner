@@ -325,6 +325,64 @@ pub struct RevisionPackRef {
     pub digest: String,
 }
 
+/// The arguments of [`TenantRuntime::load_revision`], as one struct, for
+/// [`TenantRuntime::load_revision_with`]. Field meanings are exactly
+/// `load_revision`'s parameters of the same names.
+pub struct RevisionLoad<'a> {
+    pub pack_refs: &'a [RevisionPackRef],
+    pub config: Arc<HostConfig>,
+    pub mocks: Option<Arc<MockLayer>>,
+    pub wasi_policy: Arc<RunnerWasiPolicy>,
+    pub session_host: Arc<dyn SessionHost>,
+    pub session_store: DynSessionStore,
+    pub state_store: DynStateStore,
+    pub state_host: Arc<dyn StateHost>,
+    pub secrets_manager: DynSecretsManager,
+    pub deployment_id: DeploymentId,
+    pub bundle_id: BundleId,
+    pub revision_id: RevisionId,
+    pub customer_id: Option<String>,
+    pub runtime_configs_by_pack_id: &'a BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+    pub runtime_refs_by_pack_id: &'a BTreeMap<String, Arc<BTreeMap<String, String>>>,
+    pub runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+}
+
+/// What the embedding HOST decides for one revision, beyond its pinned packs.
+/// `Default` is exactly [`TenantRuntime::load_revision`]'s behaviour.
+/// Non-exhaustive so a later host seam is an additive field, not a breaking
+/// change: construct with `RevisionHostOptions::default()` plus the `with_*`
+/// setters.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct RevisionHostOptions {
+    #[cfg(feature = "agentic-worker")]
+    billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+}
+
+impl std::fmt::Debug for RevisionHostOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("RevisionHostOptions");
+        #[cfg(feature = "agentic-worker")]
+        out.field("billing_meter", &self.billing_meter.is_some());
+        out.finish()
+    }
+}
+
+impl RevisionHostOptions {
+    /// Record this unit's agentic-worker LLM usage through `meter` as well —
+    /// see [`TenantRuntime::load_revision_with`] for how it combines with the
+    /// env-configured cloud-commerce sink.
+    #[cfg(feature = "agentic-worker")]
+    #[must_use]
+    pub fn with_billing_meter(
+        mut self,
+        meter: Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
+    ) -> Self {
+        self.billing_meter = Some(meter);
+        self
+    }
+}
+
 /// Block on a future whether or not we're already inside a tokio runtime.
 pub fn block_on<F: Future<Output = R>, R>(future: F) -> R {
     if let Ok(handle) = Handle::try_current() {
@@ -404,6 +462,13 @@ impl TenantRuntime {
     /// identity is **derived from** `deployment_id` / `bundle_id` /
     /// `revision_id` / `customer_id`, so the engine's attribution cannot drift
     /// from the key the runtime is later inserted under.
+    ///
+    /// Installs no host billing meter: agentic-worker usage goes to the
+    /// env-configured cloud-commerce sink when `GREENTIC_BILLING_*` is set,
+    /// else nowhere. Graph turns and in-process deep workers are now metered
+    /// and graph turns run under the real tenant; see
+    /// [`load_revision_with`](Self::load_revision_with) for the four
+    /// behaviour changes that brings, and for installing a per-unit meter.
     #[allow(clippy::too_many_arguments)]
     pub async fn load_revision(
         pack_refs: &[RevisionPackRef],
@@ -446,61 +511,72 @@ impl TenantRuntime {
         .await
     }
 
-    /// [`load_revision`](Self::load_revision), with the billing sink the
-    /// embedding HOST chose for this one unit.
+    /// [`load_revision`](Self::load_revision), taking its arguments as one
+    /// struct plus the host-chosen [`RevisionHostOptions`] for this unit.
     ///
-    /// `billing_meter` is installed on every agentic-worker path this runtime
-    /// builds — `dw.agent`, agent-graph turns and in-process deep workers —
-    /// in place of the env-configured cloud-commerce sink. greentic-start
-    /// passes a [`greentic_aw_runtime::billing::WorkerUsageMeter`] built from
-    /// the unit's staged `metering` block, so the spend is recorded at the
-    /// admin's per-unit ingest door. `None` is exactly [`load_revision`]:
-    /// the env-configured sink when `GREENTIC_BILLING_*` is set, else none.
+    /// Today the only option is the billing sink
+    /// ([`RevisionHostOptions::with_billing_meter`]). greentic-start installs a
+    /// [`greentic_aw_runtime::billing::WorkerUsageMeter`] built from the unit's
+    /// staged `metering` block, so the unit's LLM spend is recorded at the
+    /// admin's per-unit ingest door. It is per-REVISION rather than a
+    /// `HostBuilder` setting on purpose: one greentic-start process serves every
+    /// unit of an environment, and each unit has its own worker-usage token.
     ///
-    /// It is a per-REVISION argument rather than a `HostBuilder` setting on
-    /// purpose: one greentic-start process serves every unit of an
-    /// environment, and each unit has its own worker-usage token.
+    /// # Which sink runs (see `agent_node::resolve_billing_meter`)
+    ///
+    /// - An installed meter AND `GREENTIC_BILLING_BASE_URL` +
+    ///   `GREENTIC_BILLING_SERVICE_SECRET` set: every usage event goes to BOTH
+    ///   (a [`greentic_aw_runtime::billing::FanOutBillingMeter`]), and the
+    ///   credit gate (`over_budget`) is the env cloud-commerce sink's. An
+    ///   installed meter never removes the credit gate.
+    /// - An installed meter only: that meter alone (it has no credit gate).
+    /// - No installed meter: exactly [`load_revision`] — the env sink when
+    ///   configured, else none.
+    ///
+    /// # Behaviour that changed with this seam, for BOTH entry points
+    ///
+    /// Recorded because a publish on the dev lane reaches every consumer:
+    ///
+    /// - (a) agent-graph agent and supervisor turns now emit usage and pass
+    ///   the credit gate when `GREENTIC_BILLING_*` is set. Before, they ran on
+    ///   a `NoopBillingMeter` and were never metered or gated;
+    /// - (b) in-process deep workers (`operala.call`) now emit their own
+    ///   reasoning-loop tokens to the chosen sink, cloud-commerce included;
+    /// - (c) graph turns now run under the real tenant/env, so their tokens
+    ///   count against that tenant's `daily_token_cap_per_tenant` bucket,
+    ///   shared with `dw.agent` (before: one global `graph/run` bucket);
+    /// - (d) long-term memory previously written under the synthetic
+    ///   `graph/run` tenant by `agent_ref` graph turns is no longer reachable.
+    ///   That key was shared by every tenant, so losing it is intended.
+    ///   Per-visit conversation state is re-seeded from the graph checkpoint on
+    ///   every visit, so in-flight runs lose nothing.
     ///
     /// [`load_revision`]: Self::load_revision
-    #[cfg(feature = "agentic-worker")]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn load_revision_with_billing_meter(
-        pack_refs: &[RevisionPackRef],
-        config: Arc<HostConfig>,
-        mocks: Option<Arc<MockLayer>>,
-        wasi_policy: Arc<RunnerWasiPolicy>,
-        session_host: Arc<dyn SessionHost>,
-        session_store: DynSessionStore,
-        state_store: DynStateStore,
-        state_host: Arc<dyn StateHost>,
-        secrets_manager: DynSecretsManager,
-        deployment_id: DeploymentId,
-        bundle_id: BundleId,
-        revision_id: RevisionId,
-        customer_id: Option<String>,
-        runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
-        runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
-        runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
-        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+    pub async fn load_revision_with(
+        args: RevisionLoad<'_>,
+        options: RevisionHostOptions,
     ) -> Result<Arc<Self>> {
+        #[cfg(not(feature = "agentic-worker"))]
+        let _ = options;
         Self::load_revision_impl(
-            pack_refs,
-            config,
-            mocks,
-            wasi_policy,
-            session_host,
-            session_store,
-            state_store,
-            state_host,
-            secrets_manager,
-            deployment_id,
-            bundle_id,
-            revision_id,
-            customer_id,
-            runtime_configs_by_pack_id,
-            runtime_refs_by_pack_id,
-            runtime_ref_resolver,
-            billing_meter,
+            args.pack_refs,
+            args.config,
+            args.mocks,
+            args.wasi_policy,
+            args.session_host,
+            args.session_store,
+            args.state_store,
+            args.state_host,
+            args.secrets_manager,
+            args.deployment_id,
+            args.bundle_id,
+            args.revision_id,
+            args.customer_id,
+            args.runtime_configs_by_pack_id,
+            args.runtime_refs_by_pack_id,
+            args.runtime_ref_resolver,
+            #[cfg(feature = "agentic-worker")]
+            options.billing_meter,
         )
         .await
     }
@@ -1697,3 +1773,7 @@ mod runtime_key_tests {
         assert_eq!(next.len(), 1);
     }
 }
+
+#[cfg(all(test, feature = "agentic-worker"))]
+#[path = "runtime_billing_ratchet_tests.rs"]
+mod runtime_billing_ratchet_tests;

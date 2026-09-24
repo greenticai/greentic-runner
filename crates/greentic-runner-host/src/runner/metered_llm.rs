@@ -65,11 +65,17 @@ impl LlmProvider for MeteredLlmProvider {
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
         let response = self.inner.chat(req).await?;
         if let Some(usage) = &response.usage {
-            // The model the provider SAYS it used, else the one configured.
-            let model = if usage.model.trim().is_empty() {
-                self.inner.model()
-            } else {
+            // The CONFIGURED model id, exactly what `dw.agent` and graph turns
+            // report (`AgentConfig.llm.model`), so one worker's spend lands in
+            // one `model` bucket whichever path ran it. A provider often
+            // reports a dated id (`gpt-4o-mini-2024-07-18`) that would split
+            // the bucket and miss a price-table entry; it is used only when
+            // nothing is configured.
+            let configured = self.inner.model();
+            let model = if configured.trim().is_empty() {
                 usage.model.as_str()
+            } else {
+                configured
             };
             // `emit` is fire-and-forget by contract; an error is still only
             // ever a warning — billing never fails a deep worker's step.

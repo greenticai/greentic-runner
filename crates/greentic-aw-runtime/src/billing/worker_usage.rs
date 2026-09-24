@@ -32,14 +32,19 @@
 //! it does instead is stop asking for a while — a refused token (`401`/`403`)
 //! suspends the endpoint for [`AUTH_SUSPENSION`], a `429` for its
 //! `Retry-After` (capped), a transport error or `5xx` for
-//! [`TRANSIENT_SUSPENSION`] — so a dead or misconfigured admin costs one
-//! request per window rather than one per LLM iteration. Each suspension is
-//! one `warn`, which also reports how many events the previous window dropped.
+//! [`TRANSIENT_SUSPENSION`], and [`REJECTION_STREAK`] consecutive `400`s (an
+//! admin older than this contract) for a doubling backoff — so a dead or
+//! misconfigured admin costs one request per window rather than one per LLM
+//! iteration. Each suspension is one `warn` (concurrent failures extend it
+//! silently), which also reports how many events the previous window dropped.
+//! At most [`MAX_IN_FLIGHT`] POSTs run at once; past that an event is dropped
+//! and counted. An event the admin would refuse (empty id, id over
+//! [`MAX_FIELD_BYTES`]) is never sent.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use secrecy::{ExposeSecret, SecretString};
@@ -74,6 +79,32 @@ const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// Pause after a transport error or a `5xx`.
 const TRANSIENT_SUSPENSION: Duration = Duration::from_secs(30);
+
+/// Longest id the admin's ingest door accepts in any field (its
+/// `MAX_FIELD_LEN`). A longer one is a `400`, so it is never sent.
+pub(crate) const MAX_FIELD_BYTES: usize = 256;
+
+/// Usage POSTs in flight at once, per meter. A slow admin that still answers
+/// `2xx` would otherwise accumulate one task per LLM iteration for up to
+/// [`POST_TIMEOUT`] each. Past the bound an event is dropped and counted.
+pub(crate) const MAX_IN_FLIGHT: usize = 32;
+
+/// Consecutive `400`s after which the endpoint is suspended. An admin that
+/// predates `surface: "turn"` refuses EVERY event; without this it would be
+/// asked, and a warning written, once per LLM iteration forever.
+const REJECTION_STREAK: u32 = 5;
+
+/// First suspension after a streak of `400`s; doubles per further streak.
+const REJECTION_BASE: Duration = Duration::from_secs(60);
+
+/// Ceiling on the `400` backoff.
+const REJECTION_MAX: Duration = Duration::from_secs(1800);
+
+/// Warn on the first occurrence of a repeated condition and every 100th after,
+/// always carrying the running count.
+fn sampled(count: u64) -> bool {
+    count == 1 || count.is_multiple_of(100)
+}
 
 /// Where and as whom a unit's usage is recorded. Every field is required and
 /// is the value the embedding host resolved for this ONE unit — greentic-start
@@ -113,6 +144,8 @@ impl std::fmt::Debug for WorkerUsageTarget {
 pub enum WorkerUsageError {
     #[error("worker usage metering needs a non-blank `{0}`")]
     Blank(&'static str),
+    #[error("worker usage `{0}` is longer than the admin accepts ({MAX_FIELD_BYTES} bytes)")]
+    TooLong(&'static str),
     #[error(
         "worker usage endpoint `{0}` is not https and not loopback http; refusing to send \
          a bearer token in cleartext"
@@ -177,6 +210,14 @@ struct Inner {
     http: reqwest::Client,
     suspended_until: Mutex<Option<Instant>>,
     dropped_while_suspended: AtomicU64,
+    /// Bounds concurrent POSTs; see [`MAX_IN_FLIGHT`].
+    in_flight: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Events dropped because [`MAX_IN_FLIGHT`] POSTs were already running.
+    dropped_saturated: AtomicU64,
+    /// Events never sent because an id field was empty or too long.
+    skipped_invalid: AtomicU64,
+    /// Consecutive `400`s; reset by any accepted event.
+    rejected_streak: AtomicU32,
 }
 
 impl std::fmt::Debug for WorkerUsageMeter {
@@ -197,6 +238,16 @@ fn required(field: &'static str, value: &str) -> Result<String, WorkerUsageError
         return Err(WorkerUsageError::Blank(field));
     }
     Ok(trimmed.to_string())
+}
+
+/// [`required`] plus the admin's per-field length cap, for the ids that ride
+/// in every event body.
+fn required_id(field: &'static str, value: &str) -> Result<String, WorkerUsageError> {
+    let value = required(field, value)?;
+    if value.len() > MAX_FIELD_BYTES {
+        return Err(WorkerUsageError::TooLong(field));
+    }
+    Ok(value)
 }
 
 /// `https` anywhere, or `http` to a loopback host (which cannot leave the
@@ -223,9 +274,9 @@ impl WorkerUsageMeter {
     pub fn new(target: WorkerUsageTarget) -> Result<Self, WorkerUsageError> {
         let endpoint = required("endpoint", &target.endpoint)?;
         let token = required("token", &target.token)?;
-        let tenant_slug = required("tenant_slug", &target.tenant_slug)?;
-        let deployment_id = required("deployment_id", &target.deployment_id)?;
-        let bundle_id = required("bundle_id", &target.bundle_id)?;
+        let tenant_slug = required_id("tenant_slug", &target.tenant_slug)?;
+        let deployment_id = required_id("deployment_id", &target.deployment_id)?;
+        let bundle_id = required_id("bundle_id", &target.bundle_id)?;
         if !endpoint_is_safe(&endpoint) {
             return Err(WorkerUsageError::UnsafeEndpoint(endpoint));
         }
@@ -244,21 +295,41 @@ impl WorkerUsageMeter {
                 http,
                 suspended_until: Mutex::new(None),
                 dropped_while_suspended: AtomicU64::new(0),
+                in_flight: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+                dropped_saturated: AtomicU64::new(0),
+                skipped_invalid: AtomicU64::new(0),
+                rejected_streak: AtomicU32::new(0),
             }),
         })
     }
 
     /// Build the event for one LLM iteration. Pure apart from the fresh id
     /// and timestamp.
+    ///
+    /// Refuses (with the reason) an event the admin would refuse: an empty
+    /// `agent_id`, or an `agent_id` / `model` over [`MAX_FIELD_BYTES`]. Ids are
+    /// never truncated — a truncated id is a different id, attributed to
+    /// nothing — and an over-long model is not silently dropped from an event
+    /// that otherwise claims to say which model ran.
     pub(crate) fn build_event(
         &self,
         tokens_in: u64,
         tokens_out: u64,
         agent_id: &str,
         model: &str,
-    ) -> WorkerUsageEvent {
+    ) -> Result<WorkerUsageEvent, &'static str> {
+        let agent_id = agent_id.trim();
+        if agent_id.is_empty() {
+            return Err("empty agent_id");
+        }
+        if agent_id.len() > MAX_FIELD_BYTES {
+            return Err("agent_id longer than 256 bytes");
+        }
         let model = model.trim();
-        WorkerUsageEvent {
+        if model.len() > MAX_FIELD_BYTES {
+            return Err("model longer than 256 bytes");
+        }
+        Ok(WorkerUsageEvent {
             event_id: ulid::Ulid::new().to_string(),
             occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             tenant_slug: self.inner.tenant_slug.clone(),
@@ -271,7 +342,7 @@ impl WorkerUsageMeter {
             iterations: 1,
             duration_ms: 0,
             model: (!model.is_empty()).then(|| model.to_string()),
-        }
+        })
     }
 
     /// Deliver one event now. `emit` spawns the same delivery; tests call
@@ -279,6 +350,13 @@ impl WorkerUsageMeter {
     #[cfg(test)]
     pub(crate) async fn deliver(&self, event: WorkerUsageEvent) -> Delivery {
         self.inner.deliver(event).await
+    }
+
+    /// How much longer the endpoint stays suspended, if it is.
+    #[cfg(test)]
+    pub(crate) fn suspended_for(&self) -> Option<Duration> {
+        let until = (*self.inner.suspended_until.lock().ok()?)?;
+        until.checked_duration_since(Instant::now())
     }
 }
 
@@ -290,9 +368,26 @@ impl Inner {
         }
     }
 
+    /// Suspend the endpoint for `window`. Concurrent failures (a burst of
+    /// in-flight POSTs all answered `429`) produce ONE suspension and ONE
+    /// warning: a suspension already running is only extended, silently, and
+    /// its dropped-event count is left to the warning that started it.
     fn suspend(&self, window: Duration, reason: &str) {
-        if let Ok(mut guard) = self.suspended_until.lock() {
-            *guard = Some(Instant::now() + window);
+        let now = Instant::now();
+        let already_suspended = match self.suspended_until.lock() {
+            Ok(mut guard) => {
+                let running = guard.is_some_and(|until| now < until);
+                let until = now + window;
+                *guard = Some(match *guard {
+                    Some(existing) if running && existing > until => existing,
+                    _ => until,
+                });
+                running
+            }
+            Err(_) => false,
+        };
+        if already_suspended {
+            return;
         }
         let dropped = self.dropped_while_suspended.swap(0, Ordering::Relaxed);
         tracing::warn!(
@@ -335,6 +430,7 @@ impl Inner {
         };
         let status = response.status();
         if status.is_success() {
+            self.rejected_streak.store(0, Ordering::Relaxed);
             return Delivery::Accepted;
         }
         match status.as_u16() {
@@ -355,11 +451,26 @@ impl Inner {
                 Delivery::Failed
             }
             code if (400..500).contains(&code) => {
-                tracing::warn!(
-                    endpoint = %self.endpoint,
-                    status = code,
-                    "worker usage event refused by the admin; dropped"
-                );
+                let streak = self.rejected_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                if streak == 1 {
+                    tracing::warn!(
+                        endpoint = %self.endpoint,
+                        status = code,
+                        "worker usage event refused by the admin; dropped"
+                    );
+                }
+                if streak.is_multiple_of(REJECTION_STREAK) {
+                    // Backoff doubles per streak: 60 s, 120 s, … capped.
+                    let doublings = (streak / REJECTION_STREAK).saturating_sub(1).min(16);
+                    let window = REJECTION_BASE
+                        .saturating_mul(1u32 << doublings)
+                        .min(REJECTION_MAX);
+                    self.suspend(
+                        window,
+                        "admin refused consecutive events (4xx); an admin older than this \
+                         runtime may not accept `surface: \"turn\"`",
+                    );
+                }
                 Delivery::Rejected
             }
             _ => {
@@ -379,12 +490,40 @@ impl BillingMeter for WorkerUsageMeter {
         agent_id: &'a str,
         model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), BillingError>> + Send + 'a>> {
-        let event = self.build_event(input_tokens, output_tokens, agent_id, model);
+        let event = match self.build_event(input_tokens, output_tokens, agent_id, model) {
+            Ok(event) => event,
+            Err(reason) => {
+                let skipped = self.inner.skipped_invalid.fetch_add(1, Ordering::Relaxed) + 1;
+                if sampled(skipped) {
+                    tracing::warn!(
+                        bundle_id = %self.inner.bundle_id,
+                        reason,
+                        skipped_total = skipped,
+                        "worker usage event not sent: the admin would refuse it"
+                    );
+                }
+                return Box::pin(async { Ok(()) });
+            }
+        };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
+                let Ok(permit) = std::sync::Arc::clone(&self.inner.in_flight).try_acquire_owned()
+                else {
+                    let dropped = self.inner.dropped_saturated.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sampled(dropped) {
+                        tracing::warn!(
+                            bundle_id = %self.inner.bundle_id,
+                            in_flight = MAX_IN_FLIGHT,
+                            dropped_total = dropped,
+                            "worker usage event dropped: too many usage POSTs already in flight"
+                        );
+                    }
+                    return Box::pin(async { Ok(()) });
+                };
                 let inner = std::sync::Arc::clone(&self.inner);
                 handle.spawn(async move {
                     inner.deliver(event).await;
+                    drop(permit);
                 });
             }
             Err(_) => tracing::warn!(

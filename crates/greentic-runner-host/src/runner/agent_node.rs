@@ -2197,7 +2197,7 @@ mod aw {
     /// Bills through [`resolve_billing_meter`]`(None)` — the env-configured
     /// cloud-commerce sink, or nothing — exactly as before the host seam
     /// existed. A host that installs a per-unit meter goes through
-    /// `TenantRuntime::load_revision_with_billing_meter` instead.
+    /// `TenantRuntime::load_revision_with` instead.
     #[allow(clippy::too_many_arguments)]
     pub async fn build_agent_node_wiring(
         merged_agents: HashMap<String, AgentConfig>,
@@ -2225,14 +2225,16 @@ mod aw {
 
     /// Which billing sink a runtime built for one unit installs.
     ///
-    /// The meter the embedding HOST installed wins — for a deployed
-    /// env-canvas unit that is greentic-start's per-unit
-    /// `greentic_aw_runtime::billing::WorkerUsageMeter`, built from the unit's
-    /// staged metering block. With none installed this is exactly the
-    /// behaviour before the seam existed: the env-configured
-    /// [`greentic_aw_runtime::billing::HttpBillingMeter`] when
-    /// `GREENTIC_BILLING_BASE_URL` + `GREENTIC_BILLING_SERVICE_SECRET` are
-    /// set, else `None` (the runtime's `NoopBillingMeter`).
+    /// - An installed meter (for a deployed env-canvas unit, greentic-start's
+    ///   per-unit `greentic_aw_runtime::billing::WorkerUsageMeter`) AND the
+    ///   env-configured [`greentic_aw_runtime::billing::HttpBillingMeter`]
+    ///   (`GREENTIC_BILLING_BASE_URL` + `GREENTIC_BILLING_SERVICE_SECRET`):
+    ///   a [`greentic_aw_runtime::billing::FanOutBillingMeter`] — usage goes to
+    ///   both, and the credit gate is the env sink's. An installed meter must
+    ///   never switch the cloud-commerce credit gate off.
+    /// - Installed only: that meter.
+    /// - Env only, or neither: exactly the behaviour before the seam existed —
+    ///   the env sink, else `None` (the runtime's `NoopBillingMeter`).
     ///
     /// Resolved ONCE per `TenantRuntime` and shared by its `dw.agent`,
     /// agent-graph and deep-worker paths, so all three bill through the same
@@ -2240,10 +2242,16 @@ mod aw {
     pub fn resolve_billing_meter(
         installed: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
     ) -> Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>> {
-        installed.or_else(|| {
-            greentic_aw_runtime::billing::HttpBillingMeter::from_env()
-                .map(|meter| Arc::new(meter) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>)
-        })
+        use greentic_aw_runtime::billing::{BillingMeter, FanOutBillingMeter, HttpBillingMeter};
+        let env =
+            HttpBillingMeter::from_env().map(|meter| Arc::new(meter) as Arc<dyn BillingMeter>);
+        match (installed, env) {
+            (Some(installed), Some(env)) => {
+                Some(Arc::new(FanOutBillingMeter::new(env, installed)) as Arc<dyn BillingMeter>)
+            }
+            (Some(installed), None) => Some(installed),
+            (None, env) => env,
+        }
     }
 
     /// [`build_agent_node_wiring`] with an explicit, already-resolved billing
@@ -3040,67 +3048,60 @@ mod aw {
             );
         }
 
-        /// A meter the embedding HOST installed (a deployed unit's
-        /// `WorkerUsageMeter`) replaces the env-configured cloud-commerce sink
-        /// — it does not sit beside it. Proven by behaviour: the installed
-        /// meter answers `over_budget = true`, so the step stops at the credit
-        /// gate having consulted IT, and the env sink's wallet endpoint is
-        /// never asked even though `GREENTIC_BILLING_*` is set.
-        #[tokio::test]
-        #[serial_test::serial]
-        #[allow(unsafe_code)]
-        async fn an_installed_meter_replaces_the_env_configured_sink() {
-            struct GateMeter {
-                consulted: std::sync::atomic::AtomicUsize,
-            }
-            impl greentic_aw_runtime::billing::BillingMeter for GateMeter {
-                fn emit<'a>(
-                    &'a self,
-                    _tenant: &'a TenantContext,
-                    _input_tokens: u64,
-                    _output_tokens: u64,
-                    _agent_id: &'a str,
-                    _model: &'a str,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                                Output = Result<(), greentic_aw_runtime::billing::BillingError>,
-                            > + Send
-                            + 'a,
-                    >,
-                > {
-                    Box::pin(async { Ok(()) })
-                }
+        /// A host-installed meter used by the billing tests below: records
+        /// every emit and every budget question, and answers `over`.
+        struct ProbeMeter {
+            emits: std::sync::atomic::AtomicUsize,
+            budget_asks: std::sync::atomic::AtomicUsize,
+            over: bool,
+        }
 
-                fn over_budget<'a>(
-                    &'a self,
-                    _tenant: &'a TenantContext,
-                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
-                {
-                    self.consulted
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Box::pin(std::future::ready(true))
-                }
+        impl ProbeMeter {
+            fn new(over: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    emits: std::sync::atomic::AtomicUsize::new(0),
+                    budget_asks: std::sync::atomic::AtomicUsize::new(0),
+                    over,
+                })
+            }
+        }
+
+        impl greentic_aw_runtime::billing::BillingMeter for ProbeMeter {
+            fn emit<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+                _input_tokens: u64,
+                _output_tokens: u64,
+                _agent_id: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(), greentic_aw_runtime::billing::BillingError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                self.emits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
             }
 
-            let server = wiremock::MockServer::start().await;
-            wiremock::Mock::given(wiremock::matchers::any())
-                .respond_with(wiremock::ResponseTemplate::new(200))
-                .mount(&server)
-                .await;
-            let empty_extensions = tempfile::tempdir().expect("tempdir");
-            unsafe {
-                std::env::set_var("GREENTIC_BILLING_BASE_URL", server.uri());
-                std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
-                std::env::set_var("GREENTIC_EXTENSIONS_DIR", empty_extensions.path());
+            fn over_budget<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                self.budget_asks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(std::future::ready(self.over))
             }
+        }
 
-            let installed = Arc::new(GateMeter {
-                consulted: std::sync::atomic::AtomicUsize::new(0),
-            });
-            let chosen = resolve_billing_meter(Some(
-                Arc::clone(&installed) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>
-            ));
+        /// Build the in-process handler with `chosen` as its billing sink and
+        /// drive one turn for tenant `acme`.
+        async fn run_one_turn_billed_by(
+            chosen: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        ) {
             let mut agents = HashMap::new();
             agents.insert("greeter".to_string(), sample_agent_config("greeter"));
             let handler = build_runtime_handler_with_stores(
@@ -3120,7 +3121,6 @@ mod aw {
             .await
             .expect("handler should build from mock stores")
             .handler;
-
             let _ = handler
                 .execute(
                     "acme",
@@ -3132,24 +3132,92 @@ mod aw {
                     None,
                 )
                 .await;
+        }
 
+        /// A host-installed meter (a deployed unit's `WorkerUsageMeter`) must
+        /// NOT switch off the env-configured cloud-commerce credit gate. With
+        /// both present the credit gate is the env sink's: the wallet is asked
+        /// (`available: 0` stops the step), and the installed meter — which has
+        /// no wallet — is never asked for a budget.
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn an_installed_meter_keeps_the_env_credit_gate() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v1/tenants/acme/wallet"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"available": "0"})),
+                )
+                .mount(&server)
+                .await;
+            let empty_extensions = tempfile::tempdir().expect("tempdir");
+            unsafe {
+                std::env::set_var("GREENTIC_BILLING_BASE_URL", server.uri());
+                std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+                std::env::set_var("GREENTIC_EXTENSIONS_DIR", empty_extensions.path());
+            }
+            let installed = ProbeMeter::new(false);
+            let chosen = resolve_billing_meter(Some(
+                Arc::clone(&installed) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>
+            ));
+            run_one_turn_billed_by(chosen).await;
             unsafe {
                 std::env::remove_var("GREENTIC_BILLING_BASE_URL");
                 std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
                 std::env::remove_var("GREENTIC_EXTENSIONS_DIR");
             }
 
+            let wallet_calls = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/tenants/acme/wallet")
+                .count();
+            assert!(
+                wallet_calls >= 1,
+                "the env cloud-commerce credit gate must still run with a meter installed"
+            );
+            assert_eq!(
+                installed
+                    .budget_asks
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the installed recorder is never the credit gate"
+            );
+        }
+
+        /// With no env sink, the installed meter alone is the runtime's sink.
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn an_installed_meter_alone_is_the_sink_when_no_env_sink_is_configured() {
+            let empty_extensions = tempfile::tempdir().expect("tempdir");
+            unsafe {
+                std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+                std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+                std::env::set_var("GREENTIC_EXTENSIONS_DIR", empty_extensions.path());
+            }
+            // `over = true` stops the step at the gate, proving it was asked.
+            let installed = ProbeMeter::new(true);
+            let as_dyn =
+                Arc::clone(&installed) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>;
+            let chosen = resolve_billing_meter(Some(Arc::clone(&as_dyn)));
+            assert!(
+                chosen.as_ref().is_some_and(|c| Arc::ptr_eq(c, &as_dyn)),
+                "no env sink → the installed meter itself, not a wrapper"
+            );
+            run_one_turn_billed_by(chosen).await;
+            unsafe {
+                std::env::remove_var("GREENTIC_EXTENSIONS_DIR");
+            }
             assert!(
                 installed
-                    .consulted
+                    .budget_asks
                     .load(std::sync::atomic::Ordering::SeqCst)
-                    >= 1,
-                "the host-installed meter must be the runtime's billing sink"
-            );
-            let env_sink_calls = server.received_requests().await.unwrap_or_default().len();
-            assert_eq!(
-                env_sink_calls, 0,
-                "with a meter installed the env-configured sink must not be asked at all"
+                    >= 1
             );
         }
 

@@ -137,27 +137,64 @@ async fn a_completed_chat_is_billed_once_with_the_reported_usage() {
             40,
             9,
             "researcher".into(),
-            "gpt-4o-mini-2024".into(),
-        )
+            "configured-model".into(),
+        ),
+        "the configured model id, not the provider's dated one"
     );
 }
 
 #[tokio::test]
-async fn a_blank_reported_model_falls_back_to_the_configured_one() {
+async fn with_no_configured_model_the_reported_one_is_used() {
     let meter = Arc::new(RecordingMeter::default());
-    let llm = metered(
-        StubLlm {
-            usage: Some(Usage {
-                model: " ".into(),
-                input_tokens: 1,
-                output_tokens: 2,
-            }),
-            fail: false,
-        },
-        Arc::clone(&meter),
+    let llm = MeteredLlmProvider::new(
+        Arc::new(UnconfiguredLlm),
+        Arc::clone(&meter) as Arc<dyn BillingMeter>,
+        TenantContext::new("acme", "prod"),
+        "researcher".into(),
     );
     llm.chat(request()).await.unwrap();
-    assert_eq!(meter.calls.lock().unwrap()[0].6, "configured-model");
+    assert_eq!(meter.calls.lock().unwrap()[0].6, "reported-model");
+}
+
+/// A provider with no configured model id, reporting one in its usage.
+struct UnconfiguredLlm;
+
+#[async_trait]
+impl LlmProvider for UnconfiguredLlm {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            chat: true,
+            tools: false,
+            streaming: false,
+            vision: false,
+            system_prompt: true,
+        }
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "unconfigured"
+    }
+
+    fn model(&self) -> &str {
+        ""
+    }
+
+    async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+        Ok(ChatResponse {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Some(Usage {
+                model: "reported-model".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+        })
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, LlmError> {
+        Err(LlmError::Config("no stream".into()))
+    }
 }
 
 #[tokio::test]
@@ -262,7 +299,7 @@ async fn the_handler_bills_the_deep_workers_llm_through_its_installed_sink() {
             5,
             6,
             "writer".into(),
-            "m".into(),
+            "configured-model".into(),
         )
     );
 }
