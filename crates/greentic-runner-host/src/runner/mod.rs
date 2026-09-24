@@ -1,3 +1,4 @@
+pub mod a2a_node;
 pub mod a2a_pack_routes;
 #[cfg(feature = "agentic-worker")]
 pub(crate) mod a2a_pack_source;

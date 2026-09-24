@@ -108,6 +108,21 @@ pub struct FlowEngine {
     /// over `mcp_tool_source`.
     #[cfg(feature = "agentic-worker")]
     mcp_secrets: Option<crate::secrets::DynSecretsManager>,
+    /// Per-`(tenant, pack)` A2A tool source for `component == "a2a"` flow
+    /// nodes, built lazily from that pack's own `assets/a2a-routes.json`.
+    ///
+    /// Unlike MCP there is no env-derived source to build at construction: a
+    /// pack IS the only A2A source, and the source captures the tenant and the
+    /// deployed unit its credentials resolve under. It is cached because the
+    /// source owns the agent-card cache — rebuilding per node would refetch
+    /// every card on every turn.
+    ///
+    /// Only successes are cached. A pack that declares no agents is cheap to
+    /// re-decide (`PackRuntime::a2a_routes` is itself memoised) and caching
+    /// that answer would freeze the `GREENTIC_AW_A2A` opt-out for the life of
+    /// the process.
+    #[cfg(feature = "agentic-worker")]
+    a2a_sources: RwLock<HashMap<(String, String), Arc<greentic_aw_runtime::A2aToolSource>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -319,6 +334,20 @@ enum NodeKind {
     Mcp {
         server_id: String,
         tool: String,
+    },
+    /// Flow-execution A2A node (LOCKED ENCODING v1): `component == "a2a"` with
+    /// `agent`/`message` carried in the node payload/config. Asks one external
+    /// A2A agent one question through the SAME
+    /// `greentic_aw_runtime::a2a_source` machinery an agentic worker's
+    /// `a2a:<agent_id>` TOOL uses — including its outcome classification, so a
+    /// flow and a worker cannot disagree about what a remote task's state
+    /// means. See [`crate::runner::a2a_node`].
+    ///
+    /// `agent_id` here is the value resolved at flow-load time; `execute_a2a`
+    /// re-reads it from the rendered payload (the source of truth) and only
+    /// uses this as the fallback for the `operation` / `a2a:<id>` ref forms.
+    A2a {
+        agent_id: String,
     },
 }
 
@@ -586,6 +615,8 @@ impl FlowEngine {
             mcp_tool_source: crate::runner::mcp_node::source_from_env(),
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
         })
     }
 
@@ -606,8 +637,11 @@ impl FlowEngine {
         &self.rollout_ids
     }
 
-    /// The deployed unit an MCP credential is scoped to: this engine's
-    /// revision `bundle_id`.
+    /// The deployed unit a remote-tool credential is scoped to: this engine's
+    /// revision `bundle_id`. Read by the `mcp` node AND by the `a2a` node —
+    /// the unit is a property of the ENGINE's revision, not of the credential
+    /// category, so both must read the one value rather than each deriving its
+    /// own. The name is historical; it predates the `a2a` node.
     ///
     /// Read from the engine, not from `GREENTIC_BUNDLE_ID`: one greentic-start
     /// process serves every revision of an environment, each through its own
@@ -1689,6 +1723,10 @@ impl FlowEngine {
                 )
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::A2a { agent_id } => self
+                .execute_a2a(ctx, agent_id, payload, node_has_error_route(&node.routing))
+                .await
+                .map(DispatchOutcome::complete),
         }
     }
 
@@ -2060,14 +2098,11 @@ impl FlowEngine {
         )
         .await;
 
-        // Bind the result under the optional `output` state key. When absent,
-        // the raw tool result becomes the node payload (still addressable via
-        // the standard `node.<id>.payload` mechanism).
-        let bound = match payload.get("output").and_then(Value::as_str) {
-            Some(key) if !key.is_empty() => json!({ key: result.clone() }),
-            _ => result.clone(),
-        };
-        Ok(mcp_node_output(bound, &result, has_error_route))
+        Ok(mcp_node_output(
+            bind_node_result(&payload, result.clone()),
+            &result,
+            has_error_route,
+        ))
     }
 
     /// Compile-time stub for the MCP flow node when the agentic-worker feature
@@ -2085,6 +2120,137 @@ impl FlowEngine {
         Ok(NodeOutput::new(json!({
             "error": format!(
                 "mcp node '{server_id}/{tool}' requires the agentic-worker feature (MCP runtime not compiled in)"
+            )
+        })))
+    }
+
+    /// The A2A agents this flow's pack declares, built once per
+    /// `(tenant, pack)` and cached for its agent-card cache.
+    #[cfg(feature = "agentic-worker")]
+    fn a2a_source_for(
+        &self,
+        tenant: &str,
+        pack: &Arc<PackRuntime>,
+    ) -> Option<Arc<greentic_aw_runtime::A2aToolSource>> {
+        let key = (tenant.to_string(), pack.metadata().pack_id.to_string());
+        if let Some(cached) = self.a2a_sources.read().get(&key) {
+            return Some(Arc::clone(cached));
+        }
+        // The same manager the `mcp` node dispatches with. It is not
+        // category-specific: which category a credential is read under is a
+        // segment of the URI, chosen by `a2a_source`'s own `A2A_CATEGORY`.
+        let secrets = self.mcp_secrets_for_dispatch();
+        let source = crate::runner::a2a_node::aw::source_for_pack(
+            pack,
+            tenant,
+            secrets,
+            self.mcp_credential_unit(),
+        )?;
+        // A concurrent build wins rather than being replaced: two sources are
+        // equivalent, and keeping the installed one keeps its warm card cache.
+        let mut sources = self.a2a_sources.write();
+        let entry = sources.entry(key).or_insert(source);
+        Some(Arc::clone(entry))
+    }
+
+    /// Execute a `component == "a2a"` flow node (LOCKED ENCODING v1).
+    ///
+    /// `payload` is the already-rendered node input mapping (the engine
+    /// templates `{{ }}` against flow state before dispatch), shaped
+    /// `{ "agent": <id>, "message": <text>, "output": <optional state key> }`.
+    ///
+    /// `agent` is sourced from this payload (the source of truth); the
+    /// `agent_id` parsed at flow-load time is passed in only as the fallback
+    /// for the `operation = "<agent_id>"` / `a2a:<agent_id>` ref encodings.
+    ///
+    /// ONE turn: the node sends one message and completes. It never parks.
+    /// A remote task that is not `completed` is reported in the node's value
+    /// as its own `status`, for the flow to route on — see
+    /// [`crate::runner::a2a_node`] for why, and for the continuation rule that
+    /// makes an `input_required` round trip answerable.
+    ///
+    /// Graceful by contract, exactly as the `mcp` node is: a pack that
+    /// declares no agents, an agent it does not declare, a credential that
+    /// cannot be read, and an unreachable agent all yield a structured
+    /// `status: "error"` value — never a panic, never an aborted runtime, and
+    /// never an unauthenticated call.
+    #[cfg(feature = "agentic-worker")]
+    async fn execute_a2a(
+        &self,
+        ctx: &FlowContext<'_>,
+        agent_id: &str,
+        payload: Value,
+        has_error_route: bool,
+    ) -> Result<NodeOutput> {
+        let payload_agent = crate::runner::a2a_node::agent_from_payload(&payload);
+        let agent_id = payload_agent.as_deref().unwrap_or(agent_id);
+
+        let pack = self.pack_for_flow(ctx)?;
+        let pack_id = pack.metadata().pack_id.to_string();
+
+        // `message` must be configured. Refused as a value rather than as a
+        // node abort, so a flow with an error route handles it like every
+        // other a2a failure and one without still completes.
+        let Some(message) = payload.get("message").filter(|value| !is_blank(value)) else {
+            let result = greentic_aw_runtime::a2a_source::call_error_value(
+                agent_id,
+                "a2a node has no `message` to send (expected a non-empty `message` field \
+                 in the node's config)",
+            );
+            tracing::warn!(agent = agent_id, "a2a node has no message configured");
+            return Ok(a2a_node_output(
+                bind_node_result(&payload, result.clone()),
+                &result,
+                has_error_route,
+            ));
+        };
+
+        let source = self.a2a_source_for(ctx.tenant, pack);
+        let store = pack.state_store_handle();
+        // A scope we cannot build only costs the continuation, so it degrades
+        // rather than failing a call the remote would have answered.
+        let state_ctx = self.state_tenant_ctx(ctx).ok();
+
+        let result = crate::runner::a2a_node::aw::invoke(
+            crate::runner::a2a_node::aw::A2aCall {
+                source: source.as_ref(),
+                store: store.as_ref(),
+                state_ctx: state_ctx.as_ref(),
+                session_id: ctx.session_id.filter(|hint| !hint.is_empty()),
+                tenant: ctx.tenant,
+                env: &self.default_env,
+                pack_id: &pack_id,
+            },
+            agent_id,
+            message,
+        )
+        .await;
+
+        Ok(a2a_node_output(
+            bind_node_result(&payload, result.clone()),
+            &result,
+            has_error_route,
+        ))
+    }
+
+    /// Compile-time stub for the A2A flow node when the agentic-worker feature
+    /// (which carries the A2A client) is disabled. Mirrors the `mcp` stub: the
+    /// node degrades to a clear error value rather than failing the build or
+    /// the run.
+    #[cfg(not(feature = "agentic-worker"))]
+    async fn execute_a2a(
+        &self,
+        _ctx: &FlowContext<'_>,
+        agent_id: &str,
+        _payload: Value,
+        _has_error_route: bool,
+    ) -> Result<NodeOutput> {
+        Ok(NodeOutput::new(json!({
+            "status": "error",
+            "agent": agent_id,
+            "error": format!(
+                "a2a node '{agent_id}' requires the agentic-worker feature (the A2A client is \
+                 not compiled in)"
             )
         })))
     }
@@ -3855,7 +4021,8 @@ fn mcp_tool_error(value: &Value) -> Option<(String, String)> {
 /// raw `error.code`/`error.message` fields; any other field on `error` (e.g.
 /// `status`) and any other top-level field on the payload survive untouched.
 ///
-/// This is the single normalization point: once a payload is in this shape,
+/// This is the single normalization point — for the `a2a` node as well, via
+/// [`a2a_node_output`]: once a payload is in this shape,
 /// `to_node_output` (the `{{node.<id>.errors}}` template envelope) and
 /// `NodeOutput::errored`'s `meta.error` (read by
 /// `lift_first_node_error_from_nodes`) both read it exactly as they already read
@@ -3940,6 +4107,69 @@ fn mcp_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeO
         "mcp_call_failed",
         &message,
     ))
+}
+
+/// Bind a remote-tool node's result under its optional `output` state key.
+///
+/// When `output` is absent the raw result becomes the node payload (still
+/// addressable through the standard `node.<id>.payload` mechanism). Shared by
+/// the `mcp` and `a2a` nodes so the two cannot answer `output:` differently.
+#[cfg(feature = "agentic-worker")]
+fn bind_node_result(payload: &Value, result: Value) -> Value {
+    match payload.get("output").and_then(Value::as_str) {
+        Some(key) if !key.is_empty() => json!({ key: result }),
+        _ => result,
+    }
+}
+
+/// Whether a rendered node field carries nothing to act on: absent, `null`, or
+/// a string that is empty once trimmed (which is what an unresolved `{{ }}`
+/// template renders to — `render_template_string` yields the empty string
+/// rather than failing).
+#[cfg(feature = "agentic-worker")]
+fn is_blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// Build an A2A node's output, marking it failed when there is no answer to
+/// carry — but, exactly as [`mcp_node_output`] does, only for a node that has
+/// somewhere to route the failure. See that function for why a node without an
+/// error route keeps reporting `ok: true`: a routing array that matches
+/// nothing PARKS the run, which is worse for an operator than the value they
+/// can still read off `node.<id>.payload.status`.
+///
+/// Only the two `error`-carrying statuses mark the node failed. `completed`
+/// is an answer, and `input_required` / `working` are NOT failures — the
+/// remote agent is working correctly and the flow is expected to route on
+/// them. Treating either as an error would send a perfectly healthy exchange
+/// down an error branch, which is precisely the conflation
+/// `a2a_source::outcome` exists to prevent.
+///
+/// The two failing statuses keep different codes because they send an
+/// operator to different systems: `a2a_agent_failed` is the remote agent
+/// deciding something (`failed`/`canceled`/`rejected`/`auth_required`), while
+/// `a2a_call_failed` is us never reaching it at all. The envelope itself is
+/// built by [`normalize_mcp_tool_error`], the single definition of what a
+/// failed node's `{errors}` output looks like, so `node.<id>.errors[0].message`
+/// reads the same here as for any other node — and every other field, the
+/// `output:` binding key and `status` included, survives beside it.
+#[cfg(feature = "agentic-worker")]
+fn a2a_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeOutput {
+    if !has_error_route {
+        return NodeOutput::new(bound);
+    }
+    let Some(error) = result.get("error").and_then(Value::as_str) else {
+        return NodeOutput::new(bound);
+    };
+    let code = match result.get("status").and_then(Value::as_str) {
+        Some("failed") => "a2a_agent_failed",
+        _ => "a2a_call_failed",
+    };
+    NodeOutput::errored(normalize_mcp_tool_error(&bound, code, error))
 }
 
 /// Turn a `sorla.call` HTTP failure (a malformed route document, an unknown
@@ -4324,7 +4554,11 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("var.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
-            || full_ref.starts_with("mcp:");
+            || full_ref.starts_with("mcp:")
+            // Same for `a2a:<agent_id>`: an admin agent id may carry a dot
+            // (`recipe_v2.1`), and splitting one would ask for a component
+            // named `a2a:recipe_v2` that no pack can contain.
+            || full_ref.starts_with("a2a:");
         // packc emits `operation: None` to mean "the id is already complete" and
         // carries the operation in input.mapping instead. Splitting such an id would
         // produce a prefix that is never a key in the pack's component map (the map is
@@ -4441,6 +4675,15 @@ impl From<Node> for HostNode {
                 // validation; it is still recognized as a fallback for older
                 // packs.
                 comp if comp.starts_with("mcp:") => mcp_node_kind(&node.input.mapping, Some(comp)),
+                // LOCKED ENCODING v1 (shared with greentic-flow + designer):
+                // `component == "a2a"` (a valid `ComponentId`) with `agent` and
+                // `message` carried in the node PAYLOAD/config:
+                //   payload = { agent, message, output? }.
+                // The payload is the source of truth; an `operation =
+                // "<agent_id>"` (or an `a2a:<agent_id>` component ref) is the
+                // fallback, mirroring the `mcp` node's two encodings.
+                "a2a" => a2a_node_kind(&node.input.mapping, raw_operation.as_deref()),
+                comp if comp.starts_with("a2a:") => a2a_node_kind(&node.input.mapping, Some(comp)),
                 other => NodeKind::PackComponent {
                     component_ref: other.to_string(),
                 },
@@ -4465,6 +4708,7 @@ impl From<Node> for HostNode {
             NodeKind::TelcoXCall { .. } => "telco-x.call".to_string(),
             NodeKind::ApprovalCall { .. } => "approval.call".to_string(),
             NodeKind::Mcp { server_id, tool } => format!("mcp:{server_id}/{tool}"),
+            NodeKind::A2a { agent_id } => format!("a2a:{agent_id}"),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
@@ -4534,6 +4778,29 @@ fn mcp_node_kind(payload: &Value, legacy_ref: Option<&str>) -> NodeKind {
     }
     NodeKind::PackComponent {
         component_ref: "mcp".to_string(),
+    }
+}
+
+/// Classify a `component == "a2a"` node into [`NodeKind::A2a`].
+///
+/// LOCKED ENCODING v1: `agent` is read from the node `payload`/config object
+/// (the source of truth). When the payload omits it, the `operation`
+/// (`"<agent_id>"`) or an `a2a:<agent_id>` component ref is parsed instead.
+///
+/// When neither source yields an agent id the node falls back to an ordinary
+/// [`NodeKind::PackComponent`], so a malformed A2A node surfaces as a normal
+/// unknown-component error at run time rather than panicking at load. Flow
+/// loading stays total — the same rule [`mcp_node_kind`] follows, and for the
+/// same reason: one bad node must not take a pack's other flows with it.
+fn a2a_node_kind(payload: &Value, legacy_ref: Option<&str>) -> NodeKind {
+    if let Some(agent_id) = crate::runner::a2a_node::agent_from_payload(payload) {
+        return NodeKind::A2a { agent_id };
+    }
+    if let Some(agent_id) = legacy_ref.and_then(crate::runner::a2a_node::agent_from_ref) {
+        return NodeKind::A2a { agent_id };
+    }
+    NodeKind::PackComponent {
+        component_ref: "a2a".to_string(),
     }
 }
 
@@ -5691,8 +5958,12 @@ mod tests {
         match kind {
             // Not op-keys: these ARE the generic component paths.
             NodeKind::Exec { .. } | NodeKind::PackComponent { .. } => None,
-            // Prefix-matched by `is_native_op_key`, not listed in the array.
-            NodeKind::BuiltinEmit { .. } | NodeKind::Mcp { .. } => None,
+            // Not simple op-keys: `emit.*` is prefix-matched by
+            // `is_native_op_key`, and `mcp` / `a2a` are listed in the array but
+            // reached through TWO spellings (the bare key and the
+            // `mcp:<server>/<tool>` / `a2a:<agent_id>` ref), so neither maps to
+            // one string. Both spellings are asserted below.
+            NodeKind::BuiltinEmit { .. } | NodeKind::Mcp { .. } | NodeKind::A2a { .. } => None,
 
             NodeKind::ProviderInvoke => Some("provider.invoke"),
             NodeKind::FlowCall => Some("flow.call"),
@@ -5746,11 +6017,171 @@ mod tests {
         assert!(crate::runner::flow_adapter::is_native_op_key(
             "mcp:srv/tool"
         ));
+        // `mcp` and `a2a` are dispatched under both their bare key and their
+        // self-contained ref form; the loader must hand both through.
+        for key in ["mcp", "mcp:srv/tool", "a2a", "a2a:8d2f0c1e-recipe"] {
+            assert!(
+                crate::runner::flow_adapter::is_native_op_key(key),
+                "the engine dispatches `{key}`, but the loader does not treat it as native"
+            );
+        }
         // And a genuine pack component must NOT be native.
         assert!(!crate::runner::flow_adapter::is_native_op_key("mcp.exec"));
+        assert!(!crate::runner::flow_adapter::is_native_op_key("a2a.exec"));
 
         // Keeps `native_op_key_for` live: its exhaustiveness is the guard.
         assert_eq!(native_op_key_for(&NodeKind::FlowGoto), Some("flow.goto"));
+    }
+
+    // ── the `a2a` flow node's load-time and output-time rules ─────────────
+
+    /// The node is dispatched on `component == "a2a"`, so that string has to
+    /// survive `runtime_flow_to_flow`'s `ComponentId::from_str` at pack load.
+    /// `mcp` is a valid id for the same reason; `a2a:<agent_id>` is not, which
+    /// is exactly why the payload — not the ref — is the source of truth.
+    #[test]
+    fn the_a2a_component_ref_is_a_valid_component_id() {
+        assert!(greentic_types::ComponentId::from_str("a2a").is_ok());
+    }
+
+    #[test]
+    fn a2a_node_kind_prefers_the_payload_over_the_ref() {
+        let payload = json!({ "agent": "from-payload", "message": "hi" });
+        assert!(matches!(
+            a2a_node_kind(&payload, Some("a2a:from-ref")),
+            NodeKind::A2a { agent_id } if agent_id == "from-payload"
+        ));
+    }
+
+    #[test]
+    fn a2a_node_kind_falls_back_to_both_ref_spellings() {
+        for reference in ["a2a:8d2f0c1e-recipe", "8d2f0c1e-recipe"] {
+            assert!(
+                matches!(
+                    a2a_node_kind(&json!({ "message": "hi" }), Some(reference)),
+                    NodeKind::A2a { agent_id } if agent_id == "8d2f0c1e-recipe"
+                ),
+                "{reference} must resolve the agent id"
+            );
+        }
+    }
+
+    /// Flow loading stays total: a node naming no agent anywhere degrades to a
+    /// generic component, which surfaces at RUN time as an ordinary
+    /// unknown-component error rather than taking the whole pack down at load.
+    #[test]
+    fn an_a2a_node_naming_no_agent_loads_as_a_generic_component() {
+        for legacy in [None, Some("a2a:"), Some("")] {
+            assert!(
+                matches!(
+                    a2a_node_kind(&json!({ "message": "hi" }), legacy),
+                    NodeKind::PackComponent { .. }
+                ),
+                "legacy={legacy:?} must not classify as an a2a node"
+            );
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    fn a2a_result(status: &str, extra: (&str, &str)) -> Value {
+        json!({ "status": status, "agent": "recipe", extra.0: extra.1 })
+    }
+
+    /// The gate `mcp_node_output` already applies, for the same reason: a node
+    /// with no error route has nowhere to send a failure, and a routing array
+    /// that matches nothing PARKS the run.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn without_an_error_route_an_a2a_node_reports_ok_and_keeps_the_value() {
+        let result = a2a_result("error", ("error", "card unreachable"));
+        let output = a2a_node_output(bind_node_result(&json!({}), result.clone()), &result, false);
+        assert!(output.ok);
+        assert_eq!(output.payload["error"], "card unreachable");
+    }
+
+    /// Only the two statuses that carry an `error` mark the node failed, and
+    /// they keep DIFFERENT codes: `a2a_agent_failed` is the remote agent
+    /// deciding something, `a2a_call_failed` is us never reaching it. An
+    /// operator reading one goes to the remote agent's logs; the other, to
+    /// this deployment's.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn only_a_failure_marks_an_a2a_node_errored_and_the_two_failures_keep_their_codes() {
+        // (status, detail key, expected ok, expected code)
+        let cases = [
+            ("completed", "reply", true, None),
+            ("input_required", "question", true, None),
+            ("working", "detail", true, None),
+            ("failed", "error", false, Some("a2a_agent_failed")),
+            ("error", "error", false, Some("a2a_call_failed")),
+        ];
+        for (status, key, ok, code) in cases {
+            let result = a2a_result(status, (key, "some text"));
+            let output =
+                a2a_node_output(bind_node_result(&json!({}), result.clone()), &result, true);
+            assert_eq!(
+                output.ok, ok,
+                "status {status} produced {:?}",
+                output.payload
+            );
+            assert_eq!(
+                output.payload["status"], status,
+                "the status must survive so a flow can still route on it"
+            );
+            match code {
+                Some(code) => {
+                    assert_eq!(output.payload["error"]["code"], code, "status {status}");
+                    assert_eq!(output.payload["error"]["message"], "some text");
+                }
+                None => assert!(
+                    output.payload["error"].is_null() || output.payload["error"].is_string(),
+                    "status {status} must not be reshaped into an error envelope: {:?}",
+                    output.payload
+                ),
+            }
+        }
+    }
+
+    /// A failed node's `output:` binding key must survive beside the error
+    /// envelope, or `node.<id>.<key>` stops resolving the moment the agent
+    /// fails — which is exactly when a flow needs to read it.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_failed_a2a_node_keeps_its_output_binding_key() {
+        let result = a2a_result("failed", ("error", "the agent rejected the request"));
+        let payload = json!({ "agent": "recipe", "message": "hi", "output": "answer" });
+        let output = a2a_node_output(bind_node_result(&payload, result.clone()), &result, true);
+        assert!(!output.ok);
+        assert_eq!(output.payload["answer"]["status"], "failed");
+        assert_eq!(output.payload["error"]["code"], "a2a_agent_failed");
+    }
+
+    /// `bind_node_result` is shared with the `mcp` node, so both answer
+    /// `output:` the same way: named key wraps, absent key passes through.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn the_output_binding_rule_is_one_rule_for_both_remote_tool_nodes() {
+        let result = json!({ "status": "completed", "reply": "an omelette" });
+        assert_eq!(
+            bind_node_result(&json!({ "output": "answer" }), result.clone()),
+            json!({ "answer": result })
+        );
+        for payload in [json!({}), json!({ "output": "" }), json!("not an object")] {
+            assert_eq!(bind_node_result(&payload, result.clone()), result);
+        }
+    }
+
+    /// An unresolved `{{ }}` template renders to the empty string rather than
+    /// failing, so a blank `message` is the shape a mistyped template takes.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_blank_message_is_recognised_as_nothing_to_send() {
+        for blank in [json!(null), json!(""), json!("   ")] {
+            assert!(is_blank(&blank), "{blank} must read as blank");
+        }
+        for present in [json!("hi"), json!(0), json!(false), json!({ "a": 1 })] {
+            assert!(!is_blank(&present), "{present} must read as content");
+        }
     }
 
     // ── `sorla.call`: a route document wins over NATS (Task A5) ────────────
@@ -6013,6 +6444,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         }
     }
@@ -7067,6 +7500,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -7287,6 +7722,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
 
@@ -7452,6 +7889,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
         let ctx = FlowContext {
@@ -7599,6 +8038,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
         let ctx = FlowContext {
@@ -7777,6 +8218,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
 
@@ -7901,6 +8344,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         }
     }
@@ -8476,6 +8921,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
         }
     }
 
@@ -9034,6 +9481,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -9948,6 +10397,8 @@ mod tests {
             graph_node_handler: None,
             mcp_tool_source: None,
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
 
@@ -10352,6 +10803,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
 
@@ -10470,6 +10923,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
 
@@ -10618,6 +11073,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -11177,6 +11634,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
@@ -11360,6 +11819,8 @@ mod tests {
             graph_node_handler: None,
             mcp_tool_source: None,
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         }
     }
@@ -11570,6 +12031,8 @@ mod tests {
             graph_node_handler: None,
             mcp_tool_source: None,
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         }
     }
@@ -12129,6 +12592,8 @@ mod tests {
             graph_node_handler: None,
             mcp_tool_source: None,
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         }
     }
@@ -12272,6 +12737,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: handler,
         }
     }
@@ -12960,6 +13427,8 @@ mod tests {
             mcp_tool_source: None,
             #[cfg(feature = "agentic-worker")]
             mcp_secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            a2a_sources: RwLock::new(HashMap::new()),
             operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
