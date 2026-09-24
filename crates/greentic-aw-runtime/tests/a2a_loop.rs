@@ -258,7 +258,7 @@ async fn a2a_tool_offered_called_and_result_in_trail() {
     });
     assert_eq!(
         tool_result,
-        Some(json!({ "reply": "an omelette" })),
+        Some(json!({ "status": "completed", "agent": "recipe", "reply": "an omelette" })),
         "a2a tool result must appear in the trail; trail: {:?}",
         out.trail
     );
@@ -298,4 +298,295 @@ async fn no_a2a_source_offers_no_a2a_tool() {
     );
     assert_eq!(out.terminated_by, TerminationReason::FinalReply);
     assert_eq!(out.reply, "no tools");
+}
+
+// --- Multi-turn continuation through the agent loop ----------------------
+
+/// The `{contextId, taskId}` each `SendMessage` POST carried, in order.
+async fn sent_references(server: &MockServer) -> Vec<(Option<String>, Option<String>)> {
+    server
+        .received_requests()
+        .await
+        .expect("request log")
+        .iter()
+        .filter(|r| r.url.path() == RPC_PATH)
+        .map(|r| {
+            let body: serde_json::Value = r.body_json().expect("a json body");
+            let get = |k: &str| body["params"]["message"][k].as_str().map(str::to_string);
+            (get("contextId"), get("taskId"))
+        })
+        .collect()
+}
+
+/// A task reply carrying a context id and a status message.
+fn task_in_context(state: &str, says: &str) -> serde_json::Value {
+    json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {
+        "id": "t-1",
+        "contextId": "ctx-1",
+        "status": {
+            "state": state,
+            "message": {"messageId": "m-s", "role": "ROLE_AGENT", "parts": [{"text": says}]}
+        }
+    }}})
+}
+
+/// The whole point of the slice, end to end: the remote agent asks for more
+/// information on turn one, the worker's model sees that it is waiting, the
+/// user answers, and the SECOND turn resumes the SAME remote task — carried
+/// across `AgentRuntime::step` boundaries by the conversation state, not by
+/// anything the two steps share in memory.
+#[tokio::test]
+async fn a_second_turn_resumes_the_remote_task_the_first_turn_left_open() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(task_in_context("TASK_STATE_INPUT_REQUIRED", "Which city?")),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"task": {
+                "id": "t-1",
+                "contextId": "ctx-1",
+                "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [{"parts": [{"text": "Hotel Diagonal, Barcelona"}]}]
+            }}
+        })))
+        .mount(&server)
+        .await;
+
+    let source = Arc::new(A2aToolSource::new(vec![("recipe".into(), server.uri())]).unwrap());
+    let llm = Arc::new(RecordingLlmBackend::new(vec![
+        Ok(call_recipe_agent()),
+        Ok(final_reply("Which city should I book in?")),
+        Ok(call_recipe_agent()),
+        Ok(final_reply("Booked: Hotel Diagonal.")),
+    ]));
+    let (rt, tc) = build_runtime(llm, Some(source), cfg(vec![recipe_tool_ref()]));
+
+    let turn_one = rt
+        .step(
+            tc.clone(),
+            "s",
+            "a",
+            AgentInput {
+                text: "book a hotel in Spain".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    // (a) The model was told the remote agent is waiting, and what it asked.
+    let first_result = tool_result_of(&turn_one);
+    assert_eq!(first_result["status"], "input_required", "{first_result}");
+    assert_eq!(first_result["question"], "Which city?");
+    assert!(
+        first_result.get("reply").is_none(),
+        "an unanswered question must not arrive under `reply`: {first_result}"
+    );
+
+    // (b) The user answers, on the SAME session id.
+    let turn_two = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "Barcelona".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    let second_result = tool_result_of(&turn_two);
+    assert_eq!(second_result["status"], "completed", "{second_result}");
+    assert_eq!(second_result["reply"], "Hotel Diagonal, Barcelona");
+
+    // (c) And the second call went to the same remote task, not a new one.
+    let sent = sent_references(&server).await;
+    assert_eq!(sent.len(), 2, "two calls; got {sent:?}");
+    assert_eq!(sent[0], (None, None), "turn one opens the conversation");
+    assert_eq!(
+        sent[1],
+        (Some("ctx-1".into()), Some("t-1".into())),
+        "turn two must resume the same remote task; got {sent:?}"
+    );
+}
+
+/// A different Greentic conversation is a different remote conversation.
+/// Sharing one would let one user's exchange continue inside another's.
+#[tokio::test]
+async fn a_different_session_never_inherits_the_first_ones_remote_context() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(task_in_context("TASK_STATE_INPUT_REQUIRED", "Which city?")),
+        )
+        .mount(&server)
+        .await;
+
+    let source = Arc::new(A2aToolSource::new(vec![("recipe".into(), server.uri())]).unwrap());
+    let llm = Arc::new(RecordingLlmBackend::new(vec![
+        Ok(call_recipe_agent()),
+        Ok(final_reply("asking")),
+        Ok(call_recipe_agent()),
+        Ok(final_reply("asking")),
+    ]));
+    let (rt, tc) = build_runtime(llm, Some(source), cfg(vec![recipe_tool_ref()]));
+
+    for session in ["session-one", "session-two"] {
+        rt.step(
+            tc.clone(),
+            session,
+            "a",
+            AgentInput {
+                text: "book a hotel".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let sent = sent_references(&server).await;
+    assert_eq!(
+        sent,
+        vec![(None, None), (None, None)],
+        "each conversation opens its own remote context; got {sent:?}"
+    );
+}
+
+/// Two tenants using the SAME session id must not meet. The state store keys
+/// by tenant, so they get different states; this asserts the observable
+/// consequence rather than the key.
+#[tokio::test]
+async fn another_tenant_on_the_same_session_id_gets_its_own_remote_context() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(task_in_context("TASK_STATE_INPUT_REQUIRED", "Which city?")),
+        )
+        .mount(&server)
+        .await;
+
+    let source = Arc::new(A2aToolSource::new(vec![("recipe".into(), server.uri())]).unwrap());
+    let llm = Arc::new(RecordingLlmBackend::new(vec![
+        Ok(call_recipe_agent()),
+        Ok(final_reply("asking")),
+        Ok(call_recipe_agent()),
+        Ok(final_reply("asking")),
+    ]));
+    let store = Arc::new(MockAgentStateStore::new());
+    let cp = MockConfigProvider::new();
+    let acme = TenantContext::new("acme", "prod");
+    let globex = TenantContext::new("globex", "prod");
+    cp.insert(&acme, "a", cfg(vec![recipe_tool_ref()]));
+    cp.insert(&globex, "a", cfg(vec![recipe_tool_ref()]));
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+    let rt = AgentRuntime::new(
+        Arc::new(cp),
+        store,
+        ext,
+        llm,
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    )
+    .with_a2a_source(Some(source));
+
+    for tenant in [acme, globex] {
+        rt.step(
+            tenant,
+            "shared-session-id",
+            "a",
+            AgentInput {
+                text: "book a hotel".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let sent = sent_references(&server).await;
+    assert_eq!(
+        sent,
+        vec![(None, None), (None, None)],
+        "a second tenant must not resume the first's remote conversation; got {sent:?}"
+    );
+}
+
+/// A remote failure must not reach the model under `reply`, at the loop level
+/// and not only in the renderer's unit tests.
+#[tokio::test]
+async fn a_failed_remote_task_reaches_the_model_as_a_failure_not_a_reply() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(task_in_context("TASK_STATE_FAILED", "upstream timeout")),
+        )
+        .mount(&server)
+        .await;
+
+    let source = Arc::new(A2aToolSource::new(vec![("recipe".into(), server.uri())]).unwrap());
+    let llm = Arc::new(RecordingLlmBackend::new(vec![
+        Ok(call_recipe_agent()),
+        Ok(final_reply("The recipe agent could not answer.")),
+    ]));
+    let (rt, tc) = build_runtime(llm, Some(source), cfg(vec![recipe_tool_ref()]));
+
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = tool_result_of(&out);
+    assert_eq!(result["status"], "failed", "{result}");
+    assert!(
+        result.get("reply").is_none(),
+        "a failed remote task must not read like an answer: {result}"
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("upstream timeout")),
+        "{result}"
+    );
+}
+
+/// The a2a tool result recorded in a step's trail.
+fn tool_result_of(out: &greentic_aw_runtime::AgentOutput) -> serde_json::Value {
+    out.trail
+        .iter()
+        .find_map(|s| match s {
+            AgentStep::ToolCall { name, result, .. } if name == "ask" => Some(result.clone()),
+            _ => None,
+        })
+        .expect("the a2a tool must have been dispatched")
 }

@@ -6,13 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use greentic_a2a::fetch::{CardCache, require_secure_interface};
-use greentic_a2a::message::{Message, Part, Role, Task, TaskState};
+use greentic_a2a::message::{Message, Part, Role, Task, TaskProgress, TaskState};
 use greentic_a2a::rpc::{
     JsonRpcRequest, JsonRpcResponse, METHOD_SEND_MESSAGE, SendMessageParams, SendMessageResult,
 };
 use greentic_secrets_lib::SecretsManager;
 
 use super::auth::{CredentialScope, ensure_same_host};
+use super::continuation::A2aContinuation;
+use super::outcome::A2aOutcome;
 use super::types::{A2aRoute, A2aToolCatalog, A2aToolEntry};
 
 /// How long a fetched agent card is trusted before a refetch is considered.
@@ -161,9 +163,57 @@ impl A2aToolSource {
         Arc::new(catalog)
     }
 
-    /// Call one agent with a plain-text prompt and return its reply text.
+    /// Call one agent with a plain-text prompt and return its reply text,
+    /// starting a NEW remote conversation.
+    ///
+    /// Kept for callers that hold no conversation state of their own. It
+    /// collapses every non-answer — a task still working, a task asking us a
+    /// question — into an `Err`, because a `Result<String, String>` has
+    /// nowhere honest to put them; the shape that does is
+    /// [`A2aToolCatalog::dispatch_in_conversation`], which is what the agent
+    /// loop uses.
     pub async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
-        self.transport.call(agent_id, text).await
+        match self.transport.send(agent_id, text, None).await? {
+            A2aReply {
+                outcome: A2aOutcome::Answered { text },
+                ..
+            } => Ok(text),
+            other => Err(flatten_non_answer(agent_id, &other.outcome)),
+        }
+    }
+}
+
+/// One `SendMessage` exchange: what to tell the model, and what to remember
+/// about the remote conversation.
+///
+/// The two are returned together and decided in one place so they cannot
+/// disagree — a `task_id` kept alive for a task reported as finished would
+/// make the next call fail against a task the remote has closed.
+pub(super) struct A2aReply {
+    pub(super) outcome: A2aOutcome,
+    /// The remote's id for this conversation, when it named one. `None`
+    /// leaves whatever the caller already held in place: an agent that
+    /// answers a plain `Message` with no `contextId` has not ended the
+    /// conversation, it just did not restate its name for it.
+    pub(super) context_id: Option<String>,
+    /// The remote task still awaiting us. `Some` ONLY while the task is
+    /// open — see [`super::continuation`].
+    pub(super) task_id: Option<String>,
+}
+
+/// One sentence for an outcome that [`A2aToolSource::call`] cannot return as
+/// a reply. Never used on the catalogue path, which renders the outcome
+/// structurally instead.
+fn flatten_non_answer(agent_id: &str, outcome: &A2aOutcome) -> String {
+    match outcome.to_value(agent_id) {
+        serde_json::Value::Object(map) => map
+            .get("error")
+            .or_else(|| map.get("question"))
+            .or_else(|| map.get("detail"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("a2a agent {agent_id} did not answer")),
+        _ => format!("a2a agent {agent_id} did not answer"),
     }
 }
 
@@ -213,7 +263,13 @@ impl Transport {
         }
     }
 
-    /// Call one agent with a plain-text prompt and return its reply text.
+    /// Send one message to `agent_id`, continuing `prior` when there is one.
+    ///
+    /// `prior` is the conversation's remembered reference for this agent. Its
+    /// `context_id` and `task_id` travel on the outgoing [`Message`], which is
+    /// the whole of the multi-turn fix: without them every call opened a new
+    /// remote task, so an agent that answered `input-required` could never be
+    /// answered.
     ///
     /// Resolves the agent's (public, unauthenticated) card, takes its first
     /// `supported_interfaces` entry, and checks that interface is secure. For
@@ -227,7 +283,12 @@ impl Transport {
     /// An agent requiring a protocol extension we do not implement is refused
     /// HERE as well as withheld from the catalogue, because a dispatch is
     /// attempted for every configured agent whether it had an entry or not.
-    pub(super) async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
+    pub(super) async fn send(
+        &self,
+        agent_id: &str,
+        text: &str,
+        prior: Option<&A2aContinuation>,
+    ) -> Result<A2aReply, String> {
         let route = self
             .agents
             .get(agent_id)
@@ -272,10 +333,14 @@ impl Transport {
         }
         let auth = self.credentials.header_for(route).await?;
 
+        // The two fields this whole slice exists to populate. An absent
+        // `prior` is a first turn and correctly sends neither; a `prior`
+        // holding only a context resumes the conversation but starts a new
+        // task, which is what a follow-up question after a COMPLETED task is.
         let message = Message {
             message_id: uuid::Uuid::new_v4().to_string(),
-            context_id: None,
-            task_id: None,
+            context_id: prior.map(|c| c.context_id.clone()),
+            task_id: prior.and_then(|c| c.task_id.clone()),
             role: Role::User,
             parts: vec![Part::text(text)],
             metadata: None,
@@ -318,10 +383,18 @@ impl Transport {
         }
 
         match body.result {
-            Some(SendMessageResult::Message(reply)) => {
-                reply_text(agent_id, &reply.parts, "replied with no text part")
-            }
-            Some(SendMessageResult::Task(task)) => task_outcome(agent_id, &task),
+            Some(SendMessageResult::Message(reply)) => Ok(A2aReply {
+                outcome: A2aOutcome::Answered {
+                    text: reply_text(agent_id, &reply.parts, "replied with no text part")?,
+                },
+                context_id: reply.context_id,
+                // A bare `Message` reply is not a task, so there is nothing
+                // open to continue. Any task we were holding has been
+                // answered outside the task model; dropping its id is the
+                // honest record.
+                task_id: None,
+            }),
+            Some(SendMessageResult::Task(task)) => Ok(task_reply(agent_id, task)),
             None => Err(format!(
                 "a2a agent {agent_id} returned neither a result nor an error"
             )),
@@ -345,41 +418,55 @@ fn reply_text(agent_id: &str, parts: &[Part], empty: &str) -> Result<String, Str
     Ok(texts.join("\n"))
 }
 
-/// What the model should see when an agent answered with a `Task`.
+/// What the model should see when an agent answered with a `Task`, and what
+/// the conversation should remember about it.
 ///
-/// This slice does not poll. A task that has already finished is answered
-/// from its artifacts; one that failed is an error, so the model does not read
-/// a failure as a successful result; one still in flight is reported as
-/// pending, which is true.
-fn task_outcome(agent_id: &str, task: &Task) -> Result<String, String> {
+/// This slice does not poll. What it does instead — and what the old code
+/// could not — is keep the reference that lets the NEXT call continue the
+/// same task, which is the only thing `input-required` needs to become
+/// answerable.
+///
+/// The `task_id` is carried forward ONLY while
+/// [`TaskState::progress`] says the task is open. A completed or failed task
+/// will not accept another message, so keeping its id would make the next
+/// call fail against a task the remote has closed; the `context_id` survives
+/// either way, so a follow-up question still lands in the same remote
+/// conversation.
+fn task_reply(agent_id: &str, task: Task) -> A2aReply {
     let detail = task
         .status
         .message
         .as_ref()
-        .and_then(|m| reply_text(agent_id, &m.parts, "").ok())
-        .map(|text| format!(": {text}"))
-        .unwrap_or_default();
-    match task.status.state {
-        TaskState::Completed => {
+        .and_then(|m| reply_text(agent_id, &m.parts, "").ok());
+    let state = task.status.state;
+    let open = matches!(state.progress(), TaskProgress::Open);
+    let outcome = match state.progress() {
+        TaskProgress::Done => {
             let parts: Vec<Part> = task
                 .artifacts
                 .iter()
                 .flat_map(|artifact| artifact.parts.iter().cloned())
                 .collect();
-            reply_text(agent_id, &parts, "completed a task with no text artifact")
+            match reply_text(agent_id, &parts, "completed a task with no text artifact") {
+                Ok(text) => A2aOutcome::Answered { text },
+                // A completed task with nothing to read is not an answer.
+                // Reported as an end state rather than as an empty reply, so
+                // the model does not relay silence as the agent's response.
+                Err(reason) => A2aOutcome::Ended {
+                    state: TaskState::Completed,
+                    detail: Some(reason),
+                },
+            }
         }
-        TaskState::Submitted | TaskState::Working | TaskState::InputRequired => Ok(format!(
-            "a2a agent {agent_id} accepted the request as task {} ({:?}); \
-             polling a task to completion is not supported yet{detail}",
-            task.id, task.status.state
-        )),
-        TaskState::Failed
-        | TaskState::Rejected
-        | TaskState::Canceled
-        | TaskState::AuthRequired
-        | TaskState::Unspecified => Err(format!(
-            "a2a agent {agent_id} ended task {} as {:?}{detail}",
-            task.id, task.status.state
-        )),
+        TaskProgress::Open if state == TaskState::InputRequired => {
+            A2aOutcome::InputRequired { question: detail }
+        }
+        TaskProgress::Open => A2aOutcome::Working { state, detail },
+        TaskProgress::Ended => A2aOutcome::Ended { state, detail },
+    };
+    A2aReply {
+        outcome,
+        context_id: task.context_id,
+        task_id: open.then_some(task.id),
     }
 }

@@ -617,10 +617,19 @@ pub async fn run_step(
                 // (they should remain retryable on the next turn).
                 observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                 let t0 = Instant::now();
-                let result = match catalogs
-                    .dispatch(runtime.ext_runtime.clone(), call.clone(), &tenant)
-                    .await
-                {
+                // Bound to a `let` before the `match` on purpose: a `&mut`
+                // borrow of `state.a2a` inside a match scrutinee lives to the
+                // end of the match, and the error arm below pushes onto
+                // `state.messages`.
+                let dispatched = catalogs
+                    .dispatch(
+                        runtime.ext_runtime.clone(),
+                        call.clone(),
+                        &tenant,
+                        Some(&mut state.a2a),
+                    )
+                    .await;
+                let result = match dispatched {
                     Ok(r) => r,
                     Err(e) => {
                         let duration_ms = t0.elapsed().as_millis() as u64;

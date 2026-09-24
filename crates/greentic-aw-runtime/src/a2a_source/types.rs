@@ -3,9 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde_json::{Value, json};
+use chrono::{DateTime, Utc};
+use serde_json::Value;
 
+use super::continuation::A2aContinuations;
+use super::outcome::call_error_value;
 use super::source::Transport;
+use crate::tenant::TenantContext;
 
 /// One A2A agent a worker may call, as the pack sidecar
 /// (`assets/a2a-routes.json`, cross-repo contract 2026-09-21 §4) describes it.
@@ -109,9 +113,38 @@ impl A2aToolCatalog {
         self.errors.get(agent_id).map(String::as_str)
     }
 
-    /// Call one agent, always returning a JSON value: `{"reply": <text>}`, or
-    /// `{"error": <reason>}` so the LLM observes a failure as a normal tool
-    /// result, as the flow and MCP arms do.
+    /// Call one agent with NO conversation memory: every call opens a fresh
+    /// remote context.
+    ///
+    /// Kept for callers that have no per-conversation state to offer — the
+    /// agent-graph node path is one. Prefer
+    /// [`Self::dispatch_in_conversation`]: without a continuation a remote
+    /// agent that answers `input-required` can never be answered, which is
+    /// the defect this module was reshaped to fix.
+    pub async fn dispatch(&self, agent_id: &str, args: &Value) -> Value {
+        let mut scratch = A2aContinuations::default();
+        self.dispatch_in_conversation(
+            agent_id,
+            args,
+            &TenantContext::new("", ""),
+            &mut scratch,
+            Utc::now(),
+        )
+        .await
+    }
+
+    /// Call one agent, continuing this conversation's exchange with it.
+    ///
+    /// Always returns a JSON value so the LLM observes every outcome as a
+    /// normal tool result, as the flow and MCP arms do. The shape is
+    /// [`super::outcome`]'s: `status` names what happened and `reply` appears
+    /// only when there is an answer.
+    ///
+    /// `continuations` is read before the call and written after it, so the
+    /// remote `contextId` (and, while the task is open, its `taskId`) is
+    /// carried into the next call from the same Greentic conversation. It is
+    /// scoped by `tenant`, which the continuation itself re-checks: see
+    /// [`super::continuation`].
     ///
     /// The call is attempted for any configured agent, including one whose
     /// card could not be fetched when this catalogue was built — the listing
@@ -119,7 +152,14 @@ impl A2aToolCatalog {
     /// the card, so it succeeds only if the agent has recovered since; while
     /// the card is still down, the call fails with that cause. An agent that
     /// was never configured is refused outright.
-    pub async fn dispatch(&self, agent_id: &str, args: &Value) -> Value {
+    pub async fn dispatch_in_conversation(
+        &self,
+        agent_id: &str,
+        args: &Value,
+        tenant: &TenantContext,
+        continuations: &mut A2aContinuations,
+        now: DateTime<Utc>,
+    ) -> Value {
         let caller = self
             .caller
             .as_ref()
@@ -129,16 +169,42 @@ impl A2aToolCatalog {
                 .error_for(agent_id)
                 .map(|cause| format!("a2a agent {agent_id} is unavailable: {cause}"))
                 .unwrap_or_else(|| format!("unknown a2a agent '{agent_id}'"));
-            return json!({ "error": reason });
+            return call_error_value(agent_id, &reason);
         };
-        match caller.call(agent_id, &args_to_text(args)).await {
-            Ok(reply) => json!({ "reply": reply }),
+
+        let prior = continuations.resume(tenant, agent_id, now);
+        match caller
+            .send(agent_id, &args_to_text(args), prior.as_ref())
+            .await
+        {
+            Ok(reply) => {
+                // An agent that named no context keeps the one we already
+                // held: it did not end the conversation, it just did not
+                // restate its name for it. Only when neither side has a
+                // context is there nothing to remember.
+                let context_id = reply
+                    .context_id
+                    .or_else(|| prior.as_ref().map(|c| c.context_id.clone()));
+                match context_id {
+                    Some(context_id) => {
+                        continuations.remember(tenant, agent_id, context_id, reply.task_id, now);
+                    }
+                    // No context either way: drop any stale entry rather than
+                    // leaving one that names a task this reply just ended.
+                    None => continuations.forget(agent_id),
+                }
+                reply.outcome.to_value(agent_id)
+            }
             Err(reason) => {
-                // The model is the only reader of the `{"error"}` value; this
+                // The model is the only reader of the `error` value; this
                 // line is what lets an operator see the failure at all. The
                 // reason never carries the token (see `auth`).
+                //
+                // The continuation is deliberately LEFT IN PLACE: a transport
+                // failure says nothing about the remote task, and dropping it
+                // here would turn one flaky call into a lost conversation.
                 tracing::warn!(agent = %agent_id, error = %reason, "a2a tool call failed");
-                json!({ "error": reason })
+                call_error_value(agent_id, &reason)
             }
         }
     }

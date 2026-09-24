@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::a2a_source::A2aContinuations;
 use crate::error::StateError;
 use crate::tenant::TenantContext;
 use std::future::Future;
@@ -30,6 +31,18 @@ pub struct ConversationState {
     pub tenant_id: String,
     pub env_id: String,
     pub messages: Vec<ChatMessage>,
+    /// Remote A2A references this conversation holds, per agent, so a
+    /// follow-up resumes the same remote task instead of starting a new one.
+    ///
+    /// `#[serde(default)]` and NOT a `schema_version` bump: an older runner
+    /// reading a state written by a newer one simply ignores the field, and
+    /// `load` rejects only a version GREATER than its own — so bumping would
+    /// take every older instance in a mixed fleet offline for a field they do
+    /// not need. The cost of not bumping is that an old runner drops the
+    /// continuations on its next save, which loses at worst one remote
+    /// conversation's thread.
+    #[serde(default)]
+    pub a2a: A2aContinuations,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -44,6 +57,7 @@ impl ConversationState {
             tenant_id: tenant.tenant_id.clone(),
             env_id: tenant.env_id.clone(),
             messages: Vec::new(),
+            a2a: A2aContinuations::default(),
             created_at: now,
             updated_at: now,
         }
@@ -208,6 +222,27 @@ mod tests {
         assert_eq!(conversation_state.tenant_id, "a");
         assert_eq!(conversation_state.env_id, "b");
         assert!(conversation_state.messages.is_empty());
+        assert!(conversation_state.a2a.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn state_written_before_a2a_continuations_existed_still_decodes() {
+        // The reason the field is `#[serde(default)]` and the schema version
+        // stayed at 1: every row already in a live store predates it.
+        let json = r#"{
+            "schema_version": 1,
+            "session_id": "s",
+            "tenant_id": "acme",
+            "env_id": "prod",
+            "messages": [],
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-01T00:00:00Z"
+        }"#;
+        let state: ConversationState =
+            serde_json::from_str(json).expect("pre-existing state must still decode");
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+        assert!(state.a2a.is_empty());
     }
 
     #[test]

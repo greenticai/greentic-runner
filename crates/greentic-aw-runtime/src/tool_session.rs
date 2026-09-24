@@ -24,7 +24,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::AgentRuntime;
-use crate::a2a_source::A2aToolCatalog;
+use crate::a2a_source::{A2aContinuations, A2aToolCatalog};
 use crate::component_source::ComponentToolCatalog;
 use crate::config::ToolRef;
 use crate::error::{AgentError, ConfigError};
@@ -36,7 +36,8 @@ use crate::state::ToolCallRecord;
 use crate::tenant::TenantContext;
 use crate::tool_wire_name::{ToolNameCodec, wire_tool_name};
 use crate::tools::{
-    MissingTool, ToolLedger, dispatch_tool_call, is_tool_allowed, list_tools_for_llm, missing_tools,
+    MissingTool, ToolLedger, dispatch_tool_call_in_conversation, is_tool_allowed,
+    list_tools_for_llm, missing_tools,
 };
 
 /// The five per-tenant tool catalogs, resolved once for a tenant.
@@ -124,13 +125,19 @@ impl ToolCatalogs {
     }
 
     /// Dispatch one (already allow-list checked) call.
+    ///
+    /// `a2a_continuations` is the caller's own per-conversation record of the
+    /// remote A2A exchanges it has open. The agent loop passes the one on its
+    /// [`crate::state::ConversationState`], which is what makes a follow-up
+    /// resume the same remote task.
     pub(crate) async fn dispatch(
         &self,
         ext_runtime: Arc<ExtensionRuntime>,
         call: ToolCallRecord,
         tenant: &TenantContext,
+        a2a_continuations: Option<&mut A2aContinuations>,
     ) -> Result<Value, AgentError> {
-        dispatch_tool_call(
+        dispatch_tool_call_in_conversation(
             ext_runtime,
             self.mcp.clone(),
             self.components.clone(),
@@ -139,6 +146,7 @@ impl ToolCatalogs {
             self.a2a.clone(),
             call,
             tenant,
+            a2a_continuations,
         )
         .await
     }
@@ -186,6 +194,16 @@ pub struct ToolSession {
     codec: ToolNameCodec,
     ledger: Arc<dyn ToolLedger>,
     session_id: Option<String>,
+    /// The remote A2A exchanges this session has open.
+    ///
+    /// In memory, and only for the life of the session — an external
+    /// reasoning loop keeps no [`crate::state::ConversationState`], so there
+    /// is nowhere durable to put them. That is enough for the case that
+    /// matters here: a deep worker that asks a remote agent something, gets
+    /// `input-required`, and answers it within the same run. It is NOT
+    /// enough across a restart, and saying so is better than pretending the
+    /// agent loop's guarantee extends here.
+    a2a: tokio::sync::Mutex<A2aContinuations>,
 }
 
 impl ToolSession {
@@ -270,10 +288,12 @@ impl ToolSession {
             }
         }
 
-        let result = self
-            .catalogs
-            .dispatch(self.ext_runtime.clone(), call, &self.tenant)
-            .await?;
+        let result = {
+            let mut a2a = self.a2a.lock().await;
+            self.catalogs
+                .dispatch(self.ext_runtime.clone(), call, &self.tenant, Some(&mut a2a))
+                .await?
+        };
 
         if let Some(session_id) = self.session_id.as_deref()
             && let Err(e) = self
@@ -308,6 +328,7 @@ impl AgentRuntime {
             codec,
             ledger: self.ledger.clone(),
             session_id: None,
+            a2a: tokio::sync::Mutex::new(A2aContinuations::default()),
         }
     }
 
