@@ -41,8 +41,15 @@ pub(crate) async fn execute_sorla_http(
 ) -> Result<Option<Value>, String> {
     let route = match resolve_route(secrets, tenant, unit, sor).await {
         Ok(route) => route,
+        // No route document exists for this SoR: the caller decides between
+        // NATS and `sorla_route_missing`.
         Err(SorlaRouteError::Missing(_)) => return Ok(None),
-        Err(err @ SorlaRouteError::Invalid(_)) => return Err(err.to_string()),
+        // A malformed document, or the secrets backend itself failing to
+        // answer, is NOT "no route document" — surface it as a hard error so
+        // it can never be silently read as license to fall back to NATS.
+        Err(err @ (SorlaRouteError::Invalid(_) | SorlaRouteError::Unavailable(_))) => {
+            return Err(err.to_string());
+        }
     };
 
     let client = shared_client();
@@ -130,6 +137,33 @@ mod tests {
             .expect("a missing route document must be Ok(None), not Err");
 
         assert_eq!(result, None);
+    }
+
+    /// A secrets backend failure (as opposed to a genuine miss) must surface
+    /// as `Err`, never `Ok(None)` — `Ok(None)` is the signal the engine reads
+    /// as "fall back to NATS", and a backend that cannot answer says nothing
+    /// about whether a route document exists.
+    #[tokio::test]
+    async fn a_backend_failure_is_an_error_not_ok_none() {
+        let secrets = Handle::with(&[]);
+        secrets.fail(
+            "secrets://default/acme/_/sorla/landlord",
+            "connection refused",
+        );
+        let payload = json!({"operation": "record_rent_payment", "input": {}});
+
+        let err = execute_sorla_http(
+            &*secrets.manager(),
+            "acme",
+            None,
+            "landlord",
+            &payload,
+            "flow:f/n",
+        )
+        .await
+        .expect_err("a backend failure must be Err, never Ok(None)");
+
+        assert!(err.contains("could not be read"), "got: {err}");
     }
 
     #[tokio::test]

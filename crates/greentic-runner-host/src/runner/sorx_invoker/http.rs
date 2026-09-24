@@ -318,7 +318,21 @@ pub(crate) async fn invoke_sor(
                 .unwrap_or("capability not found"),
         })),
         401 => Err("sorla_unauthorized: the SoR rejected this caller's credential".to_string()),
-        other => Err(format!("sorx invoke failed: status={other} body={text}")),
+        other => {
+            // The body is never in the error string: it can echo the request
+            // (the capability, the record the caller sent) or carry the SoR's
+            // own diagnostic detail, and this error reaches the flow's node
+            // output and trace — the same reason `discover`'s non-2xx warn
+            // above logs only the status. A truncated copy at `debug!` is for
+            // a human tailing runner logs, never for the flow.
+            tracing::debug!(
+                url = %route.url,
+                status = other,
+                body = %text.chars().take(500).collect::<String>(),
+                "sorla: SoRX invoke returned an unhandled status"
+            );
+            Err(format!("sorx invoke failed: status={other}"))
+        }
     }
 }
 

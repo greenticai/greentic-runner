@@ -174,6 +174,28 @@ async fn invoke_404_maps_to_capability_not_found_error_value() {
     assert_eq!(out["error"], "capability_not_found");
 }
 
+/// An unhandled status (anything but 200/202/401/403/404) must never echo the
+/// SoR's response body into the error string: that error reaches the flow's
+/// node output and trace, and the body may carry the SoR's own diagnostic
+/// detail — or, as here, something outright secret.
+#[tokio::test]
+async fn invoke_500_error_names_the_status_never_the_body() {
+    let server = MockServer::start().await;
+    mount_caps_get(&server, caps_response_one_business_action()).await;
+    mount_invoke(&server, 500, json!({"secret": "leak"})).await;
+
+    let invoker = SorxHttpInvoker::fetch(server.uri()).await;
+    let err = invoker
+        .invoke("landlord", "record_rent_payment", "{}")
+        .await
+        .expect_err("an unhandled status must be Err");
+    assert!(err.contains("status=500"), "got: {err}");
+    assert!(
+        !err.contains("leak"),
+        "the response body must not leak: {err}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn invoke_carries_tenant_caller_and_role_headers() {

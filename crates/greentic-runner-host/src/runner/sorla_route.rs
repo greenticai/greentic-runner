@@ -25,10 +25,17 @@ pub struct SorlaRouteDoc {
 ///
 /// `Missing` carries the URIs that were tried, never a value. `Invalid`
 /// carries only a reason — never the raw document, which may hold a token.
+/// `Unavailable` means the secrets BACKEND itself failed to answer (denied,
+/// unreachable, ...) — never a value either — and must never be treated as
+/// "no route document": the caller cannot tell that apart from a SoR that
+/// genuinely has no route, and folding the two together either lets NATS win
+/// over a SoR that DOES have one, or misreports `sorla_route_missing` for a
+/// SoR whose document could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SorlaRouteError {
     Missing(String),
     Invalid(String),
+    Unavailable(String),
 }
 
 impl std::fmt::Display for SorlaRouteError {
@@ -36,6 +43,9 @@ impl std::fmt::Display for SorlaRouteError {
         match self {
             Self::Missing(tried) => write!(f, "no sorla route document ({tried})"),
             Self::Invalid(why) => write!(f, "sorla route document is invalid: {why}"),
+            Self::Unavailable(why) => {
+                write!(f, "sorla route document could not be read: {why}")
+            }
         }
     }
 }
@@ -51,8 +61,21 @@ struct RawDoc {
 }
 
 /// Resolve the route document for `sor`, scoped to `tenant` (and, when
-/// known, `unit` — see [`greentic_aw_runtime::scoped_secrets::read_secret_for_unit`]
+/// known, `unit` — see [`greentic_aw_runtime::scoped_secrets::secret_uri_candidates`]
 /// for the candidate order this tries).
+///
+/// This does NOT go through
+/// [`greentic_aw_runtime::scoped_secrets::read_secret_for_unit`], even though
+/// it tries the exact same candidates: that helper folds every read failure
+/// — a genuine miss AND a backend failure alike — into one `SecretMiss`,
+/// stringified, with no way to tell them apart afterwards. Reading them here
+/// instead means every candidate's [`greentic_secrets_lib::SecretError`] is
+/// inspected before it is thrown away: only `NotFound` on EVERY candidate is
+/// "no route document" ([`SorlaRouteError::Missing`]); anything else
+/// (permission denied, a backend that cannot answer at all, ...) is
+/// [`SorlaRouteError::Unavailable`] and must never be read as "try NATS
+/// instead" — the backend failing to answer says nothing about whether a
+/// route document exists.
 ///
 /// An absent or blank `token` resolves to `None`: a call built from this
 /// document must never send an empty `Authorization: Bearer ` header.
@@ -62,16 +85,49 @@ pub async fn resolve_route(
     unit: Option<&str>,
     sor: &str,
 ) -> Result<SorlaRouteDoc, SorlaRouteError> {
-    let bytes = greentic_aw_runtime::scoped_secrets::read_secret_for_unit(
-        secrets,
+    let uris = greentic_aw_runtime::scoped_secrets::secret_uri_candidates(
         SORLA_CATEGORY,
         tenant,
         None,
         unit,
         sor,
     )
-    .await
-    .map_err(|miss| SorlaRouteError::Missing(format!("sor {sor}: {miss}")))?;
+    .map_err(|error| SorlaRouteError::Invalid(format!("sor {sor}: {error}")))?;
+
+    let mut bytes: Option<Vec<u8>> = None;
+    let mut backend_error: Option<String> = None;
+    for uri in &uris {
+        match secrets.read(uri).await {
+            Ok(b) => {
+                bytes = Some(b);
+                break;
+            }
+            Err(greentic_secrets_lib::SecretError::NotFound(_)) => {}
+            Err(other) => {
+                tracing::debug!(
+                    sor = %sor,
+                    uri = %uri,
+                    error = %other,
+                    "sorla: route document read failed (backend error, not a miss)"
+                );
+                backend_error = Some(other.to_string());
+                break;
+            }
+        }
+    }
+    let bytes = match (bytes, backend_error) {
+        (Some(bytes), _) => bytes,
+        (None, Some(error)) => {
+            return Err(SorlaRouteError::Unavailable(format!("sor {sor}: {error}")));
+        }
+        (None, None) => {
+            tracing::debug!(sor = %sor, tried = %uris.join(" or "), "sorla: no route document at any scope");
+            return Err(SorlaRouteError::Missing(format!(
+                "sor {sor}: {}",
+                uris.join(" or ")
+            )));
+        }
+    };
 
     let raw: RawDoc = serde_json::from_slice(&bytes)
         .map_err(|_| SorlaRouteError::Invalid(format!("sor {sor}: not a JSON object")))?;
@@ -106,9 +162,16 @@ pub(crate) mod test_secrets {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    /// Cheap to clone: every clone shares the same backing map.
+    /// Cheap to clone: every clone shares the same backing maps.
     #[derive(Clone, Default)]
-    pub(crate) struct Handle(Arc<Mutex<HashMap<String, Vec<u8>>>>);
+    pub(crate) struct Handle {
+        entries: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        /// URIs that must fail with a BACKEND error (never `NotFound`) —
+        /// distinct from an absent entry, which is an ordinary miss. Used by
+        /// `resolve_route`'s `Unavailable` tests: a backend that cannot
+        /// answer at all must never be read as "no route document".
+        failing: Arc<Mutex<HashMap<String, String>>>,
+    }
 
     // `set` and `manager` are unused by this module's own tests — they exist
     // for `sorla_invoker` (A3), which reuses this fake rather than defining
@@ -120,14 +183,27 @@ pub(crate) mod test_secrets {
                 .iter()
                 .map(|(uri, body)| ((*uri).to_string(), body.as_bytes().to_vec()))
                 .collect();
-            Self(Arc::new(Mutex::new(map)))
+            Self {
+                entries: Arc::new(Mutex::new(map)),
+                failing: Arc::new(Mutex::new(HashMap::new())),
+            }
         }
 
         pub(crate) fn set(&self, uri: &str, body: &str) {
-            self.0
+            self.entries
                 .lock()
                 .unwrap()
                 .insert(uri.to_string(), body.as_bytes().to_vec());
+        }
+
+        /// Make every future read of `uri` fail with `SecretError::Backend`
+        /// (never `NotFound`) — a secrets backend that cannot answer at all,
+        /// as opposed to one that answered "no such entry".
+        pub(crate) fn fail(&self, uri: &str, message: &str) {
+            self.failing
+                .lock()
+                .unwrap()
+                .insert(uri.to_string(), message.to_string());
         }
 
         /// This handle, boxed as the runner's shared secrets-manager type.
@@ -139,7 +215,10 @@ pub(crate) mod test_secrets {
     #[async_trait::async_trait]
     impl greentic_secrets_lib::SecretsManager for Handle {
         async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
-            self.0
+            if let Some(message) = self.failing.lock().unwrap().get(path).cloned() {
+                return Err(greentic_secrets_lib::SecretError::Backend(message.into()));
+            }
+            self.entries
                 .lock()
                 .unwrap()
                 .get(path)
@@ -148,7 +227,7 @@ pub(crate) mod test_secrets {
         }
 
         async fn write(&self, path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
-            self.0
+            self.entries
                 .lock()
                 .unwrap()
                 .insert(path.to_string(), bytes.to_vec());
@@ -156,7 +235,7 @@ pub(crate) mod test_secrets {
         }
 
         async fn delete(&self, path: &str) -> greentic_secrets_lib::Result<()> {
-            self.0.lock().unwrap().remove(path);
+            self.entries.lock().unwrap().remove(path);
             Ok(())
         }
     }
@@ -204,6 +283,27 @@ mod tests {
             .expect_err("missing");
         assert!(matches!(err, SorlaRouteError::Missing(_)));
         assert!(err.to_string().contains("sorla/landlord"));
+    }
+
+    /// A secrets backend that cannot answer at all (denied, unreachable, ...)
+    /// must never be read as "no route document" — that would let a call
+    /// silently fall back to NATS (or misreport `sorla_route_missing`) for a
+    /// SoR that may well have a working route, the backend just could not be
+    /// asked.
+    #[tokio::test]
+    async fn a_backend_failure_is_unavailable_never_missing() {
+        let s = Handle::with(&[]);
+        s.fail(
+            "secrets://default/acme/_/sorla/landlord",
+            "connection refused",
+        );
+        let err = resolve_route(&s, "acme", None, "landlord")
+            .await
+            .expect_err("a backend failure must not resolve");
+        assert!(
+            matches!(err, SorlaRouteError::Unavailable(_)),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]

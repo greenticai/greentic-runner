@@ -5874,6 +5874,48 @@ mod tests {
         );
     }
 
+    /// A secrets BACKEND failure (as opposed to a genuine miss) must never
+    /// read as "no route document" and fall back to NATS — the backend
+    /// failing to answer says nothing about whether a route document
+    /// exists. `PanicIfDispatchedHandler` proves NATS is never touched.
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    async fn a_backend_failure_never_falls_back_to_nats() {
+        let secrets = crate::runner::sorla_route::test_secrets::Handle::with(&[]);
+        secrets.fail(
+            "secrets://default/acme/_/sorla/landlord",
+            "connection refused",
+        );
+
+        let mut engine = minimal_engine();
+        engine.mcp_secrets = Some(secrets.manager());
+        engine.remote_dispatch_handler = Some(Arc::new(PanicIfDispatchedHandler));
+
+        let ctx = sorla_call_ctx();
+        let node = sorla_call_node(Routing::End);
+        let mut state = ExecutionState::new(Value::Null);
+        let payload = json!({
+            "await": true,
+            "operation": "record_rent_payment",
+            "input": {},
+        });
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "call",
+            node: &node,
+            payload: &payload,
+        };
+
+        let result = engine
+            .dispatch_node(&ctx, "call", &node, &mut state, payload.clone(), &event)
+            .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("a backend failure must fail the node, not silently succeed"),
+        };
+        assert!(err.to_string().contains("could not be read"), "got: {err}");
+    }
+
     #[cfg(feature = "agentic-worker")]
     #[tokio::test]
     async fn no_route_and_no_nats_fails_with_sorla_route_missing() {
