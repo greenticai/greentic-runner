@@ -107,6 +107,49 @@ pub enum TaskState {
     AuthRequired,
 }
 
+/// What a task's state means to the caller waiting on it.
+///
+/// A client has exactly three questions to ask of a `TaskState`: may I send
+/// this task another message, is there an answer to read, or is it over
+/// without one. Nine states collapse onto those three, and collapsing them
+/// HERE — once, exhaustively — is what stops each call site inventing its own
+/// partial match and reading, say, `Rejected` as "still going".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskProgress {
+    /// The task is live: a follow-up message carrying its `taskId` continues
+    /// it rather than starting a new one. `InputRequired` is the case that
+    /// matters — the remote agent asked us something and is waiting.
+    Open,
+    /// The task finished successfully. Its artifacts are the answer.
+    Done,
+    /// The task is over without an answer, or cannot proceed without action
+    /// outside this exchange (`AuthRequired`). Never an answer.
+    Ended,
+}
+
+impl TaskState {
+    /// Which of the three outcomes in [`TaskProgress`] this state is.
+    ///
+    /// `AuthRequired` is deliberately [`TaskProgress::Ended`], not `Open`:
+    /// the remote is waiting, but on a credential, and no message this client
+    /// can compose will satisfy it. Calling it `Open` would keep a task
+    /// reference alive that nothing can ever advance. `Unspecified` is
+    /// `Ended` for the same reason it exists at all — a state this client
+    /// does not understand must not be guessed into a live one.
+    #[must_use]
+    pub fn progress(self) -> TaskProgress {
+        match self {
+            Self::Submitted | Self::Working | Self::InputRequired => TaskProgress::Open,
+            Self::Completed => TaskProgress::Done,
+            Self::Failed
+            | Self::Canceled
+            | Self::Rejected
+            | Self::AuthRequired
+            | Self::Unspecified => TaskProgress::Ended,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatus {
@@ -178,6 +221,33 @@ mod tests {
     fn input_required_is_modelled_because_our_flows_park() {
         let state: TaskState = serde_json::from_str(r#""TASK_STATE_INPUT_REQUIRED""#).unwrap();
         assert_eq!(state, TaskState::InputRequired);
+    }
+
+    #[test]
+    fn every_state_collapses_onto_one_of_three_outcomes() {
+        use TaskProgress::*;
+        for (state, want) in [
+            (TaskState::Submitted, Open),
+            (TaskState::Working, Open),
+            (TaskState::InputRequired, Open),
+            (TaskState::Completed, Done),
+            (TaskState::Failed, Ended),
+            (TaskState::Canceled, Ended),
+            (TaskState::Rejected, Ended),
+            (TaskState::AuthRequired, Ended),
+            (TaskState::Unspecified, Ended),
+        ] {
+            assert_eq!(state.progress(), want, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn auth_required_is_not_open_because_no_message_can_advance_it() {
+        // The remote IS waiting — but on a credential, not on us. Reading it
+        // as Open would keep a task reference alive that nothing can ever
+        // continue, and would present a refusal as a question we could answer.
+        assert_eq!(TaskState::AuthRequired.progress(), TaskProgress::Ended);
+        assert_ne!(TaskState::AuthRequired.progress(), TaskProgress::Open);
     }
 
     #[test]
