@@ -56,8 +56,22 @@ impl SorxRoutedInvoker {
             match resolve_route(&*secrets, &tenant, unit.as_deref(), sor).await {
                 Ok(route) => {
                     let (sor_ops, sor_caps) = discover(&client, &route).await;
-                    ops.extend(sor_ops);
-                    cap_by_key.extend(sor_caps);
+                    // The SoR key IS the cap-URI pack segment (global
+                    // constraint). A server can offer ops for packs other
+                    // than the one it was bound as — drop those rather than
+                    // listing (or, worse, invoking) them through this SoR's
+                    // route document/token.
+                    for op in &sor_ops {
+                        if &op.pack != sor {
+                            tracing::warn!(
+                                sor = %sor,
+                                offered_pack = %op.pack,
+                                "sorla: dropping an op whose capability pack does not match the bound SoR"
+                            );
+                        }
+                    }
+                    ops.extend(sor_ops.into_iter().filter(|op| &op.pack == sor));
+                    cap_by_key.extend(sor_caps.into_iter().filter(|((pack, _), _)| pack == sor));
                 }
                 Err(err) => {
                     tracing::warn!(

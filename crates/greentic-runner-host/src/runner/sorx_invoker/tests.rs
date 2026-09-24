@@ -7,7 +7,8 @@ use wiremock::matchers::{body_partial_json, header, header_exists, method, path}
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::http::fixtures::{
-    caps_response_for_pack, caps_response_mixed, caps_response_one_business_action,
+    caps_response_for_pack, caps_response_landlord_plus_billing, caps_response_mixed,
+    caps_response_one_business_action,
 };
 use super::http::{SorxHttpInvoker, parse_agent_endpoint_cap_uri};
 use super::routed::SorxRoutedInvoker; // module is `pub(crate)`; see mod.rs
@@ -24,6 +25,16 @@ async fn mount_caps_get(server: &MockServer, body: serde_json::Value) {
         .await;
 }
 
+/// Mount a `{status} POST /admin/v1/capabilities/invoke` response with
+/// `body` — for tests that don't also assert on the request itself.
+async fn mount_invoke(server: &MockServer, status: u16, body: serde_json::Value) {
+    Mock::given(method("POST"))
+        .and(path("/admin/v1/capabilities/invoke"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
 // ---- SorxHttpInvoker (GREENTIC_AW_SORX_URL env path) ----
 
 #[tokio::test]
@@ -35,11 +46,7 @@ async fn fetch_surfaces_agent_endpoint_alongside_business_action() {
     let mut ops = invoker.list_operations();
     ops.sort_by(|a, b| a.action.cmp(&b.action));
 
-    assert_eq!(
-        ops.len(),
-        2,
-        "business-action + agent-endpoint; event dropped"
-    );
+    assert_eq!(ops.len(), 2, "action + endpoint; event dropped");
     // agent-endpoint op keyed by (pack, endpoint_id), cap stored verbatim.
     let ep = ops
         .iter()
@@ -61,11 +68,7 @@ async fn fetch_builds_one_op_from_business_action_offer() {
     let invoker = SorxHttpInvoker::fetch(server.uri()).await;
     let ops = invoker.list_operations();
 
-    assert_eq!(
-        ops.len(),
-        1,
-        "the business-event offer must be filtered out"
-    );
+    assert_eq!(ops.len(), 1, "the event offer must be filtered out");
     let op = &ops[0];
     assert_eq!(op.pack, "landlord");
     assert_eq!(op.action, "record_rent_payment");
@@ -85,21 +88,25 @@ async fn fetch_degrades_to_empty_ops_on_unreachable_server() {
 }
 
 #[tokio::test]
+async fn discovery_401_yields_empty_ops_without_panicking() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v1/capabilities"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"secret": "leak"})))
+        .mount(&server)
+        .await;
+
+    // A rejected credential must not silently read as "zero offers" with no
+    // signal, and must not panic — the invoker still constructs.
+    let invoker = SorxHttpInvoker::fetch(server.uri()).await;
+    assert!(invoker.list_operations().is_empty());
+}
+
+#[tokio::test]
 async fn invoke_happy_path_returns_result_value() {
     let server = MockServer::start().await;
     mount_caps_get(&server, caps_response_one_business_action()).await;
-    Mock::given(method("POST"))
-        .and(path("/admin/v1/capabilities/invoke"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "ok": true,
-            "schema": "greentic.sorx.capability-invoke-result.v1",
-            "capability": "cap://greentic/business-functions/landlord/record_rent_payment/v0.1.0",
-            "status": "completed",
-            "result": {"id": "pay-1"},
-            "events": []
-        })))
-        .mount(&server)
-        .await;
+    mount_invoke(&server, 200, json!({"ok": true, "result": {"id": "pay-1"}})).await;
 
     let invoker = SorxHttpInvoker::fetch(server.uri()).await;
     let out = invoker
@@ -113,16 +120,12 @@ async fn invoke_happy_path_returns_result_value() {
 async fn invoke_202_approval_required_is_ok_not_err() {
     let server = MockServer::start().await;
     mount_caps_get(&server, caps_response_one_business_action()).await;
-    Mock::given(method("POST"))
-        .and(path("/admin/v1/capabilities/invoke"))
-        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
-            "ok": false,
-            "status": "approval_required",
-            "capability": "cap://greentic/business-functions/landlord/record_rent_payment/v0.1.0",
-            "approval": {"id": "appr-1", "state": "pending"}
-        })))
-        .mount(&server)
-        .await;
+    mount_invoke(
+        &server,
+        202,
+        json!({"ok": false, "status": "approval_required", "approval": {"id": "appr-1", "state": "pending"}}),
+    )
+    .await;
 
     let invoker = SorxHttpInvoker::fetch(server.uri()).await;
     let out = invoker
@@ -137,18 +140,12 @@ async fn invoke_202_approval_required_is_ok_not_err() {
 async fn invoke_403_maps_to_denied_error_value() {
     let server = MockServer::start().await;
     mount_caps_get(&server, caps_response_one_business_action()).await;
-    Mock::given(method("POST"))
-        .and(path("/admin/v1/capabilities/invoke"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
-            "ok": false,
-            "error": {
-                "code": "RUNTIME_CAPABILITY_DENIED",
-                "message": "policy denied",
-                "details": {}
-            }
-        })))
-        .mount(&server)
-        .await;
+    mount_invoke(
+        &server,
+        403,
+        json!({"ok": false, "error": {"code": "RUNTIME_CAPABILITY_DENIED", "message": "policy denied"}}),
+    )
+    .await;
 
     let invoker = SorxHttpInvoker::fetch(server.uri()).await;
     let out = invoker
@@ -162,18 +159,12 @@ async fn invoke_403_maps_to_denied_error_value() {
 async fn invoke_404_maps_to_capability_not_found_error_value() {
     let server = MockServer::start().await;
     mount_caps_get(&server, caps_response_one_business_action()).await;
-    Mock::given(method("POST"))
-        .and(path("/admin/v1/capabilities/invoke"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "ok": false,
-            "error": {
-                "code": "RUNTIME_CAPABILITY_NOT_FOUND",
-                "message": "capability does not resolve to a business action",
-                "details": {}
-            }
-        })))
-        .mount(&server)
-        .await;
+    mount_invoke(
+        &server,
+        404,
+        json!({"ok": false, "error": {"code": "RUNTIME_CAPABILITY_NOT_FOUND", "message": "capability does not resolve to a business action"}}),
+    )
+    .await;
 
     let invoker = SorxHttpInvoker::fetch(server.uri()).await;
     let out = invoker
@@ -471,11 +462,7 @@ async fn invoke_rereads_the_route_on_every_call() {
 async fn a_401_is_sorla_unauthorized_without_the_body() {
     let server = MockServer::start().await;
     mount_caps_get(&server, caps_response_one_business_action()).await;
-    Mock::given(method("POST"))
-        .and(path("/admin/v1/capabilities/invoke"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"secret": "leak"})))
-        .mount(&server)
-        .await;
+    mount_invoke(&server, 401, json!({"secret": "leak"})).await;
 
     let (_secrets, inv) = routed_invoker(&[("landlord", &server.uri(), None)]).await;
     let err = inv
@@ -484,4 +471,19 @@ async fn a_401_is_sorla_unauthorized_without_the_body() {
         .expect_err("401 must be Err");
     assert!(err.contains("sorla_unauthorized"));
     assert!(!err.contains("leak"));
+}
+
+#[tokio::test]
+async fn an_offer_for_another_pack_is_dropped_not_listed_under_the_bound_sor() {
+    // `landlord`'s server also offers a `billing` op — a misbehaving or
+    // shared-deployment SoR. The SoR key is the cap-URI pack segment (global
+    // constraint), so only `landlord`'s own op may surface for this SoR.
+    let server = MockServer::start().await;
+    mount_caps_get(&server, caps_response_landlord_plus_billing()).await;
+
+    let (_secrets, inv) = routed_invoker(&[("landlord", &server.uri(), None)]).await;
+    let ops = inv.list_operations();
+    assert_eq!(ops.len(), 1, "the billing op must be dropped, not listed");
+    assert_eq!(ops[0].pack, "landlord");
+    assert_eq!(ops[0].action, "record_rent_payment");
 }

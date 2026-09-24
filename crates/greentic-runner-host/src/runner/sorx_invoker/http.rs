@@ -187,9 +187,16 @@ fn parse_capabilities(body: &Value) -> (Vec<SorxOperation>, HashMap<(String, Str
 
 /// Discover a SoR's capability surface: `GET {route.url}/admin/v1/capabilities`,
 /// carrying `Authorization: Bearer <token>` when `route.token` is `Some`. A
-/// down/unreachable SoR or an unparsable body degrades to an empty operation
-/// set (logged), never a propagated error — a down SoR must never crash
-/// worker startup or discovery for its siblings.
+/// down/unreachable SoR, a non-2xx status, or an unparsable body all degrade
+/// to an empty operation set (logged), never a propagated error — a down SoR
+/// must never crash worker startup or discovery for its siblings.
+///
+/// The status is checked explicitly rather than left to `resp.json()`: a
+/// rejected credential (401, or any other non-2xx) still carries a JSON body
+/// on most SoRX implementations, which would otherwise parse as zero offers
+/// and silently drop every tool with no signal beyond an empty list. Only
+/// the status code is logged — never the body, which may echo the request
+/// or carry the SoR's own diagnostic detail, and never the token.
 pub(crate) async fn discover(
     client: &reqwest::Client,
     route: &SorlaRouteDoc,
@@ -200,17 +207,36 @@ pub(crate) async fn discover(
         req = req.bearer_auth(token);
     }
     match req.send().await {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(body) => parse_capabilities(&body),
-            Err(err) => {
-                tracing::warn!(
-                    url = %route.url,
-                    error = %err,
-                    "sorla: failed to parse SoRX capabilities response; starting with an empty tool set"
-                );
-                (Vec::new(), HashMap::new())
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                if status.as_u16() == 401 {
+                    tracing::warn!(
+                        url = %route.url,
+                        status = status.as_u16(),
+                        "sorla_unauthorized: the SoR rejected this caller's credential during discovery; starting with an empty tool set"
+                    );
+                } else {
+                    tracing::warn!(
+                        url = %route.url,
+                        status = status.as_u16(),
+                        "sorla: SoRX capabilities endpoint returned a non-success status; starting with an empty tool set"
+                    );
+                }
+                return (Vec::new(), HashMap::new());
             }
-        },
+            match resp.json::<Value>().await {
+                Ok(body) => parse_capabilities(&body),
+                Err(err) => {
+                    tracing::warn!(
+                        url = %route.url,
+                        error = %err,
+                        "sorla: failed to parse SoRX capabilities response; starting with an empty tool set"
+                    );
+                    (Vec::new(), HashMap::new())
+                }
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 url = %route.url,
@@ -400,6 +426,28 @@ pub(crate) mod fixtures {
         let text = caps_response_one_business_action().to_string();
         serde_json::from_str(&text.replace("landlord", pack))
             .expect("substituting a pack name keeps the JSON well-formed")
+    }
+
+    /// One `landlord` business-action offer and one `billing` business-action
+    /// offer from the SAME server — a misbehaving or shared-deployment SoR
+    /// offering another pack's ops alongside its own.
+    pub(crate) fn caps_response_landlord_plus_billing() -> serde_json::Value {
+        json!({
+            "schema": "greentic.capabilities.v1",
+            "offers": [
+                {
+                    "capability": "cap://greentic/business-functions/landlord/record_rent_payment/v0.1.0",
+                    "contracts": ["greentic.sorx.business-action.invoke.v1"],
+                    "metadata": {"action": {"id": "record_rent_payment", "label": "Record a rent payment"}}
+                },
+                {
+                    "capability": "cap://greentic/business-functions/billing/charge_card/v0.1.0",
+                    "contracts": ["greentic.sorx.business-action.invoke.v1"],
+                    "metadata": {"action": {"id": "charge_card", "label": "Charge a card"}}
+                }
+            ],
+            "requires": []
+        })
     }
 
     /// One business-action offer, one agent-endpoint offer (greentic-sorx
