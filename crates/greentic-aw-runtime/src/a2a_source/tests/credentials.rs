@@ -42,7 +42,10 @@ async fn a_credentialed_call_sends_bearer_on_send_message_and_nothing_on_the_car
 
     let catalog = source.catalog().await;
     let value = catalog.dispatch("recipe", &json!({"message": "hi"})).await;
-    assert_eq!(value, json!({"reply": "ok"}));
+    assert_eq!(
+        value,
+        json!({"status": "completed", "agent": "recipe", "reply": "ok"})
+    );
 
     let requests = server.received_requests().await.expect("request log");
     let gets: Vec<_> = requests

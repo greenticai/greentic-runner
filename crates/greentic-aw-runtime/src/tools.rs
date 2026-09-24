@@ -20,7 +20,7 @@ use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 
-use crate::a2a_source::A2aToolCatalog;
+use crate::a2a_source::{A2aContinuations, A2aToolCatalog};
 use crate::component_source::ComponentToolCatalog;
 use crate::config::ToolRef;
 use crate::error::{AgentError, StateError};
@@ -489,6 +489,44 @@ pub async fn dispatch_tool_call(
     call: ToolCallRecord,
     tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
+    dispatch_tool_call_in_conversation(
+        ext_runtime,
+        mcp,
+        components,
+        flows,
+        sorla,
+        a2a,
+        call,
+        tenant,
+        None,
+    )
+    .await
+}
+
+/// [`dispatch_tool_call`], plus the conversation's A2A continuations.
+///
+/// `a2a_continuations` is the ONLY difference. Passing `Some` lets an `a2a:`
+/// call resume the remote task this conversation already has open with that
+/// agent; passing `None` means "this caller holds no conversation state", so
+/// every `a2a:` call opens a fresh remote context — correct for a one-shot
+/// dispatch, and exactly what a remote agent asking `input-required` cannot
+/// be answered through.
+///
+/// Split out rather than folded into [`dispatch_tool_call`] so that function
+/// keeps its signature: it is `pub`, and greentic-start and
+/// greentic-designer pin this crate.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_tool_call_in_conversation(
+    ext_runtime: Arc<ExtensionRuntime>,
+    mcp: Option<Arc<McpToolCatalog>>,
+    components: Option<Arc<ComponentToolCatalog>>,
+    flows: Option<Arc<FlowToolCatalog>>,
+    sorla: Option<Arc<SorlaToolCatalog>>,
+    a2a: Option<Arc<A2aToolCatalog>>,
+    call: ToolCallRecord,
+    tenant: &TenantContext,
+    a2a_continuations: Option<&mut A2aContinuations>,
+) -> Result<serde_json::Value, AgentError> {
     // Established once, applied to the extension and component arms below —
     // the same arms #760 stamps on develop. Not to the `mcp:` arm: that
     // dispatches over HTTP to a server outside this deployment, and forwarding
@@ -597,10 +635,27 @@ pub async fn dispatch_tool_call(
 
     if let Some(agent_id) = call.extension_id.strip_prefix("a2a:") {
         let value = match a2a.as_deref() {
-            Some(catalog) => catalog.dispatch(agent_id, &call.args).await,
+            Some(catalog) => match a2a_continuations {
+                Some(continuations) => {
+                    catalog
+                        .dispatch_in_conversation(
+                            agent_id,
+                            &call.args,
+                            tenant,
+                            continuations,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                }
+                None => catalog.dispatch(agent_id, &call.args).await,
+            },
             None => {
                 tracing::warn!(agent = %agent_id, "a2a call has no catalog wired; returning error value");
-                serde_json::json!({ "error": format!("unknown a2a agent '{agent_id}'") })
+                serde_json::json!({
+                    "status": "error",
+                    "agent": agent_id,
+                    "error": format!("unknown a2a agent '{agent_id}'"),
+                })
             }
         };
         return Ok(value);

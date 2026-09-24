@@ -1696,6 +1696,13 @@ mod aw {
             None => None,
         };
         let tenant = TenantContext::new("", "");
+        // `dispatch_tool_call`, not its `_in_conversation` sibling: a graph
+        // node holds no `ConversationState`, so there is nowhere to keep a
+        // remote A2A `contextId` between calls. An `a2a:` tool reached from
+        // here therefore opens a fresh remote task each time and cannot
+        // answer an `input-required`. Closing that needs the graph executor's
+        // own checkpoint to carry the continuations, which is a separate
+        // change to a different state machine.
         dispatch_tool_call(ext_runtime, None, None, None, None, a2a, call, &tenant)
             .await
             .map_err(|e| GraphExecError::Tool(format!("dispatch '{}': {e}", req.tool_name)))
@@ -3876,7 +3883,10 @@ mod aw {
             .await
             .expect("dispatch succeeds");
 
-            assert_eq!(value, json!({"reply": "an omelette"}));
+            assert_eq!(
+                value,
+                json!({"status": "completed", "agent": AGENT_ID, "reply": "an omelette"})
+            );
             let requests = server.received_requests().await.unwrap();
             let post = requests
                 .iter()

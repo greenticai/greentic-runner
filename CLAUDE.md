@@ -264,6 +264,63 @@ runtime that `agent_node` already built.
 **Server contract**: `POST {endpoint}/v1/indexes/{index_id}/search`, served by
 `greentic-chronicle-ext`'s `chronicle-index-server`.
 
+### A worker's A2A conversation with a remote agent is multi-turn
+
+An `a2a:<agent_id>` tool call is a message to an external agent, and the
+remote may answer `input-required` — "which city?" — rather than an answer.
+Until this landed every `SendMessage` carried `contextId: None`, so the reply
+to that question opened a NEW remote task and the remote asked again. The
+protocol types had modelled `TaskState::InputRequired` from the start;
+nothing used it.
+
+**What the conversation remembers.** `ConversationState.a2a`
+(`a2a_source::A2aContinuations`, `#[serde(default)]`) holds, per remote
+agent, the `contextId` and — only while the task is open — the `taskId`.
+It rides in the worker's own per-session state, keyed
+`aw:{tenant}:{env}:{session}:state`, rather than in a store of its own, so it
+survives a restart on the durable backends and is shared across instances on
+Redis.
+
+**The two ids have different lifetimes, and conflating them is the bug this
+is shaped to avoid** (design §7). `contextId` is the conversation with that
+agent; `taskId` is ONE remote execution. A `taskId` is dropped the moment
+`TaskState::progress()` says the task is no longer `Open` — a completed task
+will not accept another message — while the `contextId` survives, so the next
+question lands in the same remote thread rather than a fresh one.
+
+**The lifetime rule** is idle expiry: every successful call refreshes the
+entry, and one hour (`CONTINUATION_IDLE_TTL_SECS`) after the last call it is
+dropped and the next call starts fresh. Sending a reference the remote has
+already collected is worse than sending none — depending on the agent that is
+an error, or it silently opens a new task while we believe we resumed one.
+At most 16 agents are remembered per conversation, LRU-evicted, because the
+map is serialised on every state save.
+
+**Two conversations never share a remote context.** They are different
+`ConversationState`s, so they hold different maps. Each entry ALSO records
+the tenant and env it was minted under and is discarded if they do not match
+the running `TenantContext` — the key protects the store, this protects the
+value, which matters because `ConversationState` is public and callers
+(greentic-designer) build their own.
+
+**The tool result is a tagged object, with one rule worth more than the rest
+of the shape: `reply` appears if and only if `status` is `completed`.**
+`input_required` carries `question` plus a `next_step` telling the model the
+remote is waiting; `working` carries `detail`; `failed` carries `error` and
+the remote `state` (`failed`/`canceled`/`rejected`/`auth_required`); `error`
+is OUR failure to reach the agent at all, which is a different fact and sends
+an operator to a different system. The old shape flattened every one of these
+into `{"reply": <prose about our own polling support>}`, which a model read
+as the agent's answer. Pinned by
+`a2a_source::outcome::tests::only_a_completed_outcome_carries_a_reply`.
+
+**Two call sites deliberately have NO continuation**, and both open a fresh
+remote context every time: `A2aToolCatalog::dispatch` (kept for one-shot
+callers) and the agent-graph tool node, which holds no `ConversationState` —
+closing the latter means teaching the graph executor's checkpoint to carry
+the map. `ToolSession` (the in-process deep worker behind `operala.call`)
+keeps one in memory for the life of the session only.
+
 ### Async runtime dispatch (`sorla.call` node)
 
 **A route document is the primary transport, and NATS is now the fallback (amendment

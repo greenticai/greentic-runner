@@ -424,7 +424,10 @@ mod tests {
             AgentStep::ToolCall { name, result, .. } if name == "ask" => Some(result.clone()),
             _ => None,
         });
-        assert_eq!(result, Some(json!({"reply": "an omelette"})));
+        assert_eq!(
+            result,
+            Some(json!({"status": "completed", "agent": AGENT_ID, "reply": "an omelette"}))
+        );
         assert_eq!(out.terminated_by, TerminationReason::FinalReply);
     }
 }
