@@ -418,6 +418,59 @@ fn reply_text(agent_id: &str, parts: &[Part], empty: &str) -> Result<String, Str
     Ok(texts.join("\n"))
 }
 
+/// The answer a completed task's artifacts carry: its prose, then the
+/// structured results beside it.
+///
+/// Reading only the `text` parts — which is what this did until 2026-09-25 —
+/// drops the half of the answer a program asked for. greentic-start answers a
+/// turn that produced a structured output with a `Task` whose artifacts are
+/// the turn's prose AND one `application/json` `data` part per output
+/// (worker-interop contract D13), so a Greentic worker calling another
+/// Greentic worker received the sentence and never the object the callee
+/// deliberately produced. Nothing was red: the call succeeded, the model
+/// answered from the prose alone, and the missing result looked like the
+/// callee not having produced one.
+///
+/// The media type is matched EXACTLY, never by a `+json` suffix. An Adaptive
+/// Card is `application/vnd.microsoft.card.adaptive+json`, and contract D10
+/// says a card reaches an agent caller only when it asked for one — this
+/// client never does, so a conformant server never sends one, and an exact
+/// match means a non-conformant one cannot get a card in front of the model
+/// through this door either. A vendor `+json` type is a rendering, not a
+/// result.
+///
+/// Serialized compactly on its own line, because the destination is an LLM
+/// tool result: a `Value` has to become text somewhere, and doing it here
+/// keeps the object beside the words that explain it.
+fn artifact_answer(agent_id: &str, parts: &[Part]) -> Result<String, String> {
+    let mut lines: Vec<String> = parts.iter().filter_map(|part| part.text.clone()).collect();
+    lines.extend(parts.iter().filter_map(structured_text));
+    if lines.is_empty() {
+        return Err(format!(
+            "a2a agent {agent_id} completed a task with no text artifact"
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// One artifact part's structured value as compact JSON, or `None` when the
+/// part is not one.
+fn structured_text(part: &Part) -> Option<String> {
+    let value = part.data.as_ref()?;
+    if part.media_type.as_deref() != Some(STRUCTURED_OUTPUT_MEDIA_TYPE) {
+        return None;
+    }
+    // A value that cannot be re-serialized came off the wire as JSON, so this
+    // is unreachable in practice; dropping it is still better than failing a
+    // call over a part the prose may already have explained.
+    serde_json::to_string(value).ok()
+}
+
+/// The media type greentic-start stamps on a structured-output artifact part
+/// (`interop::a2a::STRUCTURED_OUTPUT_MEDIA_TYPE`). Declared here rather than
+/// imported because the two repositories share a protocol, not a crate.
+const STRUCTURED_OUTPUT_MEDIA_TYPE: &str = "application/json";
+
 /// What the model should see when an agent answered with a `Task`, and what
 /// the conversation should remember about it.
 ///
@@ -447,7 +500,7 @@ fn task_reply(agent_id: &str, task: Task) -> A2aReply {
                 .iter()
                 .flat_map(|artifact| artifact.parts.iter().cloned())
                 .collect();
-            match reply_text(agent_id, &parts, "completed a task with no text artifact") {
+            match artifact_answer(agent_id, &parts) {
                 Ok(text) => A2aOutcome::Answered { text },
                 // A completed task with nothing to read is not an answer.
                 // Reported as an end state rather than as an empty reply, so
