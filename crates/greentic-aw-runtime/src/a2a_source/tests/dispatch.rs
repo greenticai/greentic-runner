@@ -732,3 +732,104 @@ async fn the_no_conversation_dispatch_never_resumes_anything() {
     let sent = sent_references(&server).await;
     assert_eq!(sent, vec![(None, None), (None, None)]);
 }
+
+/// The exact wire shape greentic-start answers a completed structured turn
+/// with (worker-interop contract D13, `interop::a2a::rpc::artifacts_for`):
+/// artifact 1 is the turn's prose under the name `reply`, and one
+/// `application/json` artifact follows per structured output, named after the
+/// producing node.
+fn structured_task_reply() -> serde_json::Value {
+    json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {
+        "id": "t-1",
+        "contextId": "ctx-1",
+        "status": {"state": "TASK_STATE_COMPLETED"},
+        "artifacts": [
+            {"artifactId": "a-1", "name": "reply",
+             "parts": [{"text": "It is 21.3 degrees in Barcelona."}]},
+            {"artifactId": "a-2", "name": "weather_lookup",
+             "parts": [{"data": {"temp_c": 21.3, "city": "Barcelona"},
+                        "mediaType": "application/json"}]}
+        ]
+    }}})
+}
+
+#[tokio::test]
+async fn a_structured_answer_reaches_the_model_beside_the_prose() {
+    // The half this client dropped until 2026-09-25: it read `text` parts
+    // only, so a callee's structured result — the whole reason a program
+    // calls an agent — never reached the model, with nothing red anywhere.
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, structured_task_reply()).await;
+
+    let reply = source_for(vec![("weather", server.uri())])
+        .call("weather", "Barcelona?")
+        .await
+        .expect("a completed task is a result");
+
+    assert!(
+        reply.contains("It is 21.3 degrees in Barcelona."),
+        "the prose must still lead: {reply}"
+    );
+    assert!(
+        reply.contains("\"temp_c\":21.3") && reply.contains("\"city\":\"Barcelona\""),
+        "the structured output must reach the model: {reply}"
+    );
+}
+
+#[tokio::test]
+async fn an_adaptive_card_part_is_not_read_as_a_structured_answer() {
+    // Contract D10: a card reaches an agent caller only when it asked for
+    // one, and this client never asks. Matching the media type exactly is
+    // what keeps a non-conformant server from putting card markup in front
+    // of the model through the artifact door.
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(
+        &server,
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {
+            "id": "t-1",
+            "status": {"state": "TASK_STATE_COMPLETED"},
+            "artifacts": [
+                {"parts": [{"text": "Pick one."}]},
+                {"parts": [{"data": {"type": "AdaptiveCard"},
+                            "mediaType": "application/vnd.microsoft.card.adaptive+json"}]}
+            ]
+        }}}),
+    )
+    .await;
+
+    let reply = source_for(vec![("picker", server.uri())])
+        .call("picker", "hi")
+        .await
+        .expect("the prose is still an answer");
+
+    assert_eq!(reply, "Pick one.");
+}
+
+#[tokio::test]
+async fn a_structured_only_task_is_answered_rather_than_reported_as_empty() {
+    // greentic-start always leads with the prose, so this is a shape only
+    // another implementation produces. A task carrying a result and no
+    // sentence has still answered; reporting it as "no text artifact" would
+    // tell the model the agent said nothing while holding what it said.
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(
+        &server,
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {
+            "id": "t-1",
+            "status": {"state": "TASK_STATE_COMPLETED"},
+            "artifacts": [{"parts": [{"data": {"ok": true},
+                                      "mediaType": "application/json"}]}]
+        }}}),
+    )
+    .await;
+
+    let reply = source_for(vec![("probe", server.uri())])
+        .call("probe", "hi")
+        .await
+        .expect("a structured result is an answer");
+
+    assert_eq!(reply, "{\"ok\":true}");
+}
