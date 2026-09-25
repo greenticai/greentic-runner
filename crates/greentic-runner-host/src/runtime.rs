@@ -357,6 +357,7 @@ pub struct RevisionLoad<'a> {
 pub struct RevisionHostOptions {
     #[cfg(feature = "agentic-worker")]
     billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+    run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
 }
 
 impl std::fmt::Debug for RevisionHostOptions {
@@ -364,6 +365,7 @@ impl std::fmt::Debug for RevisionHostOptions {
         let mut out = f.debug_struct("RevisionHostOptions");
         #[cfg(feature = "agentic-worker")]
         out.field("billing_meter", &self.billing_meter.is_some());
+        out.field("run_outcome_sink", &self.run_outcome_sink.is_some());
         out.finish()
     }
 }
@@ -379,6 +381,20 @@ impl RevisionHostOptions {
         meter: Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
     ) -> Self {
         self.billing_meter = Some(meter);
+        self
+    }
+
+    /// Report one [`crate::run_outcome::RunOutcome`] per flow turn of this
+    /// unit through `sink` — the deployed run audit. greentic-start installs a
+    /// [`crate::run_outcome::HttpRunOutcomeSink`] built from the same staged
+    /// `metering` block as the billing meter. Without one, flow execution and
+    /// the persisted resume state are unchanged.
+    #[must_use]
+    pub fn with_run_outcome_sink(
+        mut self,
+        sink: Arc<dyn crate::run_outcome::RunOutcomeSink>,
+    ) -> Self {
+        self.run_outcome_sink = Some(sink);
         self
     }
 }
@@ -507,6 +523,7 @@ impl TenantRuntime {
             runtime_ref_resolver,
             #[cfg(feature = "agentic-worker")]
             None,
+            None,
         )
         .await
     }
@@ -514,8 +531,10 @@ impl TenantRuntime {
     /// [`load_revision`](Self::load_revision), taking its arguments as one
     /// struct plus the host-chosen [`RevisionHostOptions`] for this unit.
     ///
-    /// Today the only option is the billing sink
-    /// ([`RevisionHostOptions::with_billing_meter`]). greentic-start installs a
+    /// Two options exist: the run-outcome sink
+    /// ([`RevisionHostOptions::with_run_outcome_sink`], the deployed run audit
+    /// — see `crate::run_outcome`) and the billing sink
+    /// ([`RevisionHostOptions::with_billing_meter`]). For the latter, greentic-start installs a
     /// [`greentic_aw_runtime::billing::WorkerUsageMeter`] built from the unit's
     /// staged `metering` block, so the unit's LLM spend is recorded at the
     /// admin's per-unit ingest door. It is per-REVISION rather than a
@@ -556,8 +575,6 @@ impl TenantRuntime {
         args: RevisionLoad<'_>,
         options: RevisionHostOptions,
     ) -> Result<Arc<Self>> {
-        #[cfg(not(feature = "agentic-worker"))]
-        let _ = options;
         Self::load_revision_impl(
             args.pack_refs,
             args.config,
@@ -577,6 +594,7 @@ impl TenantRuntime {
             args.runtime_ref_resolver,
             #[cfg(feature = "agentic-worker")]
             options.billing_meter,
+            options.run_outcome_sink,
         )
         .await
     }
@@ -602,6 +620,7 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] billing_meter: Option<
             Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
         >,
+        run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -703,6 +722,7 @@ impl TenantRuntime {
             rollout,
             #[cfg(feature = "agentic-worker")]
             billing_meter,
+            run_outcome_sink,
         )
         .await
     }
@@ -819,8 +839,10 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             stream_observers,
             RolloutIds::default(),
-            // The tenant-only path has no unit, so no host-chosen meter.
+            // The tenant-only path has no unit, so no host-chosen meter and
+            // no run-outcome sink.
             #[cfg(feature = "agentic-worker")]
+            None,
             None,
         )
         .await
@@ -849,6 +871,7 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] installed_billing_meter: Option<
             Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
         >,
+        run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
@@ -1330,7 +1353,7 @@ impl TenantRuntime {
 
         let engine = Arc::new(engine);
         let state_machine = Arc::new(
-            StateMachineRuntime::from_flow_engine(
+            StateMachineRuntime::from_flow_engine_with_run_outcome_sink(
                 Arc::clone(&config),
                 Arc::clone(&engine),
                 pack_trace,
@@ -1340,6 +1363,7 @@ impl TenantRuntime {
                 Arc::clone(&secrets_manager),
                 mocks.clone(),
                 audit_nats_client,
+                run_outcome_sink,
             )
             .context("failed to initialise state machine runtime")?,
         );
