@@ -28,6 +28,8 @@ use super::state_machine::{FlowDefinition, FlowStep, PAYLOAD_FROM_LAST_INPUT};
 
 use crate::config::{HostConfig, SecretsPolicy};
 use crate::pack::FlowDescriptor;
+use crate::run_outcome::RunOutcomeSink;
+use crate::run_outcome::turn::{RunMarker, RunOutcomeObserver, RunOutcomeReporter, TurnContext};
 use crate::runner::engine::{
     FlowContext, FlowEngine, FlowExecution, FlowSnapshot, FlowStatus, FlowWait,
 };
@@ -63,6 +65,19 @@ impl FlowResumeStore {
     }
 
     pub async fn fetch(&self, envelope: &IngressEnvelope) -> GResult<Option<FlowSnapshot>> {
+        Ok(self
+            .fetch_with_run(envelope)
+            .await?
+            .map(|(snapshot, _)| snapshot))
+    }
+
+    /// [`fetch`](Self::fetch), plus the run-audit marker stored with the
+    /// snapshot (absent on a wait parked before markers existed, or by a host
+    /// with no run-outcome sink).
+    pub(crate) async fn fetch_with_run(
+        &self,
+        envelope: &IngressEnvelope,
+    ) -> GResult<Option<(FlowSnapshot, Option<RunMarker>)>> {
         let (mut ctx, user, _, scope) = build_store_ctx(envelope)?;
         ctx = ctx.with_user(Some(user.clone()));
 
@@ -95,7 +110,7 @@ impl FlowResumeStore {
                         record.snapshot.pack_id
                     )));
                 }
-                return Ok(Some(record.snapshot));
+                return Ok(Some((record.snapshot, record.run)));
             }
             Ok(None)
         })
@@ -103,10 +118,23 @@ impl FlowResumeStore {
     }
 
     pub async fn save(&self, envelope: &IngressEnvelope, wait: &FlowWait) -> GResult<ReplyScope> {
+        self.save_with_run(envelope, wait, None).await
+    }
+
+    /// [`save`](Self::save), persisting `run` beside the snapshot so the next
+    /// resume reports under the same run id. `None` stores exactly what
+    /// [`save`](Self::save) always stored.
+    pub(crate) async fn save_with_run(
+        &self,
+        envelope: &IngressEnvelope,
+        wait: &FlowWait,
+        run: Option<RunMarker>,
+    ) -> GResult<ReplyScope> {
         let (ctx, user, hint, scope) = build_store_ctx(envelope)?;
         let record = FlowResumeRecord {
             snapshot: wait.snapshot.clone(),
             reason: wait.reason.clone(),
+            run,
         };
         let data = record_to_session_data(&record, ctx.clone(), &user, &hint)?;
         let mut reply_scope = scope.clone();
@@ -157,6 +185,11 @@ struct FlowResumeRecord {
     snapshot: FlowSnapshot,
     #[serde(default)]
     reason: Option<String>,
+    /// Run-audit marker (`crate::run_outcome`). Skipped when absent, so a host
+    /// without a run-outcome sink persists byte-identical records, and a
+    /// record written before this field existed decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<RunMarker>,
 }
 
 fn build_store_ctx(envelope: &IngressEnvelope) -> GResult<(TenantCtx, UserId, String, ReplyScope)> {
@@ -336,6 +369,45 @@ mod tests {
         store.clear(&envelope).await?;
         assert!(store.fetch(&envelope).await?.is_none());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_store_round_trips_the_run_marker() -> GResult<()> {
+        let store = FlowResumeStore::new(new_session_store());
+        let envelope = sample_envelope();
+        let marker = RunMarker::mint();
+        let _ = store
+            .save_with_run(&envelope, &sample_wait(), Some(marker.clone()))
+            .await?;
+        let (_, run) = store
+            .fetch_with_run(&envelope)
+            .await?
+            .expect("snapshot missing");
+        assert_eq!(run, Some(marker));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wait_saved_without_a_marker_resumes_without_one() -> GResult<()> {
+        let store = FlowResumeStore::new(new_session_store());
+        let envelope = sample_envelope();
+        let _ = store.save(&envelope, &sample_wait()).await?;
+        let (_, run) = store
+            .fetch_with_run(&envelope)
+            .await?
+            .expect("snapshot missing");
+        assert_eq!(run, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_written_before_run_markers_decodes_and_a_markerless_one_is_unchanged() {
+        let wait = sample_wait();
+        let legacy = json!({ "snapshot": wait.snapshot, "reason": "await-user" });
+        let record: FlowResumeRecord = serde_json::from_value(legacy.clone()).expect("decode");
+        assert!(record.run.is_none());
+        // No marker ⇒ the exact bytes a pre-audit runtime wrote.
+        assert_eq!(serde_json::to_value(&record).expect("encode"), legacy);
     }
 
     #[tokio::test]
@@ -573,6 +645,9 @@ mod tests {
 
 pub struct StateMachineRuntime {
     runner: Runner,
+    /// Reports a turn that failed after every retry, once — see
+    /// `run_outcome::turn::TurnScope`. `None` without a sink.
+    run_outcome: Option<RunOutcomeReporter>,
 }
 
 impl StateMachineRuntime {
@@ -599,7 +674,10 @@ impl StateMachineRuntime {
             builder = builder.with_flow(flow);
         }
         let runner = builder.build()?;
-        Ok(Self { runner })
+        Ok(Self {
+            runner,
+            run_outcome: None,
+        })
     }
 
     /// Build a state-machine runtime that proxies pack flows through the legacy FlowEngine.
@@ -615,6 +693,37 @@ impl StateMachineRuntime {
         mocks: Option<Arc<MockLayer>>,
         audit_nats_client: Option<async_nats::Client>,
     ) -> Result<Self> {
+        Self::from_flow_engine_with_run_outcome_sink(
+            config,
+            engine,
+            pack_trace,
+            session_host,
+            session_store,
+            state_host,
+            secrets_manager,
+            mocks,
+            audit_nats_client,
+            None,
+        )
+    }
+
+    /// [`from_flow_engine`](Self::from_flow_engine), additionally reporting one
+    /// [`crate::run_outcome::RunOutcome`] per flow turn to `run_outcome_sink`.
+    /// `None` is exactly [`from_flow_engine`](Self::from_flow_engine).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_flow_engine_with_run_outcome_sink(
+        config: Arc<HostConfig>,
+        engine: Arc<FlowEngine>,
+        pack_trace: HashMap<String, PackTraceInfo>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        mocks: Option<Arc<MockLayer>>,
+        audit_nats_client: Option<async_nats::Client>,
+        run_outcome_sink: Option<Arc<dyn RunOutcomeSink>>,
+    ) -> Result<Self> {
+        let run_outcome = run_outcome_sink.map(RunOutcomeReporter::new);
         let policy = Arc::new(config.secrets_policy.clone());
         let tenant_ctx = config.tenant_ctx();
         let secrets = Arc::new(PolicySecretsHost::new(policy, secrets_manager, tenant_ctx));
@@ -635,6 +744,7 @@ impl StateMachineRuntime {
                 resume_store,
                 mocks,
                 audit_nats_client,
+                run_outcome.clone(),
             )),
         );
 
@@ -649,7 +759,10 @@ impl StateMachineRuntime {
         let runner = builder
             .build()
             .map_err(|err| anyhow!("state machine init failed: {err}"))?;
-        Ok(Self { runner })
+        Ok(Self {
+            runner,
+            run_outcome,
+        })
     }
 
     /// Execute the flow associated with the provided ingress event.
@@ -695,10 +808,12 @@ impl StateMachineRuntime {
             input,
             session_hint: Some(session_hint),
         };
-        self.runner
-            .run_flow(request)
-            .await
-            .map_err(|err| anyhow!("flow execution failed: {err}"))
+        let run = self.runner.run_flow(request);
+        let result = match self.run_outcome.as_ref() {
+            Some(reporter) => reporter.scoped(run).await,
+            None => run.await,
+        };
+        result.map_err(|err| anyhow!("flow execution failed: {err}"))
     }
 }
 
@@ -792,6 +907,9 @@ struct PackFlowAdapter {
     /// default, off path) when `GREENTIC_EVENTS_NATS_URL` is unset or NATS
     /// could not be reached — see `docs/superpowers/specs/2026-07-03-runner-audit-emitter-design.md`.
     audit_nats_client: Option<async_nats::Client>,
+    /// Run-audit reporter; `None` (the default) installs no observer, mints no
+    /// run id and changes nothing — see `crate::run_outcome`.
+    run_outcome: Option<RunOutcomeReporter>,
 }
 
 impl PackFlowAdapter {
@@ -802,6 +920,7 @@ impl PackFlowAdapter {
         resume: FlowResumeStore,
         mocks: Option<Arc<MockLayer>>,
         audit_nats_client: Option<async_nats::Client>,
+        run_outcome: Option<RunOutcomeReporter>,
     ) -> Self {
         Self {
             tenant: config.tenant.clone(),
@@ -811,6 +930,7 @@ impl PackFlowAdapter {
             resume,
             mocks,
             audit_nats_client,
+            run_outcome,
         }
     }
 }
@@ -841,7 +961,10 @@ impl Adapter for PackFlowAdapter {
         let provider_owned = envelope.provider.clone();
         let payload = envelope.payload.clone();
         let retry_config = self.config.retry_config().into();
-        let resume_snapshot = self.resume.fetch(&envelope).await?;
+        let (resume_snapshot, resume_run) = match self.resume.fetch_with_run(&envelope).await? {
+            Some((snapshot, run)) => (Some(snapshot), run),
+            None => (None, None),
+        };
         let resume_flow_id = resume_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.next_flow.clone())
@@ -925,6 +1048,35 @@ impl Adapter for PackFlowAdapter {
         // Cloned rather than borrowed: `payload` is moved into the run below,
         // and the context must outlive that move.
         let caller_block = crate::caller_identity::caller_block(&payload).cloned();
+        // Run audit: only when a sink is installed. The wrapper observer
+        // forwards to the trace recorder, so trace output is unchanged.
+        let turn = self.run_outcome.as_ref().map(|reporter| {
+            // A retried attempt of the same turn reuses its first attempt's
+            // run rather than minting another (see `run_outcome::turn`).
+            let resumed = resume_run.or_else(|| reporter.retried_marker());
+            let turn = TurnContext::begin(
+                &envelope,
+                caller_block.as_ref(),
+                resumed,
+                effective_flow_id.as_str(),
+            );
+            reporter.remember(&turn.marker);
+            turn
+        });
+        let outcome_observer = turn.as_ref().map(|_| {
+            RunOutcomeObserver::new(
+                trace
+                    .as_ref()
+                    .map(|recorder| recorder as &dyn crate::runner::engine::ExecutionObserver),
+            )
+        });
+        let observer: Option<&dyn crate::runner::engine::ExecutionObserver> =
+            match outcome_observer.as_ref() {
+                Some(observer) => Some(observer),
+                None => trace
+                    .as_ref()
+                    .map(|recorder| recorder as &dyn crate::runner::engine::ExecutionObserver),
+            };
         let ctx = FlowContext {
             tenant: &self.tenant,
             pack_id: effective_pack_id.as_str(),
@@ -940,9 +1092,7 @@ impl Adapter for PackFlowAdapter {
             reply_scope: envelope.reply_scope.as_ref(),
             retry_config,
             attempt: 1,
-            observer: trace
-                .as_ref()
-                .map(|recorder| recorder as &dyn crate::runner::engine::ExecutionObserver),
+            observer,
             mocks,
             caller: caller_block.as_ref(),
         };
@@ -979,6 +1129,15 @@ impl Adapter for PackFlowAdapter {
                 {
                     tracing::warn!(error = %write_err, "failed to write trace");
                 }
+                // The error text is read only to pick a class; it is never
+                // part of the reported outcome.
+                if let (Some(reporter), Some(turn), Some(observer)) = (
+                    self.run_outcome.as_ref(),
+                    turn.as_ref(),
+                    outcome_observer.as_ref(),
+                ) {
+                    reporter.record_failure(turn.failed(&observer.observed(), &format!("{err:#}")));
+                }
                 return Err(RunnerError::AdapterCall {
                     // `{:#}` flattens the full anyhow source chain; a bare
                     // `to_string()` keeps only the outermost context and drops
@@ -994,13 +1153,24 @@ impl Adapter for PackFlowAdapter {
             status,
             node_outputs,
         } = execution;
+        let observed = outcome_observer
+            .as_ref()
+            .map(RunOutcomeObserver::observed)
+            .unwrap_or_default();
         match status {
             FlowStatus::Completed => {
+                if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
+                    reporter.record(turn.completed(&observed, &output));
+                }
                 self.resume.clear(&envelope).await?;
                 Ok((output, node_outputs))
             }
             FlowStatus::Waiting(wait) => {
-                let reply_scope = self.resume.save(&envelope, &wait).await?;
+                let marker = turn.as_ref().map(|turn| turn.marker_after(&observed));
+                let reply_scope = self.resume.save_with_run(&envelope, &wait, marker).await?;
+                if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
+                    reporter.record(turn.waiting(&observed, &wait.snapshot.next_node));
+                }
                 let outcome = json!({
                     "status": "pending",
                     "reason": wait.reason,

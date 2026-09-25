@@ -219,6 +219,19 @@ impl HostNode {
     pub fn operation_in_mapping(&self) -> Option<&str> {
         self.operation_in_mapping.as_deref()
     }
+
+    /// Whether this node runs an agentic worker: `dw.agent`, `dw.agent_graph`,
+    /// an `operala.call` deep worker, or an out-of-process `agentic.call`.
+    /// The run audit (`crate::run_outcome`) reports such a run as agentic.
+    pub(crate) fn is_agentic(&self) -> bool {
+        matches!(
+            self.kind,
+            NodeKind::DwAgent { .. }
+                | NodeKind::DwAgentGraph { .. }
+                | NodeKind::OperalaCall { .. }
+                | NodeKind::AgenticCall { .. }
+        )
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +253,17 @@ impl HostNode {
             payload_expr: Value::Null,
             routing: Routing::End,
             vars_out: None,
+        }
+    }
+
+    /// A `dw.agent` node, for tests that only need the node's kind.
+    pub(crate) fn for_test_dw_agent(agent_id: &str) -> Self {
+        HostNode {
+            kind: NodeKind::DwAgent {
+                agent_id: agent_id.to_string(),
+                conversational: false,
+            },
+            ..Self::for_test("dw.agent", Some(agent_id))
         }
     }
 }

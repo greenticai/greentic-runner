@@ -45,6 +45,7 @@ pub mod provider;
 pub mod provider_core;
 pub mod provider_core_only;
 pub mod routing;
+pub mod run_outcome;
 pub mod runner;
 pub mod runtime;
 pub mod runtime_refs;
