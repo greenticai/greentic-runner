@@ -47,6 +47,7 @@ pub mod mcp_secrets;
 pub mod mcp_source;
 pub mod mcp_store_pull;
 pub mod memory;
+pub mod playbook_source;
 pub mod scoped_secrets;
 pub mod short_term;
 pub mod sorla_source;
@@ -103,6 +104,11 @@ pub use mcp_source::{
     McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route,
 };
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
+pub use playbook_source::{
+    PlaybookLlmCapability, PlaybookLlmRequirement, PlaybookLlmTier, PlaybookOperation,
+    PlaybookSource, PlaybookToolCatalog, PlaybookToolEntry, PlaybookToolSource, PlaybookTurnFn,
+    PlaybookTurnRequest, PlaybookTurnResult,
+};
 pub use sorla_source::{
     SorlaToolCatalog, SorlaToolEntry, SorlaToolSource, SorxInvoker, SorxOperation,
 };
@@ -206,6 +212,10 @@ pub struct AgentRuntime {
     /// runner-host pack flow runtime) is injected at the runner-host edge, never
     /// compiled in.
     pub(crate) flows: Option<Arc<crate::flow_source::FlowToolSource>>,
+    /// Set by [`AgentRuntime::with_playbook_source`]; the pack reader and the
+    /// turn effect both live in the host (see `playbook_source`'s header for
+    /// why the turn cannot be resolved here).
+    pub(crate) playbooks: Option<Arc<crate::playbook_source::PlaybookToolSource>>,
     /// Per-tenant agentic-worker SoRLa SoR tool source. `None` disables sorla
     /// tools entirely (`sorla:`-prefixed tool refs then resolve to nothing).
     /// Set via [`AgentRuntime::with_sorla_source`]; the concrete invoker (over
@@ -264,6 +274,7 @@ impl AgentRuntime {
             guardrail_evaluator: Arc::new(crate::guardrail::AcceptAllEvaluator),
             components: None,
             flows: None,
+            playbooks: None,
             sorla: None,
             a2a: None,
             long_term_memory: None,
@@ -319,6 +330,21 @@ impl AgentRuntime {
         flows: Option<Arc<crate::flow_source::FlowToolSource>>,
     ) -> Self {
         self.flows = flows;
+        self
+    }
+
+    /// Wire the playbook tool source so `playbook:`-prefixed tool refs resolve
+    /// to the playbooks the loaded packs carry. Defaults off when not set.
+    ///
+    /// Unlike every sibling source this one carries a TURN EFFECT as well as a
+    /// reader, because running a playbook is an LLM turn rather than an outbound
+    /// call — see `playbook_source`'s header.
+    #[must_use]
+    pub fn with_playbook_source(
+        mut self,
+        playbooks: Option<Arc<crate::playbook_source::PlaybookToolSource>>,
+    ) -> Self {
+        self.playbooks = playbooks;
         self
     }
 

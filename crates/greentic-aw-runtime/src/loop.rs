@@ -314,13 +314,15 @@ pub async fn run_step(
         system_prompt
     };
 
-    // Resolve the per-tenant tool catalogs (MCP, component, flow, SoRLa, A2A)
+    // Resolve the per-tenant tool catalogs (MCP, component, flow, playbook,
+    // SoRLa, A2A)
     // once per step. Every source is infallible (degrades to an empty catalog
     // on any admin/server failure) and TTL-cached, so a stable config does not
     // re-hit the network across iterations. `None` source → no tools of that
     // prefix. `ToolCatalogs` is shared with `AgentRuntime::tool_session`, so
     // an external loop resolves exactly what this one does.
-    let catalogs = crate::tool_session::ToolCatalogs::resolve(runtime, &tenant).await;
+    let catalogs =
+        crate::tool_session::ToolCatalogs::resolve(runtime, &tenant, &config.tools).await;
 
     // Preflight: surface declared tools that won't reach the LLM. Without this
     // the runtime drops unresolved tools silently (per-tool debug warns) and the
