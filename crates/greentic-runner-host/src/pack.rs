@@ -3258,6 +3258,16 @@ impl PackRuntime {
         &self.metadata
     }
 
+    /// The manifest's human `name`, when the pack declares one (blank counts
+    /// as absent). A legacy manifest carries no name.
+    pub fn manifest_name(&self) -> Option<&str> {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
     /// Read an asset file from the pack's assets directory.
     ///
     /// Accepts paths like `assets/cards/card-a.json` or `cards/card-a.json`

@@ -149,6 +149,25 @@ fn the_body_carries_the_ingest_fields_and_nothing_else() {
     assert!(!value["event_id"].as_str().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn inside_a_run_scope_the_event_carries_the_run_id() {
+    let meter = WorkerUsageMeter::new(target("https://admin.example/ingest")).unwrap();
+    let value = crate::billing::with_run_id("01RUNID".into(), async {
+        serde_json::to_value(meter.build_event(1, 1, "a", "m").unwrap()).unwrap()
+    })
+    .await;
+    assert_eq!(value["run_id"], "01RUNID");
+
+    // Outside a run, and for an id the admin would refuse, it is omitted.
+    let outside = serde_json::to_value(meter.build_event(1, 1, "a", "m").unwrap()).unwrap();
+    assert!(outside.get("run_id").is_none(), "{outside}");
+    let long = crate::billing::with_run_id("r".repeat(300), async {
+        serde_json::to_value(meter.build_event(1, 1, "a", "m").unwrap()).unwrap()
+    })
+    .await;
+    assert!(long.get("run_id").is_none(), "{long}");
+}
+
 #[test]
 fn every_event_gets_its_own_id() {
     let meter = WorkerUsageMeter::new(target("https://admin.example/ingest")).unwrap();

@@ -9,7 +9,14 @@
 //! - a failing node reports `technical_error` with the failing node and a
 //!   short class, and no reported field carries message text or error text;
 //! - an engine `Err` reports `technical_error`;
-//! - a flow that runs a `dw.agent` node reports `agentic` only;
+//! - a flow that runs a `dw.agent` node reports `kind: agentic` with a real
+//!   status, step and code (v2 never sends `status: agentic`);
+//! - `seq` counts a run's events across turns;
+//! - an in-progress event carries `wait_kind` and a `response_due_at` taken
+//!   from the parked node's `response_timeout_secs`;
+//! - a `flow.call` sub-flow and a `flow:`-tool flow emit nothing of their own,
+//!   and a `flow.goto` continues the same run in the target flow;
+//! - the worker identity is the pack's manifest identity;
 //! - a runtime with NO sink persists the exact resume record it always did.
 //!
 //! Harness copied from `tests/resume_characterization.rs`.
@@ -27,7 +34,7 @@ use greentic_runner_host::config::{
 };
 use greentic_runner_host::engine::runtime::{IngressEnvelope, StateMachineRuntime};
 use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
-use greentic_runner_host::run_outcome::{RunKind, RunOutcome, RunOutcomeSink, RunStatus};
+use greentic_runner_host::run_outcome::{RunKind, RunOutcome, RunOutcomeSink, RunStatus, WaitKind};
 use greentic_runner_host::runner::engine::FlowEngine;
 use greentic_runner_host::storage::new_session_store;
 use greentic_runner_host::storage::session::session_host_from;
@@ -47,6 +54,7 @@ use zip::write::FileOptions;
 
 const RUNTIME_FLOW_EXTENSION_ID: &str = "greentic.pack.runtime_flow";
 const PACK_ID: &str = "run.outcome.emission";
+const PACK_NAME: &str = "Run outcome emission";
 const SECRET_TEXT: &str = "my password is hunter2";
 
 static RUNTIME: Lazy<&'static tokio::runtime::Runtime> = Lazy::new(|| {
@@ -165,6 +173,52 @@ fn build_pack(pack_path: &Path) -> Result<()> {
             }
         },
         {
+            "id": "call.flow",
+            "flow_type": "messaging",
+            "start": "call",
+            "nodes": {
+                "call": {
+                    "component": "flow.call",
+                    "input": { "flow_id": "sub.flow" },
+                    "routing": { "next": { "node_id": "ask" } }
+                },
+                "ask": {
+                    "component": "session.wait",
+                    "input": { "reason": "awaiting the user", "response_timeout_secs": 600 },
+                    "routing": { "next": { "node_id": "done" } }
+                },
+                "done": {
+                    "component": "emit.response",
+                    "input": { "text": "thanks" },
+                    "routing": "end"
+                }
+            }
+        },
+        {
+            "id": "sub.flow",
+            "flow_type": "messaging",
+            "start": "hello",
+            "nodes": {
+                "hello": {
+                    "component": "emit.response",
+                    "input": { "text": "hello from the sub-flow" },
+                    "routing": "end"
+                }
+            }
+        },
+        {
+            "id": "goto.flow",
+            "flow_type": "messaging",
+            "start": "jump",
+            "nodes": {
+                "jump": {
+                    "component": "flow.goto",
+                    "input": { "flow_id": "wait.flow" },
+                    "routing": "end"
+                }
+            }
+        },
+        {
             "id": "agent.flow",
             "flow_type": "messaging",
             "start": "agent",
@@ -192,7 +246,7 @@ fn build_pack(pack_path: &Path) -> Result<()> {
     let manifest = PackManifest {
         schema_version: "1.0".into(),
         pack_id: PACK_ID.parse()?,
-        name: None,
+        name: Some(PACK_NAME.into()),
         version: Version::parse("0.0.0")?,
         kind: PackKind::Application,
         publisher: "test".into(),
@@ -238,6 +292,7 @@ struct Harness {
     _temp: TempDir,
     runtime: StateMachineRuntime,
     sink: Arc<RecordingSink>,
+    pack: Arc<PackRuntime>,
 }
 
 fn harness(with_sink: bool) -> Result<Harness> {
@@ -261,7 +316,10 @@ fn harness(with_sink: bool) -> Result<Harness> {
         false,
         ComponentResolution::default(),
     ))?);
-    let engine = Arc::new(rt.block_on(FlowEngine::new(vec![pack], Arc::clone(&config)))?);
+    let engine = Arc::new(rt.block_on(FlowEngine::new(
+        vec![Arc::clone(&pack)],
+        Arc::clone(&config),
+    ))?);
     let session_store = new_session_store();
     let session_host = session_host_from(Arc::clone(&session_store));
     let state_host = state_host_from(new_state_store());
@@ -282,6 +340,7 @@ fn harness(with_sink: bool) -> Result<Harness> {
         _temp: temp,
         runtime,
         sink,
+        pack,
     })
 }
 
@@ -342,6 +401,16 @@ fn a_parked_run_resumes_under_the_same_run_id_and_a_new_run_gets_a_new_one() -> 
     assert_eq!(first[0].flow_id, "wait.flow");
     assert_eq!(first[0].user_ref.as_deref(), Some("webchat:u-7"));
     assert_eq!(first[0].channel.as_deref(), Some("webchat"));
+    assert_eq!(first[0].seq, 1);
+    let wait = first[0]
+        .wait
+        .as_ref()
+        .expect("in_progress carries its wait");
+    assert_eq!(wait.kind, WaitKind::UserInput);
+    assert!(wait.response_due_at.is_some());
+    assert_eq!(first[0].worker.id.as_deref(), Some(PACK_ID));
+    assert_eq!(first[0].worker.name.as_deref(), Some(PACK_NAME));
+    assert_eq!(first[0].worker.version.as_deref(), Some("0.0.0"));
     let run_id = first[0].run_id.clone();
 
     rt.block_on(h.runtime.handle(envelope("wait.flow", "again")))?;
@@ -351,11 +420,14 @@ fn a_parked_run_resumes_under_the_same_run_id_and_a_new_run_gets_a_new_one() -> 
     assert_eq!(second[0].last_step.as_deref(), Some("done"));
     assert_eq!(second[0].run_id, run_id, "a resume reuses the run id");
     assert_eq!(second[0].started_at, first[0].started_at);
+    assert_eq!(second[0].seq, 2, "seq counts the run's events");
+    assert!(second[0].wait.is_none());
 
     rt.block_on(h.runtime.handle(envelope("wait.flow", "fresh")))?;
     let third = h.sink.take();
     assert_eq!(third[0].status, RunStatus::InProgress);
     assert_ne!(third[0].run_id, run_id, "a completed run is not resumed");
+    assert_eq!(third[0].seq, 1, "a new run starts again at 1");
     Ok(())
 }
 
@@ -380,6 +452,14 @@ fn a_failing_node_is_a_technical_error_that_carries_no_message_or_error_text() -
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
         "error_code must be a short class, got {code:?}"
     );
+
+    let error_ref = outcome.error_ref.as_deref().context("error_ref")?;
+    assert_eq!(error_ref.len(), 26, "ULID");
+    if let Some(error) = outcome.error.as_ref() {
+        assert_eq!(error.error_ref, error_ref);
+        assert!(!error.safe_summary.contains("missing.component"));
+        assert!(!error.safe_summary.contains("hunter2"));
+    }
 
     let text = reported_text(outcome);
     assert!(!text.contains("hunter2"), "message text leaked: {text}");
@@ -410,7 +490,7 @@ fn an_engine_error_is_reported_as_a_technical_error() -> Result<()> {
 }
 
 #[test]
-fn a_run_that_executes_a_dw_agent_node_reports_agentic_only() -> Result<()> {
+fn a_run_that_executes_a_dw_agent_node_is_agentic_with_a_real_status() -> Result<()> {
     let rt = *RUNTIME;
     let h = harness(true)?;
     let _ = rt.block_on(h.runtime.handle(envelope("agent.flow", SECRET_TEXT)));
@@ -418,10 +498,88 @@ fn a_run_that_executes_a_dw_agent_node_reports_agentic_only() -> Result<()> {
     assert_eq!(outcomes.len(), 1);
     let outcome = &outcomes[0];
     assert_eq!(outcome.kind, RunKind::Agentic);
-    assert_eq!(outcome.status, RunStatus::Agentic);
-    assert_eq!(outcome.last_step, None);
-    assert_eq!(outcome.error_code, None);
+    assert_eq!(outcome.last_step.as_deref(), Some("agent"));
+    assert_eq!(outcome.worker.id.as_deref(), Some("helper"));
+    assert_eq!(outcome.worker.name, None);
+    // No agent config is installed, so the agent node cannot succeed here;
+    // what matters is that the status is a real one, with its code.
+    match outcome.status {
+        RunStatus::TechnicalError => {
+            assert!(outcome.error_code.is_some());
+            assert!(outcome.error_ref.is_some());
+        }
+        RunStatus::Completed => assert_eq!(outcome.error_code, None),
+        RunStatus::InProgress => assert!(outcome.wait.is_some()),
+    }
     assert!(!reported_text(outcome).contains("hunter2"));
+    Ok(())
+}
+
+#[test]
+fn a_flow_call_sub_flow_emits_nothing_and_the_parked_nodes_timeout_sets_the_deadline() -> Result<()>
+{
+    let rt = *RUNTIME;
+    let h = harness(true)?;
+    let before = chrono::Utc::now();
+    rt.block_on(h.runtime.handle(envelope("call.flow", "hello")))?;
+    let first = h.sink.take();
+    assert_eq!(first.len(), 1, "the sub-flow adds no event: {first:?}");
+    assert_eq!(first[0].flow_id, "call.flow");
+    assert_eq!(first[0].status, RunStatus::InProgress);
+    assert_eq!(first[0].seq, 1);
+    let due = first[0]
+        .wait
+        .as_ref()
+        .and_then(|wait| wait.response_due_at.clone())
+        .context("response_due_at")?;
+    let due = chrono::DateTime::parse_from_rfc3339(&due)?.with_timezone(&chrono::Utc);
+    let secs = (due - before).num_seconds();
+    assert!(
+        (595..=605).contains(&secs),
+        "600 s from the node, got {secs}"
+    );
+
+    rt.block_on(h.runtime.handle(envelope("call.flow", "again")))?;
+    let second = h.sink.take();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].status, RunStatus::Completed);
+    assert_eq!((second[0].seq, &second[0].run_id), (2, &first[0].run_id));
+    Ok(())
+}
+
+#[test]
+fn a_flow_tool_run_emits_nothing() -> Result<()> {
+    let rt = *RUNTIME;
+    let h = harness(true)?;
+    let output = rt.block_on(h.pack.run_flow_for_tool("sub.flow", json!({ "text": "x" })));
+    assert!(output.is_ok(), "{output:?}");
+    assert!(
+        h.sink.take().is_empty(),
+        "a flow tool is part of its caller's turn"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_flow_goto_continues_the_same_run_in_the_target_flow() -> Result<()> {
+    let rt = *RUNTIME;
+    let h = harness(true)?;
+    rt.block_on(h.runtime.handle(envelope("goto.flow", "hello")))?;
+    let first = h.sink.take();
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(first[0].status, RunStatus::InProgress);
+    assert_eq!(
+        first[0].flow_id, "wait.flow",
+        "the event names the target flow"
+    );
+    assert_eq!(first[0].seq, 1);
+
+    rt.block_on(h.runtime.handle(envelope("goto.flow", "again")))?;
+    let second = h.sink.take();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].status, RunStatus::Completed);
+    assert_eq!(second[0].flow_id, "wait.flow");
+    assert_eq!((second[0].seq, &second[0].run_id), (2, &first[0].run_id));
     Ok(())
 }
 

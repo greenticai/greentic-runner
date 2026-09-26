@@ -78,6 +78,36 @@ impl FlowResumeStore {
         &self,
         envelope: &IngressEnvelope,
     ) -> GResult<Option<(FlowSnapshot, Option<RunMarker>)>> {
+        Ok(self
+            .fetch_record(envelope)
+            .await?
+            .map(|record| (record.snapshot, record.run)))
+    }
+
+    /// Rewrite the run marker stored with the CURRENT wait, leaving the
+    /// snapshot and reason as they are; a no-op when nothing is parked.
+    ///
+    /// Used when a resumed turn fails: the snapshot stays parked (the user may
+    /// retry), but the run has emitted one more event, so the marker's `seq`
+    /// must move with it or the next event would repeat a `seq` the admin
+    /// already holds — and be dropped as a duplicate.
+    pub(crate) async fn restamp_run(
+        &self,
+        envelope: &IngressEnvelope,
+        run: RunMarker,
+    ) -> GResult<()> {
+        let Some(record) = self.fetch_record(envelope).await? else {
+            return Ok(());
+        };
+        let wait = FlowWait {
+            reason: record.reason,
+            snapshot: record.snapshot,
+        };
+        self.save_with_run(envelope, &wait, Some(run)).await?;
+        Ok(())
+    }
+
+    async fn fetch_record(&self, envelope: &IngressEnvelope) -> GResult<Option<FlowResumeRecord>> {
         let (mut ctx, user, _, scope) = build_store_ctx(envelope)?;
         ctx = ctx.with_user(Some(user.clone()));
 
@@ -110,7 +140,7 @@ impl FlowResumeStore {
                         record.snapshot.pack_id
                     )));
                 }
-                return Ok(Some((record.snapshot, record.run)));
+                return Ok(Some(record));
             }
             Ok(None)
         })
@@ -384,6 +414,31 @@ mod tests {
             .await?
             .expect("snapshot missing");
         assert_eq!(run, Some(marker));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restamping_moves_the_marker_and_keeps_the_wait() -> GResult<()> {
+        let store = FlowResumeStore::new(new_session_store());
+        let envelope = sample_envelope();
+        // Nothing parked: a no-op, never a new wait.
+        store.restamp_run(&envelope, RunMarker::mint()).await?;
+        assert!(store.fetch(&envelope).await?.is_none());
+
+        let mut marker = RunMarker::mint();
+        marker.seq = 1;
+        let _ = store
+            .save_with_run(&envelope, &sample_wait(), Some(marker.clone()))
+            .await?;
+        let mut moved = marker.clone();
+        moved.seq = 2;
+        store.restamp_run(&envelope, moved.clone()).await?;
+        let (snapshot, run) = store
+            .fetch_with_run(&envelope)
+            .await?
+            .expect("snapshot missing");
+        assert_eq!(run, Some(moved));
+        assert_eq!(snapshot.next_node, sample_wait().snapshot.next_node);
         Ok(())
     }
 
@@ -1052,15 +1107,22 @@ impl Adapter for PackFlowAdapter {
         // forwards to the trace recorder, so trace output is unchanged.
         let turn = self.run_outcome.as_ref().map(|reporter| {
             // A retried attempt of the same turn reuses its first attempt's
-            // run rather than minting another (see `run_outcome::turn`).
-            let resumed = resume_run.or_else(|| reporter.retried_marker());
-            let turn = TurnContext::begin(
+            // run rather than minting another (see `run_outcome::turn`). It
+            // wins over the stored marker: a failed resumed attempt restamps
+            // that marker, and a retry must not count the same turn twice.
+            let resumed = reporter.retried_marker().or(resume_run);
+            let mut turn = TurnContext::begin(
                 &envelope,
                 caller_block.as_ref(),
                 resumed,
                 effective_flow_id.as_str(),
             );
-            reporter.remember(&turn.marker);
+            if let Some((pack_id, name, version)) =
+                self.engine.pack_identity(effective_pack_id.as_str())
+            {
+                turn = turn.with_pack(pack_id, name, version);
+            }
+            turn.retries = reporter.remember(&turn.marker);
             turn
         });
         let outcome_observer = turn.as_ref().map(|_| {
@@ -1097,22 +1159,38 @@ impl Adapter for PackFlowAdapter {
             caller: caller_block.as_ref(),
         };
 
-        let execution = if let Some(snapshot) = resume_snapshot {
-            let resume_pack_id = snapshot.pack_id.clone();
-            let resume_flow_id = snapshot
-                .next_flow
-                .clone()
-                .unwrap_or_else(|| snapshot.flow_id.clone());
-            let resume_ctx = FlowContext {
-                pack_id: resume_pack_id.as_str(),
-                flow_id: resume_flow_id.as_str(),
-                ..ctx
-            };
-            self.engine.resume(resume_ctx, snapshot, payload).await
-        } else if let Some(entry) = envelope.entry_node.as_deref() {
-            self.engine.execute_from(ctx, payload, entry).await
-        } else {
-            self.engine.execute(ctx, payload).await
+        let was_resume = resume_snapshot.is_some();
+        let execution = async {
+            if let Some(snapshot) = resume_snapshot {
+                let resume_pack_id = snapshot.pack_id.clone();
+                let resume_flow_id = snapshot
+                    .next_flow
+                    .clone()
+                    .unwrap_or_else(|| snapshot.flow_id.clone());
+                let resume_ctx = FlowContext {
+                    pack_id: resume_pack_id.as_str(),
+                    flow_id: resume_flow_id.as_str(),
+                    ..ctx
+                };
+                self.engine.resume(resume_ctx, snapshot, payload).await
+            } else if let Some(entry) = envelope.entry_node.as_deref() {
+                self.engine.execute_from(ctx, payload, entry).await
+            } else {
+                self.engine.execute(ctx, payload).await
+            }
+        };
+        // With a run: the turn's span carries its `run_id`, and so does every
+        // worker-usage event the turn's agents emit (task-local, read inline
+        // by `WorkerUsageMeter::emit`). Without a sink, nothing changes.
+        let execution = match turn.as_ref() {
+            Some(turn) => {
+                let run_id = turn.marker.run_id.clone();
+                let span = tracing::info_span!("flow_turn", run_id = %run_id);
+                #[cfg(feature = "agentic-worker")]
+                let execution = greentic_aw_runtime::billing::with_run_id(run_id, execution);
+                tracing::Instrument::instrument(execution, span).await
+            }
+            None => execution.await,
         };
         let execution = match execution {
             Ok(execution) => {
@@ -1136,7 +1214,21 @@ impl Adapter for PackFlowAdapter {
                     turn.as_ref(),
                     outcome_observer.as_ref(),
                 ) {
-                    reporter.record_failure(turn.failed(&observer.observed(), &format!("{err:#}")));
+                    let observed = observer.observed();
+                    reporter.record_failure(turn.failed(&observed, &err));
+                    // A resumed run stays parked; move its stored `seq` past
+                    // the event just reported (see `restamp_run`).
+                    if was_resume
+                        && let Err(restamp_err) = self
+                            .resume
+                            .restamp_run(&envelope, turn.marker_after(&observed))
+                            .await
+                    {
+                        tracing::warn!(
+                            error = %restamp_err,
+                            "failed to restamp the run marker of a parked run after a failed turn"
+                        );
+                    }
                 }
                 return Err(RunnerError::AdapterCall {
                     // `{:#}` flattens the full anyhow source chain; a bare
@@ -1169,7 +1261,7 @@ impl Adapter for PackFlowAdapter {
                 let marker = turn.as_ref().map(|turn| turn.marker_after(&observed));
                 let reply_scope = self.resume.save_with_run(&envelope, &wait, marker).await?;
                 if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
-                    reporter.record(turn.waiting(&observed, &wait.snapshot.next_node));
+                    reporter.record(turn.waiting(&observed, &wait));
                 }
                 let outcome = json!({
                     "status": "pending",

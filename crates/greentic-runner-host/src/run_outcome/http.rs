@@ -2,7 +2,9 @@
 //! admin's per-unit ingest door.
 //!
 //! Wire contract: greentic-designer
-//! `docs/superpowers/specs/2026-09-25-deployed-run-audit-design.md` §3.1/§3.3 —
+//! `docs/superpowers/specs/2026-09-25-deployed-run-audit-design.md` §3.1/§3.3
+//! (v1) plus the additive v2 fields of the Operate → Audit v1.1 Slice B
+//! contract (`docs/superpowers/specs/2026-09-26-operate-audit-v1-1-design.md`) —
 //! `POST {admin}/api/v1/ingest/run-outcome`, bearer = the unit's
 //! worker-usage token (the SAME staged `metering` credential the
 //! `WorkerUsageMeter` presents; the admin takes tenant, env and unit from it).
@@ -17,20 +19,35 @@
 //!   "occurred_at": "2026-09-25T10:00:00.000Z",
 //!   "tenant_slug": "acme", "deployment_id": "…", "bundle_id": "…", "revision_id": "…",
 //!   "run_id": "01J…", "flow_id": "main",
-//!   "kind": "flow" | "agentic",
-//!   "status": "in_progress" | "completed" | "technical_error" | "agentic",
-//!   "last_step": "ask_name",        // omitted when unknown / agentic
+//!   "kind": "flow" | "agentic",      // agentic is sticky across the run's turns
+//!   "status": "in_progress" | "completed" | "technical_error",  // v2 never sends "agentic"
+//!   "seq": 3,                       // v2: 1 on the run's first event, +1 per event
+//!   "last_step": "ask_name",        // omitted when unknown
 //!   "user_ref": "webchat:u-1",      // omitted when unknown
 //!   "user_verified": false,
 //!   "channel": "webchat",           // omitted when unknown
 //!   "outcome_json": { … },          // omitted; ≤ 4 KB when present
 //!   "error_code": "timeout",        // technical_error only
-//!   "started_at": "2026-09-25T09:59:00.000Z"
+//!   "started_at": "2026-09-25T09:59:00.000Z",
+//!   "wait_kind": "user_input" | "approval" | "processing",  // iff in_progress
+//!   "response_due_at": "2026-09-26T09:59:00.000Z",          // iff wait_kind = user_input
+//!   "worker_id": "pack.demo",       // agentic: agent id; flow: manifest pack_id
+//!   "worker_name": "Demo",          // flow: manifest name; omitted otherwise
+//!   "worker_version": "1.2.0",      // pack manifest version
+//!   "error_ref": "01J…",            // iff technical_error
+//!   "error": {                      // technical_error, when a chain is known
+//!     "error_ref": "01J…", "error_code": "timeout",
+//!     "safe_summary": "Node `crm` failed after 2 retries: timeout",
+//!     "redacted_excerpt": "…",      // redacted, ≤ 64 KiB incl. "\n…[truncated]"
+//!     "truncated": false, "node_id": "crm", "retry_count": 2
+//!   }
 //! }
 //! ```
 //!
 //! `tenant_slug` rides for parity with the worker-usage body; the admin must
-//! still take the tenant from the token and never from here.
+//! still take the tenant from the token and never from here. Every v2 field is
+//! additive: an optional one is omitted rather than sent empty, and an
+//! over-long `worker_*` label is omitted rather than truncated.
 //!
 //! # Failure
 //!
@@ -54,7 +71,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{RunKind, RunOutcome, RunOutcomeSink, RunStatus, now_rfc3339};
+use super::{ErrorExcerpt, RunKind, RunOutcome, RunOutcomeSink, RunStatus, WaitKind, now_rfc3339};
 
 /// Budget for DNS + connect + TLS handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -164,6 +181,21 @@ pub(crate) struct RunOutcomeEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error_code: Option<String>,
     pub(crate) started_at: String,
+    pub(crate) seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) wait_kind: Option<WaitKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) response_due_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<ErrorExcerpt>,
 }
 
 /// What one delivery attempt decided. `pub(crate)` for tests.
@@ -295,6 +327,10 @@ impl HttpRunOutcomeSink {
         if flow_id.is_empty() || flow_id.len() > MAX_FIELD_BYTES {
             return Err("flow_id empty or longer than 256 bytes");
         }
+        let (wait_kind, response_due_at) = match outcome.wait {
+            Some(wait) => (Some(wait.kind), wait.response_due_at),
+            None => (None, None),
+        };
         let outcome_json = outcome.outcome_json.filter(|value| {
             serde_json::to_vec(value)
                 .map(|bytes| bytes.len() <= MAX_OUTCOME_JSON_BYTES)
@@ -318,6 +354,14 @@ impl HttpRunOutcomeSink {
             outcome_json,
             error_code: bounded(outcome.error_code),
             started_at: outcome.started_at,
+            seq: outcome.seq,
+            wait_kind,
+            response_due_at,
+            worker_id: bounded(outcome.worker.id),
+            worker_name: bounded(outcome.worker.name),
+            worker_version: bounded(outcome.worker.version),
+            error_ref: outcome.error_ref,
+            error: outcome.error,
         })
     }
 

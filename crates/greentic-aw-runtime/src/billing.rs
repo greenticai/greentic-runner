@@ -21,8 +21,10 @@ use serde::Serialize;
 use crate::tenant::TenantContext;
 
 pub mod fan_out;
+pub mod run_scope;
 pub mod worker_usage;
 pub use fan_out::FanOutBillingMeter;
+pub use run_scope::{current_run_id, with_run_id};
 pub use worker_usage::{WorkerUsageError, WorkerUsageMeter, WorkerUsageTarget};
 
 const BUDGET_TTL: Duration = Duration::from_secs(30);

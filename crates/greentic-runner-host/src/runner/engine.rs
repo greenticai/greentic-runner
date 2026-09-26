@@ -205,6 +205,11 @@ pub struct HostNode {
     /// the node's own output payload, and the result is written to
     /// `ExecutionState.vars[varName]`.
     vars_out: Option<JsonMap<String, Value>>,
+    /// The node's `response_timeout_secs` (a positive integer), read from the
+    /// ROOT of its compiled `input.mapping` and stripped from the payload so a
+    /// component never sees it. Only the run audit reads it: the deadline an
+    /// `in_progress` event reports when the flow parks at this node.
+    response_timeout_secs: Option<u64>,
 }
 
 impl HostNode {
@@ -218,6 +223,32 @@ impl HostNode {
 
     pub fn operation_in_mapping(&self) -> Option<&str> {
         self.operation_in_mapping.as_deref()
+    }
+
+    /// Whether this node is an `approval.call` gate.
+    pub(crate) fn is_approval(&self) -> bool {
+        matches!(self.kind, NodeKind::ApprovalCall { .. })
+    }
+
+    /// The canonical id of the worker an agentic node runs (`agent_id` of a
+    /// `dw.agent`, `graph_id` of a `dw.agent_graph`, the dispatch target of an
+    /// `operala.call` / `agentic.call`). `None` for every other node.
+    pub(crate) fn agent_ref(&self) -> Option<&str> {
+        match &self.kind {
+            NodeKind::DwAgent { agent_id, .. } => Some(agent_id.as_str()),
+            NodeKind::DwAgentGraph { graph_id } => Some(graph_id.as_str()),
+            NodeKind::OperalaCall { target } | NodeKind::AgenticCall { target } => {
+                Some(target.as_str())
+            }
+            _ => None,
+        }
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    }
+
+    /// See [`HostNode::response_timeout_secs`] (the field).
+    pub(crate) fn response_timeout_secs(&self) -> Option<u64> {
+        self.response_timeout_secs
     }
 
     /// Whether this node runs an agentic worker: `dw.agent`, `dw.agent_graph`,
@@ -253,7 +284,24 @@ impl HostNode {
             payload_expr: Value::Null,
             routing: Routing::End,
             vars_out: None,
+            response_timeout_secs: None,
         }
+    }
+
+    /// An `approval.call` node, for tests that only need the node's kind.
+    pub(crate) fn for_test_approval(target: &str) -> Self {
+        HostNode {
+            kind: NodeKind::ApprovalCall {
+                target: target.to_string(),
+            },
+            ..Self::for_test("approval.call", Some(target))
+        }
+    }
+
+    /// Set the node's `response_timeout_secs`.
+    pub(crate) fn with_response_timeout(mut self, secs: u64) -> Self {
+        self.response_timeout_secs = Some(secs);
+        self
     }
 
     /// A `dw.agent` node, for tests that only need the node's kind.
@@ -3294,6 +3342,22 @@ impl FlowEngine {
         Some(first)
     }
 
+    /// `(pack_id, manifest name, version)` of a loaded pack, for the run
+    /// audit's worker identity.
+    pub(crate) fn pack_identity(&self, pack_id: &str) -> Option<(String, Option<String>, String)> {
+        self.packs
+            .iter()
+            .find(|pack| pack.metadata().pack_id == pack_id)
+            .map(|pack| {
+                let meta = pack.metadata();
+                (
+                    meta.pack_id.clone(),
+                    pack.manifest_name().map(str::to_string),
+                    meta.version.clone(),
+                )
+            })
+    }
+
     pub fn flow_by_id(&self, flow_id: &str) -> Option<&FlowDescriptor> {
         let mut matches = self
             .flows
@@ -4753,6 +4817,7 @@ impl From<Node> for HostNode {
             .get("vars_out")
             .and_then(Value::as_object)
             .cloned();
+        let response_timeout_secs = response_timeout_from_mapping(&node.input.mapping);
         let payload_expr = match kind {
             NodeKind::BuiltinEmit { .. } => extract_emit_payload(&node.input.mapping),
             // VarSet dispatch re-reads name/value from NodeKind::VarSet directly;
@@ -4765,6 +4830,8 @@ impl From<Node> for HostNode {
                 let mut mapping = node.input.mapping.clone();
                 if let Some(obj) = mapping.as_object_mut() {
                     obj.remove("vars_out");
+                    // Run-audit metadata, same treatment as `vars_out`.
+                    obj.remove(RESPONSE_TIMEOUT_KEY);
                 }
                 mapping
             }
@@ -4782,8 +4849,24 @@ impl From<Node> for HostNode {
             payload_expr,
             routing: node.routing,
             vars_out,
+            response_timeout_secs,
         }
     }
+}
+
+/// Node config key naming how long a parked user may take to answer
+/// (audit wire contract v2 §4). Read from the ROOT of the node's compiled
+/// `input.mapping`, i.e. the node's op body in a `.ygtc` (or its `in_map`
+/// when it declares one).
+pub(crate) const RESPONSE_TIMEOUT_KEY: &str = "response_timeout_secs";
+
+/// A positive integer `response_timeout_secs`; anything else (absent, zero,
+/// negative, fractional, a string) is `None` and the caller falls back.
+fn response_timeout_from_mapping(mapping: &Value) -> Option<u64> {
+    mapping
+        .get(RESPONSE_TIMEOUT_KEY)
+        .and_then(Value::as_u64)
+        .filter(|secs| *secs > 0)
 }
 
 /// Classify a `component == "mcp"` node into [`NodeKind::Mcp`].
@@ -6250,6 +6333,7 @@ mod tests {
             payload_expr: Value::Null,
             routing,
             vars_out: None,
+            response_timeout_secs: None,
         }
     }
 
@@ -7257,6 +7341,7 @@ mod tests {
             payload_expr: Value::Null,
             routing: Routing::End,
             vars_out: None,
+            response_timeout_secs: None,
         };
         let _state = ExecutionState::new(Value::Null);
         let payload = json!({ "component": "qa.process" });
@@ -7325,6 +7410,7 @@ mod tests {
             payload_expr: Value::Null,
             routing: Routing::End,
             vars_out: None,
+            response_timeout_secs: None,
         };
         let _state = ExecutionState::new(Value::Null);
         let payload = json!({ "component": "qa.process" });
@@ -11227,6 +11313,7 @@ mod tests {
             payload_expr: Value::Null,
             routing: Routing::End,
             vars_out: None,
+            response_timeout_secs: None,
         };
         let mut state = ExecutionState::new(Value::Null);
         let payload = Value::Null;
@@ -11793,6 +11880,7 @@ mod tests {
                     node_id: thanks_id.clone(),
                 },
                 vars_out: None,
+                response_timeout_secs: None,
             },
         );
         nodes.insert(
@@ -11808,6 +11896,7 @@ mod tests {
                 payload_expr: json!({ "text": "thanks" }),
                 routing: Routing::End,
                 vars_out: None,
+                response_timeout_secs: None,
             },
         );
         HostFlow {
@@ -12718,6 +12807,7 @@ mod tests {
                 payload_expr,
                 routing: Routing::End,
                 vars_out: None,
+                response_timeout_secs: None,
             },
         );
         HostFlow {
@@ -12957,6 +13047,7 @@ mod tests {
             payload_expr: Value::Null,
             routing: Routing::End,
             vars_out: None,
+            response_timeout_secs: None,
         }
     }
 
