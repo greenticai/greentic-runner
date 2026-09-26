@@ -28,6 +28,7 @@ use crate::flow_source::FlowToolCatalog;
 use crate::kv::AwKv;
 use crate::llm::LlmToolSchema;
 use crate::mcp_source::McpToolCatalog;
+use crate::playbook_source::PlaybookToolCatalog;
 use crate::sorla_source::SorlaToolCatalog;
 use crate::state::ToolCallRecord;
 use crate::tenant::TenantContext;
@@ -92,11 +93,13 @@ pub fn is_tool_allowed(call: &ToolCallRecord, allowed: &[ToolRef]) -> bool {
 /// the `mcp:` branch above — but the schema can ONLY come from the `ToolRef`'s
 /// own author contract, because an A2A `AgentSkill` carries no input schema at
 /// all. A ref with no `input_schema` is dropped regardless of the catalog.
+#[allow(clippy::too_many_arguments)]
 pub fn list_tools_for_llm(
     ext_runtime: &ExtensionRuntime,
     mcp: Option<&McpToolCatalog>,
     components: Option<&ComponentToolCatalog>,
     flows: Option<&FlowToolCatalog>,
+    playbooks: Option<&PlaybookToolCatalog>,
     sorla: Option<&SorlaToolCatalog>,
     a2a: Option<&A2aToolCatalog>,
     allowed: &[ToolRef],
@@ -188,6 +191,34 @@ pub fn list_tools_for_llm(
             }
             continue;
         }
+        if let Some(playbook_id) = t.extension_id.strip_prefix("playbook:") {
+            // The CATALOG wins on both fields, which is the `mcp:` precedence
+            // rather than the `flow:` one beside it. A playbook's summary and
+            // its declared inputs are authored in the same document as its
+            // behaviour and are read from the pack this run, while the author
+            // contract on the ref is a snapshot taken when the tool was bound —
+            // so the document is the fresher statement of what this skill does.
+            let entry = playbooks.and_then(|c| c.tool_entry(playbook_id));
+            let description = entry
+                .map(|e| e.description.clone())
+                .or_else(|| t.description.clone());
+            let parameters = entry
+                .map(|e| e.parameters.clone())
+                .or_else(|| t.input_schema.clone());
+            match (description, parameters) {
+                (Some(description), Some(parameters)) => out.push(LlmToolSchema {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    description: with_usage_note(description, &t.usage_note),
+                    parameters,
+                }),
+                _ => tracing::warn!(
+                    extension = %t.extension_id, tool = %t.tool_name,
+                    "playbook tool has neither an author contract nor a catalog entry; dropping from LLM tool list"
+                ),
+            }
+            continue;
+        }
         if let Some(agent_id) = t.extension_id.strip_prefix("a2a:") {
             // Only a configured agent is a tool at all: dispatch refuses any
             // other, so advertising one would offer the model a call that can
@@ -268,11 +299,13 @@ pub struct MissingTool {
 /// reports failures instead of dropping them silently. Callers use it to warn
 /// the operator at startup — otherwise an agent whose tools all failed to load
 /// runs with an empty tool set and hallucinates tool results.
+#[allow(clippy::too_many_arguments)]
 pub fn missing_tools(
     ext_runtime: &ExtensionRuntime,
     mcp: Option<&McpToolCatalog>,
     components: Option<&ComponentToolCatalog>,
     flows: Option<&FlowToolCatalog>,
+    playbooks: Option<&PlaybookToolCatalog>,
     sorla: Option<&SorlaToolCatalog>,
     a2a: Option<&A2aToolCatalog>,
     allowed: &[ToolRef],
@@ -332,6 +365,16 @@ pub fn missing_tools(
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
                     reason: "flow tool not found in the catalog".to_string(),
+                });
+            }
+            continue;
+        }
+        if let Some(playbook_id) = t.extension_id.strip_prefix("playbook:") {
+            if playbooks.and_then(|c| c.tool_entry(playbook_id)).is_none() {
+                missing.push(MissingTool {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    reason: "playbook tool not found in the catalog".to_string(),
                 });
             }
             continue;
@@ -494,6 +537,9 @@ pub async fn dispatch_tool_call(
         mcp,
         components,
         flows,
+        // A one-shot dispatch holds no worker, so it narrows no playbook and
+        // must offer none: see `playbook_source`'s narrowing rule.
+        None,
         sorla,
         a2a,
         call,
@@ -521,6 +567,7 @@ pub async fn dispatch_tool_call_in_conversation(
     mcp: Option<Arc<McpToolCatalog>>,
     components: Option<Arc<ComponentToolCatalog>>,
     flows: Option<Arc<FlowToolCatalog>>,
+    playbooks: Option<Arc<PlaybookToolCatalog>>,
     sorla: Option<Arc<SorlaToolCatalog>>,
     a2a: Option<Arc<A2aToolCatalog>>,
     call: ToolCallRecord,
@@ -628,6 +675,22 @@ pub async fn dispatch_tool_call_in_conversation(
             None => {
                 tracing::warn!(flow = %flow_ref, "flow call has no catalog wired; returning error value");
                 serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") })
+            }
+        };
+        return Ok(value);
+    }
+    if let Some(playbook_id) = call.extension_id.strip_prefix("playbook:") {
+        // Like the flow arm this NEVER yields `Err`: the catalog turns an
+        // unknown playbook, unreadable arguments and a failed turn all into an
+        // `{"error": ...}` value, so one skill cannot end the caller's step.
+        let value = match playbooks.as_deref() {
+            Some(cat) => cat.dispatch(playbook_id, &call.args.to_string()).await,
+            None => {
+                tracing::warn!(
+                    playbook = %playbook_id,
+                    "playbook call has no catalog wired; returning error value"
+                );
+                serde_json::json!({ "error": format!("unknown playbook tool '{playbook_id}'") })
             }
         };
         return Ok(value);
@@ -1008,7 +1071,7 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, None, &allowed);
         assert!(schemas.is_empty());
     }
 
@@ -1025,7 +1088,7 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let missing = missing_tools(&rt, None, None, None, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].extension_id, "greentic.hubspot");
         assert_eq!(missing[0].tool_name, "hubspot_contacts");
@@ -1047,7 +1110,7 @@ mod tests {
             usage_note: None,
         }];
         // No catalog provided → the mcp tool is unresolvable.
-        let missing = missing_tools(&rt, None, None, None, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
         assert!(
             missing[0].reason.contains("MCP tool not found"),
@@ -1164,7 +1227,8 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "mcp:s1");
@@ -1195,7 +1259,7 @@ mod tests {
         let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, None, &allowed);
         assert_eq!(schemas.len(), 1, "the author contract resolves the tool");
         assert_eq!(schemas[0].extension_id, "mcp:s1");
         assert_eq!(schemas[0].tool_name, "get_issue");
@@ -1221,7 +1285,8 @@ mod tests {
         let catalog = catalog_with("s1", "get_issue", "Live description", live_params, None);
         let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
 
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, None, &allowed);
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0].description, "Live description");
         assert_eq!(
@@ -1260,6 +1325,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[description_only, schema_only, bare],
         );
         assert!(schemas.is_empty(), "got: {schemas:?}");
@@ -1273,7 +1339,7 @@ mod tests {
         let mut t = mcp_ref_with_contract("s1", "get_issue");
         t.usage_note = Some("Only for open issues.".into());
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, &[t]);
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, None, None, &[t]);
         assert_eq!(schemas.len(), 1);
         assert_eq!(
             schemas[0].description,
@@ -1287,7 +1353,7 @@ mod tests {
         // tool that `list_tools_for_llm` now resolves and offers.
         let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
-        assert!(missing_tools(&rt, None, None, None, None, None, &allowed).is_empty());
+        assert!(missing_tools(&rt, None, None, None, None, None, None, &allowed).is_empty());
     }
 
     #[test]
@@ -1295,7 +1361,7 @@ mod tests {
         let rt = ExtensionRuntime::for_test().unwrap();
         let mut half = mcp_ref_with_contract("s1", "get_issue");
         half.input_schema = None;
-        let missing = missing_tools(&rt, None, None, None, None, None, &[half]);
+        let missing = missing_tools(&rt, None, None, None, None, None, None, &[half]);
         assert_eq!(missing.len(), 1);
         assert!(
             missing[0].reason.contains("MCP tool not found"),
@@ -1330,7 +1396,8 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, Some(&catalog), None, None, None, None, None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-mcp ref still goes through ext_runtime (unloaded → dropped)"
@@ -1502,6 +1569,7 @@ mod tests {
             Some(&flows),
             None,
             None,
+            None,
             &allowed,
         );
         let s = schemas
@@ -1536,6 +1604,7 @@ mod tests {
             Some(&flows),
             None,
             None,
+            None,
             &allowed,
         );
         assert!(
@@ -1564,6 +1633,7 @@ mod tests {
             Some(&flows),
             None,
             None,
+            None,
             &allowed,
         );
         let s = schemas
@@ -1585,7 +1655,7 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), None, None, None, &allowed);
         assert!(
             schemas
                 .iter()
@@ -1607,6 +1677,172 @@ mod tests {
         assert!(
             out.get("error").is_none(),
             "known flow must dispatch, got {out}"
+        );
+    }
+
+    /// A catalog holding one playbook, with no tools and a turn that echoes.
+    fn playbook_catalog() -> Arc<crate::playbook_source::PlaybookToolCatalog> {
+        use crate::playbook_source::{
+            PlaybookLlmRequirement, PlaybookOperation, PlaybookSource, PlaybookToolCatalog,
+            PlaybookTurnFn, PlaybookTurnResult,
+        };
+        struct One;
+        impl PlaybookSource for One {
+            fn list_playbooks(&self) -> Vec<PlaybookOperation> {
+                vec![PlaybookOperation {
+                    playbook_id: "refund".into(),
+                    description: "From the document".into(),
+                    parameters: serde_json::json!({ "type": "object" }),
+                    instructions: "Follow the policy.".into(),
+                    llm: PlaybookLlmRequirement::default(),
+                    allow_list: vec![],
+                    guardrails: vec![],
+                }]
+            }
+        }
+        let turn: PlaybookTurnFn = Arc::new(|_req| {
+            Box::pin(async move {
+                Ok(PlaybookTurnResult {
+                    reply: "handled".into(),
+                })
+            })
+        });
+        Arc::new(PlaybookToolCatalog::from_source(&One, turn, &[]))
+    }
+
+    fn playbook_ref(description: Option<&str>) -> ToolRef {
+        ToolRef {
+            extension_id: "playbook:refund".into(),
+            tool_name: "run".into(),
+            description: description.map(str::to_string),
+            input_schema: None,
+            usage_note: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn playbook_prefixed_tool_is_listed_and_dispatched() {
+        let playbooks = playbook_catalog();
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let allowed = vec![playbook_ref(None)];
+        let schemas = list_tools_for_llm(
+            &rt,
+            None,
+            None,
+            None,
+            Some(&playbooks),
+            None,
+            None,
+            &allowed,
+        );
+        assert!(
+            schemas
+                .iter()
+                .any(|s| s.extension_id == "playbook:refund" && s.tool_name == "run"),
+            "playbook: tool must appear in listed schemas"
+        );
+
+        let call = ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "playbook:refund".into(),
+            tool_name: "run".into(),
+            args: serde_json::json!({ "order": 1 }),
+        };
+        let rt_arc = Arc::new(ExtensionRuntime::for_test().unwrap());
+        let tc = TenantContext::new("t", "e");
+        let out = dispatch_tool_call_in_conversation(
+            rt_arc,
+            None,
+            None,
+            None,
+            Some(playbooks),
+            None,
+            None,
+            call,
+            &tc,
+            None,
+        )
+        .await
+        .expect("playbook dispatch must not return Err");
+        assert_eq!(
+            out["reply"], "handled",
+            "known playbook must run, got {out}"
+        );
+    }
+
+    /// The `playbook:` arm takes the `mcp:` precedence, NOT the `flow:` one
+    /// beside it: the document is read from the pack this run, while the ref's
+    /// description is a snapshot taken when the tool was bound.
+    #[tokio::test]
+    async fn the_documents_summary_wins_over_the_author_contract() {
+        let playbooks = playbook_catalog();
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let allowed = vec![playbook_ref(Some("Stale snapshot"))];
+        let schemas = list_tools_for_llm(
+            &rt,
+            None,
+            None,
+            None,
+            Some(&playbooks),
+            None,
+            None,
+            &allowed,
+        );
+        let s = schemas
+            .iter()
+            .find(|s| s.extension_id == "playbook:refund")
+            .expect("playbook listed");
+        assert!(
+            s.description.contains("From the document"),
+            "the document must win, got: {}",
+            s.description
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_tools_reports_a_playbook_absent_from_the_catalog() {
+        let playbooks = playbook_catalog();
+        let rt = ExtensionRuntime::for_test().unwrap();
+        let absent = ToolRef {
+            extension_id: "playbook:not_carried".into(),
+            tool_name: "run".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        };
+        let missing = missing_tools(
+            &rt,
+            None,
+            None,
+            None,
+            Some(&playbooks),
+            None,
+            None,
+            &[absent, playbook_ref(None)],
+        );
+        assert_eq!(missing.len(), 1, "only the uncarried one is missing");
+        assert_eq!(missing[0].extension_id, "playbook:not_carried");
+    }
+
+    /// `dispatch_tool_call` passes `None` for the playbook catalog on purpose:
+    /// it holds no calling worker, so it can narrow no allow-list. Offering a
+    /// playbook there would run one with a tool set nobody intersected.
+    #[tokio::test]
+    async fn a_one_shot_dispatch_offers_no_playbook() {
+        let call = ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "playbook:refund".into(),
+            tool_name: "run".into(),
+            args: serde_json::json!({}),
+        };
+        let rt_arc = Arc::new(ExtensionRuntime::for_test().unwrap());
+        let tc = TenantContext::new("t", "e");
+        let out = dispatch_tool_call(rt_arc, None, None, None, None, None, call, &tc)
+            .await
+            .expect("must be an error value, never Err");
+        assert!(
+            out.get("error").is_some(),
+            "a one-shot dispatch must refuse a playbook, got {out}"
         );
     }
 
@@ -1648,7 +1884,8 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, None, None, &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, None, Some(&catalog), None, None, None, None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "component:greentic.refund");
@@ -1681,7 +1918,8 @@ mod tests {
             input_schema: None,
             usage_note: None,
         }];
-        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, None, None, &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, None, Some(&catalog), None, None, None, None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-component ref still goes through ext_runtime (unloaded → dropped)"
@@ -1800,7 +2038,8 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, Some(&catalog), None, &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "sorla:landlord");
@@ -1864,7 +2103,8 @@ mod tests {
         let allowed = vec![a2a_ref(Some("local"), Some(params.clone()))];
         let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, None, None, None, None, None, Some(&catalog), &allowed);
         assert_eq!(schemas.len(), 1, "got: {schemas:?}");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "a2a:my-agent");
@@ -1880,7 +2120,8 @@ mod tests {
         let allowed = vec![a2a_ref(Some("local"), None)];
         let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, None, None, None, None, None, Some(&catalog), &allowed);
         assert!(schemas.is_empty(), "got: {schemas:?}");
     }
 
@@ -1893,7 +2134,8 @@ mod tests {
         let allowed = vec![a2a_ref(Some("own description"), Some(params.clone()))];
         let catalog = A2aToolCatalog::for_tests(&[], &["my-agent"]);
 
-        let schemas = list_tools_for_llm(&rt, None, None, None, None, Some(&catalog), &allowed);
+        let schemas =
+            list_tools_for_llm(&rt, None, None, None, None, None, Some(&catalog), &allowed);
         assert_eq!(schemas.len(), 1, "got: {schemas:?}");
         let s = &schemas[0];
         assert_eq!(s.description, "own description");
@@ -1910,7 +2152,7 @@ mod tests {
         let allowed = vec![a2a_ref(None, Some(params))];
         let catalog = A2aToolCatalog::for_tests(&[("my-agent", "from the card")], &[]);
 
-        let missing = missing_tools(&rt, None, None, None, None, Some(&catalog), &allowed);
+        let missing = missing_tools(&rt, None, None, None, None, None, Some(&catalog), &allowed);
         assert!(missing.is_empty(), "got: {missing:?}");
     }
 
@@ -1921,7 +2163,7 @@ mod tests {
         let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![a2a_ref(None, None)];
 
-        let missing = missing_tools(&rt, None, None, None, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, None, None, None, &allowed);
         assert_eq!(missing.len(), 1, "got: {missing:?}");
         assert_eq!(missing[0].extension_id, "a2a:my-agent");
         assert!(
@@ -1943,13 +2185,13 @@ mod tests {
         let other_agent = A2aToolCatalog::for_tests(&[("someone-else", "x")], &[]);
 
         for catalog in [None, Some(&other_agent)] {
-            let schemas = list_tools_for_llm(&rt, None, None, None, None, catalog, &allowed);
+            let schemas = list_tools_for_llm(&rt, None, None, None, None, None, catalog, &allowed);
             assert!(
                 schemas.is_empty(),
                 "must not be advertised, got: {schemas:?}"
             );
 
-            let missing = missing_tools(&rt, None, None, None, None, catalog, &allowed);
+            let missing = missing_tools(&rt, None, None, None, None, None, catalog, &allowed);
             assert_eq!(missing.len(), 1, "must be reported, got: {missing:?}");
             assert!(
                 missing[0].reason.contains("not configured"),

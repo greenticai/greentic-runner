@@ -31,6 +31,7 @@ use crate::error::{AgentError, ConfigError};
 use crate::flow_source::FlowToolCatalog;
 use crate::llm::LlmToolSchema;
 use crate::mcp_source::McpToolCatalog;
+use crate::playbook_source::PlaybookToolCatalog;
 use crate::sorla_source::SorlaToolCatalog;
 use crate::state::ToolCallRecord;
 use crate::tenant::TenantContext;
@@ -40,7 +41,7 @@ use crate::tools::{
     list_tools_for_llm, missing_tools,
 };
 
-/// The five per-tenant tool catalogs, resolved once for a tenant.
+/// The six per-tenant tool catalogs, resolved once for a tenant.
 ///
 /// Every source is infallible (it degrades to an empty catalog on an
 /// admin/server failure) and TTL-cached, so resolving once per step does not
@@ -51,13 +52,26 @@ pub(crate) struct ToolCatalogs {
     pub(crate) mcp: Option<Arc<McpToolCatalog>>,
     pub(crate) components: Option<Arc<ComponentToolCatalog>>,
     pub(crate) flows: Option<Arc<FlowToolCatalog>>,
+    /// Narrowed against the CALLER's tools, unlike every sibling — a playbook
+    /// runs with `intersect(caller, document)`, which is why `resolve` needs
+    /// the allow-list the other five do not.
+    pub(crate) playbooks: Option<Arc<PlaybookToolCatalog>>,
     pub(crate) sorla: Option<Arc<SorlaToolCatalog>>,
     pub(crate) a2a: Option<Arc<A2aToolCatalog>>,
 }
 
 impl ToolCatalogs {
     /// Resolve every catalog the runtime has a source for, for `tenant`.
-    pub(crate) async fn resolve(runtime: &AgentRuntime, tenant: &TenantContext) -> Self {
+    ///
+    /// `allowed` is the calling worker's own tool list. Only the playbook
+    /// source reads it, to narrow each document's allow-list against what the
+    /// caller actually holds; passing a wider list than the worker's would
+    /// hand a skill tools its caller does not have.
+    pub(crate) async fn resolve(
+        runtime: &AgentRuntime,
+        tenant: &TenantContext,
+        allowed: &[ToolRef],
+    ) -> Self {
         let mcp = match runtime.mcp.as_ref() {
             Some(src) => Some(src.catalog(tenant).await),
             None => None,
@@ -68,6 +82,10 @@ impl ToolCatalogs {
         };
         let flows = match runtime.flows.as_ref() {
             Some(src) => Some(src.catalog(tenant).await),
+            None => None,
+        };
+        let playbooks = match runtime.playbooks.as_ref() {
+            Some(src) => Some(src.catalog(tenant, allowed).await),
             None => None,
         };
         let sorla = match runtime.sorla.as_ref() {
@@ -84,6 +102,7 @@ impl ToolCatalogs {
             mcp,
             components,
             flows,
+            playbooks,
             sorla,
             a2a,
         }
@@ -101,6 +120,7 @@ impl ToolCatalogs {
             self.mcp.as_deref(),
             self.components.as_deref(),
             self.flows.as_deref(),
+            self.playbooks.as_deref(),
             self.sorla.as_deref(),
             self.a2a.as_deref(),
             allowed,
@@ -118,6 +138,7 @@ impl ToolCatalogs {
             self.mcp.as_deref(),
             self.components.as_deref(),
             self.flows.as_deref(),
+            self.playbooks.as_deref(),
             self.sorla.as_deref(),
             self.a2a.as_deref(),
             allowed,
@@ -142,6 +163,7 @@ impl ToolCatalogs {
             self.mcp.clone(),
             self.components.clone(),
             self.flows.clone(),
+            self.playbooks.clone(),
             self.sorla.clone(),
             self.a2a.clone(),
             call,
@@ -316,7 +338,7 @@ impl AgentRuntime {
     /// not resolve are dropped from [`ToolSession::schemas`] (and
     /// logged) exactly as the loop drops them from the LLM request.
     pub async fn tool_session(&self, tenant: &TenantContext, tools: &[ToolRef]) -> ToolSession {
-        let catalogs = ToolCatalogs::resolve(self, tenant).await;
+        let catalogs = ToolCatalogs::resolve(self, tenant, tools).await;
         let schemas = catalogs.list_for_llm(&self.ext_runtime, tools);
         let codec = ToolNameCodec::for_tools(&schemas);
         ToolSession {
