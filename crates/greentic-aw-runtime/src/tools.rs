@@ -1707,7 +1707,16 @@ mod tests {
                 })
             })
         });
-        Arc::new(PlaybookToolCatalog::from_source(&One, turn, &[]))
+        Arc::new(PlaybookToolCatalog::from_source(
+            &One,
+            turn,
+            &[],
+            crate::config::LlmProviderRef {
+                provider: "openai".into(),
+                model: "gpt-4o-mini".into(),
+                credential_ref: None,
+            },
+        ))
     }
 
     fn playbook_ref(description: Option<&str>) -> ToolRef {

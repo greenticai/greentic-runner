@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use serde_json::json;
 
-use crate::config::{GuardrailRef, ToolRef};
+use crate::config::{GuardrailRef, LlmProviderRef, ToolRef};
 use crate::tenant::TenantContext;
 
 /// How long a built catalog is reused before a rebuild is considered.
@@ -141,6 +141,20 @@ pub struct PlaybookTurnRequest {
     pub llm: PlaybookLlmRequirement,
     pub tools: Vec<ToolRef>,
     pub guardrails: Vec<GuardrailRef>,
+    /// The CALLING worker's own provider and model.
+    ///
+    /// A playbook names no model (see [`PlaybookLlmRequirement`]), so something
+    /// has to. Running it on its caller's own resolution is the answer that
+    /// needs no new catalogue and no new credential: the skill spends exactly
+    /// what the worker invoking it would have spent, on the provider that
+    /// workspace already configured.
+    ///
+    /// **`llm` above is therefore a requirement the host must CHECK against
+    /// this, not a selector it resolves from.** A host that cannot tell whether
+    /// this model meets the tier must say so rather than assume it does — a
+    /// `Reasoning` playbook served by a fast model answers plausibly and
+    /// reports nothing.
+    pub caller_llm: LlmProviderRef,
     /// The caller's arguments, as the LLM produced them.
     pub input: serde_json::Value,
 }
@@ -170,6 +184,11 @@ pub struct PlaybookToolCatalog {
     /// `playbook_id` → entry, with `tools` already intersected.
     tools: HashMap<String, PlaybookToolEntry>,
     turn: PlaybookTurnFn,
+    /// The calling worker's own provider/model, carried so `dispatch` can put
+    /// it on every request. It belongs here rather than on an entry because it
+    /// is a property of the CALLER, which this whole catalog is already scoped
+    /// to — the same reason the narrowing lives here.
+    caller_llm: LlmProviderRef,
     fetched_at: Instant,
 }
 
@@ -187,6 +206,7 @@ impl PlaybookToolCatalog {
         source: &dyn PlaybookSource,
         turn: PlaybookTurnFn,
         caller_tools: &[ToolRef],
+        caller_llm: LlmProviderRef,
     ) -> Self {
         let held: BTreeSet<(&str, &str)> = caller_tools
             .iter()
@@ -224,6 +244,7 @@ impl PlaybookToolCatalog {
         Self {
             tools,
             turn,
+            caller_llm,
             fetched_at: Instant::now(),
         }
     }
@@ -269,6 +290,7 @@ impl PlaybookToolCatalog {
             llm: entry.llm.clone(),
             tools: entry.tools.clone(),
             guardrails: entry.guardrails.clone(),
+            caller_llm: self.caller_llm.clone(),
             input,
         };
         match (self.turn)(request).await {
@@ -306,15 +328,21 @@ impl PlaybookToolSource {
 
     /// `(tenant_id, env_id)` plus the caller's tool set, order-independent.
     /// A `BTreeSet` is what makes two spellings of one set share an entry.
-    fn cache_key(tenant: &TenantContext, caller_tools: &[ToolRef]) -> String {
+    fn cache_key(
+        tenant: &TenantContext,
+        caller_tools: &[ToolRef],
+        caller_llm: &LlmProviderRef,
+    ) -> String {
         let held: BTreeSet<String> = caller_tools
             .iter()
             .map(|t| format!("{}/{}", t.extension_id, t.tool_name))
             .collect();
         format!(
-            "{}:{}:{}",
+            "{}:{}:{}/{}:{}",
             tenant.tenant_id,
             tenant.env_id,
+            caller_llm.provider,
+            caller_llm.model,
             held.into_iter().collect::<Vec<_>>().join(",")
         )
     }
@@ -325,8 +353,9 @@ impl PlaybookToolSource {
         &self,
         tenant: &TenantContext,
         caller_tools: &[ToolRef],
+        caller_llm: &LlmProviderRef,
     ) -> Arc<PlaybookToolCatalog> {
-        let key = Self::cache_key(tenant, caller_tools);
+        let key = Self::cache_key(tenant, caller_tools, caller_llm);
 
         if let Some(entry) = self.cache.get(&key) {
             let snap = entry.value();
@@ -339,6 +368,7 @@ impl PlaybookToolSource {
             self.source.as_ref(),
             self.turn.clone(),
             caller_tools,
+            caller_llm.clone(),
         ));
         self.cache.insert(key, built.clone());
         built
@@ -349,6 +379,14 @@ impl PlaybookToolSource {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn caller_llm() -> LlmProviderRef {
+        LlmProviderRef {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            credential_ref: None,
+        }
+    }
 
     fn tool(ext: &str, name: &str) -> ToolRef {
         ToolRef {
@@ -415,6 +453,7 @@ mod tests {
                 tool("greentic.billing", "refund"),
                 tool("greentic.crm", "note"),
             ],
+            caller_llm(),
         );
         assert_eq!(cat.len(), 1);
         let entry = cat.tool_entry("refund").expect("entry");
@@ -434,6 +473,7 @@ mod tests {
                 tool("greentic.billing", "refund"),
                 tool("greentic.crm", "note"),
             ],
+            caller_llm(),
         );
         cat.dispatch("refund", "{\"order\":7}").await;
         let calls = seen.lock().expect("lock");
@@ -451,6 +491,7 @@ mod tests {
             turn,
             // The caller holds only ONE of the two the playbook binds.
             &[tool("greentic.billing", "refund")],
+            caller_llm(),
         );
         let entry = cat.tool_entry("refund").expect("entry");
         assert_eq!(
@@ -479,6 +520,7 @@ mod tests {
                 tool("greentic.crm", "note"),
                 tool("greentic.payroll", "pay"),
             ],
+            caller_llm(),
         );
         let entry = cat.tool_entry("refund").expect("entry");
         assert_eq!(entry.tools.len(), 2, "union would have given three");
@@ -494,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_unknown_playbook_returns_an_error_value_not_err() {
         let (turn, _) = recording_turn();
-        let cat = PlaybookToolCatalog::from_source(&FakeSource, turn, &[]);
+        let cat = PlaybookToolCatalog::from_source(&FakeSource, turn, &[], caller_llm());
         let out = cat.dispatch("no_such_playbook", "{}").await;
         assert!(out.get("error").is_some(), "must yield an error value");
         assert!(
@@ -509,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn unreadable_arguments_are_an_error_value_and_no_turn_runs() {
         let (turn, seen) = recording_turn();
-        let cat = PlaybookToolCatalog::from_source(&FakeSource, turn, &[]);
+        let cat = PlaybookToolCatalog::from_source(&FakeSource, turn, &[], caller_llm());
         let out = cat.dispatch("refund", "not json").await;
         assert!(out.get("error").is_some());
         assert!(
@@ -524,6 +566,7 @@ mod tests {
             &FakeSource,
             failing_turn("no provider satisfies tier reasoning"),
             &[],
+            caller_llm(),
         );
         let out = cat.dispatch("refund", "{}").await;
         assert_eq!(out["error"], "no provider satisfies tier reasoning");
@@ -538,7 +581,7 @@ mod tests {
             }
         }
         let (turn, _) = recording_turn();
-        let cat = PlaybookToolCatalog::from_source(&Empty, turn, &[]);
+        let cat = PlaybookToolCatalog::from_source(&Empty, turn, &[], caller_llm());
         assert!(cat.is_empty());
     }
 
@@ -548,8 +591,8 @@ mod tests {
         let source = PlaybookToolSource::new(Arc::new(FakeSource), turn);
         let tenant = TenantContext::new("acme", "prod");
         let held = [tool("greentic.billing", "refund")];
-        let first = source.catalog(&tenant, &held).await;
-        let second = source.catalog(&tenant, &held).await;
+        let first = source.catalog(&tenant, &held, &caller_llm()).await;
+        let second = source.catalog(&tenant, &held, &caller_llm()).await;
         assert!(
             Arc::ptr_eq(&first, &second),
             "second call must hit the cache"
@@ -563,7 +606,11 @@ mod tests {
         let source = PlaybookToolSource::new(Arc::new(FakeSource), turn);
         let tenant = TenantContext::new("acme", "prod");
         let narrow = source
-            .catalog(&tenant, &[tool("greentic.billing", "refund")])
+            .catalog(
+                &tenant,
+                &[tool("greentic.billing", "refund")],
+                &caller_llm(),
+            )
             .await;
         let wide = source
             .catalog(
@@ -572,6 +619,7 @@ mod tests {
                     tool("greentic.billing", "refund"),
                     tool("greentic.crm", "note"),
                 ],
+                &caller_llm(),
             )
             .await;
         assert!(
@@ -594,6 +642,7 @@ mod tests {
                     tool("greentic.billing", "refund"),
                     tool("greentic.crm", "note"),
                 ],
+                &caller_llm(),
             )
             .await;
         let other = source
@@ -603,6 +652,7 @@ mod tests {
                     tool("greentic.crm", "note"),
                     tool("greentic.billing", "refund"),
                 ],
+                &caller_llm(),
             )
             .await;
         assert!(
@@ -616,10 +666,10 @@ mod tests {
         let (turn, _) = recording_turn();
         let source = PlaybookToolSource::new(Arc::new(FakeSource), turn);
         let prod = source
-            .catalog(&TenantContext::new("acme", "prod"), &[])
+            .catalog(&TenantContext::new("acme", "prod"), &[], &caller_llm())
             .await;
         let staging = source
-            .catalog(&TenantContext::new("acme", "staging"), &[])
+            .catalog(&TenantContext::new("acme", "staging"), &[], &caller_llm())
             .await;
         assert!(!Arc::ptr_eq(&prod, &staging));
     }

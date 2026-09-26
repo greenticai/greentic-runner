@@ -322,7 +322,8 @@ pub async fn run_step(
     // prefix. `ToolCatalogs` is shared with `AgentRuntime::tool_session`, so
     // an external loop resolves exactly what this one does.
     let catalogs =
-        crate::tool_session::ToolCatalogs::resolve(runtime, &tenant, &config.tools).await;
+        crate::tool_session::ToolCatalogs::resolve(runtime, &tenant, &config.tools, &config.llm)
+            .await;
 
     // Preflight: surface declared tools that won't reach the LLM. Without this
     // the runtime drops unresolved tools silently (per-tool debug warns) and the

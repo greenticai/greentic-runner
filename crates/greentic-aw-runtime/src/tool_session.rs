@@ -26,7 +26,7 @@ use tracing::warn;
 use crate::AgentRuntime;
 use crate::a2a_source::{A2aContinuations, A2aToolCatalog};
 use crate::component_source::ComponentToolCatalog;
-use crate::config::ToolRef;
+use crate::config::{LlmProviderRef, ToolRef};
 use crate::error::{AgentError, ConfigError};
 use crate::flow_source::FlowToolCatalog;
 use crate::llm::LlmToolSchema;
@@ -63,14 +63,17 @@ pub(crate) struct ToolCatalogs {
 impl ToolCatalogs {
     /// Resolve every catalog the runtime has a source for, for `tenant`.
     ///
-    /// `allowed` is the calling worker's own tool list. Only the playbook
-    /// source reads it, to narrow each document's allow-list against what the
-    /// caller actually holds; passing a wider list than the worker's would
-    /// hand a skill tools its caller does not have.
+    /// `allowed` is the calling worker's own tool list and `caller_llm` its own
+    /// provider/model. Only the playbook source reads either: the first to
+    /// narrow each document's allow-list against what the caller actually
+    /// holds — passing a wider list than the worker's would hand a skill tools
+    /// its caller does not have — and the second because a playbook names no
+    /// model of its own, so it runs on its caller's.
     pub(crate) async fn resolve(
         runtime: &AgentRuntime,
         tenant: &TenantContext,
         allowed: &[ToolRef],
+        caller_llm: &LlmProviderRef,
     ) -> Self {
         let mcp = match runtime.mcp.as_ref() {
             Some(src) => Some(src.catalog(tenant).await),
@@ -85,7 +88,7 @@ impl ToolCatalogs {
             None => None,
         };
         let playbooks = match runtime.playbooks.as_ref() {
-            Some(src) => Some(src.catalog(tenant, allowed).await),
+            Some(src) => Some(src.catalog(tenant, allowed, caller_llm).await),
             None => None,
         };
         let sorla = match runtime.sorla.as_ref() {
@@ -337,8 +340,13 @@ impl AgentRuntime {
     /// the same schemas, through the shared [`ToolCatalogs`]. Tools that do
     /// not resolve are dropped from [`ToolSession::schemas`] (and
     /// logged) exactly as the loop drops them from the LLM request.
-    pub async fn tool_session(&self, tenant: &TenantContext, tools: &[ToolRef]) -> ToolSession {
-        let catalogs = ToolCatalogs::resolve(self, tenant, tools).await;
+    pub async fn tool_session(
+        &self,
+        tenant: &TenantContext,
+        tools: &[ToolRef],
+        llm: &LlmProviderRef,
+    ) -> ToolSession {
+        let catalogs = ToolCatalogs::resolve(self, tenant, tools, llm).await;
         let schemas = catalogs.list_for_llm(&self.ext_runtime, tools);
         let codec = ToolNameCodec::for_tools(&schemas);
         ToolSession {
@@ -364,13 +372,21 @@ impl AgentRuntime {
         agent_id: &str,
     ) -> Result<ToolSession, ConfigError> {
         let config = self.config_provider.agent_config(tenant, agent_id).await?;
-        Ok(self.tool_session(tenant, &config.tools).await)
+        Ok(self.tool_session(tenant, &config.tools, &config.llm).await)
     }
 }
 
 #[cfg(all(test, feature = "test-mock"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    fn test_llm() -> LlmProviderRef {
+        LlmProviderRef {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            credential_ref: None,
+        }
+    }
+
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
@@ -495,7 +511,7 @@ mod tests {
             // Declared but resolvable from no catalog: dropped, as the loop does.
             tool_ref("component:ghost", "nothing"),
         ];
-        let session = rt.tool_session(&tenant, &tools).await;
+        let session = rt.tool_session(&tenant, &tools, &test_llm()).await;
         let schemas = session.schemas();
         assert_eq!(schemas.len(), 2, "got {schemas:?}");
         for s in &schemas {
@@ -517,7 +533,9 @@ mod tests {
         let component = Arc::new(RecordingComponent::default());
         let rt = runtime(component.clone());
         let tenant = TenantContext::new("acme", "prod");
-        let session = rt.tool_session(&tenant, &[component_ref()]).await;
+        let session = rt
+            .tool_session(&tenant, &[component_ref()], &test_llm())
+            .await;
         let wire = wire_of(&session, "Issue a refund");
         assert_ne!(
             wire,
@@ -581,7 +599,7 @@ mod tests {
         let rt = runtime(Arc::new(RecordingComponent::default()));
         let tenant = TenantContext::new("acme", "prod");
         let session = rt
-            .tool_session(&tenant, &[tool_ref("flow:lookup", "look_up")])
+            .tool_session(&tenant, &[tool_ref("flow:lookup", "look_up")], &test_llm())
             .await;
         let wire = wire_of(&session, "Look things up");
         let out = session.call(&wire, json!({ "q": "x" })).await.unwrap();
@@ -596,7 +614,7 @@ mod tests {
         // The catalog CAN resolve the component, but this agent declared only
         // the flow — so its name must not dispatch.
         let session = rt
-            .tool_session(&tenant, &[tool_ref("flow:lookup", "look_up")])
+            .tool_session(&tenant, &[tool_ref("flow:lookup", "look_up")], &test_llm())
             .await;
         let component_wire = wire_tool_name(&format!("component:{OCI_REF}"), "issue_refund");
         let err = session
@@ -632,7 +650,7 @@ mod tests {
         let rt = runtime(component.clone());
         let tenant = TenantContext::new("acme", "prod");
         let session = rt
-            .tool_session(&tenant, &[component_ref()])
+            .tool_session(&tenant, &[component_ref()], &test_llm())
             .await
             .with_session_id("s-1");
         let wire = wire_of(&session, "Issue a refund");
@@ -652,7 +670,9 @@ mod tests {
         );
 
         // Fresh ids, and no session scoping, dispatch every time.
-        let unscoped = rt.tool_session(&tenant, &[component_ref()]).await;
+        let unscoped = rt
+            .tool_session(&tenant, &[component_ref()], &test_llm())
+            .await;
         unscoped
             .call_with_id("c-1", &wire, json!({ "order_id": "o-1" }))
             .await
