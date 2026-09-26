@@ -225,9 +225,6 @@ impl HostNode {
         self.operation_in_mapping.as_deref()
     }
 
-    /// Whether this node runs an agentic worker: `dw.agent`, `dw.agent_graph`,
-    /// an `operala.call` deep worker, or an out-of-process `agentic.call`.
-    /// The run audit (`crate::run_outcome`) reports such a run as agentic.
     /// Whether this node is an `approval.call` gate.
     pub(crate) fn is_approval(&self) -> bool {
         matches!(self.kind, NodeKind::ApprovalCall { .. })
@@ -254,6 +251,9 @@ impl HostNode {
         self.response_timeout_secs
     }
 
+    /// Whether this node runs an agentic worker: `dw.agent`, `dw.agent_graph`,
+    /// an `operala.call` deep worker, or an out-of-process `agentic.call`.
+    /// The run audit (`crate::run_outcome`) reports such a run as agentic.
     pub(crate) fn is_agentic(&self) -> bool {
         matches!(
             self.kind,
