@@ -1,6 +1,10 @@
 //! Turn-side half of the run audit: the run marker persisted with a parked
 //! snapshot, the observer that remembers which node ran (trace mode or not),
 //! and the pure functions that turn one finished turn into a [`RunOutcome`].
+//!
+//! The error chain a technical error carries is held here UNREDACTED and in
+//! memory only; it is redacted and capped by [`super::error`] as the outcome
+//! is built, before anything reaches a sink.
 
 use std::error::Error as StdError;
 use std::sync::Arc;
@@ -9,8 +13,11 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{RunKind, RunOutcome, RunOutcomeSink, RunStatus, now_rfc3339};
+use super::error::{ErrorExcerpt, anyhow_chain_text, chain_text, new_error_ref};
+use super::wait::{ParkedNode, wait_state};
+use super::{RunKind, RunOutcome, RunOutcomeSink, RunStatus, WorkerIdentity, now_rfc3339};
 use crate::engine::runtime::IngressEnvelope;
+use crate::runner::engine::FlowWait;
 use crate::runner::engine::{ExecutionObserver, NodeEvent};
 use crate::validate::ValidationIssue;
 
@@ -31,9 +38,17 @@ pub(crate) struct RunMarker {
     pub(crate) run_id: String,
     pub(crate) started_at: String,
     /// Sticky: once a run has executed an agentic node, every later event for
-    /// it is agentic, so the admin row never flips back to a flow status.
+    /// it carries `kind: agentic`, so the admin badge never flips back.
     #[serde(default)]
     pub(crate) agentic: bool,
+    /// How many events this run has emitted so far; the next one carries
+    /// `seq + 1`. A marker written before the field decodes as 0.
+    #[serde(default)]
+    pub(crate) seq: u64,
+    /// The first agentic node's worker id, so a later turn of an agentic run
+    /// that runs no agent node still reports which worker it belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_ref: Option<String>,
 }
 
 impl RunMarker {
@@ -42,6 +57,8 @@ impl RunMarker {
             run_id: ulid::Ulid::new().to_string(),
             started_at: now_rfc3339(),
             agentic: false,
+            seq: 0,
+            agent_ref: None,
         }
     }
 }
@@ -57,6 +74,17 @@ pub(crate) struct ObservedTurn {
     pub(crate) failed_class: Option<&'static str>,
     /// Whether an agentic node started.
     pub(crate) saw_agentic: bool,
+    /// The failing node's error chain, UNREDACTED. In memory only; it leaves
+    /// the process solely through [`ErrorExcerpt::build`].
+    pub(crate) failed_chain: Option<String>,
+    /// The first agentic node's worker id.
+    pub(crate) agent_ref: Option<String>,
+    /// The last node that started — the node a park happened at.
+    pub(crate) parked: Option<ParkedNode>,
+    /// The flow of the latest node event: after a `flow.goto` it is the
+    /// target flow. A `flow.call` sub-flow's events move it, and the call
+    /// node's own end / error event moves it back to the caller.
+    pub(crate) flow_id: Option<String>,
 }
 
 /// An [`ExecutionObserver`] that records [`ObservedTurn`] and forwards every
@@ -85,8 +113,16 @@ impl ExecutionObserver for RunOutcomeObserver<'_> {
         {
             let mut seen = self.seen.lock();
             seen.last_node = Some(event.node_id.to_string());
+            seen.flow_id = Some(event.context.flow_id.to_string());
+            seen.parked = Some(ParkedNode {
+                approval: event.node.is_approval(),
+                response_timeout_secs: event.node.response_timeout_secs(),
+            });
             if event.node.is_agentic() {
                 seen.saw_agentic = true;
+                if seen.agent_ref.is_none() {
+                    seen.agent_ref = event.node.agent_ref().map(str::to_string);
+                }
             }
         }
         if let Some(inner) = self.inner {
@@ -95,7 +131,11 @@ impl ExecutionObserver for RunOutcomeObserver<'_> {
     }
 
     fn on_node_end(&self, event: &NodeEvent<'_>, output: &Value) {
-        self.seen.lock().last_node = Some(event.node_id.to_string());
+        {
+            let mut seen = self.seen.lock();
+            seen.last_node = Some(event.node_id.to_string());
+            seen.flow_id = Some(event.context.flow_id.to_string());
+        }
         if let Some(inner) = self.inner {
             inner.on_node_end(event, output);
         }
@@ -105,7 +145,10 @@ impl ExecutionObserver for RunOutcomeObserver<'_> {
         {
             let mut seen = self.seen.lock();
             seen.failed_node = Some(event.node_id.to_string());
-            seen.failed_class = Some(classify_error_text(&error.to_string()));
+            seen.flow_id = Some(event.context.flow_id.to_string());
+            let chain = chain_text(error);
+            seen.failed_class = Some(classify_error_text(&chain));
+            seen.failed_chain = Some(chain);
         }
         if let Some(inner) = self.inner {
             inner.on_node_error(event, error);
@@ -161,6 +204,12 @@ pub(crate) struct TurnContext {
     pub(crate) user_ref: Option<String>,
     pub(crate) user_verified: bool,
     pub(crate) channel: Option<String>,
+    /// The pack the turn runs: a flow run's worker identity, and the version
+    /// an agentic run reports.
+    pub(crate) pack: WorkerIdentity,
+    /// Turn-level retries before this attempt (`TurnScope`), for the error
+    /// excerpt.
+    pub(crate) retries: u32,
 }
 
 impl TurnContext {
@@ -185,28 +234,73 @@ impl TurnContext {
                 .map(str::trim)
                 .filter(|p| !p.is_empty() && *p != PLACEHOLDER_PROVIDER)
                 .map(str::to_string),
+            pack: WorkerIdentity::default(),
+            retries: 0,
         }
     }
 
+    /// Attach the pack's manifest identity (`pack_id`, name, version).
+    pub(crate) fn with_pack(
+        mut self,
+        pack_id: String,
+        name: Option<String>,
+        version: String,
+    ) -> Self {
+        self.pack = WorkerIdentity {
+            id: Some(pack_id),
+            name,
+            version: Some(version),
+        };
+        self
+    }
+
+    /// The `seq` this turn's event carries.
+    fn seq(&self) -> u64 {
+        self.marker.seq.saturating_add(1)
+    }
+
+    fn agent_ref(&self, observed: &ObservedTurn) -> Option<String> {
+        self.marker
+            .agent_ref
+            .clone()
+            .or_else(|| observed.agent_ref.clone())
+    }
+
     /// The marker to persist with the next parked snapshot.
+    /// The marker to persist once THIS turn's event is emitted: it carries
+    /// the event's `seq`, so the next turn continues from it.
     pub(crate) fn marker_after(&self, observed: &ObservedTurn) -> RunMarker {
         RunMarker {
             agentic: self.marker.agentic || observed.saw_agentic,
+            seq: self.seq(),
+            agent_ref: self.agent_ref(observed),
             ..self.marker.clone()
         }
     }
 
     fn outcome(&self, observed: &ObservedTurn, status: RunStatus) -> RunOutcome {
         let agentic = self.marker.agentic || observed.saw_agentic;
+        let worker = if agentic {
+            WorkerIdentity {
+                id: self.agent_ref(observed),
+                name: None,
+                version: self.pack.version.clone(),
+            }
+        } else {
+            self.pack.clone()
+        };
         RunOutcome {
             run_id: self.marker.run_id.clone(),
-            flow_id: self.flow_id.clone(),
+            flow_id: observed
+                .flow_id
+                .clone()
+                .unwrap_or_else(|| self.flow_id.clone()),
             kind: if agentic {
                 RunKind::Agentic
             } else {
                 RunKind::Flow
             },
-            status: if agentic { RunStatus::Agentic } else { status },
+            status,
             last_step: None,
             user_ref: self.user_ref.clone(),
             user_verified: self.user_verified,
@@ -214,21 +308,34 @@ impl TurnContext {
             outcome_json: None,
             error_code: None,
             started_at: self.marker.started_at.clone(),
+            seq: self.seq(),
+            wait: None,
+            worker,
+            error_ref: None,
+            error: None,
         }
     }
 
-    /// An agentic outcome carries status and identity only.
-    fn with_detail(
+    /// A technical error: `last_step`, `error_code`, a fresh `error_ref`, and
+    /// the redacted excerpt when an error chain is known.
+    fn technical_error(
         &self,
-        mut outcome: RunOutcome,
-        last_step: Option<String>,
-        error_code: Option<String>,
+        observed: &ObservedTurn,
+        node: Option<String>,
+        code: String,
+        chain: Option<&str>,
     ) -> RunOutcome {
-        if outcome.kind == RunKind::Flow {
-            outcome.last_step = last_step;
-            outcome.error_code = error_code;
+        let error_ref = new_error_ref();
+        let error = chain.map(|chain| {
+            ErrorExcerpt::build(&error_ref, &code, node.as_deref(), self.retries, chain)
+        });
+        RunOutcome {
+            last_step: node,
+            error_code: Some(code),
+            error_ref: Some(error_ref),
+            error,
+            ..self.outcome(observed, RunStatus::TechnicalError)
         }
-        outcome
     }
 
     /// The flow reached its end. A session flow's terminal failure also ends
@@ -253,36 +360,53 @@ impl TurnContext {
                     .map(str::to_string)
                     .or_else(|| sanitize_code(kind))
                     .unwrap_or_else(|| FLOW_EXECUTION_FAILED.to_string());
-                let outcome = self.outcome(observed, RunStatus::TechnicalError);
-                self.with_detail(outcome, node, Some(code))
+                // The node's own chain when the observer saw it, else the
+                // message the engine folded into the output. Redacted below.
+                let chain = observed.failed_chain.clone().or_else(|| {
+                    metadata
+                        .and_then(|m| m.get("error_message"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+                self.technical_error(observed, node, code, chain.as_deref())
             }
-            None => {
-                let outcome = self.outcome(observed, RunStatus::Completed);
-                self.with_detail(outcome, observed.last_node.clone(), None)
-            }
+            None => RunOutcome {
+                last_step: observed.last_node.clone(),
+                ..self.outcome(observed, RunStatus::Completed)
+            },
         }
     }
 
-    /// The flow parked at `next_node`.
-    pub(crate) fn waiting(&self, observed: &ObservedTurn, next_node: &str) -> RunOutcome {
-        let outcome = self.outcome(observed, RunStatus::InProgress);
-        self.with_detail(outcome, Some(next_node.to_string()), None)
+    /// The flow parked: `last_step` is the node it resumes at, `flow_id` the
+    /// flow it resumes in (a `flow.goto` target), and `wait` says what for.
+    pub(crate) fn waiting(&self, observed: &ObservedTurn, wait: &FlowWait) -> RunOutcome {
+        let snapshot = &wait.snapshot;
+        RunOutcome {
+            flow_id: snapshot
+                .next_flow
+                .clone()
+                .unwrap_or_else(|| snapshot.flow_id.clone()),
+            last_step: Some(snapshot.next_node.clone()),
+            wait: Some(wait_state(wait.reason.as_deref(), observed.parked)),
+            ..self.outcome(observed, RunStatus::InProgress)
+        }
     }
 
-    /// The engine returned an error.
-    pub(crate) fn failed(&self, observed: &ObservedTurn, error_text: &str) -> RunOutcome {
+    /// The engine returned an error. Its text picks the class and, redacted,
+    /// becomes the excerpt; it is never the `error_code`.
+    pub(crate) fn failed(&self, observed: &ObservedTurn, error: &anyhow::Error) -> RunOutcome {
+        let chain = anyhow_chain_text(error);
         let node = observed
             .failed_node
             .clone()
             .or_else(|| observed.last_node.clone());
         let code = observed
             .failed_class
-            .unwrap_or_else(|| match classify_error_text(error_text) {
+            .unwrap_or_else(|| match classify_error_text(&chain) {
                 "node_failed" => FLOW_EXECUTION_FAILED,
                 other => other,
             });
-        let outcome = self.outcome(observed, RunStatus::TechnicalError);
-        self.with_detail(outcome, node, Some(code.to_string()))
+        self.technical_error(observed, node, code.to_string(), Some(&chain))
     }
 }
 
@@ -331,6 +455,8 @@ fn user_ref(envelope: &IngressEnvelope, caller_block: Option<&Value>) -> (Option
 struct TurnScope {
     marker: Option<RunMarker>,
     pending_failure: Option<RunOutcome>,
+    /// Attempts of this turn so far ([`RunOutcomeReporter::remember`]).
+    attempts: u32,
 }
 
 tokio::task_local! {
@@ -369,9 +495,16 @@ impl RunOutcomeReporter {
         with_scope(|scope| scope.marker.clone()).flatten()
     }
 
-    /// Remember this attempt's marker for any retry of the same turn.
-    pub(crate) fn remember(&self, marker: &RunMarker) {
-        with_scope(|scope| scope.marker = Some(marker.clone()));
+    /// Remember this attempt's marker for any retry of the same turn, and
+    /// return how many attempts of this turn ran BEFORE this one.
+    pub(crate) fn remember(&self, marker: &RunMarker) -> u32 {
+        with_scope(|scope| {
+            scope.marker = Some(marker.clone());
+            let before = scope.attempts;
+            scope.attempts = scope.attempts.saturating_add(1);
+            before
+        })
+        .unwrap_or(0)
     }
 
     /// Report a turn that reached a flow status.

@@ -5,8 +5,8 @@
 //! `docs/superpowers/specs/2026-09-24-env-canvas-unit-monitoring-phase-2-design.md`
 //! §4.1 — `POST {admin}/api/v1/ingest/worker-usage`, bearer = the unit's
 //! worker-usage token, one event per LLM iteration, `surface: "turn"`, plus an
-//! optional `model`. The body is the one greentic-start's interop reporter
-//! already sends (`src/interop/metering/event.rs`), so both producers speak one
+//! optional `model` and (audit wire contract v2 §5) an optional `run_id`. The
+//! body is the one greentic-start's interop reporter already sends (`src/interop/metering/event.rs`), so both producers speak one
 //! shape: a ULID `event_id` (the admin's primary key and idempotency key), an
 //! RFC 3339 `occurred_at` with a literal `Z`, and no content of any kind.
 //!
@@ -177,6 +177,11 @@ pub(crate) struct WorkerUsageEvent {
     /// model as `"unknown"`, and an empty string would be a bucket of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
+    /// The deployed run this LLM iteration belongs to
+    /// ([`super::run_scope::current_run_id`]); omitted outside a run and when
+    /// longer than [`MAX_FIELD_BYTES`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
 }
 
 /// What one delivery attempt decided. `pub(crate)` for tests.
@@ -342,6 +347,8 @@ impl WorkerUsageMeter {
             iterations: 1,
             duration_ms: 0,
             model: (!model.is_empty()).then(|| model.to_string()),
+            run_id: super::run_scope::current_run_id()
+                .filter(|id| !id.is_empty() && id.len() <= MAX_FIELD_BYTES),
         })
     }
 

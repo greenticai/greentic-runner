@@ -1,9 +1,13 @@
 //! Deployed run audit: one outcome event per flow TURN, so the admin can list
 //! the runs of a deployed unit as *completed*, *in progress* (read back as
-//! *dropped off* once idle), *technical error* or *agentic*.
+//! *dropped off* once its response is overdue, or once idle) or *technical
+//! error* — for plain flows and agentic runs alike.
 //!
 //! Design: greentic-designer
-//! `docs/superpowers/specs/2026-09-25-deployed-run-audit-design.md` §3.1.
+//! `docs/superpowers/specs/2026-09-25-deployed-run-audit-design.md` §3.1 (v1)
+//! and `docs/superpowers/specs/2026-09-26-operate-audit-v1-1-design.md` with
+//! the Slice B wire contract v2 (`seq`, `wait_kind`, `response_due_at`,
+//! `worker_*`, `error_ref`, the `error` excerpt).
 //!
 //! # Why the runner emits it
 //!
@@ -13,7 +17,8 @@
 //! error. By the time the embedding host sees the reply, "waiting" has been
 //! folded into it. A session also never announces that it ENDED (waits expire
 //! silently), so every turn writes its status as it happens and "dropped off"
-//! is derived at read time from an `in_progress` row that went idle.
+//! is derived at read time from an `in_progress` row whose `response_due_at`
+//! passed (or, for a v1 row with no deadline, that went idle).
 //!
 //! # A run spans turns
 //!
@@ -23,17 +28,42 @@
 //! predates this field carries none, and its resume mints a fresh id — the
 //! only cost is that such an in-flight run is split in two, once.
 //!
+//! Every event carries `seq`: 1 on a run's first event, +1 on each later one.
+//! The count is stored in the same marker (`RunMarker.seq`; a marker written
+//! before the field decodes as 0, so its next event is 1). The admin applies
+//! an event only when its `seq` is greater than the stored one.
+//!
+//! Journey identity inside one turn: a `flow.call` sub-flow and a `flow:` tool
+//! a worker invokes run INSIDE the caller's turn (`FlowEngine::execute` /
+//! `PackRuntime::run_flow_for_tool`, never through `call_traced`), so they
+//! mint no run and emit nothing of their own. A `flow.goto` is a jump in the
+//! SAME walk: the run continues under the same `run_id`, and the event
+//! reports the flow the walk ended in (a parked target's resumes carry it as
+//! `next_flow`).
+//!
 //! Card-driven packs whose pause points are rendered cards (they re-enter via
 //! `entry_node` and never park) leave no snapshot, so each of their turns is a
-//! run of its own. That is a property of those packs, not of this module.
+//! run of its own. So does an agent-forward flow (`start → dw.agent`): it
+//! reaches its end every turn, so each turn is its own journey. Both are
+//! properties of those packs, not of this module.
+//!
+//! # Agentic runs
+//!
+//! A run that executed an agentic node carries `kind: agentic` (sticky across
+//! its turns) and otherwise the SAME status rules as a flow — `completed`,
+//! `in_progress` (+ `wait_kind`) or `technical_error`, with `last_step` and
+//! `error_code`. v1 reported such a run as `status: agentic` with nothing
+//! else; v2 never emits that status.
 //!
 //! # What never leaves the process
 //!
-//! Message text, node payloads and raw error text. `error_code` is a short
-//! class (`timeout`, `secret_missing`, …) computed here; the error's own text
-//! can name internal hosts and is never sent. `outcome_json` is reserved for a
-//! flow's DECLARED output map; flows do not declare one today, so it is always
-//! absent rather than filled with the reply (which is user-visible text).
+//! Message text and node payloads. `error_code` is a short class (`timeout`,
+//! `secret_missing`, …) computed here. The error's own text leaves ONLY in the
+//! technical-error `error` excerpt, redacted and capped
+//! ([`error`]) — `safe_summary` is built from identifiers alone. `outcome_json`
+//! is reserved for a flow's DECLARED output map; flows do not declare one
+//! today, so it is always absent rather than filled with the reply (which is
+//! user-visible text).
 //!
 //! # No sink, no change
 //!
@@ -42,12 +72,15 @@
 //! no id is minted, no observer is installed and the persisted wait is
 //! byte-identical to before.
 
+pub(crate) mod error;
 pub mod http;
 pub(crate) mod turn;
+pub(crate) mod wait;
 
 use serde::Serialize;
 use serde_json::Value;
 
+pub use error::ErrorExcerpt;
 pub use http::{HttpRunOutcomeSink, RunOutcomeSinkError, RunOutcomeTarget};
 
 /// What kind of run an event describes. Serialised `snake_case`.
@@ -57,9 +90,8 @@ pub enum RunKind {
     /// A plain flow run.
     Flow,
     /// A run that executed an agentic node (`dw.agent`, `dw.agent_graph`,
-    /// `operala.call` deep worker, `agentic.call`). Reported with
-    /// [`RunStatus::Agentic`] and nothing else: an agent's turn has no
-    /// business "step" to stop at.
+    /// `operala.call` deep worker, `agentic.call`). Sticky across the run's
+    /// turns; the status follows the same rules as a flow's.
     Agentic,
 }
 
@@ -74,8 +106,41 @@ pub enum RunStatus {
     Completed,
     /// The engine failed, or a node failed and the flow ended on it.
     TechnicalError,
-    /// Any turn of an agentic run.
-    Agentic,
+}
+
+/// What an `in_progress` run is waiting for. Serialised `snake_case`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    /// A card, a channel message or any other await-input park.
+    UserInput,
+    /// An `approval.call` gate waiting for a human decision.
+    Approval,
+    /// A remote dispatch (operala / NATS / another runtime) in flight.
+    Processing,
+}
+
+/// The wait an `in_progress` event reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WaitState {
+    pub kind: WaitKind,
+    /// RFC 3339 (ms, `Z`); present iff `kind` is [`WaitKind::UserInput`].
+    pub response_due_at: Option<String>,
+}
+
+/// Who did the work: for an agentic run the agent, for a flow run the pack.
+/// Every field is optional on the wire.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WorkerIdentity {
+    /// Agentic: the agent node's canonical id. Flow: the manifest `pack_id`.
+    pub id: Option<String>,
+    /// Flow: the manifest name. Agentic: omitted (an agent config carries no
+    /// display name).
+    pub name: Option<String>,
+    /// The pack manifest version.
+    pub version: Option<String>,
 }
 
 /// One turn's outcome, as the runtime hands it to a [`RunOutcomeSink`]. The
@@ -106,6 +171,15 @@ pub struct RunOutcome {
     pub error_code: Option<String>,
     /// When the run's FIRST turn started (RFC 3339, UTC, `Z`).
     pub started_at: String,
+    /// 1 on the run's first event, +1 on every later event of the run.
+    pub seq: u64,
+    /// `in_progress` only: what the run waits for, and until when.
+    pub wait: Option<WaitState>,
+    pub worker: WorkerIdentity,
+    /// `technical_error` only: the support reference (ULID).
+    pub error_ref: Option<String>,
+    /// `technical_error` only, when an error chain was available.
+    pub error: Option<ErrorExcerpt>,
 }
 
 /// Receives one [`RunOutcome`] per flow turn.

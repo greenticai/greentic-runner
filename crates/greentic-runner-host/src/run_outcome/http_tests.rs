@@ -7,6 +7,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
+use crate::run_outcome::{WaitKind, WaitState, WorkerIdentity};
 
 const TOKEN: &str = "wut_super_secret_token_value";
 const INGEST_PATH: &str = "/api/v1/ingest/run-outcome";
@@ -39,6 +40,21 @@ fn outcome() -> RunOutcome {
         outcome_json: None,
         error_code: Some("timeout".into()),
         started_at: "2026-09-25T09:00:00.000Z".into(),
+        seq: 3,
+        wait: None,
+        worker: WorkerIdentity {
+            id: Some("pack.demo".into()),
+            name: Some("Demo".into()),
+            version: Some("1.2.0".into()),
+        },
+        error_ref: Some("01J8ERRORREFZZZZZZZZZZZZZZ".into()),
+        error: Some(ErrorExcerpt::build(
+            "01J8ERRORREFZZZZZZZZZZZZZZ",
+            "timeout",
+            Some("call_api"),
+            1,
+            "call failed\ncaused by: Authorization: Bearer abc at secrets://default/acme/_/k",
+        )),
     }
 }
 
@@ -100,6 +116,52 @@ fn the_wire_body_is_snake_case_with_attribution_from_the_target() {
     assert!(body["occurred_at"].as_str().unwrap().ends_with('Z'));
     assert!(body.get("outcome_json").is_none(), "absent, never null");
     assert!(!body.to_string().contains(TOKEN));
+
+    // v2 fields.
+    assert_eq!(body["seq"], 3);
+    assert_eq!(body["worker_id"], "pack.demo");
+    assert_eq!(body["worker_name"], "Demo");
+    assert_eq!(body["worker_version"], "1.2.0");
+    assert_eq!(body["error_ref"], "01J8ERRORREFZZZZZZZZZZZZZZ");
+    assert_eq!(body["error"]["error_ref"], body["error_ref"]);
+    assert_eq!(body["error"]["error_code"], "timeout");
+    assert_eq!(body["error"]["node_id"], "call_api");
+    assert_eq!(body["error"]["retry_count"], 1);
+    assert_eq!(body["error"]["truncated"], false);
+    assert!(body.get("wait_kind").is_none() && body.get("response_due_at").is_none());
+    let text = body.to_string();
+    assert!(
+        !text.contains("secrets://") && !text.contains("Bearer abc"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_in_progress_body_carries_its_wait_and_no_error() {
+    let sink = HttpRunOutcomeSink::new(target("https://admin.example/x")).unwrap();
+    let mut parked = outcome();
+    parked.status = RunStatus::InProgress;
+    parked.error_code = None;
+    parked.error_ref = None;
+    parked.error = None;
+    parked.wait = Some(WaitState {
+        kind: WaitKind::UserInput,
+        response_due_at: Some("2026-09-26T10:00:00.000Z".into()),
+    });
+    let body = serde_json::to_value(sink.build_event(parked).unwrap()).unwrap();
+    assert_eq!(body["status"], "in_progress");
+    assert_eq!(body["wait_kind"], "user_input");
+    assert_eq!(body["response_due_at"], "2026-09-26T10:00:00.000Z");
+    assert!(body.get("error").is_none() && body.get("error_ref").is_none());
+
+    let mut approval = outcome();
+    approval.wait = Some(WaitState {
+        kind: WaitKind::Approval,
+        response_due_at: None,
+    });
+    let body = serde_json::to_value(sink.build_event(approval).unwrap()).unwrap();
+    assert_eq!(body["wait_kind"], "approval");
+    assert!(body.get("response_due_at").is_none());
 }
 
 #[test]
@@ -115,7 +177,10 @@ fn over_long_ids_drop_the_event_and_over_long_labels_are_omitted() {
     let mut long = outcome();
     long.user_ref = Some("u".repeat(MAX_FIELD_BYTES + 1));
     long.outcome_json = Some(json!({ "blob": "x".repeat(MAX_OUTCOME_JSON_BYTES) }));
+    long.worker.name = Some("n".repeat(MAX_FIELD_BYTES + 1));
     let event = sink.build_event(long).unwrap();
+    assert_eq!(event.worker_name, None);
+    assert_eq!(event.worker_id.as_deref(), Some("pack.demo"));
     assert_eq!(event.user_ref, None);
     assert_eq!(event.outcome_json, None);
 
