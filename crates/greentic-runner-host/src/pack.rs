@@ -3411,6 +3411,92 @@ impl PackRuntime {
         names.into_iter().collect()
     }
 
+    /// Every playbook document the pack carries, as bare ids.
+    ///
+    /// The contract is one file per playbook at `assets/playbooks/<id>.yaml`
+    /// with no index beside it, because every field a listing needs is inside
+    /// each document — so enumerating the directory is the only way to find
+    /// them, and [`PackRuntime::read_asset`] can then read one by id.
+    ///
+    /// Searched in the same places assets are, and for the same reason
+    /// [`extension_archive_entries`](Self::extension_archive_entries) searches
+    /// two: the extracted tempdir an archive-backed pack holds, the
+    /// materialized directory, and the archive itself. A `BTreeSet` makes the
+    /// result stable and deduplicates a pack that has both.
+    ///
+    /// An empty result is the normal reading of a pack that carries no
+    /// playbooks — which is every pack built before the feature.
+    #[cfg(feature = "agentic-worker")]
+    pub fn playbook_ids(&self) -> Vec<String> {
+        const PREFIX: &str = "assets/playbooks/";
+        const SUFFIX: &str = ".yaml";
+
+        fn id_of(name: &str) -> Option<String> {
+            let rest = name.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+            // One level only: a nested path is not an id this reader can
+            // address through `read_asset`, so it is not a playbook.
+            (!rest.is_empty() && !rest.contains('/')).then(|| rest.to_string())
+        }
+
+        let mut ids = std::collections::BTreeSet::new();
+
+        let mut scan_dir = |root: &std::path::Path| {
+            let dir = root.join(PREFIX.trim_end_matches('/'));
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if !entry
+                            .file_type()
+                            .map(|kind| kind.is_file())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                            continue;
+                        };
+                        if let Some(id) = id_of(&format!("{PREFIX}{file_name}")) {
+                            ids.insert(id);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "failed to list the pack's playbooks directory"
+                ),
+            }
+        };
+
+        if let Some(tempdir) = &self.assets_tempdir {
+            scan_dir(tempdir.path());
+        }
+        if self.path.is_dir() {
+            scan_dir(&self.path);
+        }
+
+        if let Some(archive_path) = self
+            .archive_path
+            .as_ref()
+            .or_else(|| path_is_gtpack(&self.path).then_some(&self.path))
+        {
+            match File::open(archive_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|file| ZipArchive::new(file).map_err(anyhow::Error::from))
+            {
+                Ok(archive) => ids.extend(archive.file_names().filter_map(id_of)),
+                Err(error) => tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to read the pack archive while listing playbooks"
+                ),
+            }
+        }
+
+        ids.into_iter().collect()
+    }
+
     /// MCP route material from the optional `assets/mcp-routes.json` sidecar.
     ///
     /// `None` when the pack carries none — which is how a pack built before
