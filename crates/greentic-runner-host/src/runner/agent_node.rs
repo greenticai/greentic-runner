@@ -1938,6 +1938,54 @@ mod aw {
         // injected manager.
         let remote_tool_secrets = mcp_secrets_manager(&secrets);
 
+        // Hoisted into locals so the playbook turn host below can share the
+        // SAME source objects — and therefore the same TTL caches — rather than
+        // each nested turn re-enumerating the packs.
+        let components = component_source_from_packs(&packs, &tenant);
+        let flows = flow_source_from_packs(&packs, &tenant);
+        let sorla = match sorla_source_from_env().await {
+            Some(env) => Some(env),
+            None => {
+                crate::runner::sorla_pack_source::sorla_source_from_packs(
+                    &packs,
+                    &tenant,
+                    Some(remote_tool_secrets.clone()),
+                    unit.as_deref(),
+                )
+                .await
+            }
+        };
+        // Pack-only: there is no admin A2A source to prefer. This site covers
+        // deployed dw.agent units, the desktop runner and the designer's
+        // test-chat sidecar; `graph_node::graph_a2a_source` builds the graph
+        // turns' source from the same inputs through the same helper.
+        // `build_agent_runtime` (process-level serve, no packs) stays without
+        // one, as it is for pack MCP.
+        let a2a = crate::runner::a2a_pack_source::a2a_source_from_packs(
+            &packs,
+            &tenant,
+            Some(remote_tool_secrets.clone()),
+            unit.as_deref(),
+        );
+        // A playbook's own turn gets every source above and deliberately NOT a
+        // playbook one, so a skill cannot call a skill — see `playbook_turn`.
+        let playbooks = crate::runner::playbook_turn::playbook_source_from_packs(
+            &packs,
+            crate::runner::playbook_turn::PlaybookTurnHost {
+                state_store: state_store.clone(),
+                ext_runtime: ext_runtime.clone(),
+                llm: llm.clone(),
+                telemetry: telemetry.clone(),
+                token_meter: token_meter.clone(),
+                ledger: ledger.clone(),
+                mcp: None,
+                components: components.clone(),
+                flows: flows.clone(),
+                sorla: sorla.clone(),
+                a2a: a2a.clone(),
+            },
+        );
+
         let base = AgentRuntime::new(
             config_provider,
             state_store,
@@ -1972,32 +2020,11 @@ mod aw {
                 )
             }),
         )
-        .with_component_source(component_source_from_packs(&packs, &tenant))
-        .with_flow_source(flow_source_from_packs(&packs, &tenant))
-        .with_sorla_source(match sorla_source_from_env().await {
-            Some(env) => Some(env),
-            None => {
-                crate::runner::sorla_pack_source::sorla_source_from_packs(
-                    &packs,
-                    &tenant,
-                    Some(remote_tool_secrets.clone()),
-                    unit.as_deref(),
-                )
-                .await
-            }
-        })
-        // Pack-only: there is no admin A2A source to prefer. This site covers
-        // deployed dw.agent units, the desktop runner and the designer's
-        // test-chat sidecar; `graph_node::graph_a2a_source` builds the graph
-        // turns' source from the same inputs through the same helper.
-        // `build_agent_runtime` (process-level serve, no packs) stays without
-        // one, as it is for pack MCP.
-        .with_a2a_source(crate::runner::a2a_pack_source::a2a_source_from_packs(
-            &packs,
-            &tenant,
-            Some(remote_tool_secrets),
-            unit.as_deref(),
-        ));
+        .with_component_source(components)
+        .with_flow_source(flows)
+        .with_sorla_source(sorla)
+        .with_a2a_source(a2a)
+        .with_playbook_source(playbooks);
 
         // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
         // `dw.agent` workers ground on the ingested corpus exactly as the

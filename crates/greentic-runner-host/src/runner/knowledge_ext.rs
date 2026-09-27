@@ -909,6 +909,17 @@ mod call_site_ratchet {
     /// covers the sites reasoned about here and never the next one.
     const EXEMPT: &[(&str, usize, &str)] = &[
         (
+            "src/runner/playbook_turn.rs",
+            1,
+            "a playbook turn, whose synthesised config is `knowledge: None` \
+             because a playbook has no corpus of its own BY CONTRACT — the \
+             document has no knowledge field at all, and knowledge reaches a \
+             playbook as an entry in its tool allow-list like any other \
+             capability. Mounting retrieval here would give a skill a corpus \
+             its author never declared and its caller cannot see. Pinned by \
+             `playbook_turn::tests::a_playbook_turn_carries_no_memory_and_no_knowledge`",
+        ),
+        (
             "src/runner/graph_node.rs",
             2,
             "the supervisor ROUTING runtime, whose synthesised config is \

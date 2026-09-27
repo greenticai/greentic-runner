@@ -136,6 +136,10 @@ pub trait PlaybookSource: Send + Sync {
 /// and must not widen it back to the calling worker's.
 #[derive(Clone, Debug)]
 pub struct PlaybookTurnRequest {
+    /// The tenant the calling worker is running for. Carried on the request
+    /// because only the catalog holds it — it is resolved per tenant — and the
+    /// host needs it to seed a conversation and attribute the turn's spend.
+    pub tenant: TenantContext,
     pub playbook_id: String,
     pub instructions: String,
     pub llm: PlaybookLlmRequirement,
@@ -189,6 +193,9 @@ pub struct PlaybookToolCatalog {
     /// is a property of the CALLER, which this whole catalog is already scoped
     /// to — the same reason the narrowing lives here.
     caller_llm: LlmProviderRef,
+    /// Captured for the same reason `caller_llm` is: the catalog is already
+    /// scoped to one tenant, so every request it builds carries that one.
+    tenant: TenantContext,
     fetched_at: Instant,
 }
 
@@ -207,6 +214,7 @@ impl PlaybookToolCatalog {
         turn: PlaybookTurnFn,
         caller_tools: &[ToolRef],
         caller_llm: LlmProviderRef,
+        tenant: TenantContext,
     ) -> Self {
         let held: BTreeSet<(&str, &str)> = caller_tools
             .iter()
@@ -245,6 +253,7 @@ impl PlaybookToolCatalog {
             tools,
             turn,
             caller_llm,
+            tenant,
             fetched_at: Instant::now(),
         }
     }
@@ -285,6 +294,7 @@ impl PlaybookToolCatalog {
             }
         };
         let request = PlaybookTurnRequest {
+            tenant: self.tenant.clone(),
             playbook_id: playbook_id.to_string(),
             instructions: entry.instructions.clone(),
             llm: entry.llm.clone(),
@@ -369,6 +379,7 @@ impl PlaybookToolSource {
             self.turn.clone(),
             caller_tools,
             caller_llm.clone(),
+            tenant.clone(),
         ));
         self.cache.insert(key, built.clone());
         built
@@ -454,6 +465,7 @@ mod tests {
                 tool("greentic.crm", "note"),
             ],
             caller_llm(),
+            TenantContext::new("acme", "prod"),
         );
         assert_eq!(cat.len(), 1);
         let entry = cat.tool_entry("refund").expect("entry");
@@ -474,6 +486,7 @@ mod tests {
                 tool("greentic.crm", "note"),
             ],
             caller_llm(),
+            TenantContext::new("acme", "prod"),
         );
         cat.dispatch("refund", "{\"order\":7}").await;
         let calls = seen.lock().expect("lock");
@@ -492,6 +505,7 @@ mod tests {
             // The caller holds only ONE of the two the playbook binds.
             &[tool("greentic.billing", "refund")],
             caller_llm(),
+            TenantContext::new("acme", "prod"),
         );
         let entry = cat.tool_entry("refund").expect("entry");
         assert_eq!(
@@ -521,6 +535,7 @@ mod tests {
                 tool("greentic.payroll", "pay"),
             ],
             caller_llm(),
+            TenantContext::new("acme", "prod"),
         );
         let entry = cat.tool_entry("refund").expect("entry");
         assert_eq!(entry.tools.len(), 2, "union would have given three");
@@ -536,7 +551,13 @@ mod tests {
     #[tokio::test]
     async fn dispatch_unknown_playbook_returns_an_error_value_not_err() {
         let (turn, _) = recording_turn();
-        let cat = PlaybookToolCatalog::from_source(&FakeSource, turn, &[], caller_llm());
+        let cat = PlaybookToolCatalog::from_source(
+            &FakeSource,
+            turn,
+            &[],
+            caller_llm(),
+            TenantContext::new("acme", "prod"),
+        );
         let out = cat.dispatch("no_such_playbook", "{}").await;
         assert!(out.get("error").is_some(), "must yield an error value");
         assert!(
@@ -551,7 +572,13 @@ mod tests {
     #[tokio::test]
     async fn unreadable_arguments_are_an_error_value_and_no_turn_runs() {
         let (turn, seen) = recording_turn();
-        let cat = PlaybookToolCatalog::from_source(&FakeSource, turn, &[], caller_llm());
+        let cat = PlaybookToolCatalog::from_source(
+            &FakeSource,
+            turn,
+            &[],
+            caller_llm(),
+            TenantContext::new("acme", "prod"),
+        );
         let out = cat.dispatch("refund", "not json").await;
         assert!(out.get("error").is_some());
         assert!(
@@ -567,6 +594,7 @@ mod tests {
             failing_turn("no provider satisfies tier reasoning"),
             &[],
             caller_llm(),
+            TenantContext::new("acme", "prod"),
         );
         let out = cat.dispatch("refund", "{}").await;
         assert_eq!(out["error"], "no provider satisfies tier reasoning");
@@ -581,7 +609,13 @@ mod tests {
             }
         }
         let (turn, _) = recording_turn();
-        let cat = PlaybookToolCatalog::from_source(&Empty, turn, &[], caller_llm());
+        let cat = PlaybookToolCatalog::from_source(
+            &Empty,
+            turn,
+            &[],
+            caller_llm(),
+            TenantContext::new("acme", "prod"),
+        );
         assert!(cat.is_empty());
     }
 

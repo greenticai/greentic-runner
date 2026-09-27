@@ -1716,6 +1716,7 @@ mod tests {
                 model: "gpt-4o-mini".into(),
                 credential_ref: None,
             },
+            crate::tenant::TenantContext::new("t", "e"),
         ))
     }
 

@@ -40,6 +40,7 @@ pub mod operala_node;
 #[cfg(feature = "operala-in-process")]
 pub mod operala_tools;
 pub mod playbook_invoker;
+pub mod playbook_turn;
 // Bills an in-process deep worker's own reasoning-loop LLM calls.
 #[cfg(feature = "operala-in-process")]
 pub(crate) mod metered_llm;
