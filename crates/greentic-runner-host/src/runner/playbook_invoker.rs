@@ -35,7 +35,16 @@ use crate::pack::PackRuntime;
 /// A document above it is omitted rather than read for the fields we recognise:
 /// a playbook is a procedure with guardrails, and partially honouring one is
 /// worse than declining it.
-const MAX_DESCRIPTOR_VERSION: u32 = 1;
+///
+/// **2, not 1, and the difference is every playbook that exists.** An ABSENT
+/// field reads as 1 (`default_descriptor_version`, matching the designer's own
+/// `PlaybookDoc`), but the Playbook Studio writes 2 on every document it
+/// creates (`EMPTY_PLAYBOOK` in `web/src/features/playbook-composer/types.ts`)
+/// and its LLM auto-fill emits 2 as well. A ceiling of 1 therefore refuses
+/// every authored playbook and offers none of them as a tool — the silent
+/// tool-dropping this whole reader exists to make impossible, in the reader
+/// itself. Raise it only alongside the fields a new version adds.
+const MAX_DESCRIPTOR_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // The document, as this reader projects it
@@ -339,7 +348,7 @@ mod tests {
     use super::*;
 
     const AGENTIC: &str = r#"
-descriptor_version: 1
+descriptor_version: 2
 playbook_id: refund
 summary: Issue a refund
 execution: agentic
@@ -413,13 +422,42 @@ steps: { anything: true }
     #[test]
     fn a_newer_descriptor_version_is_refused_rather_than_partly_read() {
         let doc = r#"
-descriptor_version: 2
+descriptor_version: 3
 playbook_id: refund
 execution: agentic
 instructions: Follow the policy.
 "#;
         let err = operation_from_yaml(doc.as_bytes()).expect_err("must refuse");
         assert!(err.contains("descriptor_version"), "got: {err}");
+    }
+
+    /// The version the Playbook Studio actually writes. This test used the
+    /// value 2 as its "newer, therefore refused" case, which passed while
+    /// refusing every playbook anyone has ever authored — so the accepted case
+    /// is now pinned explicitly rather than left implied by the fixture.
+    #[test]
+    fn the_version_the_studio_writes_is_accepted() {
+        let doc = r#"
+descriptor_version: 2
+playbook_id: refund
+execution: agentic
+instructions: Follow the policy.
+"#;
+        let op = operation_from_yaml(doc.as_bytes()).expect("a studio document must be offered");
+        assert_eq!(op.playbook_id, "refund");
+    }
+
+    /// An absent field still reads as 1, so a document predating the field is
+    /// offered rather than refused.
+    #[test]
+    fn an_absent_descriptor_version_is_accepted_as_version_one() {
+        let doc = "playbook_id: p
+execution: agentic
+instructions: x
+";
+        let op =
+            operation_from_yaml(doc.as_bytes()).expect("a pre-version document must be offered");
+        assert_eq!(op.playbook_id, "p");
     }
 
     #[test]
