@@ -16,6 +16,8 @@
 //!   from the parked node's `response_timeout_secs`;
 //! - a `flow.call` sub-flow and a `flow:`-tool flow emit nothing of their own,
 //!   and a `flow.goto` continues the same run in the target flow;
+//! - the v3 `path` lists the nodes executed THIS turn in order, including a
+//!   `flow.call` callee's nodes and a `flow.goto` target's nodes;
 //! - the worker identity is the pack's manifest identity;
 //! - a runtime with NO sink persists the exact resume record it always did.
 //!
@@ -527,6 +529,12 @@ fn a_flow_call_sub_flow_emits_nothing_and_the_parked_nodes_timeout_sets_the_dead
     assert_eq!(first[0].flow_id, "call.flow");
     assert_eq!(first[0].status, RunStatus::InProgress);
     assert_eq!(first[0].seq, 1);
+    assert_eq!(
+        first[0].path,
+        ["call", "hello", "ask"],
+        "the callee's node runs under the caller's path"
+    );
+    assert!(!first[0].path_truncated);
     let due = first[0]
         .wait
         .as_ref()
@@ -544,6 +552,7 @@ fn a_flow_call_sub_flow_emits_nothing_and_the_parked_nodes_timeout_sets_the_dead
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].status, RunStatus::Completed);
     assert_eq!((second[0].seq, &second[0].run_id), (2, &first[0].run_id));
+    assert_eq!(second[0].path, ["done"], "only this turn's nodes");
     Ok(())
 }
 
@@ -573,6 +582,11 @@ fn a_flow_goto_continues_the_same_run_in_the_target_flow() -> Result<()> {
         "the event names the target flow"
     );
     assert_eq!(first[0].seq, 1);
+    assert_eq!(
+        first[0].path,
+        ["jump", "ask"],
+        "the goto target's nodes append to the same path"
+    );
 
     rt.block_on(h.runtime.handle(envelope("goto.flow", "again")))?;
     let second = h.sink.take();
@@ -580,6 +594,7 @@ fn a_flow_goto_continues_the_same_run_in_the_target_flow() -> Result<()> {
     assert_eq!(second[0].status, RunStatus::Completed);
     assert_eq!(second[0].flow_id, "wait.flow");
     assert_eq!((second[0].seq, &second[0].run_id), (2, &first[0].run_id));
+    assert_eq!(second[0].path, ["done"]);
     Ok(())
 }
 

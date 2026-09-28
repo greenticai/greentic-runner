@@ -7,7 +7,8 @@
 //! `docs/superpowers/specs/2026-09-25-deployed-run-audit-design.md` §3.1 (v1)
 //! and `docs/superpowers/specs/2026-09-26-operate-audit-v1-1-design.md` with
 //! the Slice B wire contract v2 (`seq`, `wait_kind`, `response_due_at`,
-//! `worker_*`, `error_ref`, the `error` excerpt).
+//! `worker_*`, `error_ref`, the `error` excerpt), plus the additive v3
+//! `path` / `path_truncated` ([`path`]).
 //!
 //! # Why the runner emits it
 //!
@@ -57,8 +58,9 @@
 //!
 //! # What never leaves the process
 //!
-//! Message text and node payloads. `error_code` is a short class (`timeout`,
-//! `secret_missing`, …) computed here. The error's own text leaves ONLY in the
+//! Message text and node payloads. The v3 `path` carries node IDS only.
+//! `error_code` is a short class (`timeout`, `secret_missing`, …) computed
+//! here. The error's own text leaves ONLY in the
 //! technical-error `error` excerpt, redacted and capped
 //! ([`error`]) — `safe_summary` is built from identifiers alone. `outcome_json`
 //! is reserved for a flow's DECLARED output map; flows do not declare one
@@ -74,6 +76,7 @@
 
 pub(crate) mod error;
 pub mod http;
+pub(crate) mod path;
 pub(crate) mod turn;
 pub(crate) mod wait;
 
@@ -180,6 +183,12 @@ pub struct RunOutcome {
     pub error_ref: Option<String>,
     /// `technical_error` only, when an error chain was available.
     pub error: Option<ErrorExcerpt>,
+    /// Contract v3: the ids of the nodes EXECUTED in this turn, in order,
+    /// consecutive duplicates collapsed, at most 32 (see [`path`]). Node ids
+    /// only. Empty when the observer saw no node.
+    pub path: Vec<String>,
+    /// `true` when [`Self::path`] was cut at its cap.
+    pub path_truncated: bool,
 }
 
 /// Receives one [`RunOutcome`] per flow turn.

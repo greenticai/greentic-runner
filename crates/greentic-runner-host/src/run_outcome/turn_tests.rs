@@ -473,6 +473,107 @@ fn the_observer_records_nodes_and_forwards_every_callback() {
 }
 
 #[test]
+fn the_observer_records_the_executed_path_in_order_across_sub_flows() {
+    let observer = RunOutcomeObserver::new(None);
+    let ctx_in = |flow_id: &'static str| FlowContext {
+        tenant: "demo",
+        pack_id: "p",
+        flow_id,
+        node_id: None,
+        tool: None,
+        action: None,
+        session_id: None,
+        provider_id: None,
+        reply_scope: None,
+        retry_config: RetryConfig {
+            max_attempts: 1,
+            base_delay_ms: 1,
+        },
+        attempt: 1,
+        observer: None,
+        mocks: None,
+        caller: None,
+    };
+    let caller = ctx_in("call.flow");
+    let callee = ctx_in("sub.flow");
+    let payload = json!({ "text": "hunter2" });
+    let node = HostNode::for_test("comp.a", None);
+    let event = |ctx, node_id| NodeEvent {
+        context: ctx,
+        node_id,
+        node: &node,
+        payload: &payload,
+    };
+
+    // The engine's order for `call → (sub: hello) → ask`: the call node
+    // starts, the callee's nodes run under the same observer, the call node
+    // ends, then the caller moves on.
+    observer.on_node_start(&event(&caller, "call"));
+    observer.on_node_start(&event(&callee, "hello"));
+    observer.on_node_end(&event(&callee, "hello"), &payload);
+    observer.on_node_end(&event(&caller, "call"), &payload);
+    observer.on_node_start(&event(&caller, "ask"));
+    observer.on_node_start(&event(&caller, "ask"));
+
+    let seen = observer.observed();
+    assert_eq!(seen.path.steps(), ["call", "hello", "ask"]);
+    assert!(!seen.path.truncated());
+
+    let outcome = fresh_turn().completed(&seen, &json!({}));
+    assert_eq!(outcome.path, ["call", "hello", "ask"]);
+    assert!(!outcome.path_truncated);
+    assert!(!format!("{:?}", outcome.path).contains("hunter2"));
+}
+
+#[test]
+fn a_long_walk_is_cut_at_the_cap_and_every_outcome_says_so() {
+    let observer = RunOutcomeObserver::new(None);
+    let ctx = FlowContext {
+        tenant: "demo",
+        pack_id: "p",
+        flow_id: "f",
+        node_id: None,
+        tool: None,
+        action: None,
+        session_id: None,
+        provider_id: None,
+        reply_scope: None,
+        retry_config: RetryConfig {
+            max_attempts: 1,
+            base_delay_ms: 1,
+        },
+        attempt: 1,
+        observer: None,
+        mocks: None,
+        caller: None,
+    };
+    let payload = json!({});
+    let node = HostNode::for_test("comp.a", None);
+    let ids: Vec<String> = (0..40).map(|i| format!("n{i}")).collect();
+    for id in &ids {
+        observer.on_node_start(&NodeEvent {
+            context: &ctx,
+            node_id: id,
+            node: &node,
+            payload: &payload,
+        });
+    }
+    let seen = observer.observed();
+    let turn = fresh_turn();
+    let wait = wait_at("n39", None, None);
+    let error = anyhow::anyhow!("boom");
+    for outcome in [
+        turn.completed(&seen, &json!({})),
+        turn.waiting(&seen, &wait),
+        turn.failed(&seen, &error),
+    ] {
+        assert_eq!(outcome.path.len(), 32);
+        assert_eq!(outcome.path.last().map(String::as_str), Some("n31"));
+        assert!(outcome.path_truncated);
+    }
+}
+
+#[test]
 fn the_observer_works_without_a_trace_recorder() {
     let observer = RunOutcomeObserver::new(None);
     assert!(observer.observed().last_node.is_none());

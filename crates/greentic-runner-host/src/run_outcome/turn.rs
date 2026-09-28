@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::error::{ErrorExcerpt, anyhow_chain_text, chain_text, new_error_ref};
+use super::path::StepPath;
 use super::wait::{ParkedNode, wait_state};
 use super::{RunKind, RunOutcome, RunOutcomeSink, RunStatus, WorkerIdentity, now_rfc3339};
 use crate::engine::runtime::IngressEnvelope;
@@ -85,6 +86,8 @@ pub(crate) struct ObservedTurn {
     /// target flow. A `flow.call` sub-flow's events move it, and the call
     /// node's own end / error event moves it back to the caller.
     pub(crate) flow_id: Option<String>,
+    /// Every node that started this turn, in order (contract v3 `path`).
+    pub(crate) path: StepPath,
 }
 
 /// An [`ExecutionObserver`] that records [`ObservedTurn`] and forwards every
@@ -114,6 +117,7 @@ impl ExecutionObserver for RunOutcomeObserver<'_> {
             let mut seen = self.seen.lock();
             seen.last_node = Some(event.node_id.to_string());
             seen.flow_id = Some(event.context.flow_id.to_string());
+            seen.path.push(event.node_id);
             seen.parked = Some(ParkedNode {
                 approval: event.node.is_approval(),
                 response_timeout_secs: event.node.response_timeout_secs(),
@@ -313,6 +317,8 @@ impl TurnContext {
             worker,
             error_ref: None,
             error: None,
+            path: observed.path.steps().to_vec(),
+            path_truncated: observed.path.truncated(),
         }
     }
 

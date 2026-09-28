@@ -1,7 +1,8 @@
 //! [`HttpRunOutcomeSink`]: posts one run-outcome event per flow turn to the
 //! admin's per-unit ingest door.
 //!
-//! Wire contract: greentic-designer
+//! Wire contract (v3 adds `path` / `path_truncated`, see [`super::path`]):
+//! greentic-designer
 //! `docs/superpowers/specs/2026-09-25-deployed-run-audit-design.md` §3.1/§3.3
 //! (v1) plus the additive v2 fields of the Operate → Audit v1.1 Slice B
 //! contract (`docs/superpowers/specs/2026-09-26-operate-audit-v1-1-design.md`) —
@@ -40,7 +41,9 @@
 //!     "safe_summary": "Node `crm` failed after 2 retries: timeout",
 //!     "redacted_excerpt": "…",      // redacted, ≤ 64 KiB incl. "\n…[truncated]"
 //!     "truncated": false, "node_id": "crm", "retry_count": 2
-//!   }
+//!   },
+//!   "path": ["greet", "crm", "ask_name"],  // v3: node ids run this turn, ≤ 32
+//!   "path_truncated": true          // v3: only when the path was cut
 //! }
 //! ```
 //!
@@ -196,6 +199,12 @@ pub(crate) struct RunOutcomeEvent {
     pub(crate) error_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<ErrorExcerpt>,
+    /// v3: node ids executed this turn. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) path: Vec<String>,
+    /// v3: sent only as `true`, and only beside a non-empty `path`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) path_truncated: bool,
 }
 
 /// What one delivery attempt decided. `pub(crate)` for tests.
@@ -279,6 +288,19 @@ fn bounded(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty() && v.len() <= MAX_FIELD_BYTES)
 }
 
+/// The v3 `path` as sent. An id longer than [`MAX_FIELD_BYTES`] is dropped
+/// rather than truncated into a different id, and the path is then reported
+/// as cut; `path_truncated` never rides without a path.
+fn wire_path(path: Vec<String>, truncated: bool) -> (Vec<String>, bool) {
+    let before = path.len();
+    let kept: Vec<String> = path
+        .into_iter()
+        .filter(|id| !id.is_empty() && id.len() <= MAX_FIELD_BYTES)
+        .collect();
+    let truncated = (truncated || kept.len() != before) && !kept.is_empty();
+    (kept, truncated)
+}
+
 impl HttpRunOutcomeSink {
     /// Build a sink for one unit. Refuses a blank field and an endpoint that
     /// would carry the token in cleartext off this host.
@@ -336,6 +358,7 @@ impl HttpRunOutcomeSink {
                 .map(|bytes| bytes.len() <= MAX_OUTCOME_JSON_BYTES)
                 .unwrap_or(false)
         });
+        let (path, path_truncated) = wire_path(outcome.path, outcome.path_truncated);
         Ok(RunOutcomeEvent {
             event_id: ulid::Ulid::new().to_string(),
             occurred_at: now_rfc3339(),
@@ -362,6 +385,8 @@ impl HttpRunOutcomeSink {
             worker_version: bounded(outcome.worker.version),
             error_ref: outcome.error_ref,
             error: outcome.error,
+            path,
+            path_truncated,
         })
     }
 
