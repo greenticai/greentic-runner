@@ -394,6 +394,7 @@ mod tests {
                 AgentInput {
                     text: "go".into(),
                     conversational: false,
+                    resume_payload: None,
                 },
             )
             .await

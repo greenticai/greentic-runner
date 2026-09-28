@@ -1397,7 +1397,15 @@ impl FlowEngine {
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
-                    let output_value = state.finalize_with(Some(output.payload.clone()));
+                    // A `dw.agent` parked on a `flow:` tool renders that flow's
+                    // card, not its own envelope: the card is what the user
+                    // must answer, and channels render the turn output as they
+                    // would a card node's. The full envelope (carrying the
+                    // card as `pending_presentation`) stays the node output.
+                    let rendered = tool_presentation(&output.payload)
+                        .cloned()
+                        .unwrap_or_else(|| output.payload.clone());
+                    let output_value = state.finalize_with(Some(rendered));
                     return Ok(FlowExecution::waiting(
                         output_value,
                         FlowWait { reason, snapshot },
@@ -1709,10 +1717,39 @@ impl FlowEngine {
                         }
                     }
                     crate::runner::agent_node::DwAgentDispatch::InProcess => {
+                        // Re-entry from an `awaiting_tool_input` park: the
+                        // inbound activity is the answer to the agent's parked
+                        // `flow:` tool — when it is a card submit. A typed
+                        // message instead reaches the agent as a message, and
+                        // the agent cancels the parked tool.
+                        let resume_payload = (state.take_tool_await(node_id)
+                            && is_card_submit(&state.entry))
+                        .then(|| state.entry.clone());
                         let output = self
-                            .execute_dw_agent(ctx, agent_id, payload, *conversational)
+                            .execute_dw_agent(
+                                ctx,
+                                agent_id,
+                                payload,
+                                *conversational,
+                                resume_payload.as_ref(),
+                            )
                             .await?;
-                        if *conversational {
+                        if awaiting_tool_input(&output.payload) {
+                            // A `flow:` tool parked on the user. Park HERE,
+                            // whatever `conversational` says: the next inbound
+                            // re-enters this node so the agent can resume the
+                            // tool. Not a conversational turn, so the
+                            // `MAX_PARK_TURNS` budget is left alone.
+                            state.mark_tool_await(node_id);
+                            Ok(DispatchOutcome::with_control(
+                                output,
+                                NodeControl::LoopHere {
+                                    reason: Some(format!(
+                                        "dw.agent `{agent_id}` awaiting the user on a flow tool"
+                                    )),
+                                },
+                            ))
+                        } else if *conversational {
                             let ended = output
                                 .payload
                                 .get("terminated_by")
@@ -1753,7 +1790,7 @@ impl FlowEngine {
                 }
                 #[cfg(not(feature = "agentic-worker"))]
                 {
-                    self.execute_dw_agent(ctx, agent_id, payload, *conversational)
+                    self.execute_dw_agent(ctx, agent_id, payload, *conversational, None)
                         .await
                         .map(DispatchOutcome::complete)
                 }
@@ -1809,6 +1846,7 @@ impl FlowEngine {
         agent_id: &str,
         payload: Value,
         conversational: bool,
+        resume_payload: Option<&Value>,
     ) -> Result<NodeOutput> {
         let handler = self
             .agent_node_handler
@@ -1817,7 +1855,7 @@ impl FlowEngine {
         let session_id = ctx.session_id.unwrap_or("");
         let started = std::time::Instant::now();
         let mut result = handler
-            .execute(
+            .execute_with_resume(
                 ctx.tenant,
                 &self.default_env,
                 agent_id,
@@ -1827,6 +1865,7 @@ impl FlowEngine {
                 // From the context, NOT from `payload`: the node's payload is
                 // whatever the flow mapped, and a flow's mapping is authorable.
                 ctx.caller,
+                resume_payload,
             )
             .await?;
         // Per-node timing: record this agent step's own execution time on its
@@ -1848,6 +1887,7 @@ impl FlowEngine {
         agent_id: &str,
         _payload: Value,
         _conversational: bool,
+        _resume_payload: Option<&Value>,
     ) -> Result<NodeOutput> {
         anyhow::bail!(
             "DwAgent node '{agent_id}' cannot run: this build was compiled without the \
@@ -3450,6 +3490,13 @@ pub struct ExecutionState {
     /// entry and re-dispatch — a duplicate approval request to the operator.
     #[serde(default)]
     pending_approval_await: HashMap<String, ()>,
+    /// In-process `dw.agent` nodes parked because one of the agent's `flow:`
+    /// tools is waiting on the user (a card). Set when the agent answers
+    /// `terminated_by == "awaiting_tool_input"`, taken on the re-entry that
+    /// resumes it — which is what tells that re-entry to hand the inbound
+    /// submit to the agent as the tool's answer rather than as a new message.
+    #[serde(default)]
+    pending_tool_await: HashMap<String, ()>,
     /// Submitted fields awaiting attachment to their node's output. In practice
     /// never survives a snapshot — it is consumed by the first dispatch after a
     /// resume — but is serde-defaulted like its neighbours.
@@ -3470,6 +3517,7 @@ impl ExecutionState {
             park_turns: HashMap::new(),
             pending_agent_await: HashMap::new(),
             pending_approval_await: HashMap::new(),
+            pending_tool_await: HashMap::new(),
             pending_card_answers: None,
         }
     }
@@ -3567,6 +3615,18 @@ impl ExecutionState {
     #[cfg(any(feature = "agentic-worker", test))]
     fn take_agent_await(&mut self, node_id: &str) -> bool {
         self.pending_agent_await.remove(node_id).is_some()
+    }
+
+    /// Mark `node_id` as parked on an agent's suspended `flow:` tool.
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn mark_tool_await(&mut self, node_id: &str) {
+        self.pending_tool_await.insert(node_id.to_string(), ());
+    }
+
+    /// Check-and-clear: whether `node_id` parked on a suspended `flow:` tool.
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn take_tool_await(&mut self, node_id: &str) -> bool {
+        self.pending_tool_await.remove(node_id).is_some()
     }
 
     /// Mark `node_id` as parked awaiting an approval decision.
@@ -4044,6 +4104,34 @@ fn attach_pending_card_answers(
 /// `next_node`; a `session.wait` snapshot names its SUCCESSOR, which has not
 /// run yet, so attaching answers there would name the wrong node. Returns
 /// `None` in that case, so nothing gets parked.
+/// Whether a `dw.agent` node output says the agent parked on a `flow:` tool.
+fn awaiting_tool_input(payload: &Value) -> bool {
+    payload.get("terminated_by").and_then(Value::as_str) == Some("awaiting_tool_input")
+}
+
+/// The card a `dw.agent` parked on a `flow:` tool asks the user to answer —
+/// `Some` only for such a park, and only when it carries one.
+fn tool_presentation(payload: &Value) -> Option<&Value> {
+    if !awaiting_tool_input(payload) {
+        return None;
+    }
+    payload
+        .get("pending_presentation")
+        .filter(|value| !value.is_null())
+}
+
+/// Whether an inbound activity is a card submit rather than a typed message:
+/// it names a route (`metadata.action`) or carries submitted fields. Anything
+/// with neither is an ordinary message, even with empty text.
+#[cfg(any(feature = "agentic-worker", test))]
+fn is_card_submit(entry: &Value) -> bool {
+    let has_action = resolve_entry_metadata(entry)
+        .and_then(|meta| meta.get("action"))
+        .and_then(Value::as_str)
+        .is_some_and(|action| !action.trim().is_empty());
+    has_action || !submitted_fields(entry).is_empty()
+}
+
 fn pending_from_snapshot(snapshot: &FlowSnapshot, input: &Value) -> Option<PendingCardAnswers> {
     if !snapshot.awaiting_submit {
         return None;
@@ -11913,6 +12001,15 @@ mod tests {
     /// Mirrors the FlowEngine literal in `vars_survive_park_and_resume_end_to_end`.
     #[cfg(feature = "agentic-worker")]
     fn conv_engine(flow: HostFlow, payload: serde_json::Value) -> FlowEngine {
+        conv_engine_with(flow, std::sync::Arc::new(StubAgentHandler { payload }))
+    }
+
+    /// [`conv_engine`] with a caller-supplied agent handler.
+    #[cfg(feature = "agentic-worker")]
+    fn conv_engine_with(
+        flow: HostFlow,
+        handler: std::sync::Arc<dyn crate::runner::agent_node::AgentNodeHandler>,
+    ) -> FlowEngine {
         FlowEngine {
             messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
@@ -11933,7 +12030,7 @@ mod tests {
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
-            agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
+            agent_node_handler: Some(handler),
             graph_node_handler: None,
             mcp_tool_source: None,
             mcp_secrets: None,
@@ -12033,6 +12130,169 @@ mod tests {
                 result.status
             );
         }
+    }
+
+    /// Agent handler that answers scripted node outputs in turn and records
+    /// the `resume_payload` each turn was handed.
+    #[cfg(feature = "agentic-worker")]
+    struct ToolParkAgentHandler {
+        outputs: std::sync::Mutex<Vec<serde_json::Value>>,
+        resumes: std::sync::Mutex<Vec<Option<serde_json::Value>>>,
+    }
+    #[cfg(feature = "agentic-worker")]
+    impl ToolParkAgentHandler {
+        fn new(outputs: Vec<serde_json::Value>) -> Self {
+            Self {
+                outputs: std::sync::Mutex::new(outputs),
+                resumes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for ToolParkAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+            _conversational: bool,
+            _caller: Option<&serde_json::Value>,
+        ) -> anyhow::Result<serde_json::Value> {
+            anyhow::bail!("the engine must call execute_with_resume")
+        }
+
+        async fn execute_with_resume(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+            _conversational: bool,
+            _caller: Option<&serde_json::Value>,
+            resume_payload: Option<&serde_json::Value>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.resumes.lock().unwrap().push(resume_payload.cloned());
+            let mut outputs = self.outputs.lock().unwrap();
+            anyhow::ensure!(!outputs.is_empty(), "no scripted agent output");
+            Ok(outputs.remove(0))
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    fn awaiting_tool_output() -> serde_json::Value {
+        json!({
+            "reply": "please pick a room",
+            "trail": [],
+            "terminated_by": "awaiting_tool_input",
+            "pending_presentation": { "type": "AdaptiveCard", "body": [{ "text": "Room?" }] }
+        })
+    }
+
+    /// A `dw.agent` whose `flow:` tool parked on a card parks the FLOW at the
+    /// agent node — even when the node is not conversational — renders the
+    /// card as the turn output, and on a card submit hands that submit to the
+    /// agent as the tool's answer. The park does not spend the conversational
+    /// `MAX_PARK_TURNS` budget.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn dw_agent_awaiting_tool_input_parks_renders_the_card_and_resumes_with_the_submit() {
+        let handler = std::sync::Arc::new(ToolParkAgentHandler::new(vec![
+            awaiting_tool_output(),
+            json!({ "reply": "booked", "trail": [], "terminated_by": "final_reply" }),
+        ]));
+        let engine = conv_engine_with(conversational_dw_flow(false), handler.clone());
+        let rt = Runtime::new().unwrap();
+
+        let first = rt
+            .block_on(engine.execute(conv_ctx(), json!({ "text": "book a room" })))
+            .unwrap();
+        let snapshot = match first.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected the flow to park on the tool, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "agent", "re-enter the agent node");
+        assert_eq!(
+            first.output,
+            json!({ "type": "AdaptiveCard", "body": [{ "text": "Room?" }] }),
+            "the card, not the agent envelope, is the turn output"
+        );
+        assert_eq!(
+            first.node_outputs["agent"]["pending_presentation"]["type"], "AdaptiveCard",
+            "the node output keeps the full envelope: {:?}",
+            first.node_outputs
+        );
+        assert!(snapshot.state.pending_tool_await.contains_key("agent"));
+        assert!(
+            snapshot.state.park_turns.is_empty(),
+            "a tool park is not a conversational turn"
+        );
+
+        let submit = json!({ "metadata": { "action": "submit" }, "room": "101" });
+        let second = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, submit.clone()))
+            .unwrap();
+        assert!(
+            matches!(second.status, FlowStatus::Completed),
+            "the resumed non-conversational agent routes onward, got {:?}",
+            second.status
+        );
+        assert_eq!(*handler.resumes.lock().unwrap(), vec![None, Some(submit)]);
+    }
+
+    /// A typed message arriving while the tool is parked reaches the agent as
+    /// a message (no resume payload), so the agent cancels the parked tool.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_typed_message_during_a_tool_park_is_not_a_resume_payload() {
+        let handler = std::sync::Arc::new(ToolParkAgentHandler::new(vec![
+            awaiting_tool_output(),
+            json!({ "reply": "ok, cancelled", "trail": [], "terminated_by": "final_reply" }),
+        ]));
+        let engine = conv_engine_with(conversational_dw_flow(false), handler.clone());
+        let rt = Runtime::new().unwrap();
+        let first = rt
+            .block_on(engine.execute(conv_ctx(), json!({ "text": "book a room" })))
+            .unwrap();
+        let FlowStatus::Waiting(wait) = first.status else {
+            panic!("expected a park");
+        };
+        rt.block_on(engine.resume(conv_ctx(), wait.snapshot, json!({ "text": "never mind" })))
+            .unwrap();
+        assert_eq!(*handler.resumes.lock().unwrap(), vec![None, None]);
+    }
+
+    #[test]
+    fn is_card_submit_tells_a_submit_from_a_typed_message() {
+        assert!(is_card_submit(
+            &json!({ "metadata": { "action": "submit" } })
+        ));
+        assert!(is_card_submit(
+            &json!({ "input": { "metadata": { "action": "go" } } })
+        ));
+        assert!(is_card_submit(&json!({ "room": "101", "metadata": {} })));
+        assert!(!is_card_submit(&json!({ "text": "never mind" })));
+        assert!(!is_card_submit(
+            &json!({ "text": "hi", "metadata": { "action": "  " } })
+        ));
+    }
+
+    #[test]
+    fn pending_tool_await_mark_take_and_legacy_snapshot() {
+        let mut st = ExecutionState::new(json!({}));
+        assert!(!st.take_tool_await("agent"));
+        st.mark_tool_await("agent");
+        let back: ExecutionState =
+            serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        let mut back = back;
+        assert!(back.take_tool_await("agent"), "survives the snapshot");
+        assert!(!back.take_tool_await("agent"), "take clears it");
+        let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0}"#;
+        let legacy: ExecutionState = serde_json::from_str(legacy).expect("legacy loads");
+        assert!(legacy.pending_tool_await.is_empty());
     }
 
     /// Safety-backstop behavioral test: a conversational `dw.agent` that

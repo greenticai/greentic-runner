@@ -1,8 +1,11 @@
 //! Runner-host implementation of `greentic_aw_runtime::FlowInvoker`.
 //!
-//! Exposes same-pack flows to an agentic worker as LLM tools and invokes them
-//! via `PackRuntime::run_flow_for_tool`, which guarantees non-interactive
-//! (non-pausing) execution. This is the runner-host half of the `flow:` tool
+//! Exposes same-pack flows to an agentic worker as LLM tools. `invoke` runs
+//! them via `PackRuntime::run_flow_for_tool`, which refuses a flow that parks
+//! (graph tool nodes and deep workers cannot suspend). `invoke_interactive` /
+//! `resume` are the `dw.agent` loop's path: a flow that parks on a card
+//! suspends the agent turn and is resumed with the user's submit. This is the
+//! runner-host half of the `flow:` tool
 //! seam; the aw-runtime half (`FlowToolSource`/`FlowToolCatalog`) depends only
 //! on the trait + JSON, so this is where `PackRuntime` enters.
 
@@ -12,9 +15,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use greentic_aw_runtime::{FlowInvoker, FlowOperation};
+use greentic_aw_runtime::{FlowInvokeOutcome, FlowInvoker, FlowOperation};
 
-use crate::pack::PackRuntime;
+use crate::pack::{PackRuntime, ToolFlowOutcome};
 
 /// `FlowInvoker` backed by the operator's loaded packs. Resolves a `flow_ref`
 /// to a same-pack flow and runs it non-interactively via
@@ -29,6 +32,29 @@ impl PackRuntimeFlowInvoker {
     /// Construct over the operator's loaded packs and tenant identifier.
     pub fn new(packs: Vec<Arc<PackRuntime>>, tenant: String) -> Self {
         Self { packs, tenant }
+    }
+}
+
+impl PackRuntimeFlowInvoker {
+    /// The loaded pack that owns `flow_ref`, if any. Uses the sync descriptor
+    /// list so the membership check does not await inside a linear search.
+    fn owner(&self, flow_ref: &str) -> Option<&Arc<PackRuntime>> {
+        self.packs
+            .iter()
+            .find(|pack| pack.flow_descriptors().iter().any(|d| d.id == flow_ref))
+    }
+}
+
+fn to_invoke_outcome(outcome: ToolFlowOutcome) -> FlowInvokeOutcome {
+    match outcome {
+        ToolFlowOutcome::Completed(value) => FlowInvokeOutcome::Completed(value),
+        ToolFlowOutcome::Waiting {
+            snapshot,
+            presentation,
+        } => FlowInvokeOutcome::Waiting {
+            snapshot,
+            presentation,
+        },
     }
 }
 
@@ -77,6 +103,39 @@ impl FlowInvoker for PackRuntimeFlowInvoker {
             }
 
             Err(format!("flow '{flow_ref}' not found in any loaded pack"))
+        })
+    }
+
+    fn invoke_interactive<'a>(
+        &'a self,
+        flow_ref: &'a str,
+        args_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<FlowInvokeOutcome, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let input: serde_json::Value = serde_json::from_str(args_json)
+                .map_err(|e| format!("invalid JSON args for flow '{flow_ref}': {e}"))?;
+            let pack = self
+                .owner(flow_ref)
+                .ok_or_else(|| format!("flow '{flow_ref}' not found in any loaded pack"))?;
+            pack.run_flow_for_tool_interactive(flow_ref, input)
+                .await
+                .map(to_invoke_outcome)
+        })
+    }
+
+    fn resume<'a>(
+        &'a self,
+        flow_ref: &'a str,
+        snapshot: serde_json::Value,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<FlowInvokeOutcome, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let pack = self
+                .owner(flow_ref)
+                .ok_or_else(|| format!("flow '{flow_ref}' not found in any loaded pack"))?;
+            pack.resume_flow_for_tool(flow_ref, snapshot, input)
+                .await
+                .map(to_invoke_outcome)
         })
     }
 }

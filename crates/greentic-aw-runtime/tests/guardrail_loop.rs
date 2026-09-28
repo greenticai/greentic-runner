@@ -106,6 +106,7 @@ async fn fail_closed_mandatory_unresolved_returns_guardrail_denied() {
             AgentInput {
                 text: "hello — please process this".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await;
@@ -191,6 +192,7 @@ async fn no_mandatory_guardrails_passes_through() {
             AgentInput {
                 text: "hi".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await
@@ -224,6 +226,7 @@ async fn mandatory_ref_with_empty_registry_fails_closed() {
             AgentInput {
                 text: "sensitive input".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await;
@@ -343,6 +346,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
             AgentInput {
                 text: "hello".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await;

@@ -273,6 +273,7 @@ async fn local_wasm_mcp_tool_offered_called_and_result_in_trail() {
             AgentInput {
                 text: "go".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await
@@ -347,6 +348,7 @@ async fn local_wasm_unreachable_component_degrades_no_tool_offered() {
             AgentInput {
                 text: "go".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await

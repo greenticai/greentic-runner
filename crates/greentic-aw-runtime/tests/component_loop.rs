@@ -201,6 +201,7 @@ async fn component_tool_offered_called_and_result_in_trail() {
             AgentInput {
                 text: "go".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await
@@ -262,6 +263,7 @@ async fn empty_component_source_offers_no_tool() {
             AgentInput {
                 text: "go".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await
