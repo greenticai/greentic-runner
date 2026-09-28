@@ -4128,7 +4128,7 @@ fn awaiting_tool_input(payload: &Value) -> bool {
 
 /// The card a `dw.agent` parked on a `flow:` tool asks the user to answer —
 /// `Some` only for such a park, and only when it carries one.
-fn tool_presentation(payload: &Value) -> Option<&Value> {
+pub(crate) fn tool_presentation(payload: &Value) -> Option<&Value> {
     if !awaiting_tool_input(payload) {
         return None;
     }
@@ -12257,6 +12257,32 @@ mod tests {
             "the resumed non-conversational agent routes onward, got {:?}",
             second.status
         );
+        assert_eq!(*handler.resumes.lock().unwrap(), vec![None, Some(submit)]);
+    }
+
+    /// The agent chat ingress (`/agent/chat`, `/agent/chat/stream`) turns a
+    /// request's `resume_payload` into the turn payload; the engine must hand
+    /// exactly that to the parked agent, i.e. `AgentInput.resume_payload`.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn an_agent_chat_resume_payload_reaches_the_parked_agent() {
+        let handler = std::sync::Arc::new(ToolParkAgentHandler::new(vec![
+            awaiting_tool_output(),
+            json!({ "reply": "booked", "trail": [], "terminated_by": "final_reply" }),
+        ]));
+        let engine = conv_engine_with(conversational_dw_flow(false), handler.clone());
+        let rt = Runtime::new().unwrap();
+        let first = rt
+            .block_on(engine.execute(conv_ctx(), json!({ "text": "book a room" })))
+            .unwrap();
+        let FlowStatus::Waiting(wait) = first.status else {
+            panic!("expected a park");
+        };
+        let submit = json!({ "metadata": { "action": "submit" }, "room": "101" });
+        let payload =
+            crate::http::agent_chat::turn_payload(String::new(), submit.as_object().cloned());
+        rt.block_on(engine.resume(conv_ctx(), wait.snapshot, payload))
+            .unwrap();
         assert_eq!(*handler.resumes.lock().unwrap(), vec![None, Some(submit)]);
     }
 

@@ -41,6 +41,13 @@ pub enum StreamFrame {
         tokens_in: u64,
         tokens_out: u64,
     },
+    /// The worker's `flow:` tool parked on a card (the agent ended the turn
+    /// `awaiting_tool_input`). `card` is the agent's `pending_presentation`;
+    /// the caller answers it by sending the submit as the next request's
+    /// `resume_payload`. Always followed by the terminal `Done`.
+    PendingCard {
+        card: serde_json::Value,
+    },
     Done,
     Error {
         message: String,
@@ -395,6 +402,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&e).unwrap(),
             serde_json::json!({"kind":"tool-result","call_id":"c1","status":"error","error":"boom"})
+        );
+    }
+
+    /// Wire contract with the designer's Test chat: the card a parked `flow:`
+    /// tool asks the user to answer travels as `kind: "pending-card"`.
+    #[test]
+    fn pending_card_frame_serializes_with_its_card() {
+        let card = serde_json::json!({"type": "AdaptiveCard", "body": [{"text": "Room?"}]});
+        let f = StreamFrame::PendingCard { card: card.clone() };
+        assert_eq!(
+            serde_json::to_value(&f).unwrap(),
+            serde_json::json!({"kind": "pending-card", "card": card})
         );
     }
 }
