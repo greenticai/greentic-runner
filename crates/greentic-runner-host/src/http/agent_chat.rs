@@ -19,6 +19,47 @@ pub struct AgentChatRequest {
     pub user_id: Option<String>,
     #[serde(default)]
     pub flow_id: Option<String>,
+    /// A card submit answering a `flow:` tool the worker parked on (the
+    /// previous turn ended with a `pending-card` frame / `pending_card`
+    /// field). Sent as this turn's activity payload, so the engine hands it to
+    /// the parked `dw.agent` as `AgentInput.resume_payload`. It must look like
+    /// a card submit — a non-blank `metadata.action` or submitted fields —
+    /// otherwise the engine reads it as a typed message and the agent cancels
+    /// the parked tool. Absent: an ordinary text turn.
+    #[serde(default, rename = "resume_payload", alias = "resumePayload")]
+    pub resume_payload: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The payload of one chat turn: the text message, or — when the caller
+/// answers a parked `flow:` tool — the card submit, with `text` added only
+/// when the caller sent one and the submit carries none.
+pub(crate) fn turn_payload(
+    text: String,
+    resume_payload: Option<serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    match resume_payload {
+        None => serde_json::json!({ "text": text }),
+        Some(mut submit) => {
+            if !text.trim().is_empty() {
+                submit
+                    .entry("text")
+                    .or_insert(serde_json::Value::String(text));
+            }
+            serde_json::Value::Object(submit)
+        }
+    }
+}
+
+/// The card a `dw.agent` of this turn parked on a `flow:` tool asks the user
+/// to answer: the `pending_presentation` of the node output whose
+/// `terminated_by` is `awaiting_tool_input`. `None` for any other turn.
+pub(crate) fn pending_card(
+    node_outputs: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    node_outputs
+        .values()
+        .find_map(crate::runner::engine::tool_presentation)
+        .cloned()
 }
 
 /// One outbound reply line.
@@ -33,6 +74,10 @@ pub struct ReplyView {
 #[serde(rename_all = "camelCase")]
 pub struct AgentChatResponse {
     pub replies: Vec<ReplyView>,
+    /// The card a parked `flow:` tool asks the user to answer; send its
+    /// submit back as the next request's `resume_payload`.
+    #[serde(rename = "pending_card", skip_serializing_if = "Option::is_none")]
+    pub pending_card: Option<serde_json::Value>,
 }
 
 /// Extract a human-readable reply line from an outbound activity.
@@ -65,7 +110,24 @@ pub fn replies_to_response(activities: Vec<Activity>) -> AgentChatResponse {
         .filter(|t| !t.trim().is_empty())
         .map(|text| ReplyView { text })
         .collect();
-    AgentChatResponse { replies }
+    AgentChatResponse {
+        replies,
+        pending_card: None,
+    }
+}
+
+/// Map a traced turn into the chat response. A turn that parked on a `flow:`
+/// tool carries the card as `pending_card` and NO replies: its only outbound
+/// activity is the pending-flow envelope, which `reply_text` would render as a
+/// JSON blob rather than a line the user should read.
+pub fn trace_to_response(trace: crate::host::TurnTrace) -> AgentChatResponse {
+    match pending_card(&trace.node_outputs) {
+        Some(card) => AgentChatResponse {
+            replies: Vec::new(),
+            pending_card: Some(card),
+        },
+        None => replies_to_response(trace.replies),
+    }
 }
 
 use axum::http::StatusCode;
@@ -94,7 +156,8 @@ async fn execute_chat(
         .map(str::to_string)
         .unwrap_or_else(|| default_tenant.to_string());
 
-    let mut activity = Activity::text(req.text)
+    let mut activity = Activity::text("")
+        .with_payload(turn_payload(req.text, req.resume_payload))
         .in_conversation(
             req.conversation_id
                 .unwrap_or_else(|| DEFAULT_CONVERSATION.to_string()),
@@ -104,8 +167,8 @@ async fn execute_chat(
         activity = activity.with_flow(flow);
     }
 
-    match host.handle_activity(&tenant, activity).await {
-        Ok(activities) => Ok(replies_to_response(activities)),
+    match host.handle_activity_traced(&tenant, activity).await {
+        Ok(trace) => Ok(trace_to_response(trace)),
         Err(e) => {
             let msg = format!("{e:#}");
             // handle_activity returns "tenant <name> not loaded" when the tenant
@@ -189,6 +252,31 @@ impl Drop for Cleanup {
     }
 }
 
+/// The frames a successfully completed stream turn ends with, in order.
+///
+/// - No-delta fallback: a single `TextChunk` synthesized from the assembled
+///   reply, only when the backend never streamed token deltas via the
+///   observer — a streaming backend already delivered its text incrementally,
+///   so emitting the reply again would double-print it. Skipped for a turn
+///   that parked on a `flow:` tool: its only reply is the pending-flow
+///   envelope, not text.
+/// - `PendingCard` when a `dw.agent` parked on a `flow:` tool.
+/// - The terminal `Done`, always.
+#[cfg(feature = "agentic-worker")]
+fn completed_turn_frames(trace: crate::host::TurnTrace, streamed: bool) -> Vec<StreamFrame> {
+    let mut frames = Vec::new();
+    match pending_card(&trace.node_outputs) {
+        Some(card) => frames.push(StreamFrame::PendingCard { card }),
+        None => {
+            if !streamed && let Some(reply) = first_nonempty_reply(&trace.replies) {
+                frames.push(StreamFrame::TextChunk { text: reply });
+            }
+        }
+    }
+    frames.push(StreamFrame::Done);
+    frames
+}
+
 /// Build the ingress [`Activity`] for one `/agent/chat/stream` turn.
 ///
 /// The session id is stamped with the `conversationId` on purpose. The SSE
@@ -204,12 +292,13 @@ impl Drop for Cleanup {
 /// session keeps the hint bare so the registration and lookup keys agree.
 #[cfg(feature = "agentic-worker")]
 fn build_stream_turn_activity(
-    text: String,
+    payload: serde_json::Value,
     conversation_id: String,
     user_id: Option<String>,
     flow_id: Option<String>,
 ) -> Activity {
-    let mut activity = Activity::text(text)
+    let mut activity = Activity::text("")
+        .with_payload(payload)
         .with_session(conversation_id.clone())
         .in_conversation(conversation_id)
         .from_user(user_id.unwrap_or_else(|| DEFAULT_USER.to_string()));
@@ -258,22 +347,18 @@ pub fn agent_chat_stream_core(
         };
 
         let tenant = req.tenant.unwrap_or(default_tenant);
-        let activity =
-            build_stream_turn_activity(req.text, conversation_id, req.user_id, req.flow_id);
+        let activity = build_stream_turn_activity(
+            turn_payload(req.text, req.resume_payload),
+            conversation_id,
+            req.user_id,
+            req.flow_id,
+        );
 
-        match host.handle_activity(&tenant, activity).await {
-            Ok(activities) => {
-                // No-delta fallback: only synthesize a single `TextChunk`
-                // from the assembled reply when the backend never streamed
-                // token deltas via the observer — a streaming backend
-                // already delivered its text incrementally, so emitting the
-                // reply again here would double-print it.
-                if !observer.streamed()
-                    && let Some(reply) = first_nonempty_reply(&activities)
-                {
-                    let _ = frame_tx.send(StreamFrame::TextChunk { text: reply });
+        match host.handle_activity_traced(&tenant, activity).await {
+            Ok(trace) => {
+                for frame in completed_turn_frames(trace, observer.streamed()) {
+                    let _ = frame_tx.send(frame);
                 }
-                let _ = frame_tx.send(StreamFrame::Done);
             }
             Err(e) => {
                 let _ = frame_tx.send(StreamFrame::Error {
@@ -372,6 +457,7 @@ mod tests {
             conversation_id: None,
             user_id: None,
             flow_id: None,
+            resume_payload: None,
         };
         let err = execute_chat(&host, "test", req)
             .await
@@ -393,6 +479,7 @@ mod tests {
             conversation_id: Some("c1".into()),
             user_id: None,
             flow_id: None,
+            resume_payload: None,
         };
         let frames = drive_stream_to_vec(agent_chat_stream_core(&state, req)).await;
         assert!(
@@ -416,7 +503,12 @@ mod tests {
     #[cfg(feature = "agentic-worker")]
     #[test]
     fn stream_turn_activity_stamps_session_with_conversation_id() {
-        let activity = build_stream_turn_activity("hi".into(), "conv-uuid-1".into(), None, None);
+        let activity = build_stream_turn_activity(
+            turn_payload("hi".into(), None),
+            "conv-uuid-1".into(),
+            None,
+            None,
+        );
         assert_eq!(
             activity.session_id(),
             Some("conv-uuid-1"),
@@ -465,5 +557,106 @@ mod tests {
         // B's own cleanup removes its entry.
         Cleanup::remove_stale(&registry, "c1", &observer_b);
         assert!(registry.get("c1").is_none());
+    }
+
+    #[test]
+    fn request_carries_an_optional_resume_payload() {
+        let r: AgentChatRequest = serde_json::from_value(json!({
+            "text": "", "resume_payload": { "room": "101", "metadata": { "action": "submit" } }
+        }))
+        .unwrap();
+        let submit = r.resume_payload.expect("resume_payload parsed");
+        assert_eq!(submit["room"], "101");
+
+        let absent: AgentChatRequest = serde_json::from_value(json!({ "text": "hi" })).unwrap();
+        assert!(absent.resume_payload.is_none());
+    }
+
+    #[test]
+    fn turn_payload_is_the_text_or_the_submit() {
+        assert_eq!(turn_payload("hi".into(), None), json!({ "text": "hi" }));
+
+        let submit = json!({ "room": "101", "metadata": { "action": "submit" } });
+        let map = submit.as_object().cloned();
+        assert_eq!(
+            turn_payload(String::new(), map.clone()),
+            submit,
+            "an empty text adds nothing to the submit"
+        );
+        let with_text = turn_payload("done".into(), map);
+        assert_eq!(with_text["text"], "done");
+        assert_eq!(with_text["room"], "101");
+    }
+
+    fn parked_trace() -> crate::host::TurnTrace {
+        let mut node_outputs = std::collections::HashMap::new();
+        node_outputs.insert(
+            "agent".to_string(),
+            json!({
+                "reply": "",
+                "terminated_by": "awaiting_tool_input",
+                "pending_presentation": { "type": "AdaptiveCard", "body": [] }
+            }),
+        );
+        crate::host::TurnTrace {
+            replies: vec![reply_with(json!({ "status": "pending", "response": {} }))],
+            node_outputs,
+        }
+    }
+
+    #[test]
+    fn a_parked_flow_tool_surfaces_as_pending_card_and_no_replies() {
+        let response = trace_to_response(parked_trace());
+        assert!(
+            response.replies.is_empty(),
+            "the pending envelope is not a reply"
+        );
+        let body = serde_json::to_value(&response).unwrap();
+        assert_eq!(body["pending_card"]["type"], "AdaptiveCard");
+
+        let mut done = std::collections::HashMap::new();
+        done.insert(
+            "agent".to_string(),
+            json!({ "reply": "booked", "terminated_by": "final_reply" }),
+        );
+        let plain = trace_to_response(crate::host::TurnTrace {
+            replies: vec![reply_with(json!({ "text": "booked" }))],
+            node_outputs: done,
+        });
+        let body = serde_json::to_value(&plain).unwrap();
+        assert!(
+            body.get("pending_card").is_none(),
+            "omitted when None: {body}"
+        );
+        assert_eq!(body["replies"][0]["text"], "booked");
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_parked_flow_tool_streams_pending_card_then_done() {
+        let frames = completed_turn_frames(parked_trace(), false);
+        assert!(
+            matches!(
+                frames.as_slice(),
+                [StreamFrame::PendingCard { card }, StreamFrame::Done]
+                    if card["type"] == "AdaptiveCard"
+            ),
+            "got {frames:?}"
+        );
+
+        let plain = completed_turn_frames(
+            crate::host::TurnTrace {
+                replies: vec![reply_with(json!({ "text": "booked" }))],
+                node_outputs: std::collections::HashMap::new(),
+            },
+            false,
+        );
+        assert!(
+            matches!(
+                plain.as_slice(),
+                [StreamFrame::TextChunk { text }, StreamFrame::Done] if text == "booked"
+            ),
+            "got {plain:?}"
+        );
     }
 }
