@@ -55,6 +55,8 @@ fn outcome() -> RunOutcome {
             1,
             "call failed\ncaused by: Authorization: Bearer abc at secrets://default/acme/_/k",
         )),
+        path: Vec::new(),
+        path_truncated: false,
     }
 }
 
@@ -134,6 +136,51 @@ fn the_wire_body_is_snake_case_with_attribution_from_the_target() {
         !text.contains("secrets://") && !text.contains("Bearer abc"),
         "{text}"
     );
+}
+
+#[test]
+fn an_empty_path_is_omitted_and_path_truncated_rides_only_when_true() {
+    let sink = HttpRunOutcomeSink::new(target("https://admin.example/x")).unwrap();
+    let body = serde_json::to_value(sink.build_event(outcome()).unwrap()).unwrap();
+    assert!(body.get("path").is_none(), "absent, never []");
+    assert!(body.get("path_truncated").is_none());
+
+    let mut walked = outcome();
+    walked.path = vec!["greet".into(), "call_api".into()];
+    let body = serde_json::to_value(sink.build_event(walked).unwrap()).unwrap();
+    assert_eq!(body["path"], json!(["greet", "call_api"]));
+    assert!(body.get("path_truncated").is_none(), "false is omitted");
+
+    let mut cut = outcome();
+    cut.path = (0..32).map(|i| format!("n{i}")).collect();
+    cut.path_truncated = true;
+    let body = serde_json::to_value(sink.build_event(cut).unwrap()).unwrap();
+    assert_eq!(body["path"].as_array().unwrap().len(), 32);
+    assert_eq!(body["path_truncated"], true);
+}
+
+#[test]
+fn an_over_long_path_id_is_dropped_and_reported_as_a_cut() {
+    let sink = HttpRunOutcomeSink::new(target("https://admin.example/x")).unwrap();
+    let mut long = outcome();
+    long.path = vec!["a".into(), "x".repeat(MAX_FIELD_BYTES + 1), "b".into()];
+    let event = sink.build_event(long).unwrap();
+    assert_eq!(event.path, ["a", "b"]);
+    assert!(event.path_truncated);
+
+    // Neighbours made adjacent by the drop collapse again.
+    let mut rejoined = outcome();
+    rejoined.path = vec!["a".into(), "x".repeat(MAX_FIELD_BYTES + 1), "a".into()];
+    let event = sink.build_event(rejoined).unwrap();
+    assert_eq!(event.path, ["a"]);
+    assert!(event.path_truncated);
+
+    // A cut flag never rides without a path.
+    let mut only_long = outcome();
+    only_long.path = vec!["x".repeat(MAX_FIELD_BYTES + 1)];
+    only_long.path_truncated = true;
+    let event = sink.build_event(only_long).unwrap();
+    assert!(event.path.is_empty() && !event.path_truncated);
 }
 
 #[test]
