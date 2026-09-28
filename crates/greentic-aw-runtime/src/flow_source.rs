@@ -64,6 +64,53 @@ pub trait FlowInvoker: Send + Sync {
         flow_ref: &'a str,
         args_json: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
+
+    /// Invoke one flow that MAY park on the user (a card with a routed
+    /// submit). A flow that completes answers [`FlowInvokeOutcome::Completed`];
+    /// one that waits answers [`FlowInvokeOutcome::Waiting`] with an opaque
+    /// snapshot to hand back to [`FlowInvoker::resume`] and the presentation
+    /// (the card) to show the user meanwhile.
+    ///
+    /// The default keeps every existing implementor source-compatible: it runs
+    /// the non-interactive [`FlowInvoker::invoke`], so an invoker that never
+    /// learned to suspend still answers exactly as it did before.
+    fn invoke_interactive<'a>(
+        &'a self,
+        flow_ref: &'a str,
+        args_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<FlowInvokeOutcome, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.invoke(flow_ref, args_json)
+                .await
+                .map(FlowInvokeOutcome::Completed)
+        })
+    }
+
+    /// Resume a flow parked by [`FlowInvoker::invoke_interactive`], feeding it
+    /// `input` (the user's submit). The default refuses: an invoker that never
+    /// answers `Waiting` has nothing to resume.
+    fn resume<'a>(
+        &'a self,
+        flow_ref: &'a str,
+        _snapshot: serde_json::Value,
+        _input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<FlowInvokeOutcome, String>> + Send + 'a>> {
+        Box::pin(async move { Err(format!("flow tool '{flow_ref}': resume not supported")) })
+    }
+}
+
+/// What an interactive flow-tool call produced.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FlowInvokeOutcome {
+    /// The flow ran to its end; the value is its output (the tool result).
+    Completed(serde_json::Value),
+    /// The flow parked awaiting the user. `snapshot` is opaque to this crate
+    /// and goes back verbatim to [`FlowInvoker::resume`]; `presentation` is
+    /// what the flow rendered at the park point (typically an Adaptive Card).
+    Waiting {
+        snapshot: serde_json::Value,
+        presentation: serde_json::Value,
+    },
 }
 
 /// Immutable per-tenant view of the flow-tool surface. Carries the LLM-facing
@@ -128,6 +175,37 @@ impl FlowToolCatalog {
         match self.invoker.invoke(flow_ref, args_json).await {
             Ok(value) => value,
             Err(e) => json!({ "error": e }),
+        }
+    }
+
+    /// [`Self::dispatch`] for a flow that may park on the user. Failures fold
+    /// into `Completed({"error": ...})` exactly as `dispatch` folds them, so a
+    /// flow tool still never breaks an agent step.
+    pub async fn dispatch_interactive(&self, flow_ref: &str, args_json: &str) -> FlowInvokeOutcome {
+        if self.tool_entry(flow_ref).is_none() {
+            return FlowInvokeOutcome::Completed(
+                json!({ "error": format!("unknown flow tool '{flow_ref}'") }),
+            );
+        }
+        match self.invoker.invoke_interactive(flow_ref, args_json).await {
+            Ok(outcome) => outcome,
+            Err(e) => FlowInvokeOutcome::Completed(json!({ "error": e })),
+        }
+    }
+
+    /// Resume a parked flow tool with the user's `input`. Failures fold into
+    /// `Completed({"error": ...})`. Deliberately NOT gated on the catalog
+    /// listing the flow: the call was admitted when it started, and a TTL
+    /// rebuild in between must not strand the user on a card.
+    pub async fn resume(
+        &self,
+        flow_ref: &str,
+        snapshot: serde_json::Value,
+        input: serde_json::Value,
+    ) -> FlowInvokeOutcome {
+        match self.invoker.resume(flow_ref, snapshot, input).await {
+            Ok(outcome) => outcome,
+            Err(e) => FlowInvokeOutcome::Completed(json!({ "error": e })),
         }
     }
 }
@@ -251,6 +329,33 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&prod_cat, &staging_cat),
             "different envs must have independent catalogs"
+        );
+    }
+
+    /// An invoker that never learned to suspend keeps working on the
+    /// interactive path: `invoke` is reported as `Completed`, and `resume` is
+    /// refused (there is nothing it could have parked).
+    #[tokio::test]
+    async fn default_interactive_methods_wrap_invoke_and_refuse_resume() {
+        let cat = FlowToolCatalog::from_invoker(Arc::new(FakeInvoker));
+        let out = cat.dispatch_interactive("lookup", "{}").await;
+        assert_eq!(
+            out,
+            FlowInvokeOutcome::Completed(serde_json::json!({ "echoed": "{}" }))
+        );
+        let resumed = cat
+            .resume("lookup", serde_json::json!({}), serde_json::json!({}))
+            .await;
+        let v = match resumed {
+            FlowInvokeOutcome::Completed(v) => v,
+            FlowInvokeOutcome::Waiting { .. } => serde_json::Value::Null,
+        };
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("resume not supported"),
+            "got {v}"
         );
     }
 

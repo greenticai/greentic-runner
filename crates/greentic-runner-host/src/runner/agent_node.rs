@@ -36,6 +36,43 @@ pub trait AgentNodeHandler: Send + Sync {
         conversational: bool,
         caller: Option<&Value>,
     ) -> Result<Value>;
+
+    /// [`Self::execute`] plus the user's answer to a `flow:` tool that parked
+    /// the previous turn on a card (`terminated_by == "awaiting_tool_input"`).
+    ///
+    /// `resume_payload` is the raw inbound activity (the flow's `entry`) when
+    /// the engine is re-entering this node from such a park and the activity
+    /// is a card submit; `None` otherwise. It is its own argument — like
+    /// `caller`, and for the same reason — rather than a key inside the
+    /// authorable `flow_input`.
+    ///
+    /// The default ignores it and runs [`Self::execute`], which keeps every
+    /// existing implementor source-compatible; such a handler never produces
+    /// `awaiting_tool_input`, so it is never handed a payload it would need.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_with_resume(
+        &self,
+        tenant_id: &str,
+        env_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        flow_input: &Value,
+        conversational: bool,
+        caller: Option<&Value>,
+        resume_payload: Option<&Value>,
+    ) -> Result<Value> {
+        let _ = resume_payload;
+        self.execute(
+            tenant_id,
+            env_id,
+            agent_id,
+            session_id,
+            flow_input,
+            conversational,
+            caller,
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +309,30 @@ mod aw {
             conversational: bool,
             caller: Option<&Value>,
         ) -> Result<Value> {
+            self.execute_with_resume(
+                tenant_id,
+                env_id,
+                agent_id,
+                session_id,
+                flow_input,
+                conversational,
+                caller,
+                None,
+            )
+            .await
+        }
+
+        async fn execute_with_resume(
+            &self,
+            tenant_id: &str,
+            env_id: &str,
+            agent_id: &str,
+            session_id: &str,
+            flow_input: &Value,
+            conversational: bool,
+            caller: Option<&Value>,
+            resume_payload: Option<&Value>,
+        ) -> Result<Value> {
             let user_text = flow_input
                 .get("user_text")
                 .and_then(Value::as_str)
@@ -301,6 +362,7 @@ mod aw {
             let input = AgentInput {
                 text: user_text,
                 conversational,
+                resume_payload: resume_payload.cloned(),
             };
 
             // Off by default: with neither an audit sink nor a registered
@@ -365,12 +427,19 @@ mod aw {
                         );
                     }
 
-                    Ok(json!({
+                    let mut node_output = json!({
                         "reply": output.reply,
                         "trail": output.trail,
                         "terminated_by": output.terminated_by,
                         "usage": output.usage,
-                    }))
+                    });
+                    // Present only while a `flow:` tool is parked on the user
+                    // (`terminated_by == "awaiting_tool_input"`): the card the
+                    // engine renders as this turn's output in place of `reply`.
+                    if let Some(presentation) = output.pending_presentation {
+                        node_output["pending_presentation"] = presentation;
+                    }
+                    Ok(node_output)
                 }
                 Err(AgentError::GuardrailDenied {
                     direction,

@@ -127,8 +127,20 @@ pub async fn run_step(
             trail: Vec::new(),
             terminated_by: TerminationReason::FinalReply,
             usage: StepUsage::default(),
+            pending_presentation: None,
         });
     }
+
+    // --- A flow tool parked on the user last turn ---
+    // Its `call_id` has no tool result in history yet, and nothing may reach
+    // the LLM until it does. Either resume the flow with the user's answer
+    // (below, once the tool catalogs are resolved) or cancel it here.
+    let (resuming, cancelled_step) = crate::flow_suspend::take_pending(
+        &mut state,
+        message.resume_payload.clone(),
+        chrono::Utc::now(),
+        observer.as_ref(),
+    );
 
     // --- Assemble guardrail chain (once per step, before any message push) ---
     // Mandatory refs from the platform policy are resolved first; if any
@@ -173,41 +185,48 @@ pub async fn run_step(
     };
 
     // --- Inbound guardrail hook ---
-    let user_text = match crate::guardrail::run_chain(
-        &guardrail_chain,
-        crate::guardrail::GuardrailDirection::Inbound,
-        message.text,
-        &guardrail_ctx,
-        runtime.guardrail_evaluator.as_ref(),
-    ) {
-        crate::guardrail::ChainOutcome::Pass {
-            content,
-            observations,
-        } => {
-            for obs in &observations {
-                observer.on_guardrail(obs);
+    // Skipped when resuming a parked flow tool: the user's answer goes to the
+    // flow, not the LLM, and returns as a tool result like any other tool's.
+    let user_message = if resuming.is_some() {
+        crate::flow_suspend::last_user_text(&state)
+    } else {
+        let user_text = match crate::guardrail::run_chain(
+            &guardrail_chain,
+            crate::guardrail::GuardrailDirection::Inbound,
+            message.text,
+            &guardrail_ctx,
+            runtime.guardrail_evaluator.as_ref(),
+        ) {
+            crate::guardrail::ChainOutcome::Pass {
+                content,
+                observations,
+            } => {
+                for obs in &observations {
+                    observer.on_guardrail(obs);
+                }
+                content
             }
-            content
-        }
-        crate::guardrail::ChainOutcome::Denied {
-            info,
-            direction,
-            observation,
-        } => {
-            observer.on_guardrail(&observation);
-            return Err(AgentError::GuardrailDenied {
+            crate::guardrail::ChainOutcome::Denied {
+                info,
                 direction,
-                code: info.code,
-                message: info.message,
-                details: info.details,
-            });
-        }
+                observation,
+            } => {
+                observer.on_guardrail(&observation);
+                return Err(AgentError::GuardrailDenied {
+                    direction,
+                    code: info.code,
+                    message: info.message,
+                    details: info.details,
+                });
+            }
+        };
+        // Keep user_message for long-term memory recall query below.
+        let user_message = user_text.clone();
+        state
+            .messages
+            .push(ChatMessage::User { content: user_text });
+        user_message
     };
-    // Keep user_message for long-term memory recall query below.
-    let user_message = user_text.clone();
-    state
-        .messages
-        .push(ChatMessage::User { content: user_text });
 
     // Whether long-term memory is active for this turn (provider wired + the
     // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,
@@ -359,8 +378,38 @@ pub async fn run_step(
     // `end_conversation` short-circuit below to keep a conversational agent
     // PARKED (surface the blocker) instead of silently ending the conversation.
     let mut turn_had_tool_error = false;
+    if let Some(step) = cancelled_step {
+        trail.push(step);
+    }
+    // Set when a `flow:` tool parks on the user: the presentation to show.
+    // Ends the turn with `AwaitingToolInput`.
+    let mut suspension: Option<serde_json::Value> = None;
+    let mut first_iter: u32 = 0;
+    if let Some(resume) = resuming {
+        first_iter = resume.pending.iterations_used;
+        iterations = first_iter;
+        suspension = crate::flow_suspend::resume_pending(
+            runtime,
+            &tenant,
+            session_id,
+            &catalogs,
+            &mut state,
+            &mut trail,
+            observer.as_ref(),
+            resume,
+        )
+        .await;
+        if suspension.is_some() {
+            terminated_by = TerminationReason::AwaitingToolInput;
+        }
+    }
+    let iter_range = if suspension.is_some() {
+        0..0
+    } else {
+        first_iter..config.limits.max_iter
+    };
 
-    for iter in 0..config.limits.max_iter {
+    for iter in iter_range {
         iterations = iter + 1;
 
         // Extend the lock TTL each iteration; losing the extension is
@@ -512,6 +561,18 @@ pub async fn run_step(
                 tool_calls: response.tool_calls.clone(),
             });
             for call in response.tool_calls {
+                // --- A flow tool earlier in this batch parked on the user ---
+                // Every later call still gets a result so no tool_call dangles
+                // in history, but none of them runs: the user must answer first.
+                if suspension.is_some() {
+                    crate::flow_suspend::refuse_behind_suspension(
+                        &mut state,
+                        &mut trail,
+                        observer.as_ref(),
+                        &call,
+                    );
+                    continue;
+                }
                 // --- Host built-in: `recall_memory` (long-term lookup) ---
                 // Intercepted before the allow-list + WASM dispatch; routed to
                 // the runtime's long-term backend instead of an extension.
@@ -624,14 +685,48 @@ pub async fn run_step(
                 // borrow of `state.a2a` inside a match scrutinee lives to the
                 // end of the match, and the error arm below pushes onto
                 // `state.messages`.
-                let dispatched = catalogs
-                    .dispatch(
-                        runtime.ext_runtime.clone(),
-                        call.clone(),
-                        &tenant,
-                        Some(&mut state.a2a),
+                //
+                // A `flow:` tool may PARK on the user (a card). It is the one
+                // prefix dispatched interactively; the rest stay one-shot.
+                let dispatched = if let Some(flow_ref) = call.extension_id.strip_prefix("flow:") {
+                    match crate::tools::dispatch_flow_tool_interactive(
+                        catalogs.flows.as_deref(),
+                        flow_ref,
+                        &call,
                     )
-                    .await;
+                    .await
+                    {
+                        crate::tools::FlowToolDispatch::Value(value) => Ok(value),
+                        crate::tools::FlowToolDispatch::Suspend {
+                            snapshot,
+                            presentation,
+                        } => {
+                            state.pending_tool = Some(crate::state::PendingToolCall {
+                                call_id: call.call_id.clone(),
+                                tool_name: call.tool_name.clone(),
+                                extension_id: call.extension_id.clone(),
+                                args: call.args.clone(),
+                                flow_ref: flow_ref.to_string(),
+                                flow_snapshot: snapshot,
+                                iterations_used: iterations,
+                                expires_at: crate::state::PendingToolCall::expiry_from(
+                                    chrono::Utc::now(),
+                                ),
+                            });
+                            suspension = Some(presentation);
+                            continue;
+                        }
+                    }
+                } else {
+                    catalogs
+                        .dispatch(
+                            runtime.ext_runtime.clone(),
+                            call.clone(),
+                            &tenant,
+                            Some(&mut state.a2a),
+                        )
+                        .await
+                };
                 let result = match dispatched {
                     Ok(r) => r,
                     Err(e) => {
@@ -683,6 +778,13 @@ pub async fn run_step(
                     result,
                     duration_ms,
                 });
+            }
+            if suspension.is_some() {
+                // The turn ends here, waiting on the user. The assistant text
+                // that accompanied the tool call (if any) is the reply.
+                reply = response.content.unwrap_or_default();
+                terminated_by = TerminationReason::AwaitingToolInput;
+                break;
             }
             continue; // next LLM turn with tool observations
         }
@@ -799,6 +901,7 @@ pub async fn run_step(
                 tokens_out: tokens_out_total,
                 iterations,
             },
+            pending_presentation: None,
         });
     }
 
@@ -827,6 +930,7 @@ pub async fn run_step(
             tokens_out: tokens_out_total,
             iterations,
         },
+        pending_presentation: suspension,
     })
 }
 
@@ -1296,6 +1400,7 @@ mod tests {
                 AgentInput {
                     text: "hi".into(),
                     conversational: true,
+                    resume_payload: None,
                 },
             )
             .await
@@ -1334,6 +1439,7 @@ mod tests {
                 AgentInput {
                     text: "hi".into(),
                     conversational: false,
+                    resume_payload: None,
                 },
             )
             .await

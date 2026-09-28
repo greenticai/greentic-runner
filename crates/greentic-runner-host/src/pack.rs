@@ -87,7 +87,7 @@ use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker
 use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
-use crate::runner::engine::{FlowContext, FlowEngine, FlowExecution, FlowStatus};
+use crate::runner::engine::{FlowContext, FlowEngine, FlowExecution, FlowSnapshot, FlowStatus};
 use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow, is_native_op_key};
 use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, MockLayer};
 #[cfg(feature = "fault-injection")]
@@ -347,6 +347,36 @@ pub struct FlowDescriptor {
     /// Whether this flow is an entrypoint (see [`tags_indicate_entry`]).
     #[serde(default = "default_flow_entry")]
     pub entry: bool,
+}
+
+/// What an interactive agent-tool flow run produced
+/// ([`PackRuntime::run_flow_for_tool_interactive`] /
+/// [`PackRuntime::resume_flow_for_tool`]).
+#[derive(Clone, Debug)]
+pub enum ToolFlowOutcome {
+    /// The flow ran to its end; the value is its output.
+    Completed(Value),
+    /// The flow parked awaiting the user. `snapshot` is the serialized
+    /// [`FlowSnapshot`] to resume from; `presentation` is the flow's output at
+    /// the park point (the finalized card, or every message emitted so far).
+    Waiting {
+        snapshot: Value,
+        presentation: Value,
+    },
+}
+
+fn tool_flow_outcome(flow_id: &str, execution: FlowExecution) -> Result<ToolFlowOutcome, String> {
+    match execution.status {
+        FlowStatus::Completed => Ok(ToolFlowOutcome::Completed(execution.output)),
+        FlowStatus::Waiting(wait) => {
+            let snapshot = serde_json::to_value(&wait.snapshot)
+                .map_err(|e| format!("flow '{flow_id}': cannot serialize its park point: {e}"))?;
+            Ok(ToolFlowOutcome::Waiting {
+                snapshot,
+                presentation: execution.output,
+            })
+        }
+    }
 }
 
 pub struct HostState {
@@ -2362,14 +2392,11 @@ impl PackRuntime {
         Vec::new()
     }
 
-    /// Shared load + engine + execute body for `run_flow` and
-    /// `run_flow_for_tool`. Returns the raw `FlowExecution` so each caller can
-    /// match on `FlowStatus` according to its own contract.
-    async fn execute_flow_inner(
-        &self,
-        flow_id: &str,
-        input: serde_json::Value,
-    ) -> Result<FlowExecution> {
+    /// Load a fresh engine over this pack, the way every direct flow run here
+    /// does. Shared by [`Self::execute_flow_inner`] and
+    /// [`Self::resume_flow_for_tool`], so a resumed tool flow runs on exactly
+    /// the pack and engine configuration its first leg did.
+    async fn load_flow_engine(&self) -> Result<(Arc<PackRuntime>, FlowEngine)> {
         let pack = Arc::new(
             PackRuntime::load(
                 &self.path,
@@ -2386,19 +2413,19 @@ impl PackRuntime {
             )
             .await?,
         );
-
         let engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
-        let retry_config = self.config.retry_config().into();
-        let mocks = pack.mocks.as_deref();
-        let tenant = self.config.tenant.as_str();
+        Ok((pack, engine))
+    }
 
-        // Same single establishment point as the ingress path, for callers
-        // that drive a flow directly — see `crate::caller_identity`.
-        // Cloned rather than borrowed: `input` is moved into the run below,
-        // and the context must outlive that move.
-        let caller_block = crate::caller_identity::caller_block(&input).cloned();
-        let ctx = FlowContext {
-            tenant,
+    /// The [`FlowContext`] a direct (non-ingress) flow run executes under.
+    fn direct_flow_ctx<'a>(
+        &'a self,
+        pack: &'a PackRuntime,
+        flow_id: &'a str,
+        caller: Option<&'a Value>,
+    ) -> FlowContext<'a> {
+        FlowContext {
+            tenant: self.config.tenant.as_str(),
             pack_id: pack.metadata().pack_id.as_str(),
             flow_id,
             node_id: None,
@@ -2407,13 +2434,29 @@ impl PackRuntime {
             session_id: None,
             provider_id: None,
             reply_scope: None,
-            retry_config,
+            retry_config: self.config.retry_config().into(),
             attempt: 1,
             observer: None,
-            mocks,
-            caller: caller_block.as_ref(),
-        };
+            mocks: pack.mocks.as_deref(),
+            caller,
+        }
+    }
 
+    /// Shared load + engine + execute body for `run_flow` and
+    /// `run_flow_for_tool`. Returns the raw `FlowExecution` so each caller can
+    /// match on `FlowStatus` according to its own contract.
+    async fn execute_flow_inner(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<FlowExecution> {
+        let (pack, engine) = self.load_flow_engine().await?;
+        // Same single establishment point as the ingress path, for callers
+        // that drive a flow directly — see `crate::caller_identity`.
+        // Cloned rather than borrowed: `input` is moved into the run below,
+        // and the context must outlive that move.
+        let caller_block = crate::caller_identity::caller_block(&input).cloned();
+        let ctx = self.direct_flow_ctx(&pack, flow_id, caller_block.as_ref());
         engine.execute(ctx, input).await
     }
 
@@ -2457,6 +2500,59 @@ impl PackRuntime {
                 wait.reason
             )),
         }
+    }
+
+    /// Interactive flow execution for an agentic worker's `flow:` tool.
+    ///
+    /// Unlike [`Self::run_flow_for_tool`], a flow that parks (a card awaiting
+    /// its routed submit) is not an error: it answers
+    /// [`ToolFlowOutcome::Waiting`] with the serialized [`FlowSnapshot`] to
+    /// hand back to [`Self::resume_flow_for_tool`] and the flow's output at
+    /// the park point — the finalized card — to present meanwhile.
+    ///
+    /// Only the in-process `dw.agent` loop calls this. Graph tool nodes and
+    /// deep workers keep `run_flow_for_tool`, because neither can suspend.
+    pub async fn run_flow_for_tool_interactive(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<ToolFlowOutcome, String> {
+        let execution = self
+            .execute_flow_inner(flow_id, input)
+            .await
+            .map_err(|e| e.to_string())?;
+        tool_flow_outcome(flow_id, execution)
+    }
+
+    /// Resume a flow parked by [`Self::run_flow_for_tool_interactive`] with
+    /// `input` — the user's submit, shaped exactly as the inbound activity a
+    /// standalone card flow would have been resumed with.
+    ///
+    /// `snapshot` must be a [`FlowSnapshot`] of `flow_id`; any other flow's
+    /// snapshot is refused rather than resumed under the wrong name.
+    pub async fn resume_flow_for_tool(
+        &self,
+        flow_id: &str,
+        snapshot: serde_json::Value,
+        input: serde_json::Value,
+    ) -> Result<ToolFlowOutcome, String> {
+        let snapshot: FlowSnapshot = serde_json::from_value(snapshot)
+            .map_err(|e| format!("flow '{flow_id}': unreadable resume snapshot: {e}"))?;
+        if snapshot.flow_id != flow_id {
+            return Err(format!(
+                "flow '{flow_id}': resume snapshot belongs to flow '{}'",
+                snapshot.flow_id
+            ));
+        }
+        let (pack, engine) = self.load_flow_engine().await.map_err(|e| e.to_string())?;
+        let caller_block = crate::caller_identity::caller_block(&input).cloned();
+        let snapshot_flow = snapshot.flow_id.clone();
+        let ctx = self.direct_flow_ctx(&pack, &snapshot_flow, caller_block.as_ref());
+        let execution = engine
+            .resume(ctx, snapshot, input)
+            .await
+            .map_err(|e| e.to_string())?;
+        tool_flow_outcome(flow_id, execution)
     }
 
     pub async fn invoke_component(

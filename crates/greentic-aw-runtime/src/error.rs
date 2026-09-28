@@ -139,6 +139,10 @@ pub enum TerminationReason {
     Error,
     TokenBudgetExceeded,
     ConversationEnded,
+    /// A `flow:` tool parked on the user (a card awaiting its submit). The
+    /// turn ended with [`crate::AgentOutput::pending_presentation`] to show;
+    /// the next turn resumes the tool with the user's answer.
+    AwaitingToolInput,
 }
 
 #[cfg(test)]

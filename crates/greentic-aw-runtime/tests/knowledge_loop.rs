@@ -178,6 +178,7 @@ async fn run(rt: &AgentRuntime, tc: TenantContext, observer: Arc<RecordingObserv
         AgentInput {
             text: "what is the refund policy".into(),
             conversational: false,
+            resume_payload: None,
         },
         observer,
     )

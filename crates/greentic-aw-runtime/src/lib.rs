@@ -24,6 +24,7 @@ pub mod dw;
 pub mod end_conversation;
 pub mod error;
 pub mod flow_source;
+mod flow_suspend;
 pub mod graph;
 pub mod guardrail;
 pub mod guardrail_provider;
@@ -80,7 +81,9 @@ pub use cost::MockTokenMeter;
 pub use cost::{KvTokenMeter, RedisTokenMeter, TokenMeter};
 pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
-pub use flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource};
+pub use flow_source::{
+    FlowInvokeOutcome, FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource,
+};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
 #[cfg(feature = "state-disk")]
@@ -532,6 +535,15 @@ pub struct AgentInput {
     /// the agent config in the loop.
     #[serde(default)]
     pub conversational: bool,
+    /// The user's answer to a flow tool that parked this agent on a card
+    /// ([`TerminationReason::AwaitingToolInput`]) — typically the card's
+    /// submit. `Some` resumes the pending tool flow with it; `None` while a
+    /// tool is pending cancels that tool and treats `text` as an ordinary
+    /// message. Ignored when no tool is pending.
+    ///
+    /// [`TerminationReason::AwaitingToolInput`]: crate::error::TerminationReason::AwaitingToolInput
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_payload: Option<serde_json::Value>,
 }
 
 /// Token + iteration accounting for one [`AgentRuntime::step`]. Surfaced on
@@ -557,6 +569,14 @@ pub struct AgentOutput {
     /// track it, e.g. mocks).
     #[serde(default)]
     pub usage: StepUsage,
+    /// What to show the user while the agent waits on a flow tool — set only
+    /// when `terminated_by` is [`TerminationReason::AwaitingToolInput`]. It is
+    /// the parked flow's own output at its park point (typically an Adaptive
+    /// Card), rendered in place of `reply`.
+    ///
+    /// [`TerminationReason::AwaitingToolInput`]: crate::error::TerminationReason::AwaitingToolInput
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_presentation: Option<serde_json::Value>,
 }
 
 /// One iteration of the Plan-Act-Observe loop, surfaced in the audit

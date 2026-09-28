@@ -162,6 +162,7 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
                 AgentInput {
                     text: user_text,
                     conversational,
+                    resume_payload: None,
                 },
             )
             .await

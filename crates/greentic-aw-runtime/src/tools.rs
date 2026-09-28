@@ -549,6 +549,50 @@ pub async fn dispatch_tool_call(
     .await
 }
 
+/// What the agent loop's interactive `flow:` dispatch produced.
+#[derive(Debug)]
+pub(crate) enum FlowToolDispatch {
+    /// A tool result, exactly what [`dispatch_tool_call`] would have returned.
+    Value(serde_json::Value),
+    /// The flow parked on the user; the loop suspends the turn.
+    Suspend {
+        snapshot: serde_json::Value,
+        presentation: serde_json::Value,
+    },
+}
+
+/// Interactive dispatch for the `flow:` arm ONLY — the one prefix whose tool
+/// may park on the user. Every other prefix, and every other caller (graph
+/// tool nodes, deep workers, [`dispatch_tool_call`]), keeps the
+/// non-interactive path, where a parking flow is an error value.
+///
+/// `flow_ref` is the call's `extension_id` with the `flow:` prefix stripped.
+pub(crate) async fn dispatch_flow_tool_interactive(
+    flows: Option<&FlowToolCatalog>,
+    flow_ref: &str,
+    call: &ToolCallRecord,
+) -> FlowToolDispatch {
+    let Some(cat) = flows else {
+        tracing::warn!(flow = %flow_ref, "flow call has no catalog wired; returning error value");
+        return FlowToolDispatch::Value(
+            serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") }),
+        );
+    };
+    match cat
+        .dispatch_interactive(flow_ref, &call.args.to_string())
+        .await
+    {
+        crate::flow_source::FlowInvokeOutcome::Completed(value) => FlowToolDispatch::Value(value),
+        crate::flow_source::FlowInvokeOutcome::Waiting {
+            snapshot,
+            presentation,
+        } => FlowToolDispatch::Suspend {
+            snapshot,
+            presentation,
+        },
+    }
+}
+
 /// [`dispatch_tool_call`], plus the conversation's A2A continuations.
 ///
 /// `a2a_continuations` is the ONLY difference. Passing `Some` lets an `a2a:`

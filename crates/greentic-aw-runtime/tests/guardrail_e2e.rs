@@ -289,6 +289,7 @@ async fn pii_guardrail_masks_inbound_email() {
             AgentInput {
                 text: "email me at x@y.com please".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await
@@ -337,6 +338,7 @@ async fn pii_guardrail_denies_blocklist_match() {
             AgentInput {
                 text: "this message contains forbidden content".into(),
                 conversational: false,
+                resume_payload: None,
             },
         )
         .await;
@@ -417,6 +419,7 @@ async fn pii_guardrail_enforce_denial_notifies_real_observer() {
             AgentInput {
                 text: "this message contains forbidden content".into(),
                 conversational: false,
+                resume_payload: None,
             },
             observer.clone(),
         )
@@ -466,6 +469,7 @@ async fn pii_guardrail_monitor_denial_notifies_real_observer_without_blocking() 
             AgentInput {
                 text: "this message contains forbidden content".into(),
                 conversational: false,
+                resume_payload: None,
             },
             observer.clone(),
         )

@@ -43,6 +43,15 @@ pub struct ConversationState {
     /// conversation's thread.
     #[serde(default)]
     pub a2a: A2aContinuations,
+    /// A `flow:` tool call that parked on the user (a card awaiting its
+    /// submit). While set, the conversation's history ends in an assistant
+    /// turn whose `call_id` has no tool result yet; the next step either
+    /// resumes the flow with the user's answer or cancels it, and in both
+    /// cases answers that `call_id` before anything else is sent to the LLM.
+    ///
+    /// `#[serde(default)]` for the same fleet-compatibility reason as `a2a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_tool: Option<PendingToolCall>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -58,6 +67,7 @@ impl ConversationState {
             env_id: tenant.env_id.clone(),
             messages: Vec::new(),
             a2a: A2aContinuations::default(),
+            pending_tool: None,
             created_at: now,
             updated_at: now,
         }
@@ -88,6 +98,49 @@ impl ConversationState {
                 break;
             }
         }
+    }
+}
+
+/// How long a parked flow tool waits for the user before the next turn
+/// cancels it instead of resuming it. Idle expiry, like the A2A continuation
+/// TTL: every re-park (the flow asked again) refreshes it.
+pub const PENDING_TOOL_IDLE_TTL_SECS: i64 = 60 * 60;
+
+/// A `flow:` tool call suspended on the user. See
+/// [`ConversationState::pending_tool`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingToolCall {
+    /// The LLM's call id; the eventual tool result is recorded under it.
+    pub call_id: String,
+    /// The tool name the LLM called (for the trail and observers).
+    pub tool_name: String,
+    /// The `extension_id` the LLM called (`flow:<flow_ref>`).
+    #[serde(default)]
+    pub extension_id: String,
+    /// The arguments the LLM called the tool with (for the trail).
+    #[serde(default)]
+    pub args: serde_json::Value,
+    /// The flow being run, without the `flow:` prefix.
+    pub flow_ref: String,
+    /// Opaque host snapshot of the parked flow, handed back to
+    /// [`crate::FlowInvoker::resume`] verbatim.
+    pub flow_snapshot: serde_json::Value,
+    /// Plan-Act-Observe iterations the suspended turn had already spent, so
+    /// the resumed turn continues the budget rather than restarting it.
+    pub iterations_used: u32,
+    /// When this suspension stops being resumable.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl PendingToolCall {
+    /// Expiry `PENDING_TOOL_IDLE_TTL_SECS` from `now`.
+    pub fn expiry_from(now: DateTime<Utc>) -> DateTime<Utc> {
+        now + chrono::Duration::seconds(PENDING_TOOL_IDLE_TTL_SECS)
+    }
+
+    /// Whether the suspension has lapsed at `now`.
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        now >= self.expires_at
     }
 }
 
@@ -211,6 +264,47 @@ pub trait SessionLockInner: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    /// A state saved before `pending_tool` existed (no key at all) must still
+    /// load, as "nothing pending"; and an empty one must not write the key.
+    #[test]
+    fn state_without_pending_tool_deserializes_and_omits_it_on_save() {
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "session_id": "s",
+            "tenant_id": "t",
+            "env_id": "e",
+            "messages": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let state: ConversationState = serde_json::from_value(legacy).expect("legacy state");
+        assert!(state.pending_tool.is_none());
+        let saved = serde_json::to_value(&state).expect("serialize");
+        assert!(saved.get("pending_tool").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn pending_tool_round_trips_and_expires() {
+        let now = Utc::now();
+        let pending = PendingToolCall {
+            call_id: "c1".into(),
+            tool_name: "form".into(),
+            extension_id: "flow:form".into(),
+            args: serde_json::json!({}),
+            flow_ref: "form".into(),
+            flow_snapshot: serde_json::json!({ "next_node": "card" }),
+            iterations_used: 2,
+            expires_at: PendingToolCall::expiry_from(now),
+        };
+        let back: PendingToolCall =
+            serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+        assert_eq!(back, pending);
+        assert!(!pending.is_expired(now));
+        assert!(pending.is_expired(now + chrono::Duration::seconds(PENDING_TOOL_IDLE_TTL_SECS)));
+    }
 
     #[test]
     fn empty_state_has_schema_version_1() {
