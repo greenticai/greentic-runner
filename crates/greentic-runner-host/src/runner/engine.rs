@@ -982,11 +982,15 @@ impl FlowEngine {
         let metric_tenant = ctx.tenant.to_string();
         let metric_flow_id = ctx.flow_id.to_string();
         let started = std::time::Instant::now();
+        let observer = ctx.observer;
         let result = async move {
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
                 ctx.attempt = attempt;
+                if let Some(observer) = ctx.observer {
+                    observer.on_flow_attempt(ctx.flow_id, attempt);
+                }
                 #[cfg(feature = "fault-injection")]
                 {
                     let fault_ctx = FaultContext {
@@ -1044,6 +1048,9 @@ impl FlowEngine {
         }
         .instrument(span)
         .await;
+        if let Some(observer) = observer {
+            observer.on_flow_exit(&metric_flow_id);
+        }
         let status = if result.is_ok() { "ok" } else { "err" };
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         crate::metrics::record_flow_execution(&metric_tenant, &metric_flow_id, status, duration_ms);
@@ -3416,6 +3423,16 @@ pub trait ExecutionObserver: Send + Sync {
     fn on_node_end(&self, event: &NodeEvent<'_>, output: &Value);
     fn on_node_error(&self, event: &NodeEvent<'_>, error: &dyn StdError);
     fn on_validation(&self, _event: &NodeEvent<'_>, _issues: &[ValidationIssue]) {}
+    /// A flow walk entered through `execute` / `execute_from` (a turn's
+    /// top-level run, or a `flow.call` callee) starts attempt `attempt`
+    /// (1-based). Attempt > 1 is an engine retry that re-runs the walk from
+    /// its entry node. Calls nest: a callee's attempts arrive between its
+    /// caller's attempt and the caller's [`Self::on_flow_exit`].
+    fn on_flow_attempt(&self, _flow_id: &str, _attempt: u32) {}
+    /// The walk whose attempts [`Self::on_flow_attempt`] reported has returned
+    /// (success or final failure). Exactly one per walk that reported
+    /// attempt 1. `FlowEngine::resume` reports neither.
+    fn on_flow_exit(&self, _flow_id: &str) {}
 }
 
 pub struct NodeEvent<'a> {

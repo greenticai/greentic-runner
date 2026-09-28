@@ -187,7 +187,8 @@ pub struct RunOutcome {
     /// consecutive duplicates collapsed, at most 32 (see [`path`]). Node ids
     /// only. Empty when the observer saw no node.
     pub path: Vec<String>,
-    /// `true` when [`Self::path`] was cut at its cap.
+    /// `true` when [`Self::path`] is incomplete: cut at its cap, or (on the
+    /// wire) an over-long id was dropped from it.
     pub path_truncated: bool,
 }
 

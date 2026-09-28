@@ -168,6 +168,13 @@ fn an_over_long_path_id_is_dropped_and_reported_as_a_cut() {
     assert_eq!(event.path, ["a", "b"]);
     assert!(event.path_truncated);
 
+    // Neighbours made adjacent by the drop collapse again.
+    let mut rejoined = outcome();
+    rejoined.path = vec!["a".into(), "x".repeat(MAX_FIELD_BYTES + 1), "a".into()];
+    let event = sink.build_event(rejoined).unwrap();
+    assert_eq!(event.path, ["a"]);
+    assert!(event.path_truncated);
+
     // A cut flag never rides without a path.
     let mut only_long = outcome();
     only_long.path = vec!["x".repeat(MAX_FIELD_BYTES + 1)];

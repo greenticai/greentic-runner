@@ -221,6 +221,28 @@ fn build_pack(pack_path: &Path) -> Result<()> {
             }
         },
         {
+            "id": "retry.flow",
+            "flow_type": "messaging",
+            "start": "a",
+            "nodes": {
+                "a": {
+                    "component": "emit.response",
+                    "input": { "text": "a" },
+                    "routing": { "next": { "node_id": "b" } }
+                },
+                "b": {
+                    "component": "emit.response",
+                    "input": { "text": "b" },
+                    "routing": { "next": { "node_id": "c" } }
+                },
+                "c": {
+                    "component": "emit.response",
+                    "input": { "text": "c" },
+                    "routing": "end"
+                }
+            }
+        },
+        {
             "id": "agent.flow",
             "flow_type": "messaging",
             "start": "agent",
@@ -595,6 +617,43 @@ fn a_flow_goto_continues_the_same_run_in_the_target_flow() -> Result<()> {
     assert_eq!(second[0].flow_id, "wait.flow");
     assert_eq!((second[0].seq, &second[0].run_id), (2, &first[0].run_id));
     assert_eq!(second[0].path, ["done"]);
+    Ok(())
+}
+
+/// The engine retries a transiently failing walk from its entry node with
+/// the same observer. The reported path is the final attempt's walk, never
+/// the attempts glued together (`a, b, a, b, c`).
+#[cfg(feature = "fault-injection")]
+#[test]
+fn an_engine_retry_reports_only_the_final_attempts_path() -> Result<()> {
+    use greentic_runner_host::testing::fault_injection::{
+        FaultErrorKind, FaultInjector, FaultMode, FaultPoint, FaultSpec, clear_injector,
+        set_injector,
+    };
+    let rt = *RUNTIME;
+    let h = harness(true)?;
+    // The third node render of `retry.flow` (node `c`, attempt 1) fails
+    // transiently, before `c` starts; attempt 2 runs `a, b, c` cleanly.
+    set_injector(
+        FaultInjector::new(vec![FaultSpec {
+            point: FaultPoint::TemplateRender,
+            mode: FaultMode::Nth(3),
+            error_kind: FaultErrorKind::Transient,
+            message: "injected".into(),
+        }])
+        .with_flow_id("retry.flow"),
+    );
+    let result = rt.block_on(h.runtime.handle(envelope("retry.flow", "hello")));
+    let stats = greentic_runner_host::testing::fault_injection::stats();
+    clear_injector();
+    result?;
+    assert_eq!(stats.injected, 1, "the fault fired once");
+    assert!(stats.max_attempt >= 2, "the engine retried: {stats:?}");
+    let outcomes = h.sink.take();
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0].status, RunStatus::Completed);
+    assert_eq!(outcomes[0].path, ["a", "b", "c"]);
+    assert!(!outcomes[0].path_truncated);
     Ok(())
 }
 

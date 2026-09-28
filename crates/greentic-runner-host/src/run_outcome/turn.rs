@@ -164,6 +164,20 @@ impl ExecutionObserver for RunOutcomeObserver<'_> {
             inner.on_validation(event, issues);
         }
     }
+
+    fn on_flow_attempt(&self, flow_id: &str, attempt: u32) {
+        self.seen.lock().path.attempt(attempt);
+        if let Some(inner) = self.inner {
+            inner.on_flow_attempt(flow_id, attempt);
+        }
+    }
+
+    fn on_flow_exit(&self, flow_id: &str) {
+        self.seen.lock().path.exit();
+        if let Some(inner) = self.inner {
+            inner.on_flow_exit(flow_id);
+        }
+    }
 }
 
 /// Map an error's text onto a short class. The text itself is read here and

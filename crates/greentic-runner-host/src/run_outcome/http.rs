@@ -291,13 +291,17 @@ fn bounded(value: Option<String>) -> Option<String> {
 /// The v3 `path` as sent. An id longer than [`MAX_FIELD_BYTES`] is dropped
 /// rather than truncated into a different id, and the path is then reported
 /// as cut; `path_truncated` never rides without a path.
+/// Dropping an id can make its neighbours adjacent; equal neighbours are
+/// collapsed again so the wire keeps the no-consecutive-duplicates rule.
 fn wire_path(path: Vec<String>, truncated: bool) -> (Vec<String>, bool) {
     let before = path.len();
-    let kept: Vec<String> = path
+    let mut kept: Vec<String> = path
         .into_iter()
         .filter(|id| !id.is_empty() && id.len() <= MAX_FIELD_BYTES)
         .collect();
-    let truncated = (truncated || kept.len() != before) && !kept.is_empty();
+    let dropped = kept.len() != before;
+    kept.dedup();
+    let truncated = (truncated || dropped) && !kept.is_empty();
     (kept, truncated)
 }
 

@@ -526,6 +526,51 @@ fn the_observer_records_the_executed_path_in_order_across_sub_flows() {
 }
 
 #[test]
+fn an_engine_retry_reports_only_the_last_attempts_walk() {
+    let observer = RunOutcomeObserver::new(None);
+    let ctx = FlowContext {
+        tenant: "demo",
+        pack_id: "p",
+        flow_id: "f",
+        node_id: None,
+        tool: None,
+        action: None,
+        session_id: None,
+        provider_id: None,
+        reply_scope: None,
+        retry_config: RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+        },
+        attempt: 1,
+        observer: None,
+        mocks: None,
+        caller: None,
+    };
+    let payload = json!({});
+    let node = HostNode::for_test("comp.a", None);
+    let start = |node_id| {
+        observer.on_node_start(&NodeEvent {
+            context: &ctx,
+            node_id,
+            node: &node,
+            payload: &payload,
+        })
+    };
+    observer.on_flow_attempt("f", 1);
+    start("a");
+    start("b");
+    observer.on_flow_attempt("f", 2);
+    start("a");
+    start("b");
+    start("c");
+    observer.on_flow_exit("f");
+    let outcome = fresh_turn().completed(&observer.observed(), &json!({}));
+    assert_eq!(outcome.path, ["a", "b", "c"]);
+    assert!(!outcome.path_truncated);
+}
+
+#[test]
 fn a_long_walk_is_cut_at_the_cap_and_every_outcome_says_so() {
     let observer = RunOutcomeObserver::new(None);
     let ctx = FlowContext {
