@@ -77,6 +77,7 @@ use std::sync::Arc;
 
 use super::dispatch_listener::SessionResumer;
 use crate::engine::runtime::{IngressEnvelope, StateMachineRuntime};
+use crate::runner::engine::{ParkedApproval, response_authenticates};
 
 /// Marker appended to a store hint when a pack id is known (mirrors
 /// `build_store_ctx` in `engine/runtime.rs`).
@@ -246,18 +247,41 @@ impl RuntimeSessionResumer {
 #[async_trait]
 impl SessionResumer for RuntimeSessionResumer {
     async fn resume(&self, tenant: TenantCtx, correlation_id: &str, output: Value) -> Result<()> {
-        let envelope = Self::build_resume_envelope(&tenant, correlation_id, output);
-        if split_dispatch_nonce(correlation_id).1.is_some() {
-            let parked = self.runtime.parked_approval_correlations(&envelope).await?;
-            if !response_matches_park(correlation_id, parked.as_deref()) {
+        let nonced = split_dispatch_nonce(correlation_id).1.is_some();
+        let envelope = Self::build_resume_envelope(&tenant, correlation_id, output.clone());
+        // Read for EVERY response, not only nonced ones: a sender that omits
+        // the nonce must not skip the token check. A read failure is fatal for
+        // a nonced (approval) response, as before; for any other response it
+        // falls through to the runtime, where the approval gate re-checks the
+        // token itself before deciding anything.
+        let parked = match self.runtime.parked_approvals(&envelope).await {
+            Ok(parked) => parked,
+            Err(error) if !nonced => {
+                tracing::warn!(%error, %correlation_id, "could not read the parked flow before resuming; the gate re-checks the response itself");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        match admit_response(correlation_id, &output, parked.as_deref()) {
+            Admission::Resume => {}
+            Admission::WrongGate => {
                 // Not an error: the response is real, it just no longer has a
                 // gate to land on. Resuming would hand an earlier gate's
                 // decision (or its watchdog's late `timeout`) to a different
                 // gate — or to whatever the conversation is parked on now.
                 tracing::warn!(
                     %correlation_id,
-                    parked = ?parked,
                     "dropping approval response: it does not match the approval this conversation is parked on"
+                );
+                return Ok(());
+            }
+            Admission::BadToken => {
+                // A security event: whoever sent this does not hold the token
+                // the gate was issued (or is replaying a spent one). The gate
+                // stays parked. The token is never logged.
+                tracing::warn!(
+                    %correlation_id,
+                    "dropping approval response: its decision_token is missing or does not match the one the parked approval was issued"
                 );
                 return Ok(());
             }
@@ -266,24 +290,70 @@ impl SessionResumer for RuntimeSessionResumer {
     }
 }
 
-/// Whether a NONCED approval response may resume the conversation's park.
+/// What the resumer does with a dispatch response, decided before the runtime
+/// sees it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Hand it to the runtime.
+    Resume,
+    /// A NONCED approval response for an approval this conversation is not
+    /// parked on (greentic-runner#793).
+    WrongGate,
+    /// The approval it would land on was issued a `decision_token` and the
+    /// response does not carry it (greentic-runner#794).
+    BadToken,
+}
+
+/// Decide whether `response`, published under `correlation_id`, may resume
+/// the conversation's park.
 ///
 /// `parked` is `None` when nothing is parked: that case is left to the runtime
-/// exactly as before this check existed. Otherwise the response resumes only
-/// when one of the parked approvals was published under this exact id — or
-/// when one was recorded before ids were recorded (`None`), which cannot be
-/// verified and so is not refused.
-pub(crate) fn response_matches_park(
+/// exactly as before these checks existed (a spent token cannot resurrect a
+/// gate — its mark is gone — and a fresh run re-dispatches rather than
+/// deciding).
+///
+/// Otherwise the candidates are the parked approvals the response could land
+/// on: for a nonced id, those published under this exact id (or recorded
+/// before ids were, which cannot be told apart); for an id with no nonce, all
+/// of them. A nonced response with no candidate is [`Admission::WrongGate`].
+/// A response resumes when some candidate was issued no token (a legacy park)
+/// or its token matches one; otherwise it is [`Admission::BadToken`]. An id
+/// with no nonce and no parked approval (the conversation waits on something
+/// else) is left to the runtime, as before.
+pub(crate) fn admit_response(
     correlation_id: &str,
-    parked: Option<&[Option<String>]>,
-) -> bool {
+    response: &Value,
+    parked: Option<&[ParkedApproval]>,
+) -> Admission {
     let Some(parked) = parked else {
-        return true;
+        return Admission::Resume;
     };
-    parked.iter().any(|recorded| match recorded {
-        Some(recorded) => recorded == correlation_id,
-        None => true,
-    })
+    let nonced = split_dispatch_nonce(correlation_id).1.is_some();
+    let candidates: Vec<&ParkedApproval> = parked
+        .iter()
+        .filter(|park| {
+            !nonced
+                || park
+                    .correlation_id
+                    .as_deref()
+                    .is_none_or(|recorded| recorded == correlation_id)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return if nonced {
+            Admission::WrongGate
+        } else {
+            Admission::Resume
+        };
+    }
+    if candidates
+        .iter()
+        .any(|park| response_authenticates(response, park))
+    {
+        Admission::Resume
+    } else {
+        Admission::BadToken
+    }
 }
 
 /// Split a store hint into its bare canonical hint and the pack id encoded in
@@ -518,15 +588,87 @@ mod tests {
     fn a_nonced_response_resumes_only_its_own_parked_approval() {
         let mine = format!("h::pack=p::flow=f::n={NONCE}");
         let other = format!("h::pack=p::flow=f::n={}", "f".repeat(32));
+        let untokened = |id: Option<&str>| ParkedApproval {
+            correlation_id: id.map(str::to_string),
+            token_fingerprint: None,
+        };
+        let r = json!({"ok": true, "output": {"decision": "approved"}});
         // Nothing parked: left to the runtime, unchanged.
-        assert!(response_matches_park(&mine, None));
+        assert_eq!(admit_response(&mine, &r, None), Admission::Resume);
         // Parked on this very approval.
-        assert!(response_matches_park(&mine, Some(&[Some(mine.clone())])));
+        assert_eq!(
+            admit_response(&mine, &r, Some(&[untokened(Some(&mine))])),
+            Admission::Resume
+        );
         // Parked on a DIFFERENT approval in the same conversation.
-        assert!(!response_matches_park(&mine, Some(&[Some(other.clone())])));
+        assert_eq!(
+            admit_response(&mine, &r, Some(&[untokened(Some(&other))])),
+            Admission::WrongGate
+        );
         // Parked, but not on any approval (e.g. a card after the gate passed).
-        assert!(!response_matches_park(&mine, Some(&[])));
+        assert_eq!(admit_response(&mine, &r, Some(&[])), Admission::WrongGate);
         // A legacy mark with no recorded id cannot be verified: not refused.
-        assert!(response_matches_park(&mine, Some(&[None])));
+        assert_eq!(
+            admit_response(&mine, &r, Some(&[untokened(None)])),
+            Admission::Resume
+        );
+    }
+
+    fn tokened(id: &str, fingerprint: &str) -> ParkedApproval {
+        ParkedApproval {
+            correlation_id: Some(id.to_string()),
+            token_fingerprint: Some(fingerprint.to_string()),
+        }
+    }
+
+    fn response(token: Option<&str>) -> Value {
+        match token {
+            Some(token) => {
+                json!({"ok": true, "output": {"decision": "approved", "decision_token": token}})
+            }
+            None => json!({"ok": true, "output": {"decision": "approved"}}),
+        }
+    }
+
+    #[test]
+    fn a_tokened_park_resumes_only_on_the_right_token() {
+        use crate::runner::approval_token::issue;
+        let mine = format!("h::pack=p::flow=f::n={NONCE}");
+        let issued = issue();
+        let parks = [tokened(&mine, &issued.fingerprint)];
+        assert_eq!(
+            admit_response(&mine, &response(Some(&issued.token)), Some(&parks)),
+            Admission::Resume
+        );
+        assert_eq!(
+            admit_response(&mine, &response(Some(&issue().token)), Some(&parks)),
+            Admission::BadToken,
+            "a wrong token is refused"
+        );
+        assert_eq!(
+            admit_response(&mine, &response(None), Some(&parks)),
+            Admission::BadToken,
+            "a missing token is refused"
+        );
+    }
+
+    #[test]
+    fn dropping_the_nonce_does_not_skip_the_token_check() {
+        // The derived, guessable id with no `::n=`: the attack from #794.
+        use crate::runner::approval_token::issue;
+        let issued = issue();
+        let parks = [tokened(
+            &format!("h::pack=p::flow=f::n={NONCE}"),
+            &issued.fingerprint,
+        )];
+        let guessed = "h::pack=p::flow=f";
+        assert_eq!(
+            admit_response(guessed, &response(None), Some(&parks)),
+            Admission::BadToken
+        );
+        assert_eq!(
+            admit_response(guessed, &response(Some(&issued.token)), Some(&parks)),
+            Admission::Resume
+        );
     }
 }

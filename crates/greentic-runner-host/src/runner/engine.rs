@@ -18,6 +18,7 @@ use super::mocks::MockLayer;
 use super::templating::{TemplateOptions, render_template_value};
 use crate::config::{FlowRetryConfig, HostConfig};
 use crate::pack::{FlowDescriptor, PackRuntime};
+use crate::runner::approval_token;
 use crate::runner::invocation::{InvocationMeta, build_invocation_envelope_as};
 use crate::telemetry::{
     FlowSpanAttributes, RolloutIds, annotate_span, backoff_delay_ms, set_flow_context,
@@ -2096,21 +2097,34 @@ impl FlowEngine {
         payload: Value,
         state: &mut ExecutionState,
     ) -> Result<DispatchOutcome> {
-        if let Some(pending_correlation) = state.take_approval_await(node_id) {
+        if let Some(parked) = state.take_approval_await(node_id) {
             if entry_is_approval_response(&state.entry) {
-                let outcome = approval_outcome_from_entry(&state.entry);
-                let output = NodeOutput::with_meta(
-                    state.entry.clone(),
-                    serde_json::json!({ "outcome": outcome }),
+                if response_authenticates(&state.entry, &parked) {
+                    // Taking the mark above spent the token: a replay of this
+                    // same response finds nothing parked to match.
+                    let mut response = state.entry.clone();
+                    approval_token::strip_from_response(&mut response);
+                    let outcome = approval_outcome_from_entry(&response);
+                    let output =
+                        NodeOutput::with_meta(response, serde_json::json!({ "outcome": outcome }));
+                    return Ok(DispatchOutcome::complete(output));
+                }
+                // The resumer already drops such a response; this is the
+                // authoritative check, because anything else that lands an
+                // `ok`-carrying entry on this node (a response routed without
+                // the resumer's check, or an inbound shaped like one) must
+                // not decide the gate either.
+                tracing::warn!(
+                    node_id,
+                    "refusing approval response: its decision_token is missing or does not match the one this gate was issued; the gate stays parked"
                 );
-                return Ok(DispatchOutcome::complete(output));
             }
-            // A user activity arrived while we were parked. Re-park without
-            // re-dispatching. The AwaitHere handler discards the correlation id,
-            // but the gate must keep the ORIGINAL dispatch's id: the decision
-            // that eventually arrives carries that id, and the resume path
-            // matches it against this mark.
-            state.mark_approval_await(node_id, pending_correlation);
+            // A user activity (or a refused response) arrived while we were
+            // parked. Re-park without re-dispatching. The AwaitHere handler
+            // discards the correlation id, but the gate must keep the ORIGINAL
+            // dispatch's id and token fingerprint: the decision that
+            // eventually arrives carries both, and is matched against them.
+            state.mark_approval_await(node_id, parked);
             return Ok(DispatchOutcome::await_here(
                 NodeOutput::new(serde_json::json!({ "pending": true })),
                 Some("awaiting approval decision".to_string()),
@@ -2136,12 +2150,29 @@ impl FlowEngine {
         // error never parks either — marking before the call would leave the
         // node believing it is awaiting a decision it never requested, and every
         // later inbound would re-park forever.
+        //
+        // A fresh single-use `decision_token` per dispatch (greentic-runner
+        // #794): the request carries it, the park stores only its fingerprint,
+        // and the decision resumes the gate only when it carries it back.
+        let issued = approval_token::issue();
         let outcome = self
-            .execute_remote_dispatch(ctx, APPROVAL_RUNTIME, target, payload, true)
+            .execute_remote_dispatch_with_token(
+                ctx,
+                APPROVAL_RUNTIME,
+                target,
+                payload,
+                true,
+                Some(issued.token),
+            )
             .await?;
         if let NodeControl::AwaitHere { correlation_id, .. } = &outcome.control {
-            let recorded = Some(correlation_id.clone()).filter(|id| !id.is_empty());
-            state.mark_approval_await(node_id, recorded);
+            state.mark_approval_await(
+                node_id,
+                ParkedApproval {
+                    correlation_id: Some(correlation_id.clone()).filter(|id| !id.is_empty()),
+                    token_fingerprint: Some(issued.fingerprint),
+                },
+            );
         }
         Ok(outcome)
     }
@@ -2423,6 +2454,22 @@ impl FlowEngine {
         payload: Value,
         resume_at_self: bool,
     ) -> Result<DispatchOutcome> {
+        self.execute_remote_dispatch_with_token(ctx, runtime, target, payload, resume_at_self, None)
+            .await
+    }
+
+    /// [`Self::execute_remote_dispatch`] for a dispatch that is issued a
+    /// `decision_token` (only `approval.call`); see
+    /// [`crate::runner::remote_dispatch::RemoteDispatch::decision_token`].
+    async fn execute_remote_dispatch_with_token(
+        &self,
+        ctx: &FlowContext<'_>,
+        runtime: &str,
+        target: &str,
+        payload: Value,
+        resume_at_self: bool,
+        decision_token: Option<String>,
+    ) -> Result<DispatchOutcome> {
         let handler = self.remote_dispatch_handler.as_ref().with_context(|| {
             format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
         })?;
@@ -2503,6 +2550,7 @@ impl FlowEngine {
                 correlation_id: correlation_id.clone(),
                 input: inner_input,
                 deadline_ms,
+                decision_token,
             })
             .await?;
 
@@ -3541,6 +3589,14 @@ pub struct ExecutionState {
     /// serialised as `null`), which decodes cleanly and is not verified.
     #[serde(default)]
     pending_approval_await: HashMap<String, Option<String>>,
+    /// `sha256(decision_token)`, hex, for each approval in
+    /// [`Self::pending_approval_await`] that was issued one (greentic-runner
+    /// #794). Never the token itself. Kept as a SEPARATE map rather than
+    /// widening the value above so a snapshot written before tokens existed
+    /// decodes unchanged — a gate with no entry here is a legacy park and is
+    /// resumed without a token, exactly as before.
+    #[serde(default)]
+    pending_approval_token: HashMap<String, String>,
     /// In-process `dw.agent` nodes parked because one of the agent's `flow:`
     /// tools is waiting on the user (a card). Set when the agent answers
     /// `terminated_by == "awaiting_tool_input"`, taken on the re-entry that
@@ -3568,6 +3624,7 @@ impl ExecutionState {
             park_turns: HashMap::new(),
             pending_agent_await: HashMap::new(),
             pending_approval_await: HashMap::new(),
+            pending_approval_token: HashMap::new(),
             pending_tool_await: HashMap::new(),
             pending_card_answers: None,
         }
@@ -3680,26 +3737,43 @@ impl ExecutionState {
         self.pending_tool_await.remove(node_id).is_some()
     }
 
-    /// Mark `node_id` as parked awaiting an approval decision published under
-    /// `correlation_id` (see [`Self::pending_approval_await`]).
-    fn mark_approval_await(&mut self, node_id: &str, correlation_id: Option<String>) {
+    /// Mark `node_id` as parked awaiting an approval decision (see
+    /// [`Self::pending_approval_await`] and [`Self::pending_approval_token`]).
+    fn mark_approval_await(&mut self, node_id: &str, parked: ParkedApproval) {
         self.pending_approval_await
-            .insert(node_id.to_string(), correlation_id);
+            .insert(node_id.to_string(), parked.correlation_id);
+        match parked.token_fingerprint {
+            Some(fingerprint) => {
+                self.pending_approval_token
+                    .insert(node_id.to_string(), fingerprint);
+            }
+            None => {
+                self.pending_approval_token.remove(node_id);
+            }
+        }
     }
 
-    /// Check-and-clear: `Some(correlation)` when `node_id` dispatched an
-    /// approval and is awaiting the decision, `None` otherwise. The inner
-    /// value is the correlation id recorded at dispatch (`None` for a legacy
-    /// snapshot).
-    fn take_approval_await(&mut self, node_id: &str) -> Option<Option<String>> {
-        self.pending_approval_await.remove(node_id)
+    /// Check-and-clear: `Some` when `node_id` dispatched an approval and is
+    /// awaiting the decision, `None` otherwise. Clearing the token fingerprint
+    /// here is what makes the token single-use.
+    fn take_approval_await(&mut self, node_id: &str) -> Option<ParkedApproval> {
+        let correlation_id = self.pending_approval_await.remove(node_id)?;
+        Some(ParkedApproval {
+            correlation_id,
+            token_fingerprint: self.pending_approval_token.remove(node_id),
+        })
     }
 
-    /// Every approval this state is parked on, as the correlation id each was
-    /// published under (`None` for a legacy mark). Read by the dispatch resume
-    /// path to match a response to its own gate.
-    pub(crate) fn pending_approval_correlations(&self) -> Vec<Option<String>> {
-        self.pending_approval_await.values().cloned().collect()
+    /// Every approval this state is parked on. Read by the dispatch resume
+    /// path to match a response to its own gate before resuming anything.
+    pub(crate) fn pending_approvals(&self) -> Vec<ParkedApproval> {
+        self.pending_approval_await
+            .iter()
+            .map(|(node_id, correlation_id)| ParkedApproval {
+                correlation_id: correlation_id.clone(),
+                token_fingerprint: self.pending_approval_token.get(node_id).cloned(),
+            })
+            .collect()
     }
 
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
@@ -6050,6 +6124,31 @@ fn approval_requires_human(input: &Value) -> bool {
 /// conversational `dw.agent` discriminator (`state.entry.get("ok").is_some()`).
 fn entry_is_approval_response(entry: &Value) -> bool {
     entry.get("ok").is_some()
+}
+
+/// One approval a flow is parked on, as recorded at dispatch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ParkedApproval {
+    /// The correlation id the request was published under; `None` for a mark
+    /// recorded before ids were.
+    pub(crate) correlation_id: Option<String>,
+    /// `sha256(decision_token)`, hex; `None` for a mark recorded by a runner
+    /// that issued no token (greentic-runner#794).
+    pub(crate) token_fingerprint: Option<String>,
+}
+
+/// Whether `response` may decide the gate `parked` describes.
+///
+/// A gate issued a token requires `output.decision_token` to match it —
+/// missing and wrong are refused alike. A legacy gate (no fingerprint) was
+/// never issued one and is resumed as before.
+pub(crate) fn response_authenticates(response: &Value, parked: &ParkedApproval) -> bool {
+    match parked.token_fingerprint.as_deref() {
+        None => true,
+        Some(fingerprint) => {
+            approval_token::verify(approval_token::from_response(response), fingerprint)
+        }
+    }
 }
 
 /// Map an approval response envelope to the routing outcome that becomes
@@ -9001,11 +9100,11 @@ mod tests {
             st.take_approval_await("gate").is_none(),
             "unmarked node takes None"
         );
-        st.mark_approval_await("gate", Some("corr::n=abc".into()));
+        st.mark_approval_await("gate", parked("corr::n=abc", Some("fp")));
         assert_eq!(
             st.take_approval_await("gate"),
-            Some(Some("corr::n=abc".to_string())),
-            "marked node takes its recorded correlation"
+            Some(parked("corr::n=abc", Some("fp"))),
+            "marked node takes its recorded correlation and fingerprint"
         );
         assert!(
             st.take_approval_await("gate").is_none(),
@@ -9016,17 +9115,21 @@ mod tests {
     #[test]
     fn approval_await_survives_snapshot_roundtrip() {
         let mut st = ExecutionState::new(json!({}));
-        st.mark_approval_await("gate", Some("corr::n=abc".into()));
+        st.mark_approval_await("gate", parked("corr::n=abc", Some("fp")));
         let encoded = serde_json::to_string(&st).expect("serialize");
+        assert!(
+            !encoded.contains("decision_token"),
+            "only the fingerprint is persisted"
+        );
         let mut decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(
-            decoded.pending_approval_correlations(),
-            vec![Some("corr::n=abc".to_string())]
+            decoded.pending_approvals(),
+            vec![parked("corr::n=abc", Some("fp"))]
         );
         assert_eq!(
             decoded.take_approval_await("gate"),
-            Some(Some("corr::n=abc".to_string())),
-            "the marker and its correlation must survive a park/resume snapshot"
+            Some(parked("corr::n=abc", Some("fp"))),
+            "the marker, correlation and fingerprint must survive a park/resume snapshot"
         );
     }
 
@@ -9047,8 +9150,52 @@ mod tests {
             r#"{"entry":{},"input":{},"pending_approval_await":{"gate":null}}"#,
         )
         .expect("pre-correlation snapshot decodes");
-        assert_eq!(decoded.pending_approval_correlations(), vec![None]);
-        assert_eq!(decoded.take_approval_await("gate"), Some(None));
+        assert_eq!(decoded.pending_approvals(), vec![ParkedApproval::default()]);
+        assert_eq!(
+            decoded.take_approval_await("gate"),
+            Some(ParkedApproval::default())
+        );
+    }
+
+    fn parked(correlation: &str, fingerprint: Option<&str>) -> ParkedApproval {
+        ParkedApproval {
+            correlation_id: Some(correlation.to_string()),
+            token_fingerprint: fingerprint.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_parked_before_tokens_has_no_fingerprint_and_is_not_verified() {
+        // Written by a runner predating #794: correlation id, no token map.
+        let decoded: ExecutionState = serde_json::from_str(
+            r#"{"entry":{},"input":{},"pending_approval_await":{"gate":"corr::n=abc"}}"#,
+        )
+        .expect("pre-token snapshot decodes");
+        let parks = decoded.pending_approvals();
+        assert_eq!(parks, vec![parked("corr::n=abc", None)]);
+        assert!(response_authenticates(
+            &json!({"ok": true, "output": {"decision": "approved"}}),
+            &parks[0]
+        ));
+    }
+
+    #[test]
+    fn a_tokened_gate_resumes_only_on_its_own_token_and_only_once() {
+        let issued = approval_token::issue();
+        let mut st = ExecutionState::new(json!({}));
+        st.mark_approval_await("gate", parked("corr", Some(&issued.fingerprint)));
+        let right =
+            json!({"ok": true, "output": {"decision": "approved", "decision_token": issued.token}});
+        let wrong = json!({"ok": true, "output": {"decision": "approved", "decision_token": approval_token::issue().token}});
+        let missing = json!({"ok": true, "output": {"decision": "approved"}});
+
+        let park = st.take_approval_await("gate").expect("parked");
+        assert!(!response_authenticates(&missing, &park));
+        assert!(!response_authenticates(&wrong, &park));
+        assert!(response_authenticates(&right, &park));
+        // Spent: the fingerprint left with the park, nothing remains to match.
+        assert!(st.take_approval_await("gate").is_none());
+        assert!(st.pending_approvals().is_empty());
     }
 
     #[test]

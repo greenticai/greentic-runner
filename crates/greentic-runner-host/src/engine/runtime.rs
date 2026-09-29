@@ -705,7 +705,7 @@ pub struct StateMachineRuntime {
     run_outcome: Option<RunOutcomeReporter>,
     /// The same resume store the pack-flow adapter parks into, kept so the
     /// dispatch resume path can inspect a park before resuming it (see
-    /// [`Self::parked_approval_correlations`]). `None` for [`Self::new`],
+    /// [`Self::parked_approvals`]). `None` for [`Self::new`],
     /// which has no pack-flow adapter and therefore never parks.
     resume: Option<FlowResumeStore>,
 }
@@ -827,17 +827,18 @@ impl StateMachineRuntime {
         })
     }
 
-    /// The approvals the conversation `envelope` addresses is parked on, as the
-    /// correlation id each was published under (`None` entries are marks
-    /// recorded before ids were). `Ok(None)` means nothing is parked.
+    /// The approvals the conversation `envelope` addresses is parked on, each
+    /// with the correlation id it was published under and the fingerprint of
+    /// the `decision_token` it was issued (`None` for marks recorded before
+    /// either existed). `Ok(None)` means nothing is parked.
     ///
     /// Reads the SAME slot the pack-flow adapter would resume (the envelope is
     /// canonicalised exactly as the adapter canonicalises it), so a response
     /// can be matched to its own gate before it is allowed to resume anything.
-    pub(crate) async fn parked_approval_correlations(
+    pub(crate) async fn parked_approvals(
         &self,
         envelope: &IngressEnvelope,
-    ) -> Result<Option<Vec<Option<String>>>> {
+    ) -> Result<Option<Vec<crate::runner::engine::ParkedApproval>>> {
         let Some(resume) = self.resume.as_ref() else {
             return Ok(None);
         };
@@ -846,7 +847,7 @@ impl StateMachineRuntime {
             .fetch(&envelope)
             .await
             .map_err(|err| anyhow!("failed to read the parked flow: {err}"))?;
-        Ok(snapshot.map(|snapshot| snapshot.state.pending_approval_correlations()))
+        Ok(snapshot.map(|snapshot| snapshot.state.pending_approvals()))
     }
 
     /// Execute the flow associated with the provided ingress event.
