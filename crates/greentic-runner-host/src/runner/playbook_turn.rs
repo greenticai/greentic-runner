@@ -152,7 +152,24 @@ pub(crate) fn playbook_source_from_packs(
 }
 
 /// Wire one playbook turn to `AgentRuntime::step`.
-pub(crate) fn build_turn(host: PlaybookTurnHost) -> PlaybookTurnFn {
+///
+/// **Public because a host that runs a worker with NO pack still needs this
+/// exact turn effect.** [`playbook_source_from_packs`] above is the pack-backed
+/// door, and it is the only one a deployed runtime needs; greentic-designer's
+/// Test chat builds its `AgentRuntime` from a composed form instead and resolves
+/// a `playbook:` ref from its own workspace store, so it supplies its own
+/// [`PlaybookSource`] and needs only the turn. Every type in
+/// [`PlaybookTurnHost`] is already publicly re-exported, so the struct was
+/// reachable from outside this crate while the one function consuming it was
+/// not.
+///
+/// It is exported rather than reimplemented because the composition here
+/// carries a property a caller cannot be relied on to reproduce: the nested
+/// runtime is built with every tool source EXCEPT playbooks, so a playbook
+/// cannot call a playbook *by construction* rather than by a depth counter
+/// somebody has to remember to check.
+/// `the_turn_host_carries_no_playbook_source` is what pins it.
+pub fn build_turn(host: PlaybookTurnHost) -> PlaybookTurnFn {
     Arc::new(move |req: PlaybookTurnRequest| {
         let host = host.clone();
         Box::pin(async move {
