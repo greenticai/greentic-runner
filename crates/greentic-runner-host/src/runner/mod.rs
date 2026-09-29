@@ -5,6 +5,7 @@ pub(crate) mod a2a_pack_source;
 pub mod adapt_events_email;
 pub mod adapt_timer;
 pub mod agent_node;
+pub mod approval_http;
 pub(crate) mod approval_token;
 #[cfg(feature = "agentic-worker")]
 pub(crate) mod aw_backends;

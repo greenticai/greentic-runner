@@ -214,6 +214,27 @@ logged. The runner's own deadline watchdog echoes the token in its `timeout`
 **Legacy parks** (a snapshot with no fingerprint, parked by a runner predating #794) resume
 without a token, as before; the exemption drains as those parks do.
 
+**The HTTP approval rail** (`runner/approval_http/`; design in greentic-designer
+`docs/superpowers/specs/2026-09-29-approval-rail-http-design.md`) serves `approval.call` on
+lanes with no NATS broker. greentic-start installs it with
+`RevisionHostOptions::with_approval_inbox(ApprovalInboxTarget { .. })`; the wire types live
+in ONE place, `approval_http/wire.rs`. Four things fail silently if changed:
+- **Its own engine slot.** It goes into `FlowEngine::approval_dispatch_handler`, read only for
+  the approval runtime. `remote_dispatch_configured()` reads the shared slot alone, so the
+  inbox never turns a missing SoR route into a `sorla` dispatch — `sorla.call` still fails
+  `sorla_route_missing`. NATS wins when `GREENTIC_EVENTS_NATS_URL` connects.
+- **No token on the wire.** The request body is a `RuntimeDispatchRequest` (no `routing`),
+  the token is held in memory, and a fetched decision is resumed with the held token injected
+  at `output.decision_token`, so the gate's usual check spends it.
+- **Resume at most once, never into a fresh run.** The first `200` removes the id before the
+  resume; the resume goes through `RuntimeSessionResumer::strict`, where a NONCED id with no
+  park recorded under exactly that id is `WrongGate` (the lenient NATS resumer would start a
+  fresh run from the entrypoint).
+- **Owned by the `TenantRuntime`.** Its `Drop` calls `HttpApprovalDispatcher::shutdown`, which
+  cancels the poller, forgets held tokens and drops the resumer (breaking the
+  resumer → runtime → engine → dispatcher cycle). A restart loses pending polls even when the
+  park survives in a durable store.
+
 ### Knowledge retrieval backends
 
 An agent's `Knowledge` implementation is a chain of wrappers around whatever is

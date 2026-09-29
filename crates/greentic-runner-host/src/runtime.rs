@@ -305,6 +305,10 @@ pub struct TenantRuntime {
     operator_registry: OperatorRegistry,
     operator_metrics: Arc<OperatorMetrics>,
     contract_cache: ContractCache,
+    /// The HTTP approval inbox, when this runtime serves one. Shut down on
+    /// drop: the poller stops, held decision tokens are forgotten, and a
+    /// superseded revision can never resume into a store it no longer owns.
+    approval_inbox: Option<crate::runner::approval_http::HttpApprovalDispatcher>,
 }
 
 #[derive(Clone)]
@@ -358,6 +362,7 @@ pub struct RevisionHostOptions {
     #[cfg(feature = "agentic-worker")]
     billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
     run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
+    approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
 }
 
 impl std::fmt::Debug for RevisionHostOptions {
@@ -366,6 +371,7 @@ impl std::fmt::Debug for RevisionHostOptions {
         #[cfg(feature = "agentic-worker")]
         out.field("billing_meter", &self.billing_meter.is_some());
         out.field("run_outcome_sink", &self.run_outcome_sink.is_some());
+        out.field("approval_inbox", &self.approval_inbox.is_some());
         out.finish()
     }
 }
@@ -395,6 +401,30 @@ impl RevisionHostOptions {
         sink: Arc<dyn crate::run_outcome::RunOutcomeSink>,
     ) -> Self {
         self.run_outcome_sink = Some(sink);
+        self
+    }
+
+    /// File this unit's human approvals with the admin's HTTP approval inbox
+    /// and poll for the decisions, instead of needing a NATS broker — the
+    /// HTTP approval rail (greentic-designer
+    /// `docs/superpowers/specs/2026-09-29-approval-rail-http-design.md`).
+    /// greentic-start builds the target from the same staged `metering`
+    /// block as the run-outcome sink.
+    ///
+    /// Serves ONLY `approval.call`: it goes into the engine's own approval
+    /// slot, so `sorla.call` still fails with `sorla_route_missing` on a lane
+    /// with no broker. When `GREENTIC_EVENTS_NATS_URL` also connects, NATS
+    /// wins and the inbox is not installed. A target that fails validation
+    /// (blank field, cleartext URL off loopback) is logged and skipped; the
+    /// runtime loads either way, and an approval that needs a human then fails
+    /// at the node as it did before. Validate early with
+    /// [`crate::runner::approval_http::HttpApprovalDispatcher::new`].
+    #[must_use]
+    pub fn with_approval_inbox(
+        mut self,
+        target: crate::runner::approval_http::ApprovalInboxTarget,
+    ) -> Self {
+        self.approval_inbox = Some(target);
         self
     }
 }
@@ -524,6 +554,7 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             None,
             None,
+            None,
         )
         .await
     }
@@ -595,6 +626,7 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             options.billing_meter,
             options.run_outcome_sink,
+            options.approval_inbox,
         )
         .await
     }
@@ -621,6 +653,7 @@ impl TenantRuntime {
             Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
         >,
         run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
+        approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -723,6 +756,7 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             billing_meter,
             run_outcome_sink,
+            approval_inbox,
         )
         .await
     }
@@ -844,6 +878,7 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             None,
             None,
+            None,
         )
         .await
     }
@@ -872,6 +907,7 @@ impl TenantRuntime {
             Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
         >,
         run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
+        approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
@@ -964,6 +1000,36 @@ impl TenantRuntime {
             },
             Err(_) => None,
         };
+
+        // The HTTP approval rail (greentic-designer approval-rail-http design
+        // §4.6): into the engine's OWN approval slot, never the shared one, so
+        // `sorla.call` keeps failing with `sorla_route_missing` here. NATS
+        // stays authoritative where it connected.
+        if approval_inbox.is_some() && dispatch_nats_client.is_some() {
+            tracing::info!(
+                "GREENTIC_EVENTS_NATS_URL connected; approvals go over NATS and the HTTP approval inbox is not installed"
+            );
+        }
+        let approval_inbox = crate::runner::approval_http::inbox_to_install(
+            dispatch_nats_client.is_some(),
+            approval_inbox,
+        )
+        .and_then(
+            |target| match crate::runner::approval_http::HttpApprovalDispatcher::new(target) {
+                Ok(inbox) => {
+                    engine.set_approval_dispatch_handler(Arc::new(inbox.clone()));
+                    tracing::info!("HTTP approval inbox wired into runtime: approval.call");
+                    Some(inbox)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "HTTP approval inbox not installed; approval.call needing a human will fail"
+                    );
+                    None
+                }
+            },
+        );
 
         // Clone the (possibly connected) client for the audit sink (EPIC-B
         // B-2/B-3): threaded into `StateMachineRuntime::from_flow_engine` so
@@ -1368,6 +1434,17 @@ impl TenantRuntime {
             .context("failed to initialise state machine runtime")?,
         );
 
+        // The inbox resumes through a STRICT resumer: a decision for a gate
+        // that is no longer parked under exactly its nonced id is dropped and
+        // never starts a fresh run.
+        if let Some(inbox) = &approval_inbox {
+            inbox.attach_resumer(Arc::new(
+                crate::runner::runtime_session_resumer::RuntimeSessionResumer::strict(Arc::clone(
+                    &state_machine,
+                )),
+            ));
+        }
+
         // Spawn the response listeners now that the ingress handle
         // (`state_machine`) exists. Each listener resumes paused flows by feeding
         // a synthesized ingress envelope through `StateMachineRuntime::handle`
@@ -1418,6 +1495,7 @@ impl TenantRuntime {
             operator_registry,
             operator_metrics,
             contract_cache: ContractCache::from_env(),
+            approval_inbox,
         }))
     }
 
@@ -1622,6 +1700,9 @@ impl Drop for TenantRuntime {
     fn drop(&mut self) {
         for handle in self.timer_handles.lock().drain(..) {
             handle.abort();
+        }
+        if let Some(inbox) = &self.approval_inbox {
+            inbox.shutdown();
         }
     }
 }

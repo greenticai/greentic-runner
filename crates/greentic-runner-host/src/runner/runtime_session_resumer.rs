@@ -140,6 +140,22 @@ pub fn split_dispatch_nonce(correlation_id: &str) -> (&str, Option<&str>) {
 /// Resumes paused flow sessions by driving the runtime ingress entry.
 pub struct RuntimeSessionResumer {
     runtime: Arc<StateMachineRuntime>,
+    mode: AdmissionMode,
+}
+
+/// How strictly a NONCED response must match the park before it resumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdmissionMode {
+    /// The NATS rail's rule: a nonced response with NOTHING parked is left to
+    /// the runtime (which then starts a fresh run), and a park recorded before
+    /// ids were stored may take any nonced response.
+    Lenient,
+    /// The HTTP approval inbox's rule (`runner::approval_http`): a nonced
+    /// response resumes ONLY a parked approval recorded under exactly that id.
+    /// Nothing parked, or a park without a recorded id, is
+    /// [`Admission::WrongGate`] — a decision fetched for a gate that is gone
+    /// must never start a fresh run from the flow's entrypoint.
+    Strict,
 }
 
 impl RuntimeSessionResumer {
@@ -149,7 +165,20 @@ impl RuntimeSessionResumer {
     /// ingress; resuming routes through its `handle` so the existing
     /// `FlowResumeStore::fetch` + `FlowEngine::resume` path runs unchanged.
     pub fn new(runtime: Arc<StateMachineRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            mode: AdmissionMode::Lenient,
+        }
+    }
+
+    /// A resumer for the HTTP approval inbox: a nonced response resumes only
+    /// the approval parked under exactly that id, and NEVER falls through to a
+    /// fresh run when nothing is parked (see [`AdmissionMode::Strict`]).
+    pub fn strict(runtime: Arc<StateMachineRuntime>) -> Self {
+        Self {
+            runtime,
+            mode: AdmissionMode::Strict,
+        }
     }
 
     /// Build the [`IngressEnvelope`] that re-keys the saved wait.
@@ -262,7 +291,7 @@ impl SessionResumer for RuntimeSessionResumer {
             }
             Err(error) => return Err(error),
         };
-        match admit_response(correlation_id, &output, parked.as_deref()) {
+        match admit_response_with(self.mode, correlation_id, &output, parked.as_deref()) {
             Admission::Resume => {}
             Admission::WrongGate => {
                 // Not an error: the response is real, it just no longer has a
@@ -320,23 +349,43 @@ pub(crate) enum Admission {
 /// or its token matches one; otherwise it is [`Admission::BadToken`]. An id
 /// with no nonce and no parked approval (the conversation waits on something
 /// else) is left to the runtime, as before.
+#[cfg(test)]
 pub(crate) fn admit_response(
     correlation_id: &str,
     response: &Value,
     parked: Option<&[ParkedApproval]>,
 ) -> Admission {
-    let Some(parked) = parked else {
-        return Admission::Resume;
-    };
+    admit_response_with(AdmissionMode::Lenient, correlation_id, response, parked)
+}
+
+/// [`admit_response`] under an explicit [`AdmissionMode`]. `Strict` changes
+/// only the NONCED cases: nothing parked is [`Admission::WrongGate`] rather
+/// than [`Admission::Resume`], and a park must have recorded exactly this id.
+pub(crate) fn admit_response_with(
+    mode: AdmissionMode,
+    correlation_id: &str,
+    response: &Value,
+    parked: Option<&[ParkedApproval]>,
+) -> Admission {
     let nonced = split_dispatch_nonce(correlation_id).1.is_some();
+    let strict = nonced && mode == AdmissionMode::Strict;
+    let Some(parked) = parked else {
+        return if strict {
+            Admission::WrongGate
+        } else {
+            Admission::Resume
+        };
+    };
     let candidates: Vec<&ParkedApproval> = parked
         .iter()
         .filter(|park| {
-            !nonced
-                || park
-                    .correlation_id
-                    .as_deref()
-                    .is_none_or(|recorded| recorded == correlation_id)
+            if !nonced {
+                return true;
+            }
+            match park.correlation_id.as_deref() {
+                Some(recorded) => recorded == correlation_id,
+                None => !strict,
+            }
         })
         .collect();
     if candidates.is_empty() {
@@ -668,6 +717,63 @@ mod tests {
         );
         assert_eq!(
             admit_response(guessed, &response(Some(&issued.token)), Some(&parks)),
+            Admission::Resume
+        );
+    }
+
+    /// The HTTP approval inbox's rule: a decision it fetched for a gate that is
+    /// no longer parked must never fall through to a fresh run.
+    #[test]
+    fn strict_mode_never_resumes_a_nonced_response_with_nothing_parked() {
+        use crate::runner::approval_token::issue;
+        let mine = format!("h::pack=p::flow=f::n={NONCE}");
+        let issued = issue();
+        let r = response(Some(&issued.token));
+        assert_eq!(
+            admit_response_with(AdmissionMode::Strict, &mine, &r, None),
+            Admission::WrongGate,
+            "nothing parked: a fresh run would re-execute the flow and raise a second approval"
+        );
+        assert_eq!(
+            admit_response_with(AdmissionMode::Strict, &mine, &r, Some(&[])),
+            Admission::WrongGate
+        );
+        // A park recorded without an id cannot be proven to be this gate.
+        let legacy = ParkedApproval {
+            correlation_id: None,
+            token_fingerprint: None,
+        };
+        assert_eq!(
+            admit_response_with(AdmissionMode::Strict, &mine, &r, Some(&[legacy])),
+            Admission::WrongGate
+        );
+        // Parked under exactly this id, with the right token: resumes.
+        let parks = [tokened(&mine, &issued.fingerprint)];
+        assert_eq!(
+            admit_response_with(AdmissionMode::Strict, &mine, &r, Some(&parks)),
+            Admission::Resume
+        );
+        // Parked under another nonce: dropped.
+        let other = format!("h::pack=p::flow=f::n={}", "f".repeat(32));
+        let parks = [tokened(&other, &issued.fingerprint)];
+        assert_eq!(
+            admit_response_with(AdmissionMode::Strict, &mine, &r, Some(&parks)),
+            Admission::WrongGate
+        );
+    }
+
+    /// Strict mode changes nothing for an id without a nonce, and lenient mode
+    /// (NATS) keeps today's fall-through.
+    #[test]
+    fn strict_mode_leaves_unnonced_ids_and_lenient_mode_unchanged() {
+        let r = json!({"ok": true});
+        assert_eq!(
+            admit_response_with(AdmissionMode::Strict, "h::pack=p::flow=f", &r, None),
+            Admission::Resume
+        );
+        let mine = format!("h::pack=p::flow=f::n={NONCE}");
+        assert_eq!(
+            admit_response_with(AdmissionMode::Lenient, &mine, &r, None),
             Admission::Resume
         );
     }

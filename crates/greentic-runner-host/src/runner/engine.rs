@@ -78,6 +78,16 @@ pub struct FlowEngine {
     /// Bridges `sorla.call` flow nodes into a separate runtime over pub/sub.
     /// Not feature-gated: `sorla.call` is a core runtime-dispatch node.
     remote_dispatch_handler: Option<Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>>,
+    /// The handler an `approval.call` dispatch goes through BEFORE
+    /// `remote_dispatch_handler`: the HTTP approval inbox
+    /// (`runner::approval_http`) on lanes with no broker. Read ONLY for the
+    /// approval runtime. It is a separate slot on purpose:
+    /// [`Self::remote_dispatch_configured`] reads `remote_dispatch_handler`
+    /// alone, so installing the inbox never turns a missing SoR route document
+    /// into a `sorla` remote dispatch — `sorla.call` keeps failing with
+    /// `sorla_route_missing`.
+    approval_dispatch_handler:
+        Option<Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>>,
     /// Bridges `operala.call` flow nodes into an in-process deep-worker
     /// runtime (see `runner::operala_node`). Not feature-gated (like
     /// `remote_dispatch_handler`): `operala.call` is a core runtime-dispatch
@@ -680,6 +690,7 @@ impl FlowEngine {
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             rollout_ids: RolloutIds::default(),
             operala_node_handler: None,
@@ -797,6 +808,32 @@ impl FlowEngine {
         handler: Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
     ) {
         self.remote_dispatch_handler = Some(handler);
+    }
+
+    /// Set the handler `approval.call` dispatches through in preference to
+    /// the shared remote-dispatch handler: the HTTP approval inbox
+    /// (`runner::approval_http`). Never consulted for any other runtime, and
+    /// never counted by [`Self::remote_dispatch_configured`].
+    pub fn set_approval_dispatch_handler(
+        &mut self,
+        handler: Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
+    ) {
+        self.approval_dispatch_handler = Some(handler);
+    }
+
+    /// The handler a dispatch to `runtime` goes through: the approval slot
+    /// first for the approval runtime, the shared slot otherwise.
+    fn dispatch_handler_for(
+        &self,
+        runtime: &str,
+    ) -> Option<&Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>> {
+        if runtime == APPROVAL_RUNTIME {
+            self.approval_dispatch_handler
+                .as_ref()
+                .or(self.remote_dispatch_handler.as_ref())
+        } else {
+            self.remote_dispatch_handler.as_ref()
+        }
     }
 
     /// Whether a [`RemoteDispatchHandler`] (e.g. NATS) is configured on this
@@ -2470,7 +2507,7 @@ impl FlowEngine {
         resume_at_self: bool,
         decision_token: Option<String>,
     ) -> Result<DispatchOutcome> {
-        let handler = self.remote_dispatch_handler.as_ref().with_context(|| {
+        let handler = self.dispatch_handler_for(runtime).with_context(|| {
             format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
         })?;
 
@@ -6771,6 +6808,124 @@ mod tests {
         assert!(message.contains("sorla_route_missing"), "got: {message}");
     }
 
+    /// The HTTP approval inbox lives in its own slot: installing it must not
+    /// turn a missing SoR route document into a `sorla` remote dispatch.
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    async fn an_approval_inbox_leaves_sorla_route_missing_intact() {
+        let mut engine = minimal_engine();
+        engine.set_approval_dispatch_handler(Arc::new(PanicIfDispatchedHandler));
+        let ctx = sorla_call_ctx();
+        let payload = json!({
+            "await": true,
+            "operation": "record_rent_payment",
+            "input": {},
+        });
+        let node = sorla_call_node(Routing::End);
+        let mut state = ExecutionState::new(Value::Null);
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "call",
+            node: &node,
+            payload: &payload,
+        };
+        let err = match engine
+            .dispatch_node(&ctx, "call", &node, &mut state, payload.clone(), &event)
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a missing route with only the approval inbox must fail the node"),
+        };
+        assert!(
+            err.to_string().contains("sorla_route_missing"),
+            "got: {err}"
+        );
+    }
+
+    /// `approval.call` goes through the approval slot, issued a token; every
+    /// other runtime ignores that slot.
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    async fn only_approval_dispatches_use_the_approval_slot() {
+        let inbox = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let mut engine = minimal_engine();
+        engine.set_approval_dispatch_handler(inbox.clone());
+
+        let ctx = sorla_call_ctx();
+        let node = HostNode::for_test_approval("hitl");
+        let mut state = ExecutionState::new(Value::Null);
+        let payload = json!({ "await": true, "input": { "mode": "always" } });
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "gate",
+            node: &node,
+            payload: &payload,
+        };
+        let outcome = engine
+            .dispatch_node(&ctx, "gate", &node, &mut state, payload.clone(), &event)
+            .await
+            .expect("approval.call must dispatch through the approval slot");
+        assert!(matches!(outcome.control, NodeControl::AwaitHere { .. }));
+        {
+            let calls = inbox.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].runtime, APPROVAL_RUNTIME);
+            assert!(calls[0].decision_token.is_some());
+            assert!(
+                crate::runner::runtime_session_resumer::split_dispatch_nonce(
+                    &calls[0].correlation_id
+                )
+                .1
+                .is_some(),
+                "the id carries its per-dispatch nonce"
+            );
+        }
+        let parked = state.pending_approvals();
+        assert_eq!(parked.len(), 1);
+        assert!(parked[0].token_fingerprint.is_some());
+
+        let err = engine
+            .execute_remote_dispatch(&ctx, "telco-x", "t", json!({"await": true}), true)
+            .await
+            .err()
+            .expect("a non-approval runtime must not use the approval slot");
+        assert!(
+            err.to_string()
+                .contains("no RemoteDispatchHandler configured"),
+            "got: {err}"
+        );
+        assert_eq!(inbox.calls.lock().unwrap().len(), 1);
+    }
+
+    /// With both slots set (NATS alongside), `approval.call` prefers the
+    /// approval slot; with only the shared slot it still uses that.
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    async fn approval_falls_back_to_the_shared_slot() {
+        let shared = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let mut engine = minimal_engine();
+        engine.set_remote_dispatch_handler(shared.clone());
+        let ctx = sorla_call_ctx();
+        let node = HostNode::for_test_approval("hitl");
+        let mut state = ExecutionState::new(Value::Null);
+        let payload = json!({ "await": true, "input": { "mode": "always" } });
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "gate",
+            node: &node,
+            payload: &payload,
+        };
+        engine
+            .dispatch_node(&ctx, "gate", &node, &mut state, payload.clone(), &event)
+            .await
+            .expect("approval.call must fall back to the shared slot");
+        assert_eq!(shared.calls.lock().unwrap().len(), 1);
+    }
+
     use crate::validate::{ValidationConfig, ValidationMode};
     use greentic_types::{
         Flow, FlowComponentRef, FlowId, FlowKind, FlowMetadata, InputMapping, Node, NodeId,
@@ -6795,6 +6950,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -7853,6 +8009,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -8075,6 +8232,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -8242,6 +8400,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -8391,6 +8550,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -8570,6 +8730,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: Some(dispatcher.clone() as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>),
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: DwAgentDispatch::Nats,
@@ -8697,6 +8858,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -9350,6 +9512,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -9910,6 +10073,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -10828,6 +10992,7 @@ mod tests {
             },
             cross_pack_resolver: None,
             rollout_ids: RolloutIds::default(),
+            approval_dispatch_handler: None,
             remote_dispatch_handler: Some(
                 nats_engine_dispatcher
                     as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
@@ -11232,6 +11397,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -11352,6 +11518,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -11502,6 +11669,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -12064,6 +12232,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -12265,6 +12434,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             agent_node_handler: Some(handler),
@@ -12666,6 +12836,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: Some(dispatcher),
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::Nats,
             agent_node_handler: None,
@@ -13227,6 +13398,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             agent_node_handler: Some(handler),
@@ -13368,6 +13540,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -14059,6 +14232,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            approval_dispatch_handler: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
