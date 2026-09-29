@@ -85,6 +85,7 @@ struct CapturedDispatch {
     operation: String,
     mode: DispatchMode,
     correlation_id: String,
+    decision_token: Option<String>,
 }
 
 #[async_trait]
@@ -102,6 +103,7 @@ impl RemoteDispatchHandler for RuntimeCapturingStub {
             operation: request.operation,
             mode: request.mode,
             correlation_id: request.correlation_id,
+            decision_token: request.decision_token,
         };
         *self.last.lock().unwrap() = Some(captured.clone());
         self.all.lock().unwrap().push(captured);
@@ -674,12 +676,19 @@ fn approval_call_resume_with_decision_completes_without_redispatch() -> Result<(
         "exactly one dispatch to reach the park"
     );
 
+    let token = handler
+        .last
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|d| d.decision_token.clone())
+        .expect("an approval dispatch is issued a decision_token");
     let resume_ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
     let resumed = rt
         .block_on(engine.resume(
             resume_ctx,
             wait.snapshot.clone(),
-            json!({ "ok": true, "output": { "decision": "denied" } }),
+            json!({ "ok": true, "output": { "decision": "denied", "decision_token": token } }),
         ))
         .context("resume with a decision should advance the flow")?;
 
@@ -696,6 +705,78 @@ fn approval_call_resume_with_decision_completes_without_redispatch() -> Result<(
         handler.dispatch_count(),
         1,
         "resume with a decision must NOT re-dispatch a duplicate approval request"
+    );
+    Ok(())
+}
+
+/// greentic-runner#794: the gate itself refuses a decision that does not carry
+/// the token it was issued — missing or wrong — and stays parked, whatever
+/// routed the response to it. Neither refusal re-dispatches.
+#[test]
+fn approval_call_refuses_a_decision_without_its_token() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-token.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_dispatch_pack(
+        &pack_path,
+        "approval.call",
+        json!({ "await": true, "operation": "create", "input": { "mode": "always" } }),
+        true,
+    )?;
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(RuntimeCapturingStub::default());
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+    let pack_id = pack.metadata().pack_id.clone();
+
+    let execution =
+        rt.block_on(engine.execute(flow_ctx(&config, pack_id.as_str()), Value::Null))?;
+    let FlowStatus::Waiting(wait) = execution.status else {
+        anyhow::bail!("approval.call must park");
+    };
+    let token = handler
+        .last
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|d| d.decision_token.clone())
+        .expect("an approval dispatch is issued a decision_token");
+    assert_eq!(token.len(), 43, "32 bytes, base64url without padding");
+
+    for (label, response) in [
+        (
+            "missing",
+            json!({ "ok": true, "output": { "decision": "approved" } }),
+        ),
+        (
+            "wrong",
+            json!({ "ok": true, "output": { "decision": "approved", "decision_token": "not-the-token" } }),
+        ),
+    ] {
+        let resumed = rt.block_on(engine.resume(
+            flow_ctx(&config, pack_id.as_str()),
+            wait.snapshot.clone(),
+            response,
+        ))?;
+        match resumed.status {
+            FlowStatus::Waiting(w) => assert_eq!(
+                w.snapshot.next_node, "call",
+                "a {label} token must leave the gate parked at itself"
+            ),
+            FlowStatus::Completed => anyhow::bail!("a {label} token must not decide the gate"),
+        }
+    }
+    assert_eq!(handler.dispatch_count(), 1, "a refusal never re-dispatches");
+
+    let resumed = rt.block_on(engine.resume(
+        flow_ctx(&config, pack_id.as_str()),
+        wait.snapshot.clone(),
+        json!({ "ok": true, "output": { "decision": "approved", "decision_token": token } }),
+    ))?;
+    assert!(
+        matches!(resumed.status, FlowStatus::Completed),
+        "the issued token decides the gate"
     );
     Ok(())
 }

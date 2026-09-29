@@ -354,6 +354,8 @@ struct CapturingDispatchHandler {
     last_correlation: Mutex<Option<String>>,
     /// Every dispatch in order, so a test can count them.
     all: Mutex<Vec<String>>,
+    /// The `decision_token` each dispatch in `all` was issued, same order.
+    tokens: Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
@@ -364,6 +366,10 @@ impl RemoteDispatchHandler for CapturingDispatchHandler {
             .lock()
             .unwrap()
             .push(request.correlation_id.clone());
+        self.tokens
+            .lock()
+            .unwrap()
+            .push(request.decision_token.clone());
         match request.mode {
             DispatchMode::Await => Ok(RemoteDispatchAction::AwaitingResponse {
                 correlation_id: request.correlation_id,
@@ -810,6 +816,12 @@ fn two_approvals_in_one_conversation_get_distinct_ids_and_resume_their_own_gate(
         build_runtime_with_dispatch(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
     let resumer = RuntimeSessionResumer::new(Arc::clone(&runtime));
     let dispatched = || handler.all.lock().unwrap().clone();
+    let token = |i: usize| {
+        handler.tokens.lock().unwrap()[i]
+            .clone()
+            .expect("token issued")
+    };
+    let approve = |token: String| json!({ "ok": true, "output": { "decision": "approved", "decision_token": token } });
 
     // ---- Turn 1: parks on gate1. ----
     let inbound = IngressEnvelope {
@@ -836,11 +848,7 @@ fn two_approvals_in_one_conversation_get_distinct_ids_and_resume_their_own_gate(
     assert_eq!(nonce1.len(), 32);
 
     // ---- Turn 2: approve gate1 -> gate2 dispatches and parks. ----
-    rt.block_on(resumer.resume(
-        demo_tenant(),
-        &id1,
-        json!({ "ok": true, "output": { "decision": "approved" } }),
-    ))?;
+    rt.block_on(resumer.resume(demo_tenant(), &id1, approve(token(0))))?;
     let second = dispatched();
     assert_eq!(
         second.len(),
@@ -865,16 +873,12 @@ fn two_approvals_in_one_conversation_get_distinct_ids_and_resume_their_own_gate(
     rt.block_on(resumer.resume(
         demo_tenant(),
         &id1,
-        json!({ "ok": false, "output": null, "error": { "code": "timeout" } }),
+        json!({ "ok": false, "output": { "decision_token": token(0) }, "error": { "code": "timeout" } }),
     ))?;
     assert_eq!(dispatched().len(), 2, "a stale response dispatches nothing");
 
     // ---- gate2's own decision resumes gate2 and completes the flow. ----
-    rt.block_on(resumer.resume(
-        demo_tenant(),
-        &id2,
-        json!({ "ok": true, "output": { "decision": "approved" } }),
-    ))?;
+    rt.block_on(resumer.resume(demo_tenant(), &id2, approve(token(1))))?;
     assert_eq!(
         dispatched().len(),
         2,
@@ -884,17 +888,76 @@ fn two_approvals_in_one_conversation_get_distinct_ids_and_resume_their_own_gate(
     // ---- And the park really was consumed: a repeat of gate2's decision now
     // finds nothing parked and (unchanged behaviour) starts a fresh run, which
     // raises a NEW approval with a new id. ----
-    rt.block_on(resumer.resume(
-        demo_tenant(),
-        &id2,
-        json!({ "ok": true, "output": { "decision": "approved" } }),
-    ))?;
+    rt.block_on(resumer.resume(demo_tenant(), &id2, approve(token(1))))?;
     let after = dispatched();
     assert_eq!(after.len(), 3, "no park left -> fresh run -> gate1 again");
     assert!(
         !after[..2].contains(&after[2]),
         "the fresh gate1 gets a fresh id"
     );
+    Ok(())
+}
+
+/// greentic-runner#794: a parked approval resumes only on the token it was
+/// issued. A missing or wrong token — or the guessable id with its nonce
+/// dropped — is refused at the resumer and leaves the gate parked; the right
+/// token then resumes it, once.
+#[test]
+fn an_approval_resumes_only_on_the_token_it_was_issued() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-token.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_two_approval_pack(&pack_path)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(CapturingDispatchHandler::default());
+    let runtime =
+        build_runtime_with_dispatch(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+    let resumer = RuntimeSessionResumer::new(Arc::clone(&runtime));
+    let dispatched = || handler.all.lock().unwrap().len();
+
+    rt.block_on(runtime.handle(IngressEnvelope {
+        flow_id: APPROVAL_FLOW_ID.into(),
+        ..inbound_envelope()
+    }))?;
+    assert_eq!(dispatched(), 1);
+    let id1 = handler.all.lock().unwrap()[0].clone();
+    let token1 = handler.tokens.lock().unwrap()[0]
+        .clone()
+        .expect("gate1 is issued a token");
+    let guessed = split_dispatch_nonce(&id1).0.to_string();
+
+    for (id, output) in [
+        (id1.as_str(), json!({ "decision": "approved" })),
+        (
+            id1.as_str(),
+            json!({ "decision": "approved", "decision_token": "forged" }),
+        ),
+        (guessed.as_str(), json!({ "decision": "approved" })),
+    ] {
+        rt.block_on(resumer.resume(demo_tenant(), id, json!({ "ok": true, "output": output })))?;
+        assert_eq!(
+            dispatched(),
+            1,
+            "a refused response must not resume gate1 (which would dispatch gate2)"
+        );
+    }
+
+    let approve =
+        json!({ "ok": true, "output": { "decision": "approved", "decision_token": token1 } });
+    rt.block_on(resumer.resume(demo_tenant(), &id1, approve.clone()))?;
+    assert_eq!(
+        dispatched(),
+        2,
+        "the issued token resumes gate1 -> gate2 dispatches"
+    );
+
+    // Replay: gate1's token is spent. The conversation is now parked on gate2,
+    // so the replay is dropped and nothing moves.
+    rt.block_on(resumer.resume(demo_tenant(), &id1, approve))?;
+    assert_eq!(dispatched(), 2, "a spent token resumes nothing");
     Ok(())
 }
 

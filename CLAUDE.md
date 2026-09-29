@@ -196,6 +196,24 @@ downstream SESSION id when the input names none, so a nonce on `agentic.call` wo
 every turn a fresh agent memory. The watchdog is still never cancelled; the nonce makes
 its late `timeout` harmless for approvals, not for the other runtimes.
 
+**`approval.call` is issued a single-use `decision_token`** (greentic-runner#794; approval
+rail contract v2 §4, `docs/approval-rail-contract-v2.md` in greentic-designer). Each
+dispatch mints 32 random bytes, base64url without padding (`runner/approval_token.rs`),
+publishes it at `routing.decision_token` in the request body, and stores ONLY
+`sha256(token)` in `ExecutionState::pending_approval_token` beside the correlation id. The
+response must carry it back at `output.decision_token`. Two checks, both needed:
+`RuntimeSessionResumer` (`admit_response`) drops a response whose token is missing or wrong
+BEFORE the runtime runs, and runs for every response, nonced or not — dropping the `::n=`
+suffix is exactly the guessable-id attack, so it must not skip the check; the gate itself
+(`response_authenticates` in `execute_approval_call`) is the authoritative check, because
+anything else that lands an `ok`-carrying entry on the node must not decide it either — a
+refused response re-parks like a stray inbound. Taking the park removes the fingerprint,
+so a token is spent on first use. The token is stripped from the node output, and never
+logged. The runner's own deadline watchdog echoes the token in its `timeout`
+(`build_timeout_response_message_with_token`), or the `timeout` branch could never fire.
+**Legacy parks** (a snapshot with no fingerprint, parked by a runner predating #794) resume
+without a token, as before; the exemption drains as those parks do.
+
 ### Knowledge retrieval backends
 
 An agent's `Knowledge` implementation is a chain of wrappers around whatever is

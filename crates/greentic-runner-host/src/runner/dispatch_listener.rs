@@ -289,6 +289,7 @@ mod tests {
                 correlation_id: "corr-runner-e2e".into(),
                 input: json!({"a": 1}),
                 deadline_ms: None,
+                decision_token: None,
             })
             .await
             .expect("dispatch should succeed");
