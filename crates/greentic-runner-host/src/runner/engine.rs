@@ -491,6 +491,11 @@ impl FlowExecution {
 /// [`user_facing_flow_failure_text`] for what that does and does not buy.
 const USER_FACING_FLOW_FAILURE_KEY: &str = "runner.flow.execution_failed";
 
+/// Runtime name `approval.call` dispatches under. The only runtime whose
+/// correlation id carries a per-dispatch `::n=` nonce — see
+/// `FlowEngine::execute_remote_dispatch`.
+pub(crate) const APPROVAL_RUNTIME: &str = "approval";
+
 /// Resolve the failure text for an explicitly supplied locale.
 ///
 /// Split out from [`user_facing_flow_failure_text`] so tests can exercise every
@@ -2091,7 +2096,7 @@ impl FlowEngine {
         payload: Value,
         state: &mut ExecutionState,
     ) -> Result<DispatchOutcome> {
-        if state.take_approval_await(node_id) {
+        if let Some(pending_correlation) = state.take_approval_await(node_id) {
             if entry_is_approval_response(&state.entry) {
                 let outcome = approval_outcome_from_entry(&state.entry);
                 let output = NodeOutput::with_meta(
@@ -2101,9 +2106,11 @@ impl FlowEngine {
                 return Ok(DispatchOutcome::complete(output));
             }
             // A user activity arrived while we were parked. Re-park without
-            // re-dispatching; the correlation id is discarded by the AwaitHere
-            // handler, so re-parking needs nothing from the original dispatch.
-            state.mark_approval_await(node_id);
+            // re-dispatching. The AwaitHere handler discards the correlation id,
+            // but the gate must keep the ORIGINAL dispatch's id: the decision
+            // that eventually arrives carries that id, and the resume path
+            // matches it against this mark.
+            state.mark_approval_await(node_id, pending_correlation);
             return Ok(DispatchOutcome::await_here(
                 NodeOutput::new(serde_json::json!({ "pending": true })),
                 Some("awaiting approval decision".to_string()),
@@ -2130,10 +2137,11 @@ impl FlowEngine {
         // node believing it is awaiting a decision it never requested, and every
         // later inbound would re-park forever.
         let outcome = self
-            .execute_remote_dispatch(ctx, "approval", target, payload, true)
+            .execute_remote_dispatch(ctx, APPROVAL_RUNTIME, target, payload, true)
             .await?;
-        if matches!(outcome.control, NodeControl::AwaitHere { .. }) {
-            state.mark_approval_await(node_id);
+        if let NodeControl::AwaitHere { correlation_id, .. } = &outcome.control {
+            let recorded = Some(correlation_id.clone()).filter(|id| !id.is_empty());
+            state.mark_approval_await(node_id, recorded);
         }
         Ok(outcome)
     }
@@ -2389,7 +2397,9 @@ impl FlowEngine {
     ///
     /// The correlation id is the canonical session hint (`ctx.session_id`)
     /// suffixed with `::pack=<pack_id>::flow=<flow_id>` markers so the resume
-    /// path (`RuntimeSessionResumer`) can route the response back.
+    /// path (`RuntimeSessionResumer`) can route the response back. For the
+    /// `approval` runtime ONLY, a per-dispatch `::n=<nonce>` segment is
+    /// appended LAST — see the comment where the id is built.
     ///
     /// - `await=true`  -> publish + PAUSE the flow ([`DispatchOutcome::wait`]).
     /// - `await=false` -> publish + complete immediately with
@@ -2460,6 +2470,21 @@ impl FlowEngine {
                 correlation_id.push_str("::reply=");
                 correlation_id.push_str(reply_to);
             }
+        }
+        // An approval's correlation id is its responder's idempotency key:
+        // greentic-designer-admin UNIQUE-indexes it and upserts only while the
+        // row is still pending. Without a per-dispatch component a SECOND
+        // approval in one conversation reuses the first's id, lands on the
+        // already-resolved row, creates nothing, and the flow parks forever.
+        //
+        // Appended LAST so every existing segment keeps its position; the
+        // resumer strips it first (`split_dispatch_nonce`). Scoped to the
+        // approval runtime on purpose: the agentic/telco bridges reuse the
+        // correlation id as the downstream SESSION id when the input names
+        // none, so a nonce there would give every agent turn a fresh memory.
+        if runtime == APPROVAL_RUNTIME {
+            correlation_id.push_str(crate::runner::runtime_session_resumer::NONCE_HINT_MARKER);
+            correlation_id.push_str(&crate::runner::runtime_session_resumer::new_dispatch_nonce());
         }
         let mode = if await_mode {
             greentic_types::DispatchMode::Await
@@ -3505,8 +3530,17 @@ pub struct ExecutionState {
     /// decision. Set on dispatch, cleared when the response re-enters the node.
     /// Without it a stray inbound arriving mid-await would look like a first
     /// entry and re-dispatch — a duplicate approval request to the operator.
+    ///
+    /// The value is the correlation id the request was published under —
+    /// per-dispatch since it carries a `::n=` nonce — so the resume path can
+    /// refuse a response meant for a DIFFERENT approval (an earlier gate in the
+    /// same conversation, or its watchdog's late `timeout`). The park itself is
+    /// keyed per conversation, so without this any approval response in the
+    /// conversation would resume whichever gate happens to be parked. `None`
+    /// is a snapshot written before the id was recorded (the old `()` value
+    /// serialised as `null`), which decodes cleanly and is not verified.
     #[serde(default)]
-    pending_approval_await: HashMap<String, ()>,
+    pending_approval_await: HashMap<String, Option<String>>,
     /// In-process `dw.agent` nodes parked because one of the agent's `flow:`
     /// tools is waiting on the user (a card). Set when the agent answers
     /// `terminated_by == "awaiting_tool_input"`, taken on the re-entry that
@@ -3646,15 +3680,26 @@ impl ExecutionState {
         self.pending_tool_await.remove(node_id).is_some()
     }
 
-    /// Mark `node_id` as parked awaiting an approval decision.
-    fn mark_approval_await(&mut self, node_id: &str) {
-        self.pending_approval_await.insert(node_id.to_string(), ());
+    /// Mark `node_id` as parked awaiting an approval decision published under
+    /// `correlation_id` (see [`Self::pending_approval_await`]).
+    fn mark_approval_await(&mut self, node_id: &str, correlation_id: Option<String>) {
+        self.pending_approval_await
+            .insert(node_id.to_string(), correlation_id);
     }
 
-    /// Check-and-clear: returns whether `node_id` dispatched an approval and is
-    /// awaiting the decision.
-    fn take_approval_await(&mut self, node_id: &str) -> bool {
-        self.pending_approval_await.remove(node_id).is_some()
+    /// Check-and-clear: `Some(correlation)` when `node_id` dispatched an
+    /// approval and is awaiting the decision, `None` otherwise. The inner
+    /// value is the correlation id recorded at dispatch (`None` for a legacy
+    /// snapshot).
+    fn take_approval_await(&mut self, node_id: &str) -> Option<Option<String>> {
+        self.pending_approval_await.remove(node_id)
+    }
+
+    /// Every approval this state is parked on, as the correlation id each was
+    /// published under (`None` for a legacy mark). Read by the dispatch resume
+    /// path to match a response to its own gate.
+    pub(crate) fn pending_approval_correlations(&self) -> Vec<Option<String>> {
+        self.pending_approval_await.values().cloned().collect()
     }
 
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
@@ -8952,21 +8997,36 @@ mod tests {
     #[test]
     fn approval_await_mark_and_take() {
         let mut st = ExecutionState::new(json!({}));
-        assert!(!st.take_approval_await("gate"), "unmarked node takes false");
-        st.mark_approval_await("gate");
-        assert!(st.take_approval_await("gate"), "marked node takes true");
-        assert!(!st.take_approval_await("gate"), "take clears the mark");
+        assert!(
+            st.take_approval_await("gate").is_none(),
+            "unmarked node takes None"
+        );
+        st.mark_approval_await("gate", Some("corr::n=abc".into()));
+        assert_eq!(
+            st.take_approval_await("gate"),
+            Some(Some("corr::n=abc".to_string())),
+            "marked node takes its recorded correlation"
+        );
+        assert!(
+            st.take_approval_await("gate").is_none(),
+            "take clears the mark"
+        );
     }
 
     #[test]
     fn approval_await_survives_snapshot_roundtrip() {
         let mut st = ExecutionState::new(json!({}));
-        st.mark_approval_await("gate");
+        st.mark_approval_await("gate", Some("corr::n=abc".into()));
         let encoded = serde_json::to_string(&st).expect("serialize");
         let mut decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
-        assert!(
+        assert_eq!(
+            decoded.pending_approval_correlations(),
+            vec![Some("corr::n=abc".to_string())]
+        );
+        assert_eq!(
             decoded.take_approval_await("gate"),
-            "the marker must survive a park/resume snapshot"
+            Some(Some("corr::n=abc".to_string())),
+            "the marker and its correlation must survive a park/resume snapshot"
         );
     }
 
@@ -8975,7 +9035,20 @@ mod tests {
         // Snapshots persisted before this field exists must still decode.
         let mut decoded: ExecutionState =
             serde_json::from_str(r#"{"entry":{},"input":{}}"#).expect("old snapshot decodes");
-        assert!(!decoded.take_approval_await("gate"));
+        assert!(decoded.take_approval_await("gate").is_none());
+    }
+
+    #[test]
+    fn approval_await_decodes_the_pre_correlation_unit_marker() {
+        // Before the correlation id was recorded the value was `()`, which
+        // serialises as `null`. Such a snapshot must still read as parked —
+        // with no recorded id, so the resume path does not verify it.
+        let mut decoded: ExecutionState = serde_json::from_str(
+            r#"{"entry":{},"input":{},"pending_approval_await":{"gate":null}}"#,
+        )
+        .expect("pre-correlation snapshot decodes");
+        assert_eq!(decoded.pending_approval_correlations(), vec![None]);
+        assert_eq!(decoded.take_approval_await("gate"), Some(None));
     }
 
     #[test]
