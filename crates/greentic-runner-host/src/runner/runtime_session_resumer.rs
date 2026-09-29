@@ -50,6 +50,24 @@
 //! into the synthesized `ReplyScope` so `fetch` recomputes the same
 //! `scope_hash` `save` used. The no-thread case is unchanged (no markers
 //! emitted → `thread`/`reply_to` stay `None`).
+//!
+//! ### The per-dispatch nonce (`::n=`, approval runtime only)
+//!
+//! An `approval.call` correlation id ends with `::n=<32 lowercase hex>`, minted
+//! per dispatch, so two approvals in one conversation are two ids at the
+//! responder (greentic-designer-admin UNIQUE-indexes the id). It is always the
+//! LAST segment and is stripped FIRST here, before any other marker, so the
+//! store hint and reply scope — and therefore the saved wait's key — are
+//! exactly what they were without it. The park stays keyed per conversation.
+//!
+//! The nonce is what lets a response be matched to its OWN gate: the parked
+//! snapshot records the id each pending approval was published under, and
+//! [`RuntimeSessionResumer::resume`] refuses a nonced response that names a
+//! different one (an earlier gate's late decision, or its watchdog `timeout`
+//! arriving after the conversation moved on) instead of feeding it to
+//! whichever gate is parked now. An id with no nonce (every other runtime, and
+//! any id minted before this segment existed) parses and resumes exactly as
+//! before and is never verified.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -81,6 +99,42 @@ const THREAD_HINT_MARKER: &str = "::thread=";
 /// Marker carrying the originating inbound `ReplyScope.reply_to`. See
 /// [`THREAD_HINT_MARKER`]; same contract for `reply_to`.
 const REPLY_HINT_MARKER: &str = "::reply=";
+
+/// Marker for the per-dispatch nonce an `approval` correlation id ends with.
+/// Always the LAST segment; see the module docs.
+pub(crate) const NONCE_HINT_MARKER: &str = "::n=";
+
+/// Length of a nonce value: 16 random bytes, hex-encoded (the width of a v4
+/// UUID in its `simple` form).
+const NONCE_HEX_LEN: usize = 32;
+
+/// Mint a fresh per-dispatch nonce: 32 lowercase hex characters.
+pub(crate) fn new_dispatch_nonce() -> String {
+    use rand::{RngExt, rng};
+    let mut bytes = [0u8; NONCE_HEX_LEN / 2];
+    rng().fill(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Split a trailing `::n=<nonce>` off `correlation_id`.
+///
+/// Strict on purpose: only a LAST segment of exactly 32 lowercase hex
+/// characters is a nonce. Anything else — including a thread or reply value
+/// that happens to contain `::n=` — leaves the id unchanged, so an id without
+/// a nonce parses exactly as it always did.
+pub fn split_dispatch_nonce(correlation_id: &str) -> (&str, Option<&str>) {
+    match correlation_id.rsplit_once(NONCE_HINT_MARKER) {
+        Some((prefix, nonce))
+            if nonce.len() == NONCE_HEX_LEN
+                && nonce
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+        {
+            (prefix, Some(nonce))
+        }
+        _ => (correlation_id, None),
+    }
+}
 
 /// Resumes paused flow sessions by driving the runtime ingress entry.
 pub struct RuntimeSessionResumer {
@@ -128,10 +182,13 @@ impl RuntimeSessionResumer {
         output: Value,
     ) -> IngressEnvelope {
         // Strip markers in the REVERSE of the order they were appended at
-        // dispatch (`pack`, `flow`, `thread`, `reply`) so each `rsplit_once`
-        // sees its own marker last. Each marker is optional — absent markers
-        // leave the string unchanged (back-compat with the no-thread case).
-        let (without_reply, reply_to) = split_marker(correlation_id, REPLY_HINT_MARKER);
+        // dispatch (`pack`, `flow`, `thread`, `reply`, `n`) so each
+        // `rsplit_once` sees its own marker last. Each marker is optional —
+        // absent markers leave the string unchanged (back-compat with the
+        // no-thread and no-nonce cases). The nonce is NOT part of the store
+        // key: dropping it here is what keeps the park keyed per conversation.
+        let (without_nonce, _nonce) = split_dispatch_nonce(correlation_id);
+        let (without_reply, reply_to) = split_marker(without_nonce, REPLY_HINT_MARKER);
         let (without_thread, thread) = split_marker(&without_reply, THREAD_HINT_MARKER);
         let (without_flow, flow_marker) = split_marker(&without_thread, FLOW_HINT_MARKER);
         let (bare_hint, pack_id) = split_pack_suffix(&without_flow);
@@ -190,8 +247,43 @@ impl RuntimeSessionResumer {
 impl SessionResumer for RuntimeSessionResumer {
     async fn resume(&self, tenant: TenantCtx, correlation_id: &str, output: Value) -> Result<()> {
         let envelope = Self::build_resume_envelope(&tenant, correlation_id, output);
+        if split_dispatch_nonce(correlation_id).1.is_some() {
+            let parked = self.runtime.parked_approval_correlations(&envelope).await?;
+            if !response_matches_park(correlation_id, parked.as_deref()) {
+                // Not an error: the response is real, it just no longer has a
+                // gate to land on. Resuming would hand an earlier gate's
+                // decision (or its watchdog's late `timeout`) to a different
+                // gate — or to whatever the conversation is parked on now.
+                tracing::warn!(
+                    %correlation_id,
+                    parked = ?parked,
+                    "dropping approval response: it does not match the approval this conversation is parked on"
+                );
+                return Ok(());
+            }
+        }
         self.runtime.handle(envelope).await.map(|_| ())
     }
+}
+
+/// Whether a NONCED approval response may resume the conversation's park.
+///
+/// `parked` is `None` when nothing is parked: that case is left to the runtime
+/// exactly as before this check existed. Otherwise the response resumes only
+/// when one of the parked approvals was published under this exact id — or
+/// when one was recorded before ids were recorded (`None`), which cannot be
+/// verified and so is not refused.
+pub(crate) fn response_matches_park(
+    correlation_id: &str,
+    parked: Option<&[Option<String>]>,
+) -> bool {
+    let Some(parked) = parked else {
+        return true;
+    };
+    parked.iter().any(|recorded| match recorded {
+        Some(recorded) => recorded == correlation_id,
+        None => true,
+    })
 }
 
 /// Split a store hint into its bare canonical hint and the pack id encoded in
@@ -360,5 +452,81 @@ mod tests {
             split_pack_suffix("a:b:c:d:e::pack="),
             ("a:b:c:d:e::pack=".to_string(), None)
         );
+    }
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn new_dispatch_nonce_is_32_lowercase_hex_and_fresh() {
+        let a = new_dispatch_nonce();
+        let b = new_dispatch_nonce();
+        assert_eq!(a.len(), 32);
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        );
+        assert_ne!(a, b, "two dispatches must not share a nonce");
+        let id = format!("h::pack=p::flow=f{NONCE_HINT_MARKER}{a}");
+        assert_eq!(
+            split_dispatch_nonce(&id),
+            ("h::pack=p::flow=f", Some(a.as_str()))
+        );
+    }
+
+    #[test]
+    fn split_dispatch_nonce_leaves_ids_without_a_nonce_unchanged() {
+        // No marker at all: the old format.
+        let old = "demo:provider:chan:conv:user::pack=greentic.demo::flow=wait.flow";
+        assert_eq!(split_dispatch_nonce(old), (old, None));
+        // A reply value that happens to contain `::n=` is not a nonce.
+        let reply = "a:b:c:d:e::pack=p::flow=f::reply=x::n=not-hex";
+        assert_eq!(split_dispatch_nonce(reply), (reply, None));
+        // Wrong length / upper case are not nonces either.
+        let short = "h::pack=p::n=abc";
+        assert_eq!(split_dispatch_nonce(short), (short, None));
+        let upper = format!("h::pack=p::n={}", NONCE.to_uppercase());
+        assert_eq!(split_dispatch_nonce(&upper), (upper.as_str(), None));
+    }
+
+    #[test]
+    fn a_nonce_does_not_change_the_resume_key() {
+        // The park is keyed per conversation: with or without the nonce the
+        // synthesized envelope must be identical, or the saved wait is missed.
+        let base = "demo:provider:chan:conv:user::pack=greentic.demo::flow=wait.flow::thread=topic-7::reply=msg-42";
+        let with_nonce = format!("{base}::n={NONCE}");
+        let plain = RuntimeSessionResumer::build_resume_envelope(&tenant_ctx(), base, json!(1));
+        let nonced =
+            RuntimeSessionResumer::build_resume_envelope(&tenant_ctx(), &with_nonce, json!(1));
+        assert_eq!(nonced.session_hint, plain.session_hint);
+        assert_eq!(
+            nonced.session_hint.as_deref(),
+            Some("demo:provider:chan:conv:user")
+        );
+        assert_eq!(nonced.pack_id, plain.pack_id);
+        assert_eq!(nonced.flow_id, "wait.flow");
+        let (scope, plain_scope) = (nonced.reply_scope.unwrap(), plain.reply_scope.unwrap());
+        assert_eq!(scope.thread.as_deref(), Some("topic-7"));
+        assert_eq!(
+            scope.reply_to.as_deref(),
+            Some("msg-42"),
+            "the nonce must not leak into reply_to"
+        );
+        assert_eq!(scope.scope_hash(), plain_scope.scope_hash());
+    }
+
+    #[test]
+    fn a_nonced_response_resumes_only_its_own_parked_approval() {
+        let mine = format!("h::pack=p::flow=f::n={NONCE}");
+        let other = format!("h::pack=p::flow=f::n={}", "f".repeat(32));
+        // Nothing parked: left to the runtime, unchanged.
+        assert!(response_matches_park(&mine, None));
+        // Parked on this very approval.
+        assert!(response_matches_park(&mine, Some(&[Some(mine.clone())])));
+        // Parked on a DIFFERENT approval in the same conversation.
+        assert!(!response_matches_park(&mine, Some(&[Some(other.clone())])));
+        // Parked, but not on any approval (e.g. a card after the gate passed).
+        assert!(!response_matches_park(&mine, Some(&[])));
+        // A legacy mark with no recorded id cannot be verified: not refused.
+        assert!(response_matches_park(&mine, Some(&[None])));
     }
 }

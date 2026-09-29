@@ -703,6 +703,11 @@ pub struct StateMachineRuntime {
     /// Reports a turn that failed after every retry, once — see
     /// `run_outcome::turn::TurnScope`. `None` without a sink.
     run_outcome: Option<RunOutcomeReporter>,
+    /// The same resume store the pack-flow adapter parks into, kept so the
+    /// dispatch resume path can inspect a park before resuming it (see
+    /// [`Self::parked_approval_correlations`]). `None` for [`Self::new`],
+    /// which has no pack-flow adapter and therefore never parks.
+    resume: Option<FlowResumeStore>,
 }
 
 impl StateMachineRuntime {
@@ -732,6 +737,7 @@ impl StateMachineRuntime {
         Ok(Self {
             runner,
             run_outcome: None,
+            resume: None,
         })
     }
 
@@ -796,7 +802,7 @@ impl StateMachineRuntime {
                 Arc::clone(&config),
                 Arc::clone(&engine),
                 pack_trace,
-                resume_store,
+                resume_store.clone(),
                 mocks,
                 audit_nats_client,
                 run_outcome.clone(),
@@ -817,7 +823,30 @@ impl StateMachineRuntime {
         Ok(Self {
             runner,
             run_outcome,
+            resume: Some(resume_store),
         })
+    }
+
+    /// The approvals the conversation `envelope` addresses is parked on, as the
+    /// correlation id each was published under (`None` entries are marks
+    /// recorded before ids were). `Ok(None)` means nothing is parked.
+    ///
+    /// Reads the SAME slot the pack-flow adapter would resume (the envelope is
+    /// canonicalised exactly as the adapter canonicalises it), so a response
+    /// can be matched to its own gate before it is allowed to resume anything.
+    pub(crate) async fn parked_approval_correlations(
+        &self,
+        envelope: &IngressEnvelope,
+    ) -> Result<Option<Vec<Option<String>>>> {
+        let Some(resume) = self.resume.as_ref() else {
+            return Ok(None);
+        };
+        let envelope = envelope.clone().canonicalize();
+        let snapshot = resume
+            .fetch(&envelope)
+            .await
+            .map_err(|err| anyhow!("failed to read the parked flow: {err}"))?;
+        Ok(snapshot.map(|snapshot| snapshot.state.pending_approval_correlations()))
     }
 
     /// Execute the flow associated with the provided ingress event.

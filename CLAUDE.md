@@ -184,6 +184,18 @@ into whatever turn is parked at that moment, producing a bogus timeout reply mid
 A correct bounded deadline needs a per-dispatch correlation nonce plus watchdog cancellation
 (likely shared with `sorla.call`); tracked as a follow-up, not yet implemented.
 
+**`approval.call` alone carries a per-dispatch nonce** (greentic-runner#793). Its
+correlation id ends with `::n=<32 lowercase hex>`, appended LAST so every other segment
+keeps its position, and `RuntimeSessionResumer` strips it FIRST (`split_dispatch_nonce`),
+so the park is still keyed per conversation. The id each pending approval was published
+under is recorded in `ExecutionState::pending_approval_await`, and the resumer DROPS (with
+a `warn`) a nonced response that does not match the parked one — an earlier gate's late
+decision, or its watchdog `timeout`, no longer lands on a later gate. It is scoped to the
+approval runtime on purpose: the agentic/telco bridges reuse the correlation id as the
+downstream SESSION id when the input names none, so a nonce on `agentic.call` would give
+every turn a fresh agent memory. The watchdog is still never cancelled; the nonce makes
+its late `timeout` harmless for approvals, not for the other runtimes.
+
 ### Knowledge retrieval backends
 
 An agent's `Knowledge` implementation is a chain of wrappers around whatever is
