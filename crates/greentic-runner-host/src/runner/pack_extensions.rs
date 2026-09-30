@@ -87,14 +87,39 @@ pub const ARCHIVE_SUFFIX: &str = ".gtxpack";
 /// keep the on-disk scan as the only source.
 pub const OPT_OUT_ENV: &str = "GREENTIC_AW_PACK_EXTENSIONS";
 
-/// Written last into a staged directory, only after every archive entry landed.
+/// Written last, only after every archive entry landed, BESIDE the extension
+/// directory — never inside it.
 ///
 /// The directory appears at the first write, so its existence proves an unpack
 /// STARTED. Two tenants of one process stage the same digest, and a half-written
 /// tree that a later tenant reused as "already staged" would load an extension
 /// missing files — silently, since the manifest ledger would then fail with a
 /// hash mismatch rather than the truthful "the unpack was interrupted".
-const COMPLETE_MARKER: &str = ".staged";
+///
+/// # Why the marker lives at `<digest>/`, not in the extension directory
+///
+/// The extension directory is handed to the verified loader, whose ledger check
+/// refuses ANY file present on disk but absent from the signed `manifest.json`.
+/// A marker written inside it made every signed pack-carried extension fail
+/// with "`.staged` is present in the extension directory but absent from
+/// manifest.json", so no pack-carried extension ever loaded. The layout is
+/// therefore:
+///
+/// ```text
+/// <staging root>/<digest>/.ext-staged   <- this marker
+/// <staging root>/<digest>/ext/          <- exactly the archive's files; loaded
+/// ```
+///
+/// The marker is deliberately NOT named `.staged`: the previous layout wrote
+/// `<digest>/.staged` with the archive unpacked directly into `<digest>/`, so
+/// reusing that name would read an old-layout tree as a complete new-layout
+/// one with no `ext/` beneath it. Under a new name an old-layout tree simply
+/// reads as "not staged" and is cleared and re-staged.
+const COMPLETE_MARKER: &str = ".ext-staged";
+
+/// The subdirectory of `<digest>/` that holds the unpacked archive and is the
+/// directory handed to the loader.
+const EXTENSION_SUBDIR: &str = "ext";
 
 /// Is `entry` one of the extension archives the contract describes?
 ///
@@ -236,22 +261,31 @@ fn staged_extension_id(dir: &Path) -> Option<String> {
 /// so a re-run within one process is idempotent.
 fn stage_one(entry_name: &str, bytes: &[u8]) -> Result<StagedExtension> {
     let root = staging_root().context("no staging directory is available")?;
-    let digest = hex::encode(Sha256::digest(bytes));
-    let dir = root.join(&digest[..32]);
+    stage_one_in(root, entry_name, bytes)
+}
 
-    if !dir.join(COMPLETE_MARKER).exists() {
-        // A previous attempt may have died partway through. Clear rather than
-        // unpack over the top: a stale truncated file the current archive no
-        // longer lists would survive and be hashed against the ledger.
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("clear partial staging at {}", dir.display()))?;
+/// [`stage_one`] against an explicit root, so tests can inspect the layout
+/// without sharing the process-wide staging root.
+fn stage_one_in(root: &Path, entry_name: &str, bytes: &[u8]) -> Result<StagedExtension> {
+    let digest = hex::encode(Sha256::digest(bytes));
+    let slot = root.join(&digest[..32]);
+    let dir = slot.join(EXTENSION_SUBDIR);
+    let marker = slot.join(COMPLETE_MARKER);
+
+    if !marker.exists() {
+        // A previous attempt may have died partway through, or the slot may
+        // hold a tree from the old layout (archive unpacked straight into
+        // `<digest>/` with the marker inside it). Clear the whole slot rather
+        // than unpack over the top: a stale truncated file the current archive
+        // no longer lists would survive and be hashed against the ledger.
+        if slot.exists() {
+            std::fs::remove_dir_all(&slot)
+                .with_context(|| format!("clear partial staging at {}", slot.display()))?;
         }
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create staging dir {}", dir.display()))?;
         unpack_archive(bytes, &dir)?;
-        std::fs::write(dir.join(COMPLETE_MARKER), b"")
-            .with_context(|| format!("mark {} staged", dir.display()))?;
+        std::fs::write(&marker, b"").with_context(|| format!("mark {} staged", dir.display()))?;
     }
 
     let extension_id = staged_extension_id(&dir);
@@ -702,5 +736,261 @@ mod tests {
             !is_shadowed(&anonymous, &on_disk),
             "an unreadable id must reach the loader, not be assumed shadowed"
         );
+    }
+
+    /// Every regular file under `dir`, as `/`-joined relative paths, sorted.
+    fn files_under(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, current: &Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(current).expect("read staged dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(base, &path, out);
+                } else {
+                    let rel = path.strip_prefix(base).expect("under base");
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The regression: the directory handed to the loader must contain EXACTLY
+    /// the archive's files. The loader's ledger refuses any file the signed
+    /// manifest does not list, so a completion marker written inside it made
+    /// every signed pack-carried extension unloadable.
+    #[test]
+    fn the_loader_directory_holds_only_the_archives_files_and_the_marker_sits_beside_it() {
+        let root = tempfile::tempdir().expect("staging root");
+        let archive = zip_bytes(&[
+            ("describe.json", describe_bytes("acme.tool").as_slice()),
+            ("manifest.json", b"{}".as_slice()),
+            ("extension.wasm", b"wasm".as_slice()),
+            ("assets/icon.svg", b"<svg/>".as_slice()),
+        ]);
+
+        let staged =
+            stage_one_in(root.path(), "extensions/acme.tool.gtxpack", &archive).expect("stage");
+
+        assert_eq!(
+            files_under(&staged.dir),
+            vec![
+                "assets/icon.svg",
+                "describe.json",
+                "extension.wasm",
+                "manifest.json",
+            ],
+            "nothing but the archive's own entries may appear in the loader's directory"
+        );
+        let slot = staged.dir.parent().expect("slot");
+        assert_eq!(slot.parent(), Some(root.path()));
+        assert!(
+            slot.join(COMPLETE_MARKER).is_file(),
+            "the completion marker must live beside the extension directory"
+        );
+        assert!(!staged.dir.join(COMPLETE_MARKER).exists());
+        assert!(!staged.dir.join(".staged").exists());
+    }
+
+    #[test]
+    fn a_completed_stage_is_reused_and_not_unpacked_again() {
+        let root = tempfile::tempdir().expect("staging root");
+        let archive = extension_archive("acme.tool");
+
+        let first = stage_one_in(root.path(), "extensions/a.gtxpack", &archive).expect("first");
+        // A sentinel the archive does not contain: if the second call re-unpacked
+        // (which clears the slot first), it would be gone.
+        let sentinel = first.dir.parent().expect("slot").join("sentinel");
+        std::fs::write(&sentinel, b"kept").expect("write sentinel");
+
+        let second = stage_one_in(root.path(), "extensions/a.gtxpack", &archive).expect("second");
+
+        assert_eq!(first.dir, second.dir);
+        assert!(sentinel.exists(), "a completed stage must be reused as-is");
+        assert_eq!(second.extension_id.as_deref(), Some("acme.tool"));
+    }
+
+    #[test]
+    fn a_partial_unpack_without_the_marker_is_redone() {
+        let root = tempfile::tempdir().expect("staging root");
+        let archive = extension_archive("acme.tool");
+        let digest = hex::encode(Sha256::digest(&archive));
+        let slot = root.path().join(&digest[..32]);
+        let dir = slot.join(EXTENSION_SUBDIR);
+        std::fs::create_dir_all(&dir).expect("partial dir");
+        std::fs::write(dir.join("describe.json"), b"trunc").expect("truncated describe");
+        std::fs::write(dir.join("stale.bin"), b"left behind").expect("stale file");
+
+        let staged = stage_one_in(root.path(), "extensions/a.gtxpack", &archive).expect("stage");
+
+        assert_eq!(
+            files_under(&staged.dir),
+            vec!["describe.json", "extension.wasm"]
+        );
+        assert_eq!(
+            std::fs::read(staged.dir.join("describe.json")).expect("describe"),
+            describe_bytes("acme.tool"),
+        );
+        assert!(slot.join(COMPLETE_MARKER).is_file());
+    }
+
+    /// A slot written by the previous layout — archive unpacked straight into
+    /// `<digest>/` with `.staged` inside it — must not be mistaken for a
+    /// completed new-layout stage; it is cleared and re-staged.
+    #[test]
+    fn a_slot_left_by_the_old_layout_is_restaged_into_the_new_one() {
+        let root = tempfile::tempdir().expect("staging root");
+        let archive = extension_archive("acme.tool");
+        let digest = hex::encode(Sha256::digest(&archive));
+        let slot = root.path().join(&digest[..32]);
+        unpack_archive(&archive, &{
+            std::fs::create_dir_all(&slot).expect("old slot");
+            slot.clone()
+        })
+        .expect("old-layout unpack");
+        std::fs::write(slot.join(".staged"), b"").expect("old marker");
+
+        let staged = stage_one_in(root.path(), "extensions/a.gtxpack", &archive).expect("stage");
+
+        assert_eq!(staged.dir, slot.join(EXTENSION_SUBDIR));
+        assert_eq!(
+            files_under(&staged.dir),
+            vec!["describe.json", "extension.wasm"]
+        );
+        assert_eq!(
+            files_under(&slot),
+            vec![
+                COMPLETE_MARKER.to_string(),
+                format!("{EXTENSION_SUBDIR}/describe.json"),
+                format!("{EXTENSION_SUBDIR}/extension.wasm"),
+            ],
+            "the old-layout files and marker must be gone"
+        );
+    }
+
+    /// The test whose absence let the in-directory marker ship: a SIGNED
+    /// extension carried in a pack goes through the same verified loader the
+    /// runtime uses (`register_from_packs` → `register_loaded_from_dir`) and
+    /// registers. Signature, manifest ledger (including its "no file outside the
+    /// ledger" rule) and TOFU anchor are all real; only the trust root is a
+    /// temp dir.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_signed_pack_carried_extension_is_staged_and_registers_through_the_loader() {
+        use std::io::Write;
+
+        use greentic_ext_runtime::{DiscoveryPaths, ExtensionRuntime, RuntimeConfig};
+
+        let archive = signed_extension_archive("acme.signed-tool");
+
+        let empty_root = tempfile::tempdir().expect("an empty discovery root");
+        let trust = tempfile::tempdir().expect("a temp trust root");
+        let config =
+            RuntimeConfig::from_paths(DiscoveryPaths::new(empty_root.path().to_path_buf()))
+                .with_trust_root(trust.path().to_path_buf());
+        let mut runtime = ExtensionRuntime::new(config).expect("build an extension runtime");
+        assert!(runtime.loaded().is_empty(), "nothing is installed on disk");
+
+        let holder = tempfile::tempdir().expect("tempdir");
+        let pack_path = holder.path().join("worker.gtpack");
+        let mut writer =
+            zip::ZipWriter::new(std::fs::File::create(&pack_path).expect("create pack"));
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("extensions/acme.signed-tool.gtxpack", options)
+            .expect("start entry");
+        writer.write_all(&archive).expect("write entry");
+        writer.finish().expect("finish pack");
+
+        let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(&pack_path));
+        let report = register_from_packs(&mut runtime, &[pack]);
+
+        assert_eq!(
+            report,
+            PackExtensionLoad {
+                loaded: 1,
+                shadowed: 0,
+                failed: 0,
+            },
+            "a correctly signed pack-carried extension must pass the load gate"
+        );
+        assert!(
+            runtime
+                .loaded()
+                .keys()
+                .any(|id| id.as_str() == "acme.signed-tool"),
+            "the extension must be registered in the runtime"
+        );
+    }
+
+    /// A minimal, correctly signed `.gtxpack`: an empty wasm component, a
+    /// whole-archive manifest bound into the describe, and an ed25519 signature
+    /// over the JCS-canonical describe — produced bind → sign, as the SDK does.
+    #[cfg(feature = "agentic-worker")]
+    fn signed_extension_archive(id: &str) -> Vec<u8> {
+        use greentic_extension_sdk_contract::{
+            DescribeJson, artifact_sha256, bind_manifest, build_manifest, sign_describe,
+        };
+
+        // `(component)` in binary form: the component-model preamble alone.
+        let wasm: Vec<u8> = vec![0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
+        let wasm_sha = artifact_sha256(&wasm);
+
+        let mut describe: DescribeJson = serde_json::from_value(serde_json::json!({
+            "apiVersion": "greentic.ai/v2",
+            "kind": "DesignExtension",
+            "compat": {
+                "min_designer_version": ">=1.0.0",
+                "min_runner_version": "^0.12.0",
+                "contract_version": "1.2.0"
+            },
+            "metadata": {
+                "id": id,
+                "name": id,
+                "version": "0.1.0",
+                "summary": "test",
+                "author": { "name": "test" },
+                "license": "MIT"
+            },
+            "engine": { "greenticDesigner": "*", "extRuntime": "*" },
+            "capabilities": {
+                "offered": [{ "id": "greentic:test/ping", "version": "1.0.0" }],
+                "required": []
+            },
+            "runtime": {
+                "memoryLimitMB": 64,
+                "permissions": {},
+                "components": {
+                    "stub": {
+                        "gtpack": {
+                            "file": "extension.wasm",
+                            "sha256": wasm_sha,
+                            "pack_id": id,
+                            "component_version": "0.1.0"
+                        },
+                        "sha256": wasm_sha,
+                        "world": "greentic:component/stub@0.1.0"
+                    }
+                }
+            },
+            "contributions": {}
+        }))
+        .expect("a valid describe");
+
+        let manifest = build_manifest(vec![("extension.wasm", wasm.as_slice())]);
+        let manifest_json = serde_json::to_vec(&manifest).expect("serialise manifest");
+        bind_manifest(&mut describe, &manifest_json);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        sign_describe(&mut describe, &key).expect("sign describe");
+        let describe_json = serde_json::to_vec_pretty(&describe).expect("serialise describe");
+
+        zip_bytes(&[
+            ("describe.json", describe_json.as_slice()),
+            ("manifest.json", manifest_json.as_slice()),
+            ("extension.wasm", wasm.as_slice()),
+        ])
     }
 }

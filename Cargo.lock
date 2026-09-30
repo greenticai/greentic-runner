@@ -3281,6 +3281,7 @@ dependencies = [
  "criterion",
  "cron",
  "dashmap",
+ "ed25519-dalek",
  "futures",
  "greentic-aw-runtime",
  "greentic-config",

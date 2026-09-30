@@ -226,6 +226,9 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 tower.workspace = true
 http-body-util = "0.1"
 wiremock = "0.6"
+# Signs the pack-carried extension fixture in `runner::pack_extensions` tests so
+# the real load gate (signature + ledger + TOFU anchor) is exercised end to end.
+ed25519-dalek.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.2.0-dev, <1.3.0-0", features = ["test-mock"] }
 # Not `.workspace = true`: despite the root Cargo.toml comment near line 244,
 # this crate is not in `[workspace.dependencies]` — it's a `[patch.crates-io]`
