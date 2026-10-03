@@ -4293,16 +4293,80 @@ pub(crate) fn tool_presentation(payload: &Value) -> Option<&Value> {
         .filter(|value| !value.is_null())
 }
 
+/// Keys of a `ChannelMessageEnvelope` that the TRANSPORT owns. On the
+/// `greentic-start` path every inbound message carries them, typed or not, so
+/// they say nothing about whether a person submitted a card.
+///
+/// `text` and `metadata` are excluded by [`submitted_fields`] already.
+#[cfg(any(feature = "agentic-worker", test))]
+const ENVELOPE_TRANSPORT_KEYS: &[&str] = &[
+    "id",
+    "tenant",
+    "channel",
+    "session_id",
+    "reply_scope",
+    "from",
+    "to",
+    "correlation_id",
+    "attachments",
+    "extensions",
+];
+
+/// Channel context a provider may stamp on a message's `metadata` whether or
+/// not a card was submitted. Context, not input, so it never makes a typed
+/// message a submit.
+#[cfg(any(feature = "agentic-worker", test))]
+const CHANNEL_CONTEXT_METADATA_KEYS: &[&str] = &["locale", "team", "env", "autoStart"];
+
+/// Whether `map` is a `ChannelMessageEnvelope`: the three keys no card input
+/// has any reason to share are all there. Decided by SHAPE, not by where the
+/// map sits, because both arrive — wrapped under `entry.input` and as the flat
+/// entry itself — and a Run Demo entry's root keys are the card's own input
+/// ids (an input named `channel` is still an input there, since it never
+/// comes with a `session_id` and a `tenant`).
+#[cfg(any(feature = "agentic-worker", test))]
+fn is_channel_envelope(map: &JsonMap<String, Value>) -> bool {
+    map.contains_key("session_id") && map.contains_key("channel") && map.contains_key("tenant")
+}
+
 /// Whether an inbound activity is a card submit rather than a typed message:
-/// it names a route (`metadata.action`) or carries submitted fields. Anything
+/// it names a route (`metadata.action`) or carries INPUT values. Anything
 /// with neither is an ordinary message, even with empty text.
+///
+/// Input values exclude what the envelope carries for transport and channel
+/// context. Counting them (via [`submitted_fields`] alone) made every message
+/// on the `greentic-start` path a "submit", because the whole
+/// `ChannelMessageEnvelope` is the entry (or sits under `entry.input`) and
+/// always has `id`, `tenant`, `channel` and `session_id` — so a person typing
+/// while a `flow:` tool was parked had the text delivered AS the tool's
+/// answer, and the tool's card was shown again, for any text at all.
 #[cfg(any(feature = "agentic-worker", test))]
 fn is_card_submit(entry: &Value) -> bool {
-    let has_action = resolve_entry_metadata(entry)
+    let metadata = resolve_entry_metadata(entry).and_then(Value::as_object);
+    let has_action = metadata
         .and_then(|meta| meta.get("action"))
         .and_then(Value::as_str)
         .is_some_and(|action| !action.trim().is_empty());
-    has_action || !submitted_fields(entry).is_empty()
+    if has_action {
+        return true;
+    }
+    let envelope = entry
+        .get("input")
+        .filter(|v| v.is_object())
+        .unwrap_or(entry);
+    let root_input = envelope.as_object().is_some_and(|map| {
+        let channel_envelope = is_channel_envelope(map);
+        map.keys().any(|key| {
+            key != "metadata"
+                && key != "text"
+                && !(channel_envelope && ENVELOPE_TRANSPORT_KEYS.contains(&key.as_str()))
+        })
+    });
+    let metadata_input = metadata.is_some_and(|meta| {
+        meta.keys()
+            .any(|key| key != "action" && !CHANNEL_CONTEXT_METADATA_KEYS.contains(&key.as_str()))
+    });
+    root_input || metadata_input
 }
 
 fn pending_from_snapshot(snapshot: &FlowSnapshot, input: &Value) -> Option<PendingCardAnswers> {
@@ -12695,6 +12759,91 @@ mod tests {
         };
         rt.block_on(engine.resume(conv_ctx(), wait.snapshot, json!({ "text": "never mind" })))
             .unwrap();
+        assert_eq!(*handler.resumes.lock().unwrap(), vec![None, None]);
+    }
+
+    /// What `greentic-start` really hands the engine for a typed message: the
+    /// whole `ChannelMessageEnvelope` under `input`, with its transport
+    /// identity (`id`, `tenant`, `channel`, `session_id`, ...) and, for a
+    /// signed-in caller, the provider's `extensions.caller` block.
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn wrapped_typed_message(text: &str) -> serde_json::Value {
+        json!({
+            "input": {
+                "id": "msg-2",
+                "tenant": { "env": "local", "tenant": "acme", "tenant_id": "acme" },
+                "channel": "webchat",
+                "session_id": "sess-1",
+                "from": { "id": "user-1", "kind": "user" },
+                "to": [],
+                "correlation_id": "corr-1",
+                "attachments": [],
+                "metadata": {},
+                "extensions": { "caller": { "sub": "user-1", "user_verified": true } },
+                "text": text
+            }
+        })
+    }
+
+    /// The defect behind "any text I type re-shows the same card". On the
+    /// `greentic-start` path every inbound message is a whole envelope, so the
+    /// envelope's own keys were counted as submitted fields and EVERY typed
+    /// message looked like a card submit: the parked `flow:` tool was resumed
+    /// with the text instead of being cancelled.
+    #[test]
+    fn a_typed_message_in_a_channel_envelope_is_not_a_card_submit() {
+        assert!(!is_card_submit(&wrapped_typed_message("2+2 berapa?")));
+        // Channel context the provider may stamp on a typed message's metadata.
+        let mut with_context = wrapped_typed_message("hi");
+        with_context["input"]["metadata"] =
+            json!({ "locale": "en-US", "team": "support", "env": "prod", "autoStart": false });
+        assert!(!is_card_submit(&with_context));
+        // A real submit through the same envelope is still a submit: by its
+        // route, and by input values carried without one.
+        let mut by_action = wrapped_typed_message("");
+        by_action["input"]["metadata"] = json!({ "action": "start_request" });
+        assert!(is_card_submit(&by_action));
+        let mut by_values = wrapped_typed_message("");
+        by_values["input"]["metadata"] = json!({ "room": "101" });
+        assert!(is_card_submit(&by_values));
+        // The same envelope delivered FLAT (it is the entry itself, not under
+        // `input`): the shape the generic JSON ingress hands the engine.
+        let flat_typed = wrapped_typed_message("2+2 berapa?")["input"].clone();
+        assert!(!is_card_submit(&flat_typed));
+        let mut flat_submit = flat_typed.clone();
+        flat_submit["metadata"] = json!({ "action": "start_request" });
+        assert!(is_card_submit(&flat_submit));
+        // Run Demo's flat entry keeps its inputs at the root: a field that
+        // happens to share an envelope key's name is still an input there.
+        assert!(is_card_submit(
+            &json!({ "channel": "email", "metadata": {} })
+        ));
+    }
+
+    /// The engine-level view of the same defect: a typed message in a channel
+    /// envelope while a `flow:` tool is parked reaches the agent as a message
+    /// (no resume payload), so the agent cancels the tool.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_typed_envelope_message_during_a_tool_park_is_not_a_resume_payload() {
+        let handler = std::sync::Arc::new(ToolParkAgentHandler::new(vec![
+            awaiting_tool_output(),
+            json!({ "reply": "that is outside my scope", "trail": [], "terminated_by": "final_reply" }),
+        ]));
+        let engine = conv_engine_with(conversational_dw_flow(false), handler.clone());
+        let rt = Runtime::new().unwrap();
+        let first = rt
+            .block_on(engine.execute(conv_ctx(), wrapped_typed_message("book a room")))
+            .unwrap();
+        let FlowStatus::Waiting(wait) = first.status else {
+            panic!("expected a park");
+        };
+        rt.block_on(engine.resume(
+            conv_ctx(),
+            wait.snapshot,
+            wrapped_typed_message("2+2 berapa?"),
+        ))
+        .unwrap();
         assert_eq!(*handler.resumes.lock().unwrap(), vec![None, None]);
     }
 
