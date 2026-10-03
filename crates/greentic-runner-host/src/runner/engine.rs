@@ -1121,7 +1121,9 @@ impl FlowEngine {
         // Computed before `snapshot.state` is moved out below, since it borrows
         // `snapshot` (specifically `next_node` and `awaiting_submit`).
         let pending_card_answers = pending_from_snapshot(&snapshot, &input);
+        let resumed_at = resumed_card_node(&snapshot);
         let mut state = snapshot.state;
+        state.resumed_at = resumed_at;
         // Replace BOTH `input` AND `entry` with the new activity. The
         // routing context (built by `build_routing_context`) reads
         // `entry.input.metadata.*` for the synthesised `response.*` fields
@@ -1344,6 +1346,8 @@ impl FlowEngine {
                     if owned_the_submit {
                         consume_routing_action(&mut state.entry);
                     }
+                    // Routed (or parked): the resume it carried is spent.
+                    state.resumed_at = None;
 
                     match decision {
                         NextDecision::Next(n) => current = n,
@@ -3646,6 +3650,13 @@ pub struct ExecutionState {
     /// resume — but is serde-defaulted like its neighbours.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_card_answers: Option<PendingCardAnswers>,
+    /// The node this turn RESUMED at, when it resumed a card parked on
+    /// `awaiting_submit`. It is what lets a route marked `on_message` tell "the
+    /// card was just rendered" (park) from "the person answered the card by
+    /// typing" (take the route). Cleared as soon as that node has routed, so
+    /// it never survives into a later node or a snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resumed_at: Option<String>,
 }
 
 impl ExecutionState {
@@ -3664,6 +3675,7 @@ impl ExecutionState {
             pending_approval_token: HashMap::new(),
             pending_tool_await: HashMap::new(),
             pending_card_answers: None,
+            resumed_at: None,
         }
     }
 
@@ -4268,6 +4280,13 @@ fn attach_pending_card_answers(
     };
     map.insert("answers".to_string(), Value::Object(answers));
     true
+}
+
+/// The card node a resume lands on, or `None` when the snapshot is not a card
+/// awaiting its submit. A `session.wait` snapshot names its SUCCESSOR in
+/// `next_node`, which has not run, so it must not be treated as a resumed card.
+fn resumed_card_node(snapshot: &FlowSnapshot) -> Option<String> {
+    snapshot.awaiting_submit.then(|| snapshot.next_node.clone())
 }
 
 /// Decide what to park for the node awaiting a submit, from the snapshot being
@@ -5791,6 +5810,31 @@ fn evaluate_custom_routing(
         let condition = route.get("condition").and_then(|v| v.as_str());
         let to = route.get("to").and_then(|v| v.as_str());
 
+        if route.get("on_message").and_then(Value::as_bool) == Some(true) {
+            // "Anything that is not one of this card's buttons": taken only when
+            // THIS turn resumed the card (so a freshly rendered card still
+            // parks, which an unconditional route would not) and carries no
+            // action. It counts as conditional for the same reason.
+            has_condition = true;
+            unmatched_conditions.push("on_message");
+            let resumed_here = state.resumed_at.as_deref() == Some(node_id.as_str());
+            let no_action = resolve_dotted_path(&ctx, "response.action")
+                .is_none_or(|action| action.trim().is_empty());
+            if resumed_here
+                && no_action
+                && let Some(target) = to
+                && let Ok(nid) = NodeId::new(target)
+            {
+                tracing::debug!(
+                    flow_id = %flow_ir.id,
+                    node_id = %node_id,
+                    target = target,
+                    "on_message route taken"
+                );
+                return CustomRoutingDecision::Next(nid);
+            }
+            continue;
+        }
         if let Some(cond) = condition {
             has_condition = true;
             unmatched_conditions.push(cond);
@@ -9446,6 +9490,100 @@ mod tests {
             }
             other => panic!("expected NodeControl::AwaitHere, got {other:?}"),
         }
+    }
+
+    // --- on_message routes: where a card sends a typed answer -------------
+
+    fn on_message_routing() -> Value {
+        json!([
+            { "condition": "response.action == \"go_a\"", "to": "page_a" },
+            { "to": "fallback", "on_message": true },
+            { "out": true }
+        ])
+    }
+
+    fn empty_flow() -> HostFlow {
+        HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        }
+    }
+
+    fn route_with(resumed_at: Option<&str>, entry: Value) -> CustomRoutingDecision {
+        let mut state = ExecutionState::new(entry.clone());
+        state.entry = entry;
+        state.resumed_at = resumed_at.map(str::to_string);
+        evaluate_custom_routing(
+            &on_message_routing(),
+            &NodeOutput::new(Value::Null),
+            &state,
+            &empty_flow(),
+            &NodeId::from_str("menu").unwrap(),
+        )
+    }
+
+    #[test]
+    fn an_on_message_route_does_not_fire_when_the_card_was_just_rendered() {
+        // Not resumed: an unconditional route here would skip the card entirely.
+        let decision = route_with(None, json!({ "text": "hello" }));
+        assert!(
+            matches!(decision, CustomRoutingDecision::Wait),
+            "a freshly rendered card must park, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn an_on_message_route_is_taken_when_the_person_types_at_the_parked_card() {
+        let decision = route_with(Some("menu"), json!({ "text": "2+2 berapa?" }));
+        match decision {
+            CustomRoutingDecision::Next(n) => assert_eq!(n.as_str(), "fallback"),
+            other => panic!("expected fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_button_still_wins_over_the_on_message_route() {
+        let entry = json!({ "text": "", "metadata": { "action": "go_a" } });
+        match route_with(Some("menu"), entry) {
+            CustomRoutingDecision::Next(n) => assert_eq!(n.as_str(), "page_a"),
+            other => panic!("expected page_a, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_action_reparks_instead_of_taking_the_on_message_route() {
+        let entry = json!({ "text": "", "metadata": { "action": "stale_button" } });
+        let decision = route_with(Some("menu"), entry);
+        assert!(
+            matches!(decision, CustomRoutingDecision::Wait),
+            "a click that matches nothing is not a typed message, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn a_resume_at_another_node_does_not_take_the_route() {
+        let decision = route_with(Some("some_other_card"), json!({ "text": "hi" }));
+        assert!(matches!(decision, CustomRoutingDecision::Wait));
+    }
+
+    #[test]
+    fn only_a_card_awaiting_its_submit_counts_as_a_resumed_card() {
+        let mut snapshot = FlowSnapshot {
+            pack_id: "p".into(),
+            flow_id: "f".into(),
+            next_flow: None,
+            next_node: "menu".into(),
+            awaiting_submit: true,
+            state: ExecutionState::new(Value::Null),
+        };
+        assert_eq!(resumed_card_node(&snapshot).as_deref(), Some("menu"));
+        // `session.wait` names its successor, which has not run.
+        snapshot.awaiting_submit = false;
+        assert_eq!(resumed_card_node(&snapshot), None);
     }
 
     /// Regression: a `Routing::Custom` array containing at least one
