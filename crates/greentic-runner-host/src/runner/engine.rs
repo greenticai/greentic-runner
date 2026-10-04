@@ -457,6 +457,28 @@ struct ComponentCall {
     has_error_route: bool,
 }
 
+/// A flow run that failed, with what the nodes that DID run produced.
+///
+/// The terminal failure is surfaced to a session as a metadata-only `Ok`
+/// envelope (see `execute_with_retries`). That envelope used to carry no node
+/// outputs at all, so a caller reading per-node traces (the designer's Run
+/// Demo developer mode) saw nothing for a turn whose earlier steps had really
+/// run. Every `?` inside a flow run still converts from `anyhow::Error` with no
+/// outputs; only the site that has the state in hand fills them in.
+struct FlowFailure {
+    error: anyhow::Error,
+    node_outputs: JsonMap<String, Value>,
+}
+
+impl From<anyhow::Error> for FlowFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            node_outputs: JsonMap::new(),
+        }
+    }
+}
+
 impl FlowExecution {
     fn completed(output: Value, node_outputs: JsonMap<String, Value>) -> Self {
         Self {
@@ -1050,7 +1072,10 @@ impl FlowEngine {
                     .await
                 {
                     Ok(value) => return Ok(value),
-                    Err(err) => {
+                    Err(FlowFailure {
+                        error: err,
+                        node_outputs,
+                    }) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
                             // User-facing session flows surface the terminal
                             // error as a metadata-only Ok envelope so the
@@ -1069,7 +1094,7 @@ impl FlowEngine {
                                             "flow_id": ctx.flow_id,
                                         }
                                     }),
-                                    Default::default(),
+                                    node_outputs,
                                 ));
                             }
                             return Err(err);
@@ -1143,6 +1168,7 @@ impl FlowEngine {
         self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
             .instrument(span)
             .await
+            .map_err(|failure| failure.error)
     }
 
     async fn execute_once(
@@ -1150,7 +1176,7 @@ impl FlowEngine {
         ctx: &FlowContext<'_>,
         input: Value,
         entry_node: Option<String>,
-    ) -> Result<FlowExecution> {
+    ) -> Result<FlowExecution, FlowFailure> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
         let mut state = ExecutionState::new(input);
         let missing = seed_vars_and_collect_missing_required(
@@ -1166,7 +1192,7 @@ impl FlowEngine {
                 "required flow variable not provided",
                 "en",
             );
-            anyhow::bail!("{label}: {}", missing.join(", "));
+            return Err(anyhow!("{label}: {}", missing.join(", ")).into());
         }
         self.drive_flow(ctx, flow_ir, state, entry_node, ctx.flow_id.to_string())
             .await
@@ -1179,7 +1205,7 @@ impl FlowEngine {
         mut state: ExecutionState,
         resume_from: Option<String>,
         mut current_flow_id: String,
-    ) -> Result<FlowExecution> {
+    ) -> Result<FlowExecution, FlowFailure> {
         let mut current = match resume_from {
             Some(node) => NodeId::from_str(&node)
                 .with_context(|| format!("invalid resume node id `{node}`"))?,
@@ -1282,7 +1308,11 @@ impl FlowEngine {
                     // Propagate so `execute()`'s retry loop can retry transient
                     // failures, then convert to a metadata-only Ok envelope at
                     // the top level once retries are exhausted (session flows).
-                    return Err(err);
+                    // The envelope keeps what the earlier nodes produced.
+                    return Err(FlowFailure {
+                        error: err,
+                        node_outputs: state.outputs_map(),
+                    });
                 }
             };
 
@@ -9752,6 +9782,79 @@ mod tests {
             mocks: None,
             caller: None,
         }
+    }
+
+    /// A node that fails mid-turn must not erase what the nodes before it
+    /// produced: the terminal-failure envelope carries their outputs, so a
+    /// caller reading per-node traces still sees the steps that really ran.
+    #[tokio::test]
+    async fn a_terminal_failure_keeps_the_outputs_of_the_nodes_that_ran() {
+        let (pack_id_str, flow_id_str) = ("test-pack", "partial.flow");
+        let node = |id: &str, component: &str, routing: Routing| {
+            let id = NodeId::from_str(id).unwrap();
+            (
+                id.clone(),
+                Node {
+                    id,
+                    component: FlowComponentRef {
+                        id: component.parse().unwrap(),
+                        pack_alias: None,
+                        operation: None,
+                    },
+                    input: InputMapping {
+                        mapping: json!({ "message": "hello" }),
+                    },
+                    output: OutputMapping {
+                        mapping: Value::Null,
+                    },
+                    err_map: None,
+                    routing,
+                    telemetry: TelemetryHints::default(),
+                    conversational: false,
+                },
+            )
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        let (first_id, first) = node(
+            "first",
+            "emit.log",
+            Routing::Next {
+                node_id: NodeId::from_str("second").unwrap(),
+            },
+        );
+        nodes.insert(first_id, first);
+        let (second_id, second) = node("second", "no.such.component", Routing::End);
+        nodes.insert(second_id, second);
+        let flow = HostFlow::from(Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str(flow_id_str).unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([("default".to_string(), Value::String("first".into()))]),
+            nodes,
+            metadata: Default::default(),
+        });
+        let engine = broken_flow_engine(pack_id_str, flow_id_str);
+        engine.flow_cache.write().insert(
+            FlowKey {
+                pack_id: pack_id_str.to_string(),
+                flow_id: flow_id_str.to_string(),
+            },
+            flow,
+        );
+        let ctx = terminal_failure_ctx(pack_id_str, flow_id_str);
+        let result = engine
+            .execute(ctx, Value::Null)
+            .await
+            .expect("a session flow surfaces the failure as an envelope");
+        assert_eq!(
+            result.output["metadata"]["error_kind"],
+            "flow_execution_failed"
+        );
+        assert!(
+            result.node_outputs.contains_key("first"),
+            "the node that ran before the failure must keep its output, got {:?}",
+            result.node_outputs
+        );
     }
 
     #[tokio::test]
