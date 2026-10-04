@@ -43,9 +43,9 @@ async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
 futures = "0.3"
-greentic-flow = ">=1.2.0-dev, <1.3.0-0"
+greentic-flow = ">=1.2.0-dev.37223336412, <1.3.0-0"
 greentic-session = ">=1.2.0-dev, <1.3.0-0"
-greentic-state = ">=1.2.0-dev, <1.3.0-0"
+greentic-state = ">=1.2.0-dev.37220328375, <1.3.0-0"
 greentic-config = ">=1.2.0-dev, <1.3.0-0"
 greentic-config-types = ">=1.2.0-dev, <1.3.0-0"
 greentic-secrets-lib = ">=1.2.0-dev, <1.3.0-0"
@@ -145,21 +145,21 @@ features = [
 ]
 
 [workspace.dependencies.greentic-interfaces]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-dev.37221142016, <1.3.0-0"
 default-features = false
 features = [
     "bindings-rust",
 ]
 
 [workspace.dependencies.greentic-interfaces-guest]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-dev.37221142016, <1.3.0-0"
 default-features = false
 
 [workspace.dependencies.greentic-interfaces-host]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-dev.37221142016, <1.3.0-0"
 
 [workspace.dependencies.greentic-interfaces-wasmtime]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-dev.37221142016, <1.3.0-0"
 
 [workspace.dependencies.greentic-x-runtime]
 version = ">=1.2.0-dev, <1.3.0-0"

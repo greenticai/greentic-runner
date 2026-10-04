@@ -207,6 +207,18 @@ mod tests {
             Ok(())
         }
 
+        fn set_json_if_absent(
+            &self,
+            _tenant: &TenantCtx,
+            _prefix: &str,
+            _key: &StoreStateKey,
+            _value: &Value,
+            _ttl_secs: Option<u32>,
+        ) -> TypesResult<bool> {
+            self.record("set_json_if_absent");
+            Ok(true)
+        }
+
         fn del(
             &self,
             _tenant: &TenantCtx,
