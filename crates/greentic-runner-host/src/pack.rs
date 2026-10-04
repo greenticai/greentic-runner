@@ -34,8 +34,9 @@ use greentic_interfaces_wasmtime::host_helpers::v1::{
     runtime_config::{ConfigError, RuntimeConfigHost},
     secrets_store::{SecretsError, SecretsErrorV1_1, SecretsStoreHost, SecretsStoreHostV1_1},
     state_store::{
-        OpAck as StateOpAck, StateKey as HostStateKey, StateStoreError as StateError,
-        StateStoreHost, TenantCtx as StateTenantCtx,
+        OpAck as StateOpAck, OpAckV1_1 as StateOpAckV1_1, StateKey as HostStateKey,
+        StateStoreError as StateError, StateStoreErrorV1_1 as StateErrorV1_1, StateStoreHost,
+        StateStoreHostV1_1, TenantCtx as StateTenantCtx, TenantCtxV1_1 as StateTenantCtxV1_1,
     },
     telemetry_logger::{
         OpAck as TelemetryAck, SpanContext as TelemetrySpanContext,
@@ -1276,6 +1277,164 @@ impl StateStoreHost for HostState {
     }
 }
 
+/// `StateStore::set_json_if_absent` reports a backend that has no atomic
+/// implementation as `InvalidInput` with this message; surface it as a stable
+/// `unsupported` code instead of a generic failure.
+const UNSUPPORTED_IF_ABSENT_MARKER: &str = "set_json_if_absent is not supported";
+
+fn state_error_from_if_absent(err: greentic_types::GreenticError) -> StateError {
+    let code = if err.code == greentic_types::ErrorCode::InvalidInput
+        && err.message.contains(UNSUPPORTED_IF_ABSENT_MARKER)
+    {
+        "unsupported"
+    } else if err.code == greentic_types::ErrorCode::Unavailable {
+        "unavailable"
+    } else {
+        "internal"
+    };
+    StateError {
+        code: code.into(),
+        message: err.to_string(),
+    }
+}
+
+impl HostState {
+    /// Shared body of `write-if-absent`: same tenant derivation, fault hook,
+    /// prefix and bytes-to-JSON conversion as `StateStoreHost::write`.
+    fn state_write_if_absent(
+        &mut self,
+        key: HostStateKey,
+        bytes: Vec<u8>,
+        ctx: Option<StateTenantCtx>,
+    ) -> Result<bool, StateError> {
+        let store = match self.state_store.as_ref() {
+            Some(store) => store.clone(),
+            None => {
+                return Err(StateError {
+                    code: "unavailable".into(),
+                    message: "state store not configured".into(),
+                });
+            }
+        };
+        let tenant_ctx = match self.tenant_ctx_from_v1(ctx) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                return Err(StateError {
+                    code: "invalid-ctx".into(),
+                    message: err.to_string(),
+                });
+            }
+        };
+        #[cfg(feature = "fault-injection")]
+        {
+            let exec_ctx = self.exec_ctx.as_ref();
+            let flow_id = exec_ctx
+                .map(|ctx| ctx.flow_id.as_str())
+                .unwrap_or("unknown");
+            let node_id = exec_ctx.and_then(|ctx| ctx.node_id.as_deref());
+            let attempt = exec_ctx.map(|ctx| ctx.tenant.attempt).unwrap_or(1);
+            let fault_ctx = FaultContext {
+                pack_id: self.pack_id.as_str(),
+                flow_id,
+                node_id,
+                attempt,
+            };
+            if let Err(err) = maybe_fail(FaultPoint::StateWrite, fault_ctx) {
+                return Err(StateError {
+                    code: "internal".into(),
+                    message: err.to_string(),
+                });
+            }
+        }
+        let key = StoreStateKey::from(key);
+        let value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()));
+        store
+            .set_json_if_absent(&tenant_ctx, STATE_PREFIX, &key, &value, None)
+            .map_err(state_error_from_if_absent)
+    }
+}
+
+fn state_ctx_v1_from_v1_1(ctx: StateTenantCtxV1_1) -> StateTenantCtx {
+    StateTenantCtx {
+        env: ctx.env,
+        tenant: ctx.tenant,
+        tenant_id: ctx.tenant_id,
+        team: ctx.team,
+        team_id: ctx.team_id,
+        user: ctx.user,
+        user_id: ctx.user_id,
+        trace_id: ctx.trace_id,
+        i18n_id: ctx.i18n_id,
+        correlation_id: ctx.correlation_id,
+        attributes: ctx.attributes,
+        session_id: ctx.session_id,
+        flow_id: ctx.flow_id,
+        node_id: ctx.node_id,
+        provider_id: ctx.provider_id,
+        deadline_ms: ctx.deadline_ms,
+        attempt: ctx.attempt,
+        idempotency_key: ctx.idempotency_key,
+        impersonation: ctx.impersonation.map(|imp| {
+            greentic_interfaces_wasmtime::state_store_store_v1_0::greentic::interfaces_types::types::Impersonation {
+                actor_id: imp.actor_id,
+                reason: imp.reason,
+            }
+        }),
+    }
+}
+
+fn state_error_v1_1(err: StateError) -> StateErrorV1_1 {
+    StateErrorV1_1 {
+        code: err.code,
+        message: err.message,
+    }
+}
+
+/// `greentic:state/state-store@1.1.0`: the same read/write/delete as 1.0.0
+/// (delegated, so tenant derivation, fault hooks and byte conversion cannot
+/// drift) plus the atomic `write-if-absent`.
+impl StateStoreHostV1_1 for HostState {
+    fn read(
+        &mut self,
+        key: HostStateKey,
+        ctx: Option<StateTenantCtxV1_1>,
+    ) -> Result<Vec<u8>, StateErrorV1_1> {
+        StateStoreHost::read(self, key, ctx.map(state_ctx_v1_from_v1_1)).map_err(state_error_v1_1)
+    }
+
+    fn write(
+        &mut self,
+        key: HostStateKey,
+        bytes: Vec<u8>,
+        ctx: Option<StateTenantCtxV1_1>,
+    ) -> Result<StateOpAckV1_1, StateErrorV1_1> {
+        StateStoreHost::write(self, key, bytes, ctx.map(state_ctx_v1_from_v1_1))
+            .map(|_| StateOpAckV1_1::Ok)
+            .map_err(state_error_v1_1)
+    }
+
+    fn delete(
+        &mut self,
+        key: HostStateKey,
+        ctx: Option<StateTenantCtxV1_1>,
+    ) -> Result<StateOpAckV1_1, StateErrorV1_1> {
+        StateStoreHost::delete(self, key, ctx.map(state_ctx_v1_from_v1_1))
+            .map(|_| StateOpAckV1_1::Ok)
+            .map_err(state_error_v1_1)
+    }
+
+    fn write_if_absent(
+        &mut self,
+        key: HostStateKey,
+        bytes: Vec<u8>,
+        ctx: Option<StateTenantCtxV1_1>,
+    ) -> Result<bool, StateErrorV1_1> {
+        self.state_write_if_absent(key, bytes, ctx.map(state_ctx_v1_from_v1_1))
+            .map_err(state_error_v1_1)
+    }
+}
+
 impl TelemetryLoggerHost for HostState {
     fn log(
         &mut self,
@@ -1760,7 +1919,12 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             runner_host_http: Some(|state: &mut ComponentState| state.host_mut()),
             runner_host_kv: Some(|state: &mut ComponentState| state.host_mut()),
             telemetry_logger: Some(|state: &mut ComponentState| state.host_mut()),
-            state_store: allow_state_store.then_some(|state: &mut ComponentState| state.host_mut()),
+            // The v1.1 helper registers BOTH `state-store@1.1.0` and `@1.0.0` from
+            // one host impl, so the legacy field stays `None` (it is ignored when
+            // v1.1 is set and would otherwise read as a double registration).
+            state_store_v1_1: allow_state_store
+                .then_some(|state: &mut ComponentState| state.host_mut()),
+            state_store: None,
             secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             secrets_store: None,
             runtime_config: Some(|state: &mut ComponentState| state.host_mut()),
