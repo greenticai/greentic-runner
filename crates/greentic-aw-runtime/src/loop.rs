@@ -750,6 +750,13 @@ pub async fn run_step(
                         // Surface the failure so audit/stream observers see a matching
                         // outcome instead of a dangling call.
                         observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
+                        if let Some(t) = &run_trace {
+                            t.append(
+                                agent_id,
+                                "tool",
+                                &crate::run_trace::summarise_result(&call.tool_name, &err_obs),
+                            );
+                        }
                         trail.push(AgentStep::ToolCall {
                             name: call.tool_name.clone(),
                             call_id: call.call_id.clone(),
@@ -764,6 +771,13 @@ pub async fn run_step(
                 let duration_ms = t0.elapsed().as_millis() as u64;
 
                 observer.on_tool_result(&call.tool_name, &call.call_id, &result);
+                if let Some(t) = &run_trace {
+                    t.append(
+                        agent_id,
+                        "tool",
+                        &crate::run_trace::summarise_result(&call.tool_name, &result),
+                    );
+                }
 
                 // Record successful result in ledger (best-effort).
                 if let Err(e) = runtime
@@ -886,6 +900,12 @@ pub async fn run_step(
                     warn!(error = %e, "long-term ingest skipped: tenant conversion failed");
                 }
             }
+        }
+
+        if !reply.is_empty()
+            && let Some(t) = &run_trace
+        {
+            t.append(agent_id, "reply", &reply);
         }
 
         runtime.telemetry.record_step(&StepTelemetryCtx {
@@ -2100,5 +2120,32 @@ mod tests {
             .unwrap();
         let prompts = llm.seen_system_prompts.lock().unwrap();
         assert_eq!(prompts[0], "sys");
+    }
+
+    #[tokio::test]
+    async fn the_final_reply_is_recorded_on_the_trace() {
+        let llm = one_reply("all done");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm, &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new(trace.clone()),
+            runtime.step(
+                tc.clone(),
+                "sess-rec",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let events = trace.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "a");
+        assert_eq!(events[0].kind, "reply");
+        assert_eq!(events[0].summary, "all done");
     }
 }

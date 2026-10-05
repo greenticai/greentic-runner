@@ -168,6 +168,20 @@ pub fn augment_system_prompt(base: &str, view: Option<&str>) -> String {
     }
 }
 
+/// One line describing a tool outcome. Records the tool and a truncated result;
+/// never the arguments, which may carry what the user typed or a credential.
+pub fn summarise_result(tool: &str, result: &serde_json::Value) -> String {
+    let cut = |text: String| -> String { text.chars().take(MAX_SUMMARY_CHARS).collect() };
+    if let Some(err) = result.get("error") {
+        let detail = err
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
+        return format!("{tool} failed: {}", cut(detail));
+    }
+    format!("{tool} -> {}", cut(result.to_string()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -297,5 +311,20 @@ mod tests {
         assert_eq!(augment_system_prompt("base", None), "base");
         let out = augment_system_prompt("base", Some("<run_context>\n</run_context>"));
         assert!(out.starts_with("base\n\n<run_context>"));
+    }
+
+    #[test]
+    fn a_tool_error_is_summarised_as_a_failure() {
+        let s = summarise_result("flow:refund", &serde_json::json!({"error": "no card"}));
+        assert!(s.starts_with("flow:refund failed"), "{s}");
+        assert!(s.contains("no card"));
+    }
+
+    #[test]
+    fn a_tool_result_is_summarised_with_its_name_and_never_exceeds_the_cap() {
+        let big = serde_json::json!({"rows": "x".repeat(10_000)});
+        let s = summarise_result("sql/query", &big);
+        assert!(s.starts_with("sql/query ->"), "{s}");
+        assert!(s.chars().count() <= MAX_SUMMARY_CHARS + 64);
     }
 }
