@@ -38,6 +38,7 @@ pub mod llm_extension;
 #[cfg(feature = "greentic-llm-backend")]
 pub mod llm_greentic;
 pub mod llm_openai;
+mod lock_keepalive;
 pub mod long_term;
 pub mod r#loop;
 pub mod manifest_provider;
