@@ -578,10 +578,16 @@ pub(crate) async fn dispatch_flow_tool_interactive(
             serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") }),
         );
     };
-    match cat
-        .dispatch_interactive(flow_ref, &call.args.to_string())
-        .await
-    {
+    // A nested flow is `.await`ed here, so it inherits the run context; it
+    // runs under what the caller's policy grants this binding (shared
+    // context, Phase A2). Nothing changes when no context is open.
+    let args = call.args.to_string();
+    let outcome = crate::run_trace::under_binding(
+        &call.extension_id,
+        cat.dispatch_interactive(flow_ref, &args),
+    )
+    .await;
+    match outcome {
         crate::flow_source::FlowInvokeOutcome::Completed(value) => FlowToolDispatch::Value(value),
         crate::flow_source::FlowInvokeOutcome::Waiting {
             snapshot,
@@ -715,7 +721,11 @@ pub async fn dispatch_tool_call_in_conversation(
 
     if let Some(flow_ref) = call.extension_id.strip_prefix("flow:") {
         let value = match flows.as_deref() {
-            Some(cat) => cat.dispatch(flow_ref, &call.args.to_string()).await,
+            Some(cat) => {
+                let args = call.args.to_string();
+                crate::run_trace::under_binding(&call.extension_id, cat.dispatch(flow_ref, &args))
+                    .await
+            }
             None => {
                 tracing::warn!(flow = %flow_ref, "flow call has no catalog wired; returning error value");
                 serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") })
