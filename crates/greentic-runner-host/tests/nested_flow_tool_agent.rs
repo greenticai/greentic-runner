@@ -243,6 +243,11 @@ struct Recorder {
     sessions: Mutex<Vec<String>>,
     callers: Mutex<Vec<Option<Value>>>,
     saw_run_context: Mutex<Vec<bool>>,
+    /// The FIRST step calls its own flow tool this many times, one after the
+    /// other (a wide flow); every later step just replies.
+    fan_out: usize,
+    fanned: std::sync::atomic::AtomicBool,
+    fan_out_results: Mutex<Vec<String>>,
 }
 
 impl Recorder {
@@ -280,6 +285,22 @@ impl AgentNodeHandler for Recorder {
             .push(greentic_aw_runtime::RunContext::current().is_some());
         if self.fail {
             anyhow::bail!("stub agent failed on purpose");
+        }
+        if self.fan_out > 0
+            && let Some(pack) = &self.recurse
+            && !self.fanned.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            for _ in 0..self.fan_out {
+                let inner = pack.run_flow_for_tool("agent.flow", json!({})).await;
+                self.fan_out_results
+                    .lock()
+                    .unwrap()
+                    .push(result_text(&inner));
+            }
+            return Ok(self.reply.clone());
+        }
+        if self.fan_out > 0 {
+            return Ok(self.reply.clone());
         }
         if let Some(pack) = &self.recurse {
             let inner = pack
@@ -716,6 +737,41 @@ fn nesting_stops_at_the_depth_limit() -> Result<()> {
     let text = result_text(&out);
     assert!(text.contains("the limit is 3"), "{text}");
     assert_eq!(recorder.sessions().len(), 3, "three nested levels ran");
+    Ok(())
+}
+
+/// The depth cap bounds how deep, not how wide: one step fanning out to 16
+/// flow-tool calls is 17 nested agent steps under one outermost call, and the
+/// 17th is refused while the first 16 run.
+#[test]
+fn a_wide_fan_out_is_refused_at_the_seventeenth_nested_agent_step() -> Result<()> {
+    let h = harness()?;
+    let recorder = Arc::new(Recorder {
+        reply: json!({ "reply": "leaf" }),
+        recurse: Some(Arc::clone(&h.pack)),
+        fan_out: 16,
+        ..Recorder::default()
+    });
+    let handler: Arc<dyn AgentNodeHandler> = recorder.clone();
+    register(&h.pack, &handler);
+
+    let out = RUNTIME.block_on(h.pack.run_flow_for_tool("agent.flow", json!({})));
+
+    assert!(
+        result_text(&out).contains("leaf"),
+        "the outer step ran: {out:?}"
+    );
+    assert_eq!(
+        recorder.sessions().len(),
+        16,
+        "steps 1..=16 reached the agent"
+    );
+    let results = recorder.fan_out_results.lock().unwrap().clone();
+    assert_eq!(results.len(), 16);
+    for ok in &results[..15] {
+        assert!(ok.contains("leaf") && !ok.contains("refused"), "{ok}");
+    }
+    assert!(results[15].contains("the limit is 16"), "{}", results[15]);
     Ok(())
 }
 

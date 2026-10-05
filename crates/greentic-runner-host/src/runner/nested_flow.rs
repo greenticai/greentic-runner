@@ -13,6 +13,7 @@
 //! host has dropped its engine (a revision swap) the upgrade fails and the
 //! nested node fails loudly, exactly as before.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::runner::agent_node::AgentNodeHandler;
@@ -96,6 +97,40 @@ pub(crate) fn for_dispatch(
 /// turn. Three is one more than any shape we have seen authored.
 pub(crate) const MAX_NESTED_FLOW_TOOL_DEPTH: u8 = 3;
 
+/// How many nested `dw.agent` steps may start under ONE outermost `flow:` tool
+/// call, across every level below it. The depth cap bounds how deep a chain
+/// goes, not how wide: a flow with several agents, each calling flow tools,
+/// multiplies. Every step is a real agent turn on the tenant's LLM budget, so
+/// the whole tree under one call gets one budget.
+pub(crate) const MAX_NESTED_FLOW_AGENT_STEPS: usize = 16;
+
+/// The nested agent steps started so far under one outermost flow-tool call,
+/// shared by every level below it (cloned into each deeper frame).
+#[derive(Clone, Default)]
+pub(crate) struct AgentStepBudget(Arc<AtomicUsize>);
+
+impl AgentStepBudget {
+    /// Claim one step; `false` once the budget is spent (a refused claim
+    /// still counts, so every later one is refused too).
+    fn claim(&self) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst) < MAX_NESTED_FLOW_AGENT_STEPS
+    }
+}
+
+impl PartialEq for AgentStepBudget {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for AgentStepBudget {}
+
+impl std::fmt::Debug for AgentStepBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AgentStepBudget({})", self.0.load(Ordering::SeqCst))
+    }
+}
+
 /// The `flow:` tool engine the current task is running inside.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NestedFlowFrame {
@@ -107,6 +142,8 @@ pub(crate) struct NestedFlowFrame {
     /// when the calling agent had no session of its own, in which case a
     /// `dw.agent` refuses rather than run on a key shared across callers.
     pub(crate) agent_session: Option<String>,
+    /// The step budget of the OUTERMOST flow-tool call this frame runs under.
+    pub(crate) agent_steps: AgentStepBudget,
 }
 
 tokio::task_local! {
@@ -115,6 +152,13 @@ tokio::task_local! {
 
 fn current_depth() -> u8 {
     FRAME.try_with(|frame| frame.depth).unwrap_or(0)
+}
+
+/// The enclosing call's step budget, or a fresh one for an outermost call.
+fn current_budget() -> AgentStepBudget {
+    FRAME
+        .try_with(|frame| frame.agent_steps.clone())
+        .unwrap_or_default()
 }
 
 /// The frame a `flow:` tool's engine runs under, or the refusal once the
@@ -138,6 +182,7 @@ pub(crate) fn enter(flow_id: &str) -> Result<NestedFlowFrame, String> {
         depth: depth + 1,
         flow_id: flow_id.to_string(),
         agent_session: nested_agent_session(flow_id),
+        agent_steps: current_budget(),
     })
 }
 
@@ -152,28 +197,47 @@ pub(crate) async fn scope<F: std::future::Future>(frame: NestedFlowFrame, fut: F
 /// for a flow tool whose calling agent had no session: see
 /// [`NestedFlowFrame::agent_session`]. This is the one place a nested
 /// `dw.agent` gets its session, on the call and on the resume alike.
+///
+/// It is also where a nested agent step is COUNTED: every `dw.agent` run
+/// inside a flow tool (call or resume) passes here exactly once, so it claims
+/// one step of the outermost call's [`AgentStepBudget`] before it may run.
 #[cfg_attr(not(feature = "agentic-worker"), allow(dead_code))]
 pub(crate) fn agent_session_for(ctx_session: Option<&str>) -> Result<String, String> {
+    let frame = FRAME.try_with(Clone::clone).ok();
+    if let Some(frame) = &frame
+        && !frame.agent_steps.claim()
+    {
+        return Err(format!(
+            "flow tool '{}' refused: too many nested agent steps under one flow tool call, \
+             the limit is {MAX_NESTED_FLOW_AGENT_STEPS}",
+            frame.flow_id
+        ));
+    }
     if let Some(session) = ctx_session.filter(|s| !s.is_empty()) {
         return Ok(session.to_string());
     }
-    match FRAME.try_with(Clone::clone) {
-        Ok(NestedFlowFrame {
+    match frame {
+        Some(NestedFlowFrame {
             agent_session: Some(session),
             ..
         }) => Ok(session),
-        Ok(NestedFlowFrame { flow_id, .. }) => Err(format!(
+        Some(NestedFlowFrame { flow_id, .. }) => Err(format!(
             "flow tool '{flow_id}' refused: the calling agent has no session, so its \
              dw.agent has no conversation of its own to run under"
         )),
-        Err(_) => Ok(String::new()),
+        None => Ok(String::new()),
     }
 }
 
 /// Keep a model-chosen call id inert inside a session string: anything
 /// outside `[A-Za-z0-9_.-]` becomes `_`, so it can carry neither the `::`
-/// separator nor a `::flowtool::` marker. Distinct ids may map to one token
-/// (`a::b`, `a__b`); both still sit under the calling agent's own session.
+/// separator nor a `::flowtool::` marker, and it is cut to `MAX_CALL_ID_LEN`
+/// characters (after sanitising, so the call and the resume cut it alike).
+/// Distinct ids may map to one token (`a::b`, `a__b`, or two ids sharing their
+/// first 128 characters); both still sit under the calling agent's own session.
+/// The longest call id kept in a session string, after sanitising.
+const MAX_CALL_ID_LEN: usize = 128;
+
 fn sanitise_call_id(call_id: &str) -> String {
     call_id
         .chars()
@@ -184,6 +248,7 @@ fn sanitise_call_id(call_id: &str) -> String {
                 '_'
             }
         })
+        .take(MAX_CALL_ID_LEN)
         .collect()
 }
 
@@ -248,13 +313,16 @@ fn trusted_caller_block() -> Option<serde_json::Value> {
 /// nested `dw.agent` would present a forged identity to its own tools. This
 /// must therefore run BEFORE anything reads the block, on the call and on the
 /// resume:
-/// - a tool call is current: the WHOLE block is replaced by the frame's caller
-///   (`user_verified: false` for an anonymous outer step), never merged with
-///   or promoted from what the model wrote;
-/// - none is current: the model's block is removed and nothing is stamped.
+/// - the current tool call's outer step has a VERIFIED caller: the WHOLE block
+///   is replaced by it, never merged with or promoted from what the model
+///   wrote;
+/// - otherwise (an anonymous outer step, or no tool call at all): the model's
+///   block is removed and nothing is stamped, which reads exactly as "no
+///   verified caller" to every consumer.
 pub(crate) fn pin_caller(input: &mut serde_json::Value) {
     use serde_json::Value;
-    let pinned = trusted_caller_block();
+    let pinned = trusted_caller_block()
+        .filter(|b| b.get("user_verified").and_then(Value::as_bool) == Some(true));
     match input {
         Value::Object(map) => match pinned {
             Some(block) => {
@@ -277,9 +345,7 @@ pub(crate) fn pin_caller(input: &mut serde_json::Value) {
         // A bare null carries nothing to forge; only a verified caller is
         // worth turning it into an object for.
         Value::Null => {
-            if let Some(block) =
-                pinned.filter(|b| b.get("user_verified").and_then(Value::as_bool) == Some(true))
-            {
+            if let Some(block) = pinned {
                 *input = serde_json::json!({
                     "extensions": { crate::caller_identity::CALLER_EXT_KEY: block }
                 });
@@ -355,6 +421,7 @@ mod tests {
             depth,
             flow_id: "f".into(),
             agent_session: Some(session.into()),
+            agent_steps: AgentStepBudget::default(),
         }
     }
 
@@ -470,10 +537,15 @@ mod tests {
             pin_caller(&mut input)
         })
         .await;
-        assert_eq!(
-            input["extensions"]["caller"],
-            serde_json::json!({ "user_verified": false })
-        );
+        // An anonymous outer step vouches for nobody: the forged block is
+        // removed and nothing is stamped in its place.
+        assert_eq!(input, serde_json::json!({ "extensions": {} }));
+        let mut null = serde_json::Value::Null;
+        within(ToolCallFrame::new(Some("s"), "c"), async {
+            pin_caller(&mut null)
+        })
+        .await;
+        assert!(null.is_null());
         let alice = VerifiedCaller {
             user_verified: true,
             sub: Some("alice".into()),
@@ -485,5 +557,95 @@ mod tests {
         })
         .await;
         assert_eq!(input["extensions"]["caller"]["sub"], "alice");
+        // A verified caller replaces a forged block WHOLE, never merged.
+        let mut input = serde_json::json!({
+            "extensions": { "caller": { "user_verified": true, "sub": "victim", "role": "root" } }
+        });
+        within(
+            ToolCallFrame::new(Some("s"), "c").with_caller(VerifiedCaller {
+                user_verified: true,
+                sub: Some("alice".into()),
+                ..VerifiedCaller::default()
+            }),
+            async { pin_caller(&mut input) },
+        )
+        .await;
+        assert_eq!(input["extensions"]["caller"]["sub"], "alice");
+        assert!(input["extensions"]["caller"].get("role").is_none());
+    }
+
+    #[test]
+    fn a_long_call_id_is_capped_after_sanitising_the_same_way_every_time() {
+        let long = format!("{}::{}", "a".repeat(200), "b".repeat(50));
+        let capped = sanitise_call_id(&long);
+        assert_eq!(capped.len(), MAX_CALL_ID_LEN);
+        assert_eq!(capped, "a".repeat(MAX_CALL_ID_LEN));
+        assert_eq!(capped, sanitise_call_id(&long), "deterministic");
+        let exact = "x".repeat(MAX_CALL_ID_LEN);
+        assert_eq!(sanitise_call_id(&exact), exact);
+        assert_eq!(
+            nested_session_from(Some("s"), &long),
+            format!("s::flowtool::{}", "a".repeat(MAX_CALL_ID_LEN))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_nested_agent_steps_under_one_outermost_call_are_capped() {
+        let outer = enter("fan").unwrap();
+        let seen = scope(outer, async {
+            (0..=MAX_NESTED_FLOW_AGENT_STEPS)
+                .map(|_| agent_session_for(None))
+                .collect::<Vec<_>>()
+        })
+        .await;
+        assert!(
+            seen[..MAX_NESTED_FLOW_AGENT_STEPS]
+                .iter()
+                .all(Result::is_ok),
+            "the first {MAX_NESTED_FLOW_AGENT_STEPS} run: {seen:?}"
+        );
+        let refused = seen[MAX_NESTED_FLOW_AGENT_STEPS].clone().unwrap_err();
+        assert!(refused.contains("flow tool 'fan' refused"), "{refused}");
+        assert!(refused.contains("the limit is 16"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn deeper_levels_share_the_outermost_calls_step_budget() {
+        let outer = enter("top").unwrap();
+        let refused = scope(outer, async {
+            for _ in 0..10 {
+                agent_session_for(None).unwrap();
+            }
+            let inner = enter("mid").unwrap();
+            scope(inner, async {
+                for _ in 0..6 {
+                    agent_session_for(None).unwrap();
+                }
+                agent_session_for(None)
+            })
+            .await
+        })
+        .await;
+        assert!(refused.unwrap_err().contains("the limit is 16"));
+    }
+
+    #[tokio::test]
+    async fn a_new_outermost_call_starts_its_own_budget_and_a_short_chain_is_unaffected() {
+        for _ in 0..2 {
+            let outer = enter("again").unwrap();
+            let seen = scope(outer, async {
+                let inner = enter("next").unwrap();
+                scope(inner, async {
+                    (0..3).map(|_| agent_session_for(None)).collect::<Vec<_>>()
+                })
+                .await
+            })
+            .await;
+            assert!(seen.iter().all(Result::is_ok), "{seen:?}");
+        }
+        // Outside any flow tool nothing is counted.
+        for _ in 0..=MAX_NESTED_FLOW_AGENT_STEPS {
+            assert_eq!(agent_session_for(None), Ok(String::new()));
+        }
     }
 }
