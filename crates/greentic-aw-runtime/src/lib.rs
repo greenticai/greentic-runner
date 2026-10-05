@@ -51,6 +51,7 @@ pub mod memory;
 pub mod playbook_source;
 pub mod run_trace;
 pub mod scoped_secrets;
+pub mod share_policy;
 pub mod short_term;
 pub mod sorla_source;
 pub mod state;
@@ -114,6 +115,7 @@ pub use playbook_source::{
     PlaybookTurnRequest, PlaybookTurnResult,
 };
 pub use run_trace::{RunContext, RunTrace};
+pub use share_policy::{BindingModes, ShareMode, SharePolicy};
 pub use sorla_source::{
     SorlaToolCatalog, SorlaToolEntry, SorlaToolSource, SorxInvoker, SorxOperation,
 };
