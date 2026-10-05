@@ -11,6 +11,7 @@
 //! data, not instructions. It is never durable and never sent to a remote
 //! party (`a2a:`).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Most events kept; the oldest are dropped first.
@@ -25,7 +26,50 @@ pub const MAX_VIEW_CHARS: usize = 2000;
 pub struct TraceEvent {
     pub actor: String,
     pub kind: String,
+    /// The full (truncated, sanitised) summary.
     pub summary: String,
+    /// The step that recorded a tool outcome; only it sees `summary`.
+    pub owner: Option<StepId>,
+    /// What every other step sees instead: `<tool> ok|failed`.
+    pub shared_summary: Option<String>,
+}
+
+static NEXT_STEP: AtomicU64 = AtomicU64::new(1);
+
+/// Identifies one `run_step` invocation inside a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StepId(u64);
+
+impl StepId {
+    /// A process-unique id.
+    pub fn fresh() -> Self {
+        Self(NEXT_STEP.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Whether a tool call succeeded, as recorded across an agent boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Ok,
+    Failed,
+}
+
+impl ToolOutcome {
+    /// `Failed` when the result carries a non-null `"error"`.
+    pub fn of(result: &serde_json::Value) -> Self {
+        if result.get("error").is_some_and(|e| !e.is_null()) {
+            Self::Failed
+        } else {
+            Self::Ok
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// The shared log. Cheap to clone behind an [`Arc`].
@@ -77,20 +121,52 @@ impl RunTrace {
         self.events.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record one event. Actor and kind are sanitised too: a nested agent id is
-    /// author-controlled text.
-    pub fn append(&self, actor: &str, kind: &str, summary: &str) {
-        let event = TraceEvent {
-            actor: sanitise(actor, 64),
-            kind: sanitise(kind, 32),
-            summary: sanitise(summary, MAX_SUMMARY_CHARS),
-        };
+    fn push(&self, event: TraceEvent) {
         let mut events = self.lock();
         events.push(event);
         if events.len() > MAX_EVENTS {
             let excess = events.len() - MAX_EVENTS;
             events.drain(..excess);
         }
+    }
+
+    /// Record an event every agent in the run may read in full (a guarded
+    /// reply). Never use it for a raw tool result: see
+    /// [`RunTrace::append_tool_outcome`]. Actor and kind are sanitised too: a
+    /// nested agent id is author-controlled text.
+    pub fn append(&self, actor: &str, kind: &str, summary: &str) {
+        self.push(TraceEvent {
+            actor: sanitise(actor, 64),
+            kind: sanitise(kind, 32),
+            summary: sanitise(summary, MAX_SUMMARY_CHARS),
+            owner: None,
+            shared_summary: None,
+        });
+    }
+
+    /// Record a tool outcome. `detail` (see [`summarise_result`]) is shown only
+    /// to `owner`, the step that called the tool and already holds the result
+    /// in its own history. Every other agent sees `<tool> ok|failed`: a raw
+    /// result has passed no outbound guardrail, so it must not cross an agent
+    /// boundary (spec 4.1).
+    pub fn append_tool_outcome(
+        &self,
+        owner: StepId,
+        actor: &str,
+        tool: &str,
+        outcome: ToolOutcome,
+        detail: &str,
+    ) {
+        self.push(TraceEvent {
+            actor: sanitise(actor, 64),
+            kind: sanitise("tool", 32),
+            summary: sanitise(detail, MAX_SUMMARY_CHARS),
+            owner: Some(owner),
+            shared_summary: Some(sanitise(
+                &format!("{tool} {}", outcome.word()),
+                MAX_SUMMARY_CHARS,
+            )),
+        });
     }
 
     pub fn len(&self) -> usize {
@@ -105,9 +181,14 @@ impl RunTrace {
         self.lock().clone()
     }
 
-    /// A delimited block of the newest events that fit the view budget, oldest
-    /// first, or `None` when nothing was recorded.
+    /// The view an outsider gets: [`RunTrace::render_view_for`] with no viewer.
     pub fn render_view(&self) -> Option<String> {
+        self.render_view_for(None)
+    }
+
+    /// A delimited block of the newest events that fit the view budget, oldest
+    /// first, as `viewer` may see them, or `None` when nothing was recorded.
+    pub fn render_view_for(&self, viewer: Option<StepId>) -> Option<String> {
         let events = self.lock();
         if events.is_empty() {
             return None;
@@ -115,7 +196,11 @@ impl RunTrace {
         let mut lines: Vec<String> = Vec::new();
         let mut used = 0usize;
         for e in events.iter().rev() {
-            let line = format!("- [{}/{}] {}", e.actor, e.kind, e.summary);
+            let text = match (&e.owner, &e.shared_summary) {
+                (Some(owner), Some(shared)) if Some(*owner) != viewer => shared.as_str(),
+                _ => e.summary.as_str(),
+            };
+            let line = format!("- [{}/{}] {}", e.actor, e.kind, text);
             used += line.chars().count() + 1;
             if used > MAX_VIEW_CHARS && !lines.is_empty() {
                 break;
@@ -598,5 +683,67 @@ mod tests {
             assert!(after.caller_policy().is_some());
         })
         .await;
+    }
+
+    #[test]
+    fn a_tool_outcome_is_detailed_only_for_its_owner() {
+        let t = RunTrace::new();
+        let me = StepId::fresh();
+        let other = StepId::fresh();
+        t.append_tool_outcome(
+            me,
+            "inner",
+            "lookup",
+            ToolOutcome::Ok,
+            "lookup -> SECRET-42",
+        );
+        t.append("inner", "reply", "found it");
+        let mine = t.render_view_for(Some(me)).expect("view");
+        assert!(mine.contains("SECRET-42"), "{mine}");
+        for view in [
+            t.render_view_for(Some(other)),
+            t.render_view_for(None),
+            t.render_view(),
+        ] {
+            let v = view.expect("view");
+            assert!(!v.contains("SECRET-42"), "{v}");
+            assert!(v.contains("lookup ok"), "{v}");
+            assert!(
+                v.contains("found it"),
+                "the reply crosses the boundary: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_tool_says_so_without_its_error_text() {
+        let t = RunTrace::new();
+        t.append_tool_outcome(
+            StepId::fresh(),
+            "inner",
+            "flow:x",
+            ToolOutcome::Failed,
+            "flow:x failed: db password wrong",
+        );
+        let v = t.render_view().expect("view");
+        assert!(v.contains("flow:x failed"), "{v}");
+        assert!(!v.contains("password"), "{v}");
+    }
+
+    #[test]
+    fn outcome_reads_the_error_key() {
+        assert_eq!(
+            ToolOutcome::of(&serde_json::json!({"ok": 1})),
+            ToolOutcome::Ok
+        );
+        assert_eq!(
+            ToolOutcome::of(&serde_json::json!({"error": null})),
+            ToolOutcome::Ok
+        );
+        assert_eq!(
+            ToolOutcome::of(&serde_json::json!({"error": "x"})),
+            ToolOutcome::Failed
+        );
+        assert_ne!(StepId::fresh(), StepId::fresh());
     }
 }

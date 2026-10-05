@@ -118,6 +118,9 @@ async fn run_step_scoped(
         .as_ref()
         .filter(|c| c.mode() == crate::share_policy::ShareMode::ReadWrite)
         .map(|c| c.trace().clone());
+    // Who this step is, for the owned tool outcomes it records and the view it
+    // reads: a raw result is shown only to the step that called the tool.
+    let step_id = crate::run_trace::StepId::fresh();
 
     // --- Cost budget gate (spec Decision 14) ---
     if let Some(cap) = config.limits.daily_token_cap_per_tenant {
@@ -487,7 +490,10 @@ async fn run_step_scoped(
         let request = LlmRequest {
             system_prompt: crate::run_trace::augment_system_prompt(
                 &system_prompt,
-                run_trace.as_ref().and_then(|t| t.render_view()).as_deref(),
+                run_trace
+                    .as_ref()
+                    .and_then(|t| t.render_view_for(Some(step_id)))
+                    .as_deref(),
             ),
             history: state.messages.clone(),
             tools: tools_schema,
@@ -797,9 +803,11 @@ async fn run_step_scoped(
                         // outcome instead of a dangling call.
                         observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
                         if let Some(t) = &record_to {
-                            t.append(
+                            t.append_tool_outcome(
+                                step_id,
                                 agent_id,
-                                "tool",
+                                &call.tool_name,
+                                crate::run_trace::ToolOutcome::Failed,
                                 &crate::run_trace::summarise_result(&call.tool_name, &err_obs),
                             );
                         }
@@ -818,9 +826,11 @@ async fn run_step_scoped(
 
                 observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                 if let Some(t) = &record_to {
-                    t.append(
+                    t.append_tool_outcome(
+                        step_id,
                         agent_id,
-                        "tool",
+                        &call.tool_name,
+                        crate::run_trace::ToolOutcome::of(&result),
                         &crate::run_trace::summarise_result(&call.tool_name, &result),
                     );
                 }
@@ -2118,6 +2128,33 @@ mod tests {
             tokens_in: 1,
             tokens_out: 1,
         })]))
+    }
+
+    /// The reply recorded on the run trace must be the GUARDED one, so the
+    /// record has to come after the outbound chain. A behavioural test needs a
+    /// real guardrail WASM (`tests/guardrail_e2e.rs`, skipped when it is not
+    /// built); this pins the ordering in the source so the pin holds without it.
+    #[test]
+    fn the_reply_is_recorded_after_the_outbound_guardrail_chain() {
+        let src = include_str!("loop.rs");
+        let prod = &src[..src
+            .find("#[cfg(all(test, feature = \"test-mock\"))]")
+            .unwrap()];
+        let outbound = prod
+            .find("crate::guardrail::GuardrailDirection::Outbound,")
+            .expect("outbound chain call");
+        let record = prod
+            .find("t.append(agent_id, \"reply\", &reply)")
+            .expect("reply record");
+        assert!(
+            outbound < record,
+            "the reply must be recorded after the outbound chain"
+        );
+        assert_eq!(
+            prod.matches("t.append(agent_id, \"reply\"").count(),
+            1,
+            "exactly one reply record"
+        );
     }
 
     #[tokio::test]

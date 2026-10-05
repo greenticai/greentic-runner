@@ -114,7 +114,7 @@ pub use playbook_source::{
     PlaybookSource, PlaybookToolCatalog, PlaybookToolEntry, PlaybookToolSource, PlaybookTurnFn,
     PlaybookTurnRequest, PlaybookTurnResult,
 };
-pub use run_trace::{RunContext, RunTrace};
+pub use run_trace::{RunContext, RunTrace, StepId, ToolOutcome};
 pub use share_policy::{BindingModes, ShareMode, SharePolicy};
 pub use sorla_source::{
     SorlaToolCatalog, SorlaToolEntry, SorlaToolSource, SorxInvoker, SorxOperation,
