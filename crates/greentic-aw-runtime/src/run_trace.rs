@@ -172,7 +172,7 @@ pub fn augment_system_prompt(base: &str, view: Option<&str>) -> String {
 /// never the arguments, which may carry what the user typed or a credential.
 pub fn summarise_result(tool: &str, result: &serde_json::Value) -> String {
     let cut = |text: String| -> String { text.chars().take(MAX_SUMMARY_CHARS).collect() };
-    if let Some(err) = result.get("error") {
+    if let Some(err) = result.get("error").filter(|e| !e.is_null()) {
         let detail = err
             .as_str()
             .map(str::to_string)
@@ -318,6 +318,12 @@ mod tests {
         let s = summarise_result("flow:refund", &serde_json::json!({"error": "no card"}));
         assert!(s.starts_with("flow:refund failed"), "{s}");
         assert!(s.contains("no card"));
+    }
+
+    #[test]
+    fn a_null_error_field_is_not_a_failure() {
+        let s = summarise_result("t", &serde_json::json!({"error": null, "rows": [1]}));
+        assert!(s.starts_with("t ->"), "{s}");
     }
 
     #[test]
