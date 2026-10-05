@@ -1987,6 +1987,12 @@ mod aw {
             }
         };
 
+        // Shared context (Phase A2): per-binding sharing modes from the packs.
+        // Computed here because `merged_agents` is moved just below.
+        let share_policy = crate::runner::run_context_policy::share_policy_from_packs(
+            &packs,
+            merged_agents.keys().map(String::as_str),
+        );
         let agent_count = merged_agents.len();
         let overlay = ManifestToolOverlayProvider::new(
             HostConfigProvider::new(merged_agents),
@@ -2093,7 +2099,8 @@ mod aw {
         .with_flow_source(flows)
         .with_sorla_source(sorla)
         .with_a2a_source(a2a)
-        .with_playbook_source(playbooks);
+        .with_playbook_source(playbooks)
+        .with_share_policy(share_policy);
 
         // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
         // `dw.agent` workers ground on the ingested corpus exactly as the
@@ -4701,6 +4708,63 @@ mod aw {
             assert!(
                 !build(without.path()).await.has_a2a_source(),
                 "control: no sidecar, no source"
+            );
+        }
+
+        /// Wiring guard: the in-process runtime carries the pack's sharing
+        /// policy. A dropped `.with_share_policy(..)` would only show as nested
+        /// calls that silently share nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn the_in_process_runtime_wires_the_pack_carried_share_policy() {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+            }
+
+            async fn build(pack_dir: &std::path::Path) -> Arc<AgentRuntime> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                let secrets: crate::secrets::DynSecretsManager =
+                    Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+                let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(pack_dir));
+                super::build_runtime_with_stores(
+                    agents,
+                    "t1".to_string(),
+                    secrets,
+                    None,
+                    vec![pack],
+                    Arc::new(MockAgentStateStore::new()),
+                    Arc::new(MockTokenMeter::new(0)),
+                    Arc::new(NoopToolLedger),
+                    Some("worker-a".to_string()),
+                    None,
+                )
+                .await
+                .expect("runtime should build")
+            }
+
+            let with_sidecar = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(with_sidecar.path().join("assets")).unwrap();
+            std::fs::write(
+                with_sidecar.path().join("assets/run-context.json"),
+                br#"{"greeter":{"flow:refund":"read"}}"#,
+            )
+            .unwrap();
+            let rt = build(with_sidecar.path()).await;
+            assert!(
+                rt.share_policy()
+                    .is_some_and(|p| p.has_sharing_binding("greeter"))
+            );
+
+            let without = tempfile::tempdir().unwrap();
+            assert!(
+                build(without.path()).await.share_policy().is_none(),
+                "control"
             );
         }
 
