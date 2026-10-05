@@ -456,5 +456,10 @@ mod tests {
             "Follow the refund policy.",
             "default none"
         );
+        assert_eq!(
+            inner_prompt(Some(greentic_aw_runtime::ShareMode::None)).await,
+            "Follow the refund policy.",
+            "an explicit none binding"
+        );
     }
 }

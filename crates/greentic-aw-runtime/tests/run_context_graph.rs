@@ -1,5 +1,6 @@
-//! Agent-graph turns inherit an OPEN run context (Phase A2 opens none for a
-//! graph itself): the executor awaits each agent turn inline, so the second
+//! Agent-graph turns inherit an OPEN run context (no production path opens a
+//! context around a graph in Phase A2: the gate lives in
+//! `RuntimeAgentNodeHandler` only): the executor awaits each agent turn inline, so the second
 //! agent sees the first one's reply. With no context, nothing changes.
 
 #![cfg(feature = "test-mock")]

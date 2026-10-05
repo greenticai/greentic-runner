@@ -251,7 +251,8 @@ pub struct AgentRuntime {
     /// `config.memory.short_term`.
     pub(crate) short_term_memory: Option<Arc<dyn crate::memory::MemoryProvider>>,
     /// Per-binding sharing modes from the pack's `assets/run-context.json`
-    /// (shared context, Phase A2). `None` means every binding is `none`.
+    /// (shared context, Phase A2). `None` means every NESTED binding is `none`
+    /// (a top-level turn under an open context still injects and records).
     pub(crate) share_policy: Option<Arc<crate::share_policy::SharePolicy>>,
 }
 

@@ -56,6 +56,9 @@ pub(crate) fn share_policy_from_packs<'a>(
 /// opening. Opt-out, like `GREENTIC_AW_FLOW_TOOLS`: the switch ON is the
 /// sidecar's presence, because no environment variable reaches a k8s or Cloud
 /// Run workload from the designer.
+///
+/// Any value other than `0`/`false`/`off`/`no` (trimmed, case-insensitive) means
+/// ON, the empty string and garbage included.
 pub(crate) fn run_context_enabled() -> bool {
     let value = std::env::var("GREENTIC_AW_RUN_CONTEXT")
         .ok()
@@ -291,6 +294,18 @@ mod tests {
     #[serial_test::serial]
     #[allow(unsafe_code)]
     async fn the_kill_switch_accepts_every_spelling() {
+        /// Removes the variable on drop, so a failing assertion cannot leak it.
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            #[allow(unsafe_code)]
+            fn drop(&mut self) {
+                // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+                unsafe {
+                    std::env::remove_var("GREENTIC_AW_RUN_CONTEXT");
+                }
+            }
+        }
+        let _guard = EnvGuard;
         for value in ["0", "false", "OFF", " no ", "No"] {
             // SAFETY: #[serial] serializes env-mutating tests (crate convention).
             unsafe {
@@ -307,8 +322,11 @@ mod tests {
             std::env::set_var("GREENTIC_AW_RUN_CONTEXT", "1");
         }
         assert!(run_context_enabled());
-        unsafe {
-            std::env::remove_var("GREENTIC_AW_RUN_CONTEXT");
+        for value in ["", "maybe"] {
+            unsafe {
+                std::env::set_var("GREENTIC_AW_RUN_CONTEXT", value);
+            }
+            assert!(run_context_enabled(), "{value:?} means ON");
         }
     }
 

@@ -26,11 +26,13 @@ pub const MAX_VIEW_CHARS: usize = 2000;
 pub struct TraceEvent {
     pub actor: String,
     pub kind: String,
-    /// The full (truncated, sanitised) summary.
+    /// The full (truncated, sanitised) summary. For a tool outcome this is the
+    /// RAW tool output: it is never rendered into a prompt and must not be
+    /// logged.
     pub summary: String,
-    /// The step that recorded a tool outcome; only it sees `summary`.
+    /// The step that recorded a tool outcome (its own history holds the result).
     pub owner: Option<StepId>,
-    /// What every other step sees instead: `<tool> ok|failed`.
+    /// What EVERY step sees in the rendered view: `<tool> ok|failed`.
     pub shared_summary: Option<String>,
 }
 
@@ -177,6 +179,8 @@ impl RunTrace {
         self.lock().is_empty()
     }
 
+    /// A copy of the stored events. `summary` holds RAW (truncated) tool output:
+    /// do not log it or render it into a prompt.
     pub fn events(&self) -> Vec<TraceEvent> {
         self.lock().clone()
     }
@@ -188,7 +192,14 @@ impl RunTrace {
 
     /// A delimited block of the newest events that fit the view budget, oldest
     /// first, as `viewer` may see them, or `None` when nothing was recorded.
-    pub fn render_view_for(&self, viewer: Option<StepId>) -> Option<String> {
+    ///
+    /// A tool outcome renders as its narrow `<tool> ok|failed` form for EVERY
+    /// viewer, its owner included: the owner's own history already holds the
+    /// raw result, so the detail would only duplicate tokens and promote
+    /// untrusted tool output into the system prompt. The raw (truncated)
+    /// summary stays on the stored event. `viewer` is kept so callers need not
+    /// change should a future event kind be viewer-specific.
+    pub fn render_view_for(&self, _viewer: Option<StepId>) -> Option<String> {
         let events = self.lock();
         if events.is_empty() {
             return None;
@@ -196,10 +207,7 @@ impl RunTrace {
         let mut lines: Vec<String> = Vec::new();
         let mut used = 0usize;
         for e in events.iter().rev() {
-            let text = match (&e.owner, &e.shared_summary) {
-                (Some(owner), Some(shared)) if Some(*owner) != viewer => shared.as_str(),
-                _ => e.summary.as_str(),
-            };
+            let text = e.shared_summary.as_deref().unwrap_or(e.summary.as_str());
             let line = format!("- [{}/{}] {}", e.actor, e.kind, text);
             used += line.chars().count() + 1;
             if used > MAX_VIEW_CHARS && !lines.is_empty() {
@@ -255,6 +263,9 @@ impl RunContext {
     /// A read-write context bound to `tenant_id`: a step for any other tenant
     /// ignores it, so a trace can never carry one tenant's results into
     /// another's prompt.
+    ///
+    /// Warning: a host that builds a context itself bypasses the pack sidecar
+    /// and the `GREENTIC_AW_RUN_CONTEXT` kill switch (both live in runner-host).
     pub fn new(tenant_id: impl Into<String>, trace: Arc<RunTrace>) -> Self {
         Self {
             tenant_id: tenant_id.into(),
@@ -292,12 +303,16 @@ impl RunContext {
         self.caller_policy.as_ref()
     }
 
+    /// Warning: a host that sets a mode itself bypasses the pack sidecar and the
+    /// `GREENTIC_AW_RUN_CONTEXT` kill switch (both live in runner-host).
     #[must_use]
     pub fn with_mode(mut self, mode: crate::share_policy::ShareMode) -> Self {
         self.mode = mode;
         self
     }
 
+    /// Warning: a host that sets a policy itself bypasses the pack sidecar and
+    /// the `GREENTIC_AW_RUN_CONTEXT` kill switch (both live in runner-host).
     #[must_use]
     pub fn with_caller_policy(
         mut self,
@@ -686,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_outcome_is_detailed_only_for_its_owner() {
+    fn a_tool_outcome_is_narrow_for_every_viewer_its_owner_included() {
         let t = RunTrace::new();
         let me = StepId::fresh();
         let other = StepId::fresh();
@@ -698,9 +713,8 @@ mod tests {
             "lookup -> SECRET-42",
         );
         t.append("inner", "reply", "found it");
-        let mine = t.render_view_for(Some(me)).expect("view");
-        assert!(mine.contains("SECRET-42"), "{mine}");
         for view in [
+            t.render_view_for(Some(me)),
             t.render_view_for(Some(other)),
             t.render_view_for(None),
             t.render_view(),

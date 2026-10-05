@@ -174,7 +174,8 @@ impl FlowInvoker for FixedFlow {
 
 /// Two agents in one run: `inner` calls a tool whose result is secret, then
 /// `outer` takes a turn. `outer` must see the tool's name and outcome and
-/// `inner`'s reply, never the result; `inner` itself sees its own result.
+/// `inner`'s reply, never the result; `inner` itself also sees only the narrow
+/// form (its own history already holds the raw result).
 #[tokio::test]
 async fn another_agent_sees_a_tool_outcome_but_not_its_result() {
     let llm = Arc::new(MockLlmBackend::new(vec![
@@ -200,10 +201,11 @@ async fn another_agent_sees_a_tool_outcome_but_not_its_result() {
     .await;
     let p = prompts(&llm);
     assert!(
-        p[1].contains("SECRET-42"),
-        "the caller sees its own result: {}",
+        !p[1].contains("SECRET-42"),
+        "the owner's view is narrow too: {}",
         p[1]
     );
+    assert!(p[1].contains("x ok"), "{}", p[1]);
     assert!(
         !p[2].contains("SECRET-42"),
         "another agent must not: {}",
@@ -624,8 +626,9 @@ async fn a_playbook_shares_nothing_unless_its_binding_says_so() {
     );
 }
 
-/// outer read_write -> playbook:p read -> playbook's flow:x read_write => leaf runs
-/// under `min` = read: it sees the view and records nothing.
+/// outer read (the policy gives `playbook:p` Read; read_write is only the implicit
+/// root) -> playbook's flow:x read_write => leaf runs under `min` = read: it sees
+/// the view and records nothing.
 #[tokio::test]
 async fn the_stricter_mode_wins_down_a_chain() {
     let run = chain(

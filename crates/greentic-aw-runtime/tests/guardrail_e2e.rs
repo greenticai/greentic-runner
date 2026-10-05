@@ -190,12 +190,31 @@ fn write_signed_extension_dir(wasm_src: &std::path::Path, dest_dir: &std::path::
 }
 
 /// Return the path to the built extension.wasm, or `None` if not present.
+///
+/// `PII_WASM` (a path to the `.wasm`) is tried first, then the sibling-checkout
+/// layout. With `REQUIRE_PII_WASM=1` a missing WASM panics instead of letting
+/// the tests skip, so CI cannot pass vacuously.
 fn pii_wasm_src() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("PII_WASM")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+    {
+        return Some(p);
+    }
     // CARGO_MANIFEST_DIR = <runner-root>/.worktrees/guardrail-capability/crates/greentic-aw-runtime
     // 5 levels up = <greentic-workspace-root>
     let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../../../component-guardrail-pii/dist/greentic.guardrail-pii/extension.wasm");
-    if p.exists() { Some(p) } else { None }
+    if p.exists() {
+        return Some(p);
+    }
+    if std::env::var("REQUIRE_PII_WASM").is_ok_and(|v| v == "1") {
+        panic!(
+            "REQUIRE_PII_WASM=1 but the component-guardrail-pii WASM was not found; \
+             set PII_WASM to the extension.wasm path or build the sibling checkout"
+        );
+    }
+    None
 }
 
 // ─── Smoke: verify signature chain works and the capability lands in registry ─

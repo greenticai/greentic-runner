@@ -3800,6 +3800,11 @@ impl PackRuntime {
     /// Per-binding sharing modes from the optional `assets/run-context.json`
     /// sidecar (shared context, Phase A2). `None` when the pack carries none,
     /// which means every binding of every agent is `none`.
+    ///
+    /// Parsed at most once per `PackRuntime` (lazily), but
+    /// `share_policy_from_packs` (agent_node.rs) calls it for EVERY pack at
+    /// each agent-runtime build, so the sidecar is in practice read when a
+    /// runtime is built, not only when an agent first shares.
     pub fn run_context(&self) -> Option<&crate::runner::run_context_routes::PackRunContext> {
         self.run_context
             .get_or_init(|| {
