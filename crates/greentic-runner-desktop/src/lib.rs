@@ -521,6 +521,11 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                         greentic_runner_host::runner::nested_flow::NestedFlowHandlers::default()
                             .with_agent(&handler),
                     );
+                } else {
+                    tracing::info!(
+                        env = greentic_runner_host::runner::nested_flow::NESTED_FLOW_AGENTS_ENV,
+                        "dw.agent handler not lent to flow-tool engines (opted out)"
+                    );
                 }
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into desktop FlowEngine");

@@ -1,15 +1,21 @@
 //! The PRODUCTION host (`TenantRuntime::load`, the constructor the pack
 //! watcher uses) lends its real `dw.agent` handler to flow-tool engines.
 //!
-//! Nothing is stubbed: the handler is the real `RuntimeAgentNodeHandler` built
-//! from `HostConfig.agents`, with an LLM that cannot answer (no credential),
-//! so the nested agent FAILS. What is asserted is WHICH failure: without
-//! lending, a flow tool's `dw.agent` dies with "no AgentNodeHandler
-//! configured"; with it, the real handler is reached and the error is the
-//! agent's own.
+//! The handler is the real `RuntimeAgentNodeHandler` built from
+//! `HostConfig.agents`, with an LLM that cannot answer (no credential), so the
+//! nested agent FAILS. What is asserted is WHICH failure: without lending, a
+//! flow tool's `dw.agent` dies with "no AgentNodeHandler configured"; with it,
+//! the real handler is reached and the error is the agent's own.
+//!
+//! What is NOT real: the test calls `pack.run_flow_for_tool` directly, with no
+//! outer agent and no `ToolCallFrame`. So the caller is stripped (nothing is
+//! stamped) and the nested agent runs under a fresh `flowtool::<flow>::<ULID>`
+//! session, not one derived from a calling agent's session and call id.
 //!
 //! The tests mutate process env (dispatch mode, opt-out), so they hold one
-//! lock; this file is its own test binary, so nothing else reads those vars.
+//! lock, and every run first clears the variables the host reads for this
+//! decision, so an operator's shell cannot change the outcome; this file is its
+//! own test binary, so nothing else reads those vars.
 
 #![cfg(feature = "agentic-worker")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -190,23 +196,40 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard(Vec<(&'static str, Option<String>)>);
 
+/// Every variable the host reads to decide whether (and how) a `dw.agent`
+/// runs and is lent: cleared before each run so the shell cannot decide it.
+const HOST_ENV: &[&str] = &[
+    "GREENTIC_AW_DISPATCH",
+    "GREENTIC_AW_NESTED_FLOW_AGENTS",
+    "GREENTIC_AW_REDIS_URL",
+    "GREENTIC_AW_STATE_BACKEND",
+    "GREENTIC_EVENTS_NATS_URL",
+];
+
 impl EnvGuard {
+    /// Clear [`HOST_ENV`], then set `vars`; every prior value comes back on
+    /// drop.
     fn set(vars: &[(&'static str, &str)]) -> Self {
-        let prev = vars
+        let prev = HOST_ENV
             .iter()
-            .map(|(k, v)| {
-                let old = std::env::var(k).ok();
-                unsafe { std::env::set_var(k, v) };
-                (*k, old)
-            })
+            .copied()
+            .chain(vars.iter().map(|(k, _)| *k))
+            .map(|k| (k, std::env::var(k).ok()))
             .collect();
+        for key in HOST_ENV {
+            unsafe { std::env::remove_var(key) };
+        }
+        for (key, value) in vars {
+            unsafe { std::env::set_var(key, value) };
+        }
         Self(prev)
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        for (key, old) in &self.0 {
+        // In reverse, so a key recorded twice ends on its ORIGINAL value.
+        for (key, old) in self.0.iter().rev() {
             match old {
                 Some(value) => unsafe { std::env::set_var(key, value) },
                 None => unsafe { std::env::remove_var(key) },

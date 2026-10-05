@@ -56,7 +56,7 @@ pub const NESTED_FLOW_AGENTS_ENV: &str = "GREENTIC_AW_NESTED_FLOW_AGENTS";
 
 /// Pure form of [`nested_flow_agents_enabled`] over an env getter.
 #[must_use]
-pub fn nested_flow_agents_enabled_from(get_env: impl Fn(&str) -> Option<String>) -> bool {
+pub(crate) fn nested_flow_agents_enabled_from(get_env: impl Fn(&str) -> Option<String>) -> bool {
     match get_env(NESTED_FLOW_AGENTS_ENV) {
         Some(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),

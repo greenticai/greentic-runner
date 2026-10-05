@@ -1414,18 +1414,22 @@ impl TenantRuntime {
             // slot lives on the instance). Only for in-process dispatch: over
             // NATS a nested engine has no remote handler and must keep
             // failing loudly. `GREENTIC_AW_NESTED_FLOW_AGENTS=0` opts out.
-            if !crate::runner::nested_flow::nested_flow_agents_enabled() {
-                tracing::info!(
-                    env = crate::runner::nested_flow::NESTED_FLOW_AGENTS_ENV,
-                    "dw.agent handler not lent to flow-tool engines (opted out)"
-                );
-            } else if let Some(handlers) =
+            // The opt-out is reported only when it changed something: with
+            // nothing to lend (NATS, no handler) there is nothing opted out of.
+            if let Some(handlers) =
                 crate::runner::nested_flow::for_dispatch(dw_dispatch, nested_agent_handler.as_ref())
             {
-                for pack in &pack_runtimes {
-                    pack.set_nested_flow_handlers(handlers.clone());
+                if crate::runner::nested_flow::nested_flow_agents_enabled() {
+                    for pack in &pack_runtimes {
+                        pack.set_nested_flow_handlers(handlers.clone());
+                    }
+                    tracing::info!("dw.agent handler lent to flow-tool engines");
+                } else {
+                    tracing::info!(
+                        env = crate::runner::nested_flow::NESTED_FLOW_AGENTS_ENV,
+                        "dw.agent handler not lent to flow-tool engines (opted out)"
+                    );
                 }
-                tracing::info!("dw.agent handler lent to flow-tool engines");
             }
             if matches!(
                 dw_dispatch,
