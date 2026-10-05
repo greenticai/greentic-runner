@@ -30,6 +30,30 @@ use crate::{AgentRuntime, AgentStep, StepObserver};
 /// The error value every tool call queued behind a suspended one receives.
 pub(crate) const BEHIND_SUSPENSION_ERROR: &str = "another step is waiting for the user";
 
+/// The result recorded for a parked call while it waits for the user, so
+/// messages appended after it keep the transcript provider-valid.
+pub(crate) const AWAITING_PLACEHOLDER: &str = "awaiting_user_input";
+
+/// Record `content` as the result of `call_id`: replace the `Tool` message
+/// already answering it (the park placeholder) in place, or push one when
+/// there is none (a park recorded without a placeholder).
+pub(crate) fn patch_tool_result(state: &mut ConversationState, call_id: &str, content: Value) {
+    let existing = state.messages.iter_mut().find_map(|m| match m {
+        ChatMessage::Tool {
+            call_id: id,
+            content,
+        } if id == call_id => Some(content),
+        _ => None,
+    });
+    match existing {
+        Some(slot) => *slot = content,
+        None => state.messages.push(ChatMessage::Tool {
+            call_id: call_id.to_string(),
+            content,
+        }),
+    }
+}
+
 /// A parked flow tool that this turn will resume.
 pub(crate) struct Resume {
     pub(crate) pending: PendingToolCall,
@@ -61,10 +85,7 @@ pub(crate) fn take_pending(
     };
     let result = json!({ "status": "cancelled", "reason": reason });
     observer.on_tool_result(&pending.tool_name, &pending.call_id, &result);
-    state.messages.push(ChatMessage::Tool {
-        call_id: pending.call_id.clone(),
-        content: result.clone(),
-    });
+    patch_tool_result(state, &pending.call_id, result.clone());
     let step = AgentStep::ToolCall {
         name: pending.tool_name,
         call_id: pending.call_id,
@@ -133,10 +154,7 @@ pub(crate) async fn resume_pending(
             {
                 warn!(error = %e, "ledger record failed; continuing");
             }
-            state.messages.push(ChatMessage::Tool {
-                call_id: pending.call_id.clone(),
-                content: result.clone(),
-            });
+            patch_tool_result(state, &pending.call_id, result.clone());
             trail.push(AgentStep::ToolCall {
                 name: pending.tool_name,
                 call_id: pending.call_id,
@@ -182,4 +200,43 @@ pub(crate) fn refuse_behind_suspension(
         result,
         duration_ms: 0,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(id: &str, content: Value) -> ChatMessage {
+        ChatMessage::Tool {
+            call_id: id.into(),
+            content,
+        }
+    }
+
+    fn state_with(messages: Vec<ChatMessage>) -> ConversationState {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = messages;
+        s
+    }
+
+    #[test]
+    fn patch_replaces_the_placeholder_in_place() {
+        let mut s = state_with(vec![
+            tool("c1", json!({ "status": AWAITING_PLACEHOLDER })),
+            ChatMessage::User {
+                content: "q".into(),
+            },
+        ]);
+        patch_tool_result(&mut s, "c1", json!({ "ok": true }));
+        assert_eq!(s.messages.len(), 2);
+        assert!(matches!(&s.messages[0],
+            ChatMessage::Tool { content, .. } if content == &json!({ "ok": true })));
+    }
+
+    #[test]
+    fn patch_pushes_when_there_is_no_placeholder() {
+        let mut s = state_with(vec![]);
+        patch_tool_result(&mut s, "c1", json!({ "status": "cancelled" }));
+        assert_eq!(s.messages.len(), 1);
+    }
 }

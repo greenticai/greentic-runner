@@ -736,6 +736,20 @@ pub async fn run_step(
                                 parked_at: Some(chrono::Utc::now()),
                                 side_turns: 0,
                             });
+                            if config.on_text_while_parked
+                                == crate::config::ParkedTextPolicy::SideTurn
+                            {
+                                // Answer the parked call now so side turns can
+                                // be appended after it without breaking the
+                                // provider's tool-call pairing; resume or
+                                // cancel patches this result in place.
+                                state.messages.push(ChatMessage::Tool {
+                                    call_id: call.call_id.clone(),
+                                    content: serde_json::json!({
+                                        "status": crate::flow_suspend::AWAITING_PLACEHOLDER
+                                    }),
+                                });
+                            }
                             suspension = Some(presentation);
                             continue;
                         }
