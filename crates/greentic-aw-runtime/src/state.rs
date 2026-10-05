@@ -106,6 +106,13 @@ impl ConversationState {
 /// TTL: every re-park (the flow asked again) refreshes it.
 pub const PENDING_TOOL_IDLE_TTL_SECS: i64 = 60 * 60;
 
+/// Side turns answered while one tool stays parked, before a typed message
+/// cancels it instead.
+pub const MAX_SIDE_TURNS: u32 = 20;
+
+/// A side turn refreshes the idle expiry but never beyond this age of the park.
+pub const PENDING_TOOL_MAX_AGE_SECS: i64 = 24 * 60 * 60;
+
 /// A `flow:` tool call suspended on the user. See
 /// [`ConversationState::pending_tool`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -130,6 +137,15 @@ pub struct PendingToolCall {
     pub iterations_used: u32,
     /// When this suspension stops being resumable.
     pub expires_at: DateTime<Utc>,
+    /// The card the flow parked on, kept so a side turn can re-offer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<serde_json::Value>,
+    /// When the park began (caps how far side turns can extend `expires_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_at: Option<DateTime<Utc>>,
+    /// Side turns answered since the park.
+    #[serde(default)]
+    pub side_turns: u32,
 }
 
 impl PendingToolCall {
@@ -298,6 +314,9 @@ mod tests {
             flow_snapshot: serde_json::json!({ "next_node": "card" }),
             iterations_used: 2,
             expires_at: PendingToolCall::expiry_from(now),
+            presentation: Some(serde_json::json!({ "card": "A" })),
+            parked_at: Some(now),
+            side_turns: 3,
         };
         let back: PendingToolCall =
             serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
@@ -375,5 +394,12 @@ mod tests {
         } else {
             panic!("expected User u2 at position 1");
         }
+    }
+
+    #[test]
+    fn a_pending_tool_stored_before_side_turns_still_deserialises() {
+        let old = r#"{"call_id":"c","tool_name":"t","flow_ref":"f","flow_snapshot":{},"iterations_used":1,"expires_at":"2026-10-05T00:00:00Z"}"#;
+        let p: PendingToolCall = serde_json::from_str(old).unwrap();
+        assert!(p.presentation.is_none() && p.parked_at.is_none() && p.side_turns == 0);
     }
 }

@@ -112,6 +112,7 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
         guardrails: vec![],
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     }
 }
 

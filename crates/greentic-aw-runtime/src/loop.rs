@@ -144,6 +144,7 @@ pub async fn run_step(
             terminated_by: TerminationReason::FinalReply,
             usage: StepUsage::default(),
             pending_presentation: None,
+            side_turn: false,
         });
     }
 
@@ -731,6 +732,9 @@ pub async fn run_step(
                                 expires_at: crate::state::PendingToolCall::expiry_from(
                                     chrono::Utc::now(),
                                 ),
+                                presentation: Some(presentation.clone()),
+                                parked_at: Some(chrono::Utc::now()),
+                                side_turns: 0,
                             });
                             suspension = Some(presentation);
                             continue;
@@ -941,6 +945,7 @@ pub async fn run_step(
                 iterations,
             },
             pending_presentation: None,
+            side_turn: false,
         });
     }
 
@@ -970,6 +975,7 @@ pub async fn run_step(
             iterations,
         },
         pending_presentation: suspension,
+        side_turn: false,
     })
 }
 
@@ -1102,6 +1108,7 @@ mod tests {
             knowledge: None,
             conversational: false,
             opening_message: None,
+            on_text_while_parked: Default::default(),
         }
     }
 

@@ -152,6 +152,8 @@ pub(crate) async fn resume_pending(
         } => {
             pending.flow_snapshot = snapshot;
             pending.expires_at = PendingToolCall::expiry_from(Utc::now());
+            pending.presentation = Some(presentation.clone());
+            pending.side_turns = 0;
             state.pending_tool = Some(pending);
             Some(presentation)
         }

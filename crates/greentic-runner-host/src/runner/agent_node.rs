@@ -2864,6 +2864,7 @@ mod aw {
                 knowledge: None,
                 conversational: false,
                 opening_message: None,
+                on_text_while_parked: Default::default(),
             }
         }
 
@@ -2898,6 +2899,7 @@ mod aw {
                     knowledge: None,
                     conversational: false,
                     opening_message: None,
+                    on_text_while_parked: Default::default(),
                 },
             );
             let config_provider = Arc::new(config_provider);

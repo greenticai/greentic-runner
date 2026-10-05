@@ -1284,6 +1284,7 @@ mod aw {
                 limits: parent.limits.clone(),
                 conversational: false,
                 opening_message: None,
+                on_text_while_parked: Default::default(),
             });
         }
         Ok(AgentConfig {
@@ -1301,6 +1302,7 @@ mod aw {
             knowledge: None,
             conversational: false,
             opening_message: None,
+            on_text_while_parked: Default::default(),
         })
     }
 
@@ -1619,6 +1621,7 @@ mod aw {
             knowledge: None,
             conversational: false,
             opening_message: None,
+            on_text_while_parked: Default::default(),
         };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
@@ -2907,6 +2910,7 @@ mod aw {
                 knowledge: None,
                 conversational: false,
                 opening_message: None,
+                on_text_while_parked: Default::default(),
             };
             let mut provider = InMemoryConfigProvider::new();
             provider.insert(tenant, agent_id, cfg);
@@ -3212,6 +3216,7 @@ mod aw {
                 }),
                 conversational: false,
                 opening_message: None,
+                on_text_while_parked: Default::default(),
             }
         }
 
@@ -4020,6 +4025,7 @@ mod aw {
                 guardrails: vec![],
                 conversational: false,
                 opening_message: None,
+                on_text_while_parked: Default::default(),
             }
         }
 

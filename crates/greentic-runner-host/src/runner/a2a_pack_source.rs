@@ -348,6 +348,7 @@ mod tests {
             guardrails: vec![],
             conversational: false,
             opening_message: None,
+            on_text_while_parked: Default::default(),
         };
         let llm = Arc::new(RecordingLlm {
             responses: Mutex::new(vec![

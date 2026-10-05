@@ -74,7 +74,8 @@ pub use component_source::{
     ComponentToolSource,
 };
 pub use config::{
-    AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ToolRef,
+    AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ParkedTextPolicy,
+    ToolRef,
 };
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
@@ -579,6 +580,11 @@ pub struct AgentOutput {
     /// [`TerminationReason::AwaitingToolInput`]: crate::error::TerminationReason::AwaitingToolInput
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_presentation: Option<serde_json::Value>,
+    /// True when this turn answered a typed message as a side turn while the
+    /// flow tool stayed parked; `reply` is the answer and
+    /// `pending_presentation` the card re-offered after it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub side_turn: bool,
 }
 
 /// One iteration of the Plan-Act-Observe loop, surfaced in the audit

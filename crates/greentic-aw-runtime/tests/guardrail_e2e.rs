@@ -559,6 +559,7 @@ fn build_full_runtime(
         knowledge: None,
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     };
 
     let cp = MockConfigProvider::new();

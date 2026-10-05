@@ -108,6 +108,7 @@ fn config_for(req: &PlaybookTurnRequest, agent_id: &str) -> AgentConfig {
         knowledge: None,
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     }
 }
 
