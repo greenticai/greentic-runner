@@ -41,6 +41,7 @@ pub mod mcp_pack_routes;
 #[cfg(feature = "agentic-worker")]
 pub mod mcp_warm_listener;
 pub mod mocks;
+pub mod nested_flow;
 pub mod operala_node;
 #[cfg(feature = "operala-in-process")]
 pub mod operala_tools;

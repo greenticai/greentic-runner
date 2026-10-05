@@ -165,6 +165,11 @@ pub struct PackRuntime {
     /// Lazily-parsed `assets/run-context.json` sidecar — see
     /// [`PackRuntime::run_context`]. Twin of `a2a_routes`, read on first use.
     run_context: std::sync::OnceLock<Option<crate::runner::run_context_routes::PackRunContext>>,
+    /// Handlers a `flow:` tool's per-call engine borrows from the host that
+    /// wired the top-level engine — see [`crate::runner::nested_flow`].
+    /// Write-once; empty means "nested engines get no handler" (the
+    /// pre-existing behaviour).
+    nested_flow_handlers: std::sync::OnceLock<crate::runner::nested_flow::NestedFlowHandlers>,
     /// Lazily-parsed `assets/sorla-routes.json` sidecar — see
     /// [`PackRuntime::sorla_routes`]. Twin of `mcp_routes`, read on first use.
     sorla_routes: std::sync::OnceLock<Option<crate::runner::sorla_pack_routes::PackSorlaRoutes>>,
@@ -2454,6 +2459,7 @@ impl PackRuntime {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
@@ -2469,6 +2475,21 @@ impl PackRuntime {
     /// [`set_runtime_config_non_secret`](Self::set_runtime_config_non_secret)
     /// uses. `None` is the legacy tenant-only path, which keeps the bare pack
     /// scope.
+    /// Lend this pack's flow-tool engines the host's node handlers. Called
+    /// once per pack by the host after it wired its top-level engine; a
+    /// second call keeps the first registration and warns.
+    pub fn set_nested_flow_handlers(
+        &self,
+        handlers: crate::runner::nested_flow::NestedFlowHandlers,
+    ) {
+        if self.nested_flow_handlers.set(handlers).is_err() {
+            tracing::warn!(
+                pack_id = self.metadata.pack_id.as_str(),
+                "nested flow-tool handlers already registered for this pack; keeping the first"
+            );
+        }
+    }
+
     pub fn set_unit_id(&mut self, unit_id: Option<String>) {
         self.unit_id = unit_id;
     }
@@ -2581,7 +2602,12 @@ impl PackRuntime {
             )
             .await?,
         );
-        let engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
+        let mut engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
+        // Read from `self` (the pack the host built its agent runtime over),
+        // not from the freshly loaded `pack`, whose slot is empty.
+        if let Some(handlers) = self.nested_flow_handlers.get() {
+            handlers.install_on(&mut engine);
+        }
         Ok((pack, engine))
     }
 
@@ -4190,6 +4216,7 @@ impl PackRuntime {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
@@ -6297,6 +6324,7 @@ pub(crate) mod tests {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
             cache,
