@@ -4363,9 +4363,34 @@ const ENVELOPE_TRANSPORT_KEYS: &[&str] = &[
 
 /// Channel context a provider may stamp on a message's `metadata` whether or
 /// not a card was submitted. Context, not input, so it never makes a typed
-/// message a submit.
+/// message a submit. The webchat provider stamps all of these on every
+/// activity (`messaging-provider-webchat` `ops/envelope.rs`, `ops/ingest.rs`).
 #[cfg(any(feature = "agentic-worker", test))]
-const CHANNEL_CONTEXT_METADATA_KEYS: &[&str] = &["locale", "team", "env", "autoStart"];
+const CHANNEL_CONTEXT_METADATA_KEYS: &[&str] = &[
+    "locale",
+    "team",
+    "env",
+    "autoStart",
+    "universal",
+    "tenant",
+    "tenant_id",
+    "tenant_channel_id",
+    "route",
+    "conversation_id",
+    "user_id",
+    "user_verified",
+    "flow_hint",
+    "extensions",
+];
+
+/// Provider passthroughs are flattened into `metadata` as `channel.<key>`.
+#[cfg(any(feature = "agentic-worker", test))]
+const CHANNEL_CONTEXT_METADATA_PREFIX: &str = "channel.";
+
+#[cfg(any(feature = "agentic-worker", test))]
+fn is_channel_context_key(key: &str) -> bool {
+    CHANNEL_CONTEXT_METADATA_KEYS.contains(&key) || key.starts_with(CHANNEL_CONTEXT_METADATA_PREFIX)
+}
 
 /// Whether `map` is a `ChannelMessageEnvelope`: the three keys no card input
 /// has any reason to share are all there. Decided by SHAPE, not by where the
@@ -4413,7 +4438,7 @@ fn is_card_submit(entry: &Value) -> bool {
     });
     let metadata_input = metadata.is_some_and(|meta| {
         meta.keys()
-            .any(|key| key != "action" && !CHANNEL_CONTEXT_METADATA_KEYS.contains(&key.as_str()))
+            .any(|key| key != "action" && !is_channel_context_key(key))
     });
     root_input || metadata_input
 }
@@ -13059,6 +13084,72 @@ mod tests {
         assert!(is_card_submit(
             &json!({ "channel": "email", "metadata": {} })
         ));
+    }
+
+    /// What the webchat provider stamps on EVERY message (typed or clicked):
+    /// `messaging-provider-webchat` `ops/envelope.rs` (universal, tenant,
+    /// tenant_channel_id, route, extensions, channel.*) and `ops/ingest.rs`
+    /// (user_id, user_verified, flow_hint, locale). Verified against
+    /// greentic-messaging-providers develop e4f7b389.
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn provider_stamped_metadata() -> serde_json::Value {
+        json!({
+            "universal": "true",
+            "env": "prod",
+            "tenant": "acme",
+            "tenant_channel_id": "chan-1",
+            "route": "conv-1",
+            "user_id": "user-1",
+            "user_verified": "true",
+            "flow_hint": "main",
+            "locale": "en-US",
+            "extensions": "{\"caller\":{\"sub\":\"user-1\"}}",
+            "channel.channel_data": "{}"
+        })
+    }
+
+    #[test]
+    fn a_typed_message_with_provider_stamped_metadata_is_not_a_card_submit() {
+        let mut typed = wrapped_typed_message("how do I get a mail signature?");
+        typed["input"]["metadata"] = provider_stamped_metadata();
+        assert!(!is_card_submit(&typed));
+        // Same envelope delivered flat.
+        let flat = typed["input"].clone();
+        assert!(!is_card_submit(&flat));
+    }
+
+    #[test]
+    fn a_click_is_still_a_card_submit_beside_provider_stamped_metadata() {
+        let mut by_action = wrapped_typed_message("");
+        let mut meta = provider_stamped_metadata();
+        meta["action"] = json!("start_request");
+        by_action["input"]["metadata"] = meta;
+        assert!(is_card_submit(&by_action));
+
+        let mut by_values = wrapped_typed_message("");
+        let mut meta = provider_stamped_metadata();
+        meta["room"] = json!("101");
+        by_values["input"]["metadata"] = meta;
+        assert!(is_card_submit(&by_values));
+    }
+
+    #[test]
+    fn channel_context_prefix_matches_only_the_channel_namespace() {
+        let mut typed = wrapped_typed_message("hi");
+        typed["input"]["metadata"] = json!({ "mychannel.x": "1" });
+        assert!(is_card_submit(&typed));
+        typed["input"]["metadata"] = json!({ "channel.x": "1" });
+        assert!(!is_card_submit(&typed));
+    }
+
+    /// Known limitation (spec D1): a card whose ONLY input shares a name with
+    /// a provider-stamped key cannot be told from typed text without the
+    /// PR-2 submit marker. Pinned so changing it is deliberate.
+    #[test]
+    fn a_lone_card_input_named_like_a_stamped_key_is_not_seen_as_a_submit() {
+        let mut click = wrapped_typed_message("");
+        click["input"]["metadata"] = json!({ "route": "billing" });
+        assert!(!is_card_submit(&click));
     }
 
     /// The engine-level view of the same defect: a typed message in a channel
