@@ -74,7 +74,8 @@ pub use component_source::{
     ComponentToolSource,
 };
 pub use config::{
-    AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ToolRef,
+    AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ParkedTextPolicy,
+    ToolRef,
 };
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
@@ -491,6 +492,24 @@ impl AgentRuntime {
         kb.search_bound(&ctx, query, binding).await
     }
 
+    /// The card of the session's live parked `flow:` tool, if any. A host uses
+    /// it to keep the card on offer when a turn fails after the park was kept
+    /// (an LLM error or a lock timeout during a side turn), so the user's next
+    /// submit is not lost. `None` when nothing is parked, the park expired, or
+    /// the state cannot be read.
+    pub async fn parked_card(
+        &self,
+        tenant: &TenantContext,
+        session_id: &str,
+    ) -> Option<serde_json::Value> {
+        let state = self.state_store.load(tenant, session_id).await.ok()?;
+        let pending = state.pending_tool?;
+        if pending.is_expired(chrono::Utc::now()) {
+            return None;
+        }
+        pending.presentation
+    }
+
     /// Execute one agentic step against the given session.
     /// Implementation lives in [`r#loop::run_step`].
     pub async fn step(
@@ -579,6 +598,11 @@ pub struct AgentOutput {
     /// [`TerminationReason::AwaitingToolInput`]: crate::error::TerminationReason::AwaitingToolInput
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_presentation: Option<serde_json::Value>,
+    /// True when this turn answered a typed message as a side turn while the
+    /// flow tool stayed parked; `reply` is the answer and
+    /// `pending_presentation` the card re-offered after it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub side_turn: bool,
 }
 
 /// One iteration of the Plan-Act-Observe loop, surfaced in the audit

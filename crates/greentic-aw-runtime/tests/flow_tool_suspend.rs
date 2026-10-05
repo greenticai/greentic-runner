@@ -221,6 +221,7 @@ fn harness(llm: Arc<RecordingLlm>, flows: Arc<ScriptedFlows>) -> Harness {
             guardrails: vec![],
             conversational: false,
             opening_message: None,
+            on_text_while_parked: Default::default(),
         },
     );
     let rt = AgentRuntime::new(

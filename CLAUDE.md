@@ -155,6 +155,29 @@ successor (SP2). Non-conversational `dw.agent` is unchanged (one-shot). The flow
 `ExecutionState.park_turns`, persisted in the park/resume snapshot; a plain constant,
 no env var / config knob).
 
+**Typed text while a `flow:` tool is parked (`AgentConfig.on_text_while_parked`).** A `dw.agent`
+whose `flow:` tool parked on a card ends the turn `awaiting_tool_input`
+(`pending_presentation` = the card). By default (`cancel`) a typed message cancels the
+parked tool (`flow_suspend::take_pending`). With `on_text_while_parked: side_turn` the
+agent instead answers the message (RAG, tools, memory) and the tool STAYS parked: the
+card is re-offered, the turn ends `awaiting_tool_input` with `side_turn: true`, and the
+engine renders `[reply, card]` (`engine::rendered_park`), so a later card submit resumes
+the flow with its state intact. Rules that fail silently if changed: (1) a
+`Tool{status: "awaiting_user_input"}` placeholder is written at park ONLY under
+`side_turn`, so side Q/A can follow it without breaking provider tool-call pairing —
+resume and cancel PATCH it by `call_id` (`flow_suspend::patch_tool_result`), never push a
+second result; (2) `ConversationState::truncate_history` removes whole assistant/tool
+groups and never the group holding the pending call; (3) a side turn refuses `flow:` tool
+calls (one park slot), is capped at `MAX_SIDE_TURNS` (20), and refreshes the 1h idle
+expiry only up to `parked_at + 24h`; (4) a park with no stored card (`presentation`),
+an expired park, or the cap falls back to the cancel behaviour. Whether a message is a
+card submit at all is `engine::is_card_submit`: provider-stamped context keys
+(`universal`, `user_id`, `flow_hint`, `extensions`, `channel.*`, and `route`/`tenant` only
+when equal to the envelope identity) are NOT input. The order is: the provider's explicit
+`metadata.greentic_submit == "true"` marker (stamped by `messaging-provider-webchat` only on a
+message activity with object `value`, so a `data: {}` submit still counts), then
+`metadata.action`, then that key heuristic (the fallback for providers that do not stamp it). Design: `docs/superpowers/specs/2026-10-05-parked-flow-side-question-design.md`.
+
 The out-of-process (`DwAgentDispatch::Nats`) dispatch path supports the same
 conversational park-loop, identical in outcome to the in-process path. A fresh user turn
 marks a pending-await marker (`ExecutionState.pending_agent_await`, serde-persisted) and

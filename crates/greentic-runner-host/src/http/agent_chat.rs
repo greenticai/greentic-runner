@@ -62,6 +62,18 @@ pub(crate) fn pending_card(
         .cloned()
 }
 
+/// The agent's answer to a typed message that was handled as a side turn
+/// while a `flow:` tool stayed parked: the reply to show before the card.
+fn side_turn_reply(
+    node_outputs: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    node_outputs.values().find_map(|output| {
+        let is_side_turn = output.get("side_turn").and_then(|v| v.as_bool()) == Some(true);
+        let reply = output.get("reply").and_then(|v| v.as_str())?;
+        (is_side_turn && !reply.trim().is_empty()).then(|| reply.to_string())
+    })
+}
+
 /// One outbound reply line.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,13 +129,16 @@ pub fn replies_to_response(activities: Vec<Activity>) -> AgentChatResponse {
 }
 
 /// Map a traced turn into the chat response. A turn that parked on a `flow:`
-/// tool carries the card as `pending_card` and NO replies: its only outbound
+/// tool carries the card as `pending_card` and no replies — its only outbound
 /// activity is the pending-flow envelope, which `reply_text` would render as a
-/// JSON blob rather than a line the user should read.
+/// JSON blob rather than a line the user should read — except a side turn,
+/// whose answer is the one reply.
 pub fn trace_to_response(trace: crate::host::TurnTrace) -> AgentChatResponse {
     match pending_card(&trace.node_outputs) {
         Some(card) => AgentChatResponse {
-            replies: Vec::new(),
+            replies: side_turn_reply(&trace.node_outputs)
+                .map(|text| vec![ReplyView { text }])
+                .unwrap_or_default(),
             pending_card: Some(card),
         },
         None => replies_to_response(trace.replies),
@@ -266,7 +281,14 @@ impl Drop for Cleanup {
 fn completed_turn_frames(trace: crate::host::TurnTrace, streamed: bool) -> Vec<StreamFrame> {
     let mut frames = Vec::new();
     match pending_card(&trace.node_outputs) {
-        Some(card) => frames.push(StreamFrame::PendingCard { card }),
+        Some(card) => {
+            // A side turn's answer has not reached the client unless it was
+            // streamed token by token.
+            if !streamed && let Some(text) = side_turn_reply(&trace.node_outputs) {
+                frames.push(StreamFrame::TextChunk { text });
+            }
+            frames.push(StreamFrame::PendingCard { card });
+        }
         None => {
             if !streamed && let Some(reply) = first_nonempty_reply(&trace.replies) {
                 frames.push(StreamFrame::TextChunk { text: reply });
@@ -629,6 +651,62 @@ mod tests {
             "omitted when None: {body}"
         );
         assert_eq!(body["replies"][0]["text"], "booked");
+    }
+
+    #[test]
+    fn a_side_turn_carries_its_reply_and_the_card() {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert(
+            "agent".to_string(),
+            json!({
+                "reply": "the signature is in Settings",
+                "terminated_by": "awaiting_tool_input",
+                "side_turn": true,
+                "pending_presentation": { "type": "AdaptiveCard", "body": [] }
+            }),
+        );
+        let response = trace_to_response(crate::host::TurnTrace {
+            replies: vec![],
+            node_outputs: outputs,
+        });
+        let body = serde_json::to_value(&response).unwrap();
+        assert_eq!(body["replies"][0]["text"], "the signature is in Settings");
+        assert_eq!(body["pending_card"]["type"], "AdaptiveCard");
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_side_turn_that_was_not_streamed_sends_its_reply_before_the_card() {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert(
+            "agent".to_string(),
+            json!({
+                "reply": "the signature is in Settings",
+                "terminated_by": "awaiting_tool_input",
+                "side_turn": true,
+                "pending_presentation": { "type": "AdaptiveCard", "body": [] }
+            }),
+        );
+        let trace = || crate::host::TurnTrace {
+            replies: vec![],
+            node_outputs: outputs.clone(),
+        };
+        let frames = completed_turn_frames(trace(), false);
+        assert!(
+            matches!(frames.as_slice(),
+                [StreamFrame::TextChunk { text }, StreamFrame::PendingCard { .. }, StreamFrame::Done]
+                    if text == "the signature is in Settings"),
+            "{frames:?}"
+        );
+        // Already streamed token by token: only the card follows.
+        let frames = completed_turn_frames(trace(), true);
+        assert!(
+            matches!(
+                frames.as_slice(),
+                [StreamFrame::PendingCard { .. }, StreamFrame::Done]
+            ),
+            "{frames:?}"
+        );
     }
 
     #[cfg(feature = "agentic-worker")]

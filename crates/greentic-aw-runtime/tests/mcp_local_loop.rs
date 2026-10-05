@@ -126,6 +126,7 @@ fn build_agent_config(allowed_tools: Vec<ToolRef>) -> AgentConfig {
         knowledge: None,
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     }
 }
 

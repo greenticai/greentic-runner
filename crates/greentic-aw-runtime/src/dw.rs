@@ -137,6 +137,7 @@ pub fn agent_config_from_dw_manifest(m: &DwApplicationManifest) -> AgentConfig {
         knowledge: None,
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     }
 }
 

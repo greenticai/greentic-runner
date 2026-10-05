@@ -239,6 +239,7 @@ mod tests {
             guardrails: vec![],
             conversational: false,
             opening_message: None,
+            on_text_while_parked: Default::default(),
         };
         assert!(!long_term_active(false, &cfg));
         assert!(!long_term_active(true, &cfg));

@@ -21,8 +21,13 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::config::ParkedTextPolicy;
+use crate::error::TerminationReason;
 use crate::flow_source::FlowInvokeOutcome;
-use crate::state::{ChatMessage, ConversationState, PendingToolCall, ToolCallRecord};
+use crate::state::{
+    ChatMessage, ConversationState, MAX_SIDE_TURNS, PENDING_TOOL_MAX_AGE_SECS, PendingToolCall,
+    ToolCallRecord,
+};
 use crate::tenant::TenantContext;
 use crate::tool_session::ToolCatalogs;
 use crate::{AgentRuntime, AgentStep, StepObserver};
@@ -30,49 +35,222 @@ use crate::{AgentRuntime, AgentStep, StepObserver};
 /// The error value every tool call queued behind a suspended one receives.
 pub(crate) const BEHIND_SUSPENSION_ERROR: &str = "another step is waiting for the user";
 
+/// The result recorded for a parked call while it waits for the user, so
+/// messages appended after it keep the transcript provider-valid.
+pub(crate) const AWAITING_PLACEHOLDER: &str = "awaiting_user_input";
+
+/// Index of the LATEST assistant turn carrying a tool call `call_id`. Matching
+/// on the call id alone would hit an older turn when a backend reuses ids.
+fn latest_assistant_with(messages: &[ChatMessage], call_id: &str) -> Option<usize> {
+    messages.iter().rposition(|m| {
+        matches!(m, ChatMessage::Assistant { tool_calls, .. }
+            if tool_calls.iter().any(|c| c.call_id == call_id))
+    })
+}
+
+/// End of the run of `Tool` messages answering the assistant turn at `at`.
+fn tool_run_end(messages: &[ChatMessage], at: usize) -> usize {
+    let mut end = at + 1;
+    while matches!(messages.get(end), Some(ChatMessage::Tool { .. })) {
+        end += 1;
+    }
+    end
+}
+
+/// Record `content` as the result of `call_id`: replace the `Tool` already
+/// answering the latest assistant turn that made the call (the park
+/// placeholder) in place, or add one at the end of that turn's results when
+/// there is none. If that assistant turn is no longer in history nothing is
+/// added: a `Tool` with no assistant turn before it is refused by the provider.
+pub(crate) fn patch_tool_result(state: &mut ConversationState, call_id: &str, content: Value) {
+    let Some(at) = latest_assistant_with(&state.messages, call_id) else {
+        return;
+    };
+    let end = tool_run_end(&state.messages, at);
+    let existing = state.messages[at + 1..end]
+        .iter_mut()
+        .find_map(|m| match m {
+            ChatMessage::Tool {
+                call_id: id,
+                content,
+            } if id == call_id => Some(content),
+            _ => None,
+        });
+    match existing {
+        Some(slot) => *slot = content,
+        None => state.messages.insert(
+            end,
+            ChatMessage::Tool {
+                call_id: call_id.to_string(),
+                content,
+            },
+        ),
+    }
+}
+
 /// A parked flow tool that this turn will resume.
 pub(crate) struct Resume {
     pub(crate) pending: PendingToolCall,
     pub(crate) payload: Value,
 }
 
+/// What the start of a step found on the conversation's parked flow tool.
+pub(crate) enum Taken {
+    /// Nothing was parked.
+    Nothing,
+    /// The turn carries the user's answer: resume the flow.
+    Resume(Resume),
+    /// The park was cancelled (typed message, or expired); the trail step
+    /// records it. The turn proceeds as an ordinary message.
+    Cancelled(AgentStep),
+    /// The park STAYS and this turn answers the typed message as a side turn.
+    Side,
+}
+
+/// The note added to the system prompt of the turn that RESUMES a flow tool
+/// after one or more side turns, so the model answers about the finished step
+/// and not the last side question.
+pub(crate) const RESUME_AFTER_SIDE_TURNS_NOTE: &str = "The form step the user was asked to \
+complete has now finished; its result is the tool result in the conversation. \
+Reply about that result, not about the earlier side questions.";
+
+/// The note added to the system prompt of a side turn.
+pub(crate) const SIDE_TURN_NOTE: &str = "A form step is waiting for the user to \
+fill it in. Do not start that step again. Answer the user's question, then \
+mention that the form can be continued.";
+
 /// Take the conversation's pending flow tool, if any.
 ///
 /// Returns the resume to run when the suspension is live and the turn carries
-/// the user's answer. Otherwise the pending call is CANCELLED here — its
-/// `call_id` answered with `{"status": "cancelled", "reason": ...}` — and the
-/// returned trail step records it; the turn then proceeds as an ordinary
-/// message.
+/// the user's answer. With `policy == SideTurn`, a typed message on a live,
+/// re-offerable park leaves the park in place ([`Taken::Side`]). Otherwise the
+/// pending call is CANCELLED here — its `call_id` answered with
+/// `{"status": "cancelled", "reason": ...}` — and the returned trail step
+/// records it; the turn then proceeds as an ordinary message.
 pub(crate) fn take_pending(
     state: &mut ConversationState,
     resume_payload: Option<Value>,
     now: DateTime<Utc>,
     observer: &dyn StepObserver,
-) -> (Option<Resume>, Option<AgentStep>) {
+    policy: ParkedTextPolicy,
+) -> Taken {
+    let Some(pending) = state.pending_tool.as_ref() else {
+        return Taken::Nothing;
+    };
+    if policy == ParkedTextPolicy::SideTurn
+        && resume_payload.is_none()
+        && side_turn_allowed(pending, now)
+        && ensure_placeholder(state)
+    {
+        if let Some(pending) = state.pending_tool.as_mut() {
+            begin_side_turn(pending, now);
+        }
+        return Taken::Side;
+    }
     let Some(pending) = state.pending_tool.take() else {
-        return (None, None);
+        return Taken::Nothing;
     };
     let reason = if pending.is_expired(now) {
         "the step waiting for the user expired before they answered"
     } else if let Some(payload) = resume_payload {
-        return (Some(Resume { pending, payload }), None);
+        return Taken::Resume(Resume { pending, payload });
     } else {
         "the user sent a message instead of completing this step"
     };
     let result = json!({ "status": "cancelled", "reason": reason });
     observer.on_tool_result(&pending.tool_name, &pending.call_id, &result);
-    state.messages.push(ChatMessage::Tool {
-        call_id: pending.call_id.clone(),
-        content: result.clone(),
-    });
-    let step = AgentStep::ToolCall {
+    patch_tool_result(state, &pending.call_id, result.clone());
+    Taken::Cancelled(AgentStep::ToolCall {
         name: pending.tool_name,
         call_id: pending.call_id,
         args: pending.args,
         result,
         duration_ms: 0,
+    })
+}
+
+/// Whether a typed message may be answered while `pending` stays parked: the
+/// park is live (idle expiry and the 24h age cap), under the side-turn cap,
+/// and carries the card to re-offer afterwards.
+fn side_turn_allowed(pending: &PendingToolCall, now: DateTime<Utc>) -> bool {
+    let within_age = pending
+        .parked_at
+        .is_none_or(|at| now < at + chrono::Duration::seconds(PENDING_TOOL_MAX_AGE_SECS));
+    !pending.is_expired(now)
+        && within_age
+        && pending.side_turns < MAX_SIDE_TURNS
+        && pending.presentation.is_some()
+}
+
+/// Count a side turn and refresh the idle expiry, never beyond
+/// `parked_at + PENDING_TOOL_MAX_AGE_SECS`.
+fn begin_side_turn(pending: &mut PendingToolCall, now: DateTime<Utc>) {
+    pending.side_turns += 1;
+    let idle = PendingToolCall::expiry_from(now);
+    pending.expires_at = match pending.parked_at {
+        Some(at) => idle.min(at + chrono::Duration::seconds(PENDING_TOOL_MAX_AGE_SECS)),
+        None => idle,
     };
-    (None, Some(step))
+}
+
+/// Make sure the parked call has a `Tool` result in history (a park recorded
+/// without a placeholder, e.g. under the cancel policy), inserting one right
+/// after the assistant turn that made the call. `false` when that turn is no
+/// longer in history, in which case the park cannot take a side turn.
+fn ensure_placeholder(state: &mut ConversationState) -> bool {
+    let Some(call_id) = state.pending_tool.as_ref().map(|p| p.call_id.clone()) else {
+        return false;
+    };
+    let Some(at) = latest_assistant_with(&state.messages, &call_id) else {
+        return false;
+    };
+    let end = tool_run_end(&state.messages, at);
+    if state.messages[at + 1..end]
+        .iter()
+        .any(|m| matches!(m, ChatMessage::Tool { call_id: id, .. } if *id == call_id))
+    {
+        return true;
+    }
+    state.messages.insert(
+        at + 1,
+        ChatMessage::Tool {
+            call_id,
+            content: json!({ "status": AWAITING_PLACEHOLDER }),
+        },
+    );
+    true
+}
+
+/// After a side turn's loop: re-offer the stored card. Turns the step's end
+/// into `AwaitingToolInput` carrying that card, whatever stopped the loop
+/// (a final reply, the iteration cap, the timeout). Returns whether it did.
+/// If the model ended the conversation instead, the park is cancelled so no
+/// call stays pending behind a finished segment.
+pub(crate) fn finish_side_turn(
+    state: &mut ConversationState,
+    terminated_by: &mut TerminationReason,
+    suspension: &mut Option<Value>,
+) -> bool {
+    if matches!(terminated_by, TerminationReason::ConversationEnded) {
+        if let Some(pending) = state.pending_tool.take() {
+            patch_tool_result(
+                state,
+                &pending.call_id,
+                json!({ "status": "cancelled", "reason": "the conversation ended" }),
+            );
+        }
+        return false;
+    }
+    let Some(card) = state
+        .pending_tool
+        .as_ref()
+        .and_then(|p| p.presentation.clone())
+    else {
+        return false;
+    };
+    *terminated_by = TerminationReason::AwaitingToolInput;
+    *suspension = Some(card);
+    true
 }
 
 /// The most recent user message's text. A resumed turn carries a card submit
@@ -133,10 +311,7 @@ pub(crate) async fn resume_pending(
             {
                 warn!(error = %e, "ledger record failed; continuing");
             }
-            state.messages.push(ChatMessage::Tool {
-                call_id: pending.call_id.clone(),
-                content: result.clone(),
-            });
+            patch_tool_result(state, &pending.call_id, result.clone());
             trail.push(AgentStep::ToolCall {
                 name: pending.tool_name,
                 call_id: pending.call_id,
@@ -152,6 +327,8 @@ pub(crate) async fn resume_pending(
         } => {
             pending.flow_snapshot = snapshot;
             pending.expires_at = PendingToolCall::expiry_from(Utc::now());
+            pending.presentation = Some(presentation.clone());
+            pending.side_turns = 0;
             state.pending_tool = Some(pending);
             Some(presentation)
         }
@@ -180,4 +357,114 @@ pub(crate) fn refuse_behind_suspension(
         result,
         duration_ms: 0,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(id: &str, content: Value) -> ChatMessage {
+        ChatMessage::Tool {
+            call_id: id.into(),
+            content,
+        }
+    }
+
+    fn state_with(messages: Vec<ChatMessage>) -> ConversationState {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = messages;
+        s
+    }
+
+    #[test]
+    fn patch_replaces_the_placeholder_in_place() {
+        let mut s = state_with(vec![
+            asst(&["c1"]),
+            tool("c1", json!({ "status": AWAITING_PLACEHOLDER })),
+            ChatMessage::User {
+                content: "q".into(),
+            },
+        ]);
+        patch_tool_result(&mut s, "c1", json!({ "ok": true }));
+        assert_eq!(s.messages.len(), 3);
+        assert!(matches!(&s.messages[1],
+            ChatMessage::Tool { content, .. } if content == &json!({ "ok": true })));
+    }
+
+    fn asst(ids: &[&str]) -> ChatMessage {
+        ChatMessage::Assistant {
+            content: String::new(),
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCallRecord {
+                    call_id: (*id).into(),
+                    extension_id: "flow:form".into(),
+                    tool_name: "form".into(),
+                    args: json!({}),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn patch_adds_the_result_after_its_assistant_turn_when_there_is_no_placeholder() {
+        let mut s = state_with(vec![asst(&["c1"])]);
+        patch_tool_result(&mut s, "c1", json!({ "status": "cancelled" }));
+        assert_eq!(s.messages.len(), 2);
+    }
+
+    #[test]
+    fn patch_never_adds_an_orphan_when_the_assistant_turn_is_gone() {
+        let mut s = state_with(vec![]);
+        patch_tool_result(&mut s, "c1", json!({ "status": "cancelled" }));
+        assert!(s.messages.is_empty());
+    }
+
+    /// A backend that reuses call ids: the result must land on the Tool that
+    /// answers the LATEST assistant turn carrying the id, not an older one.
+    #[test]
+    fn patch_targets_the_latest_assistant_turn_when_a_call_id_is_reused() {
+        let old = json!({ "old": true });
+        let mut s = state_with(vec![
+            asst(&["c1"]),
+            tool("c1", old.clone()),
+            ChatMessage::User {
+                content: "next".into(),
+            },
+            asst(&["c1"]),
+            tool("c1", json!({ "status": AWAITING_PLACEHOLDER })),
+        ]);
+        patch_tool_result(&mut s, "c1", json!({ "new": true }));
+        assert!(matches!(&s.messages[1], ChatMessage::Tool { content, .. } if content == &old));
+        assert!(matches!(&s.messages[4],
+            ChatMessage::Tool { content, .. } if content == &json!({ "new": true })));
+    }
+
+    #[test]
+    fn ensure_placeholder_answers_the_latest_assistant_turn_when_a_call_id_is_reused() {
+        let mut s = state_with(vec![
+            asst(&["c1"]),
+            tool("c1", json!({ "old": true })),
+            ChatMessage::User {
+                content: "next".into(),
+            },
+            asst(&["c1"]),
+        ]);
+        s.pending_tool = Some(crate::state::PendingToolCall {
+            call_id: "c1".into(),
+            tool_name: "form".into(),
+            extension_id: "flow:form".into(),
+            args: json!({}),
+            flow_ref: "form".into(),
+            flow_snapshot: json!({}),
+            iterations_used: 0,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            presentation: Some(json!({})),
+            parked_at: None,
+            side_turns: 0,
+        });
+        assert!(ensure_placeholder(&mut s));
+        assert_eq!(s.messages.len(), 5);
+        assert!(matches!(&s.messages[4], ChatMessage::Tool { .. }));
+    }
 }

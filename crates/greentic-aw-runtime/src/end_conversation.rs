@@ -75,6 +75,7 @@ mod tests {
             knowledge: None,
             conversational,
             opening_message: None,
+            on_text_while_parked: Default::default(),
         }
     }
 

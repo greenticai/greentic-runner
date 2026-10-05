@@ -1486,9 +1486,7 @@ impl FlowEngine {
                     // must answer, and channels render the turn output as they
                     // would a card node's. The full envelope (carrying the
                     // card as `pending_presentation`) stays the node output.
-                    let rendered = tool_presentation(&output.payload)
-                        .cloned()
-                        .unwrap_or_else(|| output.payload.clone());
+                    let rendered = rendered_park(&output.payload);
                     let output_value = state.finalize_with(Some(rendered));
                     return Ok(FlowExecution::waiting(
                         output_value,
@@ -4342,6 +4340,39 @@ pub(crate) fn tool_presentation(payload: &Value) -> Option<&Value> {
         .filter(|value| !value.is_null())
 }
 
+/// Envelope metadata key the webchat provider sets to `"true"` on a card submit
+/// (an activity carrying Action.Submit `data`, even `{}`) and never on typed
+/// text. Contract with `messaging-provider-webchat` (`SUBMIT_MARKER_KEY`). The
+/// `greentic_` prefix is one the provider never copies from client data.
+const SUBMIT_MARKER_KEY: &str = "greentic_submit";
+
+/// What a `dw.agent` parked on a `flow:` tool renders as the turn's output.
+/// The card alone for a plain park. For a SIDE turn (a typed message answered
+/// while the tool stays parked) the agent's reply followed by the card, as two
+/// replies, so the user reads the answer and still sees the form to continue.
+pub(crate) fn rendered_park(payload: &Value) -> Value {
+    let Some(card) = tool_presentation(payload) else {
+        return payload.clone();
+    };
+    let side_reply = payload
+        .get("side_turn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && payload
+            .get("reply")
+            .and_then(Value::as_str)
+            .is_some_and(|reply| !reply.trim().is_empty());
+    if !side_reply {
+        return card.clone();
+    }
+    let mut reply = payload.clone();
+    if let Some(map) = reply.as_object_mut() {
+        map.remove("pending_presentation");
+        map.remove("side_turn");
+    }
+    Value::Array(vec![reply, card.clone()])
+}
+
 /// Keys of a `ChannelMessageEnvelope` that the TRANSPORT owns. On the
 /// `greentic-start` path every inbound message carries them, typed or not, so
 /// they say nothing about whether a person submitted a card.
@@ -4364,8 +4395,60 @@ const ENVELOPE_TRANSPORT_KEYS: &[&str] = &[
 /// Channel context a provider may stamp on a message's `metadata` whether or
 /// not a card was submitted. Context, not input, so it never makes a typed
 /// message a submit.
+///
+/// The webchat provider (`messaging-provider-webchat` `ops/envelope.rs`,
+/// `ops/ingest.rs`) MAY stamp these on a Direct Line activity: `universal`,
+/// `env`, `locale`, `extensions`, `user_id`, `user_verified`, and `flow_hint`
+/// when the `X-Greentic-Flow` header is present. `team` is kept from the
+/// earlier allow-list. `route` and `tenant` are handled separately
+/// ([`stamped_identity_matches`]).
+///
+/// NONE of these is trustworthy: Action.Submit `data` is copied into
+/// `metadata` after the stamping, so a client can overwrite any of them (only
+/// `user_*`/`greentic_*` are protected). Safe here only because a client that
+/// can add keys can already send plain text or add `action`.
+///
+/// The failure direction matters: a card INPUT that shares one of these names
+/// is invisible to the classifier, so a click carrying only that input reads
+/// as typed text and the parked tool is cancelled (#811). The explicit submit
+/// marker (spec PR-2) is the real fix.
 #[cfg(any(feature = "agentic-worker", test))]
-const CHANNEL_CONTEXT_METADATA_KEYS: &[&str] = &["locale", "team", "env", "autoStart"];
+const CHANNEL_CONTEXT_METADATA_KEYS: &[&str] = &[
+    "locale",
+    "team",
+    "env",
+    "autoStart",
+    "universal",
+    "user_id",
+    "user_verified",
+    "flow_hint",
+    "extensions",
+];
+
+/// Provider passthroughs are flattened into `metadata` as `channel.<key>`.
+#[cfg(any(feature = "agentic-worker", test))]
+const CHANNEL_CONTEXT_METADATA_PREFIX: &str = "channel.";
+
+#[cfg(any(feature = "agentic-worker", test))]
+fn is_channel_context_key(key: &str) -> bool {
+    CHANNEL_CONTEXT_METADATA_KEYS.contains(&key) || key.starts_with(CHANNEL_CONTEXT_METADATA_PREFIX)
+}
+
+/// `route` (= conversation id = `session_id`) and `tenant` (= `tenant.tenant`)
+/// are context only when they carry the value the provider derives from the
+/// envelope itself. A card input that merely shares the name overwrites them
+/// with its own value and is therefore input, not context.
+#[cfg(any(feature = "agentic-worker", test))]
+fn stamped_identity_matches(key: &str, value: &Value, envelope: &Value) -> bool {
+    let Some(value) = value.as_str() else {
+        return false;
+    };
+    match key {
+        "route" => envelope.get("session_id").and_then(Value::as_str) == Some(value),
+        "tenant" => envelope.pointer("/tenant/tenant").and_then(Value::as_str) == Some(value),
+        _ => false,
+    }
+}
 
 /// Whether `map` is a `ChannelMessageEnvelope`: the three keys no card input
 /// has any reason to share are all there. Decided by SHAPE, not by where the
@@ -4399,6 +4482,14 @@ fn is_card_submit(entry: &Value) -> bool {
     if has_action {
         return true;
     }
+    // An explicit marker from the provider settles it, including a submit with
+    // no fields of its own that no key-shape heuristic can tell from typed text.
+    let marked = metadata
+        .and_then(|meta| meta.get(SUBMIT_MARKER_KEY))
+        .is_some_and(|value| value.as_str() == Some("true") || value.as_bool() == Some(true));
+    if marked {
+        return true;
+    }
     let envelope = entry
         .get("input")
         .filter(|v| v.is_object())
@@ -4412,8 +4503,12 @@ fn is_card_submit(entry: &Value) -> bool {
         })
     });
     let metadata_input = metadata.is_some_and(|meta| {
-        meta.keys()
-            .any(|key| key != "action" && !CHANNEL_CONTEXT_METADATA_KEYS.contains(&key.as_str()))
+        meta.iter().any(|(key, value)| {
+            key != "action"
+                && key != SUBMIT_MARKER_KEY
+                && !is_channel_context_key(key)
+                && !stamped_identity_matches(key, value, envelope)
+        })
     });
     root_input || metadata_input
 }
@@ -6127,7 +6222,7 @@ fn submitted_fields(entry: &Value) -> JsonMap<String, Value> {
     let mut fields = JsonMap::new();
     if let Some(Value::Object(meta)) = resolve_entry_metadata(entry) {
         for (key, value) in meta {
-            if key == "action" {
+            if key == "action" || key == SUBMIT_MARKER_KEY {
                 continue;
             }
             fields.insert(key.clone(), value.clone());
@@ -8466,6 +8561,7 @@ mod tests {
                 knowledge: None,
                 conversational: false,
                 opening_message: None,
+                on_text_while_parked: Default::default(),
             },
         );
         let config_provider = Arc::new(config_provider);
@@ -13003,6 +13099,82 @@ mod tests {
         assert_eq!(*handler.resumes.lock().unwrap(), vec![None, None]);
     }
 
+    #[cfg(feature = "agentic-worker")]
+    fn side_turn_output() -> serde_json::Value {
+        json!({
+            "reply": "the signature is in Settings",
+            "trail": [],
+            "terminated_by": "awaiting_tool_input",
+            "side_turn": true,
+            "pending_presentation": { "type": "AdaptiveCard", "body": [{ "text": "Room?" }] }
+        })
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_plain_park_still_renders_only_the_card() {
+        let out = awaiting_tool_output();
+        assert_eq!(rendered_park(&out), out["pending_presentation"]);
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_side_turn_park_renders_the_reply_then_the_card() {
+        let out = side_turn_output();
+        let rendered = rendered_park(&out);
+        let items = rendered.as_array().expect("reply + card");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["reply"], "the signature is in Settings");
+        assert!(items[0].get("pending_presentation").is_none());
+        assert_eq!(items[1], out["pending_presentation"]);
+    }
+
+    /// A typed message answered as a side turn leaves the flow parked at the
+    /// agent node with the await re-armed, so the NEXT card submit still
+    /// reaches the agent as a resume payload.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_side_turn_keeps_the_await_armed_so_a_submit_still_resumes() {
+        let handler = std::sync::Arc::new(ToolParkAgentHandler::new(vec![
+            awaiting_tool_output(),
+            side_turn_output(),
+            json!({ "reply": "booked", "trail": [], "terminated_by": "final_reply" }),
+        ]));
+        let engine = conv_engine_with(conversational_dw_flow(false), handler.clone());
+        let rt = Runtime::new().unwrap();
+        let first = rt
+            .block_on(engine.execute(conv_ctx(), json!({ "text": "book a room" })))
+            .unwrap();
+        let FlowStatus::Waiting(wait) = first.status else {
+            panic!("expected a park");
+        };
+        let second = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                wait.snapshot,
+                json!({ "text": "how do I get a signature?" }),
+            ))
+            .unwrap();
+        assert!(
+            second.output.is_array(),
+            "reply and card: {}",
+            second.output
+        );
+        let FlowStatus::Waiting(wait) = second.status else {
+            panic!("the side turn must keep the flow parked");
+        };
+        rt.block_on(engine.resume(
+            conv_ctx(),
+            wait.snapshot,
+            json!({ "metadata": { "action": "submit" } }),
+        ))
+        .unwrap();
+        let resumes = handler.resumes.lock().unwrap();
+        assert_eq!(resumes.len(), 3);
+        assert!(resumes[0].is_none() && resumes[1].is_none());
+        assert!(resumes[2].is_some(), "the submit must resume the tool");
+    }
+
     /// What `greentic-start` really hands the engine for a typed message: the
     /// whole `ChannelMessageEnvelope` under `input`, with its transport
     /// identity (`id`, `tenant`, `channel`, `session_id`, ...) and, for a
@@ -13059,6 +13231,127 @@ mod tests {
         assert!(is_card_submit(
             &json!({ "channel": "email", "metadata": {} })
         ));
+    }
+
+    /// What the webchat provider stamps on EVERY message (typed or clicked):
+    /// `messaging-provider-webchat` `ops/envelope.rs` (universal, tenant,
+    /// tenant_channel_id, route, extensions, channel.*) and `ops/ingest.rs`
+    /// (user_id, user_verified, flow_hint, locale). Verified against
+    /// greentic-messaging-providers develop e4f7b389.
+    #[cfg(any(feature = "agentic-worker", test))]
+    fn provider_stamped_metadata() -> serde_json::Value {
+        json!({
+            "universal": "true",
+            "env": "prod",
+            "tenant": "acme",
+            "route": "sess-1",
+            "user_id": "user-1",
+            "user_verified": "true",
+            "flow_hint": "main",
+            "locale": "en-US",
+            "extensions": "{\"caller\":{\"sub\":\"user-1\"}}",
+            "channel.channel_data": "{}"
+        })
+    }
+
+    #[test]
+    fn a_typed_message_with_provider_stamped_metadata_is_not_a_card_submit() {
+        let mut typed = wrapped_typed_message("how do I get a mail signature?");
+        typed["input"]["metadata"] = provider_stamped_metadata();
+        assert!(!is_card_submit(&typed));
+        // Same envelope delivered flat.
+        let flat = typed["input"].clone();
+        assert!(!is_card_submit(&flat));
+    }
+
+    #[test]
+    fn a_click_is_still_a_card_submit_beside_provider_stamped_metadata() {
+        let mut by_action = wrapped_typed_message("");
+        let mut meta = provider_stamped_metadata();
+        meta["action"] = json!("start_request");
+        by_action["input"]["metadata"] = meta;
+        assert!(is_card_submit(&by_action));
+
+        let mut by_values = wrapped_typed_message("");
+        let mut meta = provider_stamped_metadata();
+        meta["room"] = json!("101");
+        by_values["input"]["metadata"] = meta;
+        assert!(is_card_submit(&by_values));
+    }
+
+    #[test]
+    fn channel_context_prefix_matches_only_the_channel_namespace() {
+        let mut typed = wrapped_typed_message("hi");
+        typed["input"]["metadata"] = json!({ "mychannel.x": "1" });
+        assert!(is_card_submit(&typed));
+        typed["input"]["metadata"] = json!({ "channel.x": "1" });
+        assert!(!is_card_submit(&typed));
+    }
+
+    /// The webchat provider marks a card submit explicitly (`greentic_submit`),
+    /// so a submit that carries no fields of its own is still a submit.
+    #[test]
+    fn the_provider_submit_marker_makes_an_empty_submit_a_submit() {
+        let mut click = wrapped_typed_message("message");
+        let mut meta = provider_stamped_metadata();
+        meta["greentic_submit"] = json!("true");
+        click["input"]["metadata"] = meta;
+        assert!(is_card_submit(&click));
+        let flat = click["input"].clone();
+        assert!(is_card_submit(&flat));
+        // Without the marker the same envelope is typed text.
+        let mut typed = wrapped_typed_message("message");
+        typed["input"]["metadata"] = provider_stamped_metadata();
+        assert!(!is_card_submit(&typed));
+        // Only the string "true" counts.
+        let mut other = wrapped_typed_message("message");
+        let mut meta = provider_stamped_metadata();
+        meta["greentic_submit"] = json!("false");
+        other["input"]["metadata"] = meta;
+        assert!(!is_card_submit(&other));
+    }
+
+    #[test]
+    fn the_submit_marker_is_not_a_submitted_answer() {
+        let entry = json!({ "metadata": { "room": "101", "greentic_submit": "true" } });
+        let fields = submitted_fields(&entry);
+        assert!(fields.contains_key("room"));
+        assert!(!fields.contains_key("greentic_submit"));
+    }
+
+    /// `route` and `tenant` are only context when they carry the value the
+    /// provider derives from the envelope (`route` = conversation id =
+    /// `session_id`; `tenant` = `tenant.tenant`). A card input that merely
+    /// shares the name overwrites them with its own value, and that click
+    /// must stay a submit or the parked tool is cancelled by a button press.
+    #[test]
+    fn a_card_input_named_like_a_stamped_key_with_its_own_value_is_a_submit() {
+        for (key, value) in [("route", "billing"), ("tenant", "other-corp")] {
+            let mut click = wrapped_typed_message("");
+            click["input"]["metadata"] = json!({ key: value });
+            assert!(is_card_submit(&click), "{key}={value} must count as input");
+            let flat = click["input"].clone();
+            assert!(
+                is_card_submit(&flat),
+                "flat {key}={value} must count as input"
+            );
+        }
+        // The same keys carrying the envelope's own identity are context.
+        let mut typed = wrapped_typed_message("hi");
+        typed["input"]["metadata"] = json!({ "route": "sess-1", "tenant": "acme" });
+        assert!(!is_card_submit(&typed));
+    }
+
+    /// Stamped only on the auto-start envelope or never on the activities
+    /// path: not context for a message that can reach a parked node, so a card
+    /// input of that name is input.
+    #[test]
+    fn keys_the_activities_path_never_stamps_are_input() {
+        for key in ["tenant_id", "conversation_id", "tenant_channel_id"] {
+            let mut click = wrapped_typed_message("");
+            click["input"]["metadata"] = json!({ key: "x" });
+            assert!(is_card_submit(&click), "{key} must count as input");
+        }
     }
 
     /// The engine-level view of the same defect: a typed message in a channel

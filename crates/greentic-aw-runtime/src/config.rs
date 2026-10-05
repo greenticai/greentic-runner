@@ -132,6 +132,17 @@ pub struct GuardrailRef {
     pub mode: GuardrailMode,
 }
 
+/// What a typed message does while a `flow:` tool is parked on the user.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParkedTextPolicy {
+    /// Cancel the parked tool; the text is an ordinary message (today's behaviour).
+    #[default]
+    Cancel,
+    /// Answer the text as a side turn and keep the tool parked.
+    SideTurn,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub agent_id: String,
@@ -152,6 +163,10 @@ pub struct AgentConfig {
     /// one-shot behaviour.
     #[serde(default)]
     pub conversational: bool,
+    /// What a typed message does while a `flow:` tool is parked on a card.
+    /// Default `cancel` = today's behaviour.
+    #[serde(default)]
+    pub on_text_while_parked: ParkedTextPolicy,
     /// Optional author-configured greeting. When set, the FIRST turn that
     /// arrives with no user text (e.g. the flow entered the agent via a
     /// button/card, not a typed message) replies with this verbatim instead of
@@ -407,6 +422,7 @@ mod tests {
             knowledge: None,
             conversational: false,
             opening_message: None,
+            on_text_while_parked: Default::default(),
         };
         let json = serde_json::to_string(&original).unwrap();
         let round: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -426,6 +442,19 @@ mod tests {
         }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.guardrails.is_empty());
+    }
+
+    #[test]
+    fn on_text_while_parked_defaults_to_cancel_and_parses() {
+        let base = r#"{"agent_id":"a","system_prompt":"s","tools":[],"llm":{"provider":"openai","model":"m"}}"#;
+        let cfg: AgentConfig = serde_json::from_str(base).unwrap();
+        assert_eq!(cfg.on_text_while_parked, ParkedTextPolicy::Cancel);
+        let with = base.replace(
+            "\"tools\"",
+            "\"on_text_while_parked\":\"side_turn\",\"tools\"",
+        );
+        let cfg: AgentConfig = serde_json::from_str(&with).unwrap();
+        assert_eq!(cfg.on_text_while_parked, ParkedTextPolicy::SideTurn);
     }
 
     #[test]

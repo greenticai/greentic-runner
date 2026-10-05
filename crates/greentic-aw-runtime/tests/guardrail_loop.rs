@@ -59,6 +59,7 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
         knowledge: None,
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -160,6 +161,7 @@ async fn no_mandatory_guardrails_passes_through() {
         knowledge: None,
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -310,6 +312,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
         knowledge: None,
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     };
 
     let cp = greentic_aw_runtime::mock::MockConfigProvider::new();
