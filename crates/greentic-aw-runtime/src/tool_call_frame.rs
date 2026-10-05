@@ -19,7 +19,11 @@ use std::future::Future;
 use crate::tenant::VerifiedCaller;
 
 /// The calling agent's session and the LLM's call id for one tool call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` prints only the call id and whether a session and a verified caller
+/// are present: the session is a conversation key and `sub` names a person,
+/// neither of which belongs in a log line.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ToolCallFrame {
     /// The calling agent's conversation session; `None` for a caller that has
     /// none (a `ToolSession` built without `with_session_id`).
@@ -72,6 +76,16 @@ impl ToolCallFrame {
     }
 }
 
+impl std::fmt::Debug for ToolCallFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallFrame")
+            .field("call_id", &self.call_id)
+            .field("has_session", &self.session_id.is_some())
+            .field("verified_caller", &self.caller.user_verified)
+            .finish()
+    }
+}
+
 tokio::task_local! {
     static CURRENT: ToolCallFrame;
 }
@@ -84,6 +98,11 @@ pub async fn within<F: Future>(frame: ToolCallFrame, fut: F) -> F::Output {
 }
 
 /// The tool call the current task is dispatching, if any.
+///
+/// Inside a nested agent (a `dw.agent` running in a `flow:` tool's flow) this
+/// is still the OUTER agent's frame for any tool call that agent makes other
+/// than a `flow:` one: only flow-tool dispatch publishes a new frame. Only the
+/// flow-tool entry reads it, and it re-frames before anything nested runs.
 #[must_use]
 pub fn current_tool_call() -> Option<ToolCallFrame> {
     CURRENT.try_with(Clone::clone).ok()
@@ -134,6 +153,21 @@ mod tests {
         let anon = ToolCallFrame::new(Some("s"), "c");
         assert_eq!(anon.caller(), &VerifiedCaller::default());
         assert!(!anon.caller().user_verified);
+    }
+
+    #[test]
+    fn debug_prints_neither_the_session_nor_the_callers_identity() {
+        let f = ToolCallFrame::new(Some("secret-session"), "c7").with_caller(VerifiedCaller {
+            user_verified: true,
+            sub: Some("alice@example.com".into()),
+            ..VerifiedCaller::default()
+        });
+        let shown = format!("{f:?}");
+        assert!(!shown.contains("secret-session"), "{shown}");
+        assert!(!shown.contains("alice"), "{shown}");
+        assert!(shown.contains("c7"), "{shown}");
+        assert!(shown.contains("has_session: true"), "{shown}");
+        assert!(shown.contains("verified_caller: true"), "{shown}");
     }
 
     #[test]
