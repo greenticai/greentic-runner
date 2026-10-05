@@ -318,10 +318,10 @@ impl UserLedgerBinding {
             }
             return None;
         }
-        let subject = verified_subject(tenant)?;
         if !enabled {
             return None;
         }
+        let subject = verified_subject(tenant)?;
         Some(LedgerTurn {
             binding: Arc::clone(self),
             subject,

@@ -16,11 +16,12 @@ use std::time::Duration;
 
 use greentic_aw_runtime::cost::MockTokenMeter;
 use greentic_aw_runtime::error::LlmError;
+use greentic_aw_runtime::error::TerminationReason;
 use greentic_aw_runtime::llm::LlmResponse;
 use greentic_aw_runtime::mock::{
     MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, NoopToolLedger,
 };
-use greentic_aw_runtime::state::ToolCallRecord;
+use greentic_aw_runtime::state::{AgentStateStore, ToolCallRecord};
 use greentic_aw_runtime::tenant::{TenantContext, VerifiedCaller};
 use greentic_aw_runtime::tool_call_frame::within;
 use greentic_aw_runtime::user_ledger::{
@@ -41,6 +42,8 @@ struct StubLedger {
     fail: bool,
     hang: bool,
     hang_append: bool,
+    /// Real-time delay before a read answers.
+    read_delay: Option<Duration>,
     reads: Mutex<Vec<String>>,
     appends: Mutex<Vec<(String, String, String)>>,
 }
@@ -49,6 +52,9 @@ impl UserLedger for StubLedger {
     fn read<'a>(&'a self, subject: &'a str, _limit: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
         self.reads.lock().unwrap().push(subject.to_string());
         Box::pin(async move {
+            if let Some(d) = self.read_delay {
+                tokio::time::sleep(d).await;
+            }
             if self.hang {
                 std::future::pending::<()>().await;
             }
@@ -126,12 +132,20 @@ fn reply(text: &str) -> Result<LlmResponse, LlmError> {
 }
 
 fn bare_runtime(a: AgentConfig, llm: Arc<MockLlmBackend>) -> AgentRuntime {
+    bare_runtime_with_store(a, llm, Arc::new(MockAgentStateStore::new()))
+}
+
+fn bare_runtime_with_store(
+    a: AgentConfig,
+    llm: Arc<MockLlmBackend>,
+    store: Arc<MockAgentStateStore>,
+) -> AgentRuntime {
     let cp = MockConfigProvider::new();
     let id = a.agent_id.clone();
     cp.insert(&TenantContext::new(TENANT, "prod"), &id, a);
     AgentRuntime::new(
         Arc::new(cp),
-        Arc::new(MockAgentStateStore::new()),
+        store,
         Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
         llm,
         Arc::new(MockTelemetry::new()),
@@ -147,10 +161,14 @@ fn runtime(
     ledger: Arc<StubLedger>,
     mode: LedgerMode,
 ) -> AgentRuntime {
+    with_ledger(bare_runtime(a, llm), ledger, mode)
+}
+
+fn with_ledger(rt: AgentRuntime, ledger: Arc<StubLedger>, mode: LedgerMode) -> AgentRuntime {
     let mut agents = HashMap::new();
     agents.insert("helper".to_string(), mode);
     let dyn_ledger: Arc<dyn UserLedger> = ledger;
-    bare_runtime(a, llm).with_user_ledger(Some(Arc::new(UserLedgerBinding::new(
+    rt.with_user_ledger(Some(Arc::new(UserLedgerBinding::new(
         TENANT, dyn_ledger, agents,
     ))))
 }
@@ -371,6 +389,13 @@ async fn only_the_guarded_reply_is_appended() {
     for leaked in ["SECRET-42", "4111-ARG", "4111-USER"] {
         assert!(!all.contains(leaked), "{leaked} must not reach the ledger");
     }
+    // Two LLM iterations, one read: the view is fetched once per step, not per
+    // iteration.
+    assert_eq!(
+        ledger.reads.lock().unwrap().len(),
+        1,
+        "the ledger is read once for the whole step"
+    );
 }
 
 #[tokio::test]
@@ -636,5 +661,212 @@ async fn a_nested_agent_inside_a_flow_tool_frame_never_appends_to_the_ledger() {
     assert!(
         ledger.appends.lock().unwrap().is_empty(),
         "no ledger append from a nested agent"
+    );
+}
+
+/// The view is prompt text for this step only: it never lands in the persisted
+/// conversation history, so it is not replayed (or re-stored) on later turns.
+#[tokio::test]
+async fn the_user_history_never_lands_in_the_saved_conversation() {
+    let llm = Arc::new(MockLlmBackend::new(vec![reply("noted")]));
+    let ledger = Arc::new(StubLedger {
+        events: history(),
+        ..Default::default()
+    });
+    let store = Arc::new(MockAgentStateStore::new());
+    let rt = with_ledger(
+        bare_runtime_with_store(agent("helper", vec![]), llm.clone(), store.clone()),
+        ledger,
+        LedgerMode::ReadWrite,
+    );
+    rt.step(verified("sub-1"), "s1", "helper", input("hi"))
+        .await
+        .unwrap();
+    assert!(prompts(&llm)[0].contains("PREVIOUS-BOOKING"), "control");
+    let state = store.load(&verified("sub-1"), "s1").await.unwrap();
+    assert!(!state.messages.is_empty(), "control: the turn was saved");
+    let saved = format!("{:?}", state.messages);
+    assert!(!saved.contains("PREVIOUS-BOOKING"), "{saved}");
+    assert!(!saved.contains("user_history"), "{saved}");
+}
+
+/// A flow tool that parks on a card first, then completes on resume.
+struct ParkingFlow;
+
+impl FlowInvoker for ParkingFlow {
+    fn list_flows(&self) -> Vec<FlowOperation> {
+        vec![FlowOperation {
+            flow_ref: "form".into(),
+            description: "form flow".into(),
+            parameters: json!({ "type": "object" }),
+        }]
+    }
+    fn invoke<'a>(
+        &'a self,
+        _f: &'a str,
+        _a: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async { Err("interactive only".to_string()) })
+    }
+    fn invoke_interactive<'a>(
+        &'a self,
+        _f: &'a str,
+        _a: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<FlowInvokeOutcome, String>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(FlowInvokeOutcome::Waiting {
+                snapshot: json!({ "snap": "A" }),
+                presentation: json!({ "card": "A" }),
+            })
+        })
+    }
+    fn resume<'a>(
+        &'a self,
+        _f: &'a str,
+        _s: Value,
+        _i: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<FlowInvokeOutcome, String>> + Send + 'a>> {
+        Box::pin(async { Ok(FlowInvokeOutcome::Completed(json!({ "room": "101" }))) })
+    }
+}
+
+/// A turn that parks on a card records nothing (its text never passed the
+/// outbound chain); the resumed turn's final reply is recorded exactly once.
+#[tokio::test]
+async fn a_parked_then_resumed_turn_appends_once_on_the_final_reply() {
+    let llm = Arc::new(MockLlmBackend::new(vec![
+        Ok(LlmResponse {
+            content: Some("PARK-TEXT let me ask you".into()),
+            tool_calls: vec![ToolCallRecord {
+                call_id: "c1".into(),
+                extension_id: "flow:form".into(),
+                tool_name: "form".into(),
+                args: json!({}),
+            }],
+            tokens_in: 1,
+            tokens_out: 1,
+        }),
+        reply("room 101 booked"),
+    ]));
+    let ledger = Arc::new(StubLedger::default());
+    let tool = ToolRef {
+        extension_id: "flow:form".into(),
+        tool_name: "form".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
+    };
+    let store = Arc::new(MockAgentStateStore::new());
+    let rt = with_ledger(
+        bare_runtime_with_store(agent("helper", vec![tool]), llm, store),
+        ledger.clone(),
+        LedgerMode::ReadWrite,
+    )
+    .with_flow_source(Some(Arc::new(FlowToolSource::new(Arc::new(ParkingFlow)))));
+
+    let parked = rt
+        .step(verified("sub-1"), "s1", "helper", input("book a room"))
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(parked.terminated_by, TerminationReason::AwaitingToolInput);
+    assert!(
+        ledger.appends.lock().unwrap().is_empty(),
+        "a parked turn appends nothing"
+    );
+
+    let resumed = rt
+        .step(
+            verified("sub-1"),
+            "s1",
+            "helper",
+            AgentInput {
+                text: String::new(),
+                conversational: false,
+                resume_payload: Some(json!({ "metadata": { "action": "submit" } })),
+            },
+        )
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(resumed.terminated_by, TerminationReason::FinalReply);
+    assert_eq!(
+        *ledger.appends.lock().unwrap(),
+        vec![(
+            "sub-1".to_string(),
+            "reply".to_string(),
+            "room 101 booked".to_string()
+        )],
+        "exactly one append, the resumed final reply"
+    );
+    assert_eq!(ledger.reads.lock().unwrap().len(), 2, "one read per step");
+}
+
+/// The ledger read runs alongside the tool-catalog resolution, so a slow
+/// catalog (1 s, a delayed admin) and a slow read (1.2 s) cost about the
+/// slower of the two, not their sum (2.2 s). Real time: every catalog source
+/// is either synchronous or real HTTP, and paused time over a real socket
+/// auto-advances into the client timeouts.
+#[tokio::test]
+async fn the_read_overlaps_the_catalog_resolution() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let admin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/designer/tenant/me/mcp-servers"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "servers": [] }))
+                .set_delay(Duration::from_millis(1000)),
+        )
+        .expect(1)
+        .mount(&admin)
+        .await;
+    let mcp = Arc::new(greentic_aw_runtime::McpToolSource::new(
+        admin.uri(),
+        "gtc_live_test",
+    ));
+    let cp = MockConfigProvider::new();
+    cp.insert(
+        &TenantContext::new(TENANT, "prod"),
+        "helper",
+        agent("helper", vec![]),
+    );
+    let llm = Arc::new(MockLlmBackend::new(vec![reply("ok")]));
+    let ledger = Arc::new(StubLedger {
+        events: history(),
+        read_delay: Some(Duration::from_millis(1200)),
+        ..Default::default()
+    });
+    let rt = with_ledger(
+        AgentRuntime::new(
+            Arc::new(cp),
+            Arc::new(MockAgentStateStore::new()),
+            Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
+            llm.clone(),
+            Arc::new(MockTelemetry::new()),
+            Arc::new(MockTokenMeter::new(0)),
+            Arc::new(NoopToolLedger),
+            Some(mcp),
+        ),
+        ledger,
+        LedgerMode::Read,
+    );
+    let started = std::time::Instant::now();
+    rt.step(verified("sub-1"), "s1", "helper", input("hi"))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        prompts(&llm)[0].contains("PREVIOUS-BOOKING"),
+        "control: the slow read still landed"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1200),
+        "control: the read was waited for: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2000),
+        "read and catalog must overlap (sum would be 2.2 s): {elapsed:?}"
     );
 }
