@@ -23,13 +23,13 @@ use crate::tenant::VerifiedCaller;
 pub struct ToolCallFrame {
     /// The calling agent's conversation session; `None` for a caller that has
     /// none (a `ToolSession` built without `with_session_id`).
-    pub session_id: Option<String>,
+    session_id: Option<String>,
     /// The LLM's call id, the key the tool result is recorded under.
-    pub call_id: String,
+    call_id: String,
     /// The verified caller of the OUTER step, as the host stamped it on the
     /// step's `TenantContext`; never anything the model wrote. Anonymous
     /// (the default) when the outer step had none.
-    pub caller: VerifiedCaller,
+    caller: VerifiedCaller,
 }
 
 impl ToolCallFrame {
@@ -44,10 +44,25 @@ impl ToolCallFrame {
     }
 
     /// The same frame carrying the outer step's verified caller.
+    ///
+    /// Trusted input: build `caller` only from a host-stamped
+    /// `TenantContext`, never from tool arguments or anything the model wrote.
     #[must_use]
     pub fn with_caller(mut self, caller: VerifiedCaller) -> Self {
         self.caller = caller;
         self
+    }
+
+    /// The calling agent's session, if it has one.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// The LLM's call id for this tool call.
+    #[must_use]
+    pub fn call_id(&self) -> &str {
+        &self.call_id
     }
 
     /// The outer step's verified caller (anonymous when it had none).
@@ -61,7 +76,9 @@ tokio::task_local! {
     static CURRENT: ToolCallFrame;
 }
 
-/// Run `fut` with `frame` as the current tool call.
+/// Run `fut` with `frame` as the current tool call. The frame's caller is
+/// trusted by every nested reader: only the host's own dispatch path may
+/// build one, from a host-stamped `TenantContext`.
 pub async fn within<F: Future>(frame: ToolCallFrame, fut: F) -> F::Output {
     CURRENT.scope(frame, fut).await
 }

@@ -359,14 +359,18 @@ fn a_nested_agent_session_is_derived_from_the_calling_tool() -> Result<()> {
     let handler: Arc<dyn AgentNodeHandler> = recorder.clone();
     register(&h.pack, &handler);
 
-    for (session, call) in [(Some("s-outer"), "c1"), (None, "dw-7")] {
-        RUNTIME
-            .block_on(within(
-                ToolCallFrame::new(session, call),
-                h.pack.run_flow_for_tool("agent.flow", json!({})),
-            ))
-            .map_err(anyhow::Error::msg)?;
-    }
+    RUNTIME
+        .block_on(within(
+            ToolCallFrame::new(Some("s-outer"), "c1"),
+            h.pack.run_flow_for_tool("agent.flow", json!({})),
+        ))
+        .map_err(anyhow::Error::msg)?;
+    RUNTIME
+        .block_on(within(
+            ToolCallFrame::new(Some("s-outer"), "dw-7"),
+            h.pack.run_flow_for_tool("agent.flow", json!({})),
+        ))
+        .map_err(anyhow::Error::msg)?;
     RUNTIME
         .block_on(h.pack.run_flow_for_tool("agent.flow", json!({})))
         .map_err(anyhow::Error::msg)?;
@@ -376,7 +380,7 @@ fn a_nested_agent_session_is_derived_from_the_calling_tool() -> Result<()> {
 
     let seen = recorder.sessions();
     assert_eq!(seen[0], "s-outer::flowtool::c1");
-    assert_eq!(seen[1], "flowtool::dw-7");
+    assert_eq!(seen[1], "s-outer::flowtool::dw-7");
     assert!(seen[2].starts_with("flowtool::agent.flow::"), "{seen:?}");
     assert!(seen[3].starts_with("flowtool::agent.flow::"), "{seen:?}");
     assert_ne!(seen[2], seen[3], "no frame: every call is its own session");
@@ -646,10 +650,26 @@ fn a_second_registration_warns_and_the_first_one_wins() -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing_subscriber::layer::{Context, SubscriberExt};
 
+    /// Counts only the registration warning, by its message, so an unrelated
+    /// WARN from elsewhere cannot satisfy or break the assertion.
     struct WarnCounter(Arc<AtomicUsize>);
+    struct MessageOf(String);
+    impl tracing::field::Visit for MessageOf {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
         fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
-            if *event.metadata().level() == tracing::Level::WARN {
+            let mut message = MessageOf(String::new());
+            event.record(&mut message);
+            if *event.metadata().level() == tracing::Level::WARN
+                && message
+                    .0
+                    .contains("nested flow-tool handlers already registered for this pack")
+            {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -666,11 +686,148 @@ fn a_second_registration_warns_and_the_first_one_wins() -> Result<()> {
         register(&h.pack, &first_handler);
         register(&h.pack, &second_handler);
     });
-    assert_eq!(warns.load(Ordering::SeqCst), 1, "the second call warns");
+    assert_eq!(
+        warns.load(Ordering::SeqCst),
+        1,
+        "exactly the second registration warns, with the registration message"
+    );
 
     let out = RUNTIME.block_on(h.pack.run_flow_for_tool("agent.flow", json!({})));
     assert!(result_text(&out).contains("first"), "{out:?}");
     assert_eq!(first.sessions().len(), 1);
     assert!(second.sessions().is_empty());
+    Ok(())
+}
+
+// ----------------------------------------------- Task 5: depth, ids, sessions
+
+#[test]
+fn nesting_stops_at_the_depth_limit() -> Result<()> {
+    let h = harness()?;
+    let recorder = Arc::new(Recorder {
+        recurse: Some(Arc::clone(&h.pack)),
+        ..Recorder::default()
+    });
+    let handler: Arc<dyn AgentNodeHandler> = recorder.clone();
+    register(&h.pack, &handler);
+
+    let out = RUNTIME.block_on(h.pack.run_flow_for_tool("agent.flow", json!({})));
+
+    let text = result_text(&out);
+    assert!(text.contains("the limit is 3"), "{text}");
+    assert_eq!(recorder.sessions().len(), 3, "three nested levels ran");
+    Ok(())
+}
+
+#[test]
+fn a_call_id_cannot_forge_another_session() -> Result<()> {
+    let h = harness()?;
+    let recorder = recorder_with(&h);
+    for call in ["a::b", "x::flowtool::y"] {
+        RUNTIME
+            .block_on(within(
+                ToolCallFrame::new(Some("s"), call),
+                h.pack.run_flow_for_tool("agent.flow", json!({})),
+            ))
+            .map_err(anyhow::Error::msg)?;
+    }
+    assert_eq!(
+        recorder.sessions(),
+        vec![
+            "s::flowtool::a__b".to_string(),
+            "s::flowtool::x__flowtool__y".to_string()
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_hostile_call_id_gets_the_same_session_on_the_call_and_the_resume() -> Result<()> {
+    let h = harness()?;
+    let recorder = recorder_with(&h);
+    park_and_resume(
+        &h,
+        || ToolCallFrame::new(Some("s"), "c::flowtool::z"),
+        json!({}),
+        json!({ "text": "1" }),
+    )?;
+    assert_eq!(
+        recorder.sessions(),
+        vec!["s::flowtool::c__flowtool__z".to_string(); 2]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_calling_agent_with_no_session_is_refused_not_run_on_a_shared_key() -> Result<()> {
+    let h = harness()?;
+    let recorder = recorder_with(&h);
+
+    // The name used as the call id is what some providers send.
+    let out = RUNTIME.block_on(within(
+        ToolCallFrame::new(None, "agent.flow"),
+        h.pack.run_flow_for_tool("agent.flow", json!({})),
+    ));
+
+    let text = result_text(&out);
+    assert!(
+        text.contains("flow tool 'agent.flow' refused: the calling agent has no session"),
+        "{text}"
+    );
+    assert!(
+        recorder.sessions().is_empty(),
+        "the nested agent must not run"
+    );
+
+    // An empty session reads as none (`ToolCallFrame::new`), same refusal.
+    let out = RUNTIME.block_on(within(
+        ToolCallFrame::new(Some(""), "c1"),
+        h.pack.run_flow_for_tool("agent.flow", json!({})),
+    ));
+    assert!(result_text(&out).contains("has no session"), "{out:?}");
+    assert!(recorder.sessions().is_empty());
+
+    // With a session the same call runs.
+    RUNTIME
+        .block_on(within(
+            ToolCallFrame::new(Some("s"), "agent.flow"),
+            h.pack.run_flow_for_tool("agent.flow", json!({})),
+        ))
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        recorder.sessions(),
+        vec!["s::flowtool::agent.flow".to_string()]
+    );
+    Ok(())
+}
+
+#[test]
+fn the_refusal_also_holds_on_the_resume_of_a_parked_call() -> Result<()> {
+    let h = harness()?;
+    let recorder = recorder_with(&h);
+    let first = RUNTIME
+        .block_on(within(
+            ToolCallFrame::new(Some("s"), "c1"),
+            h.pack.run_flow_for_tool_interactive("park.flow", json!({})),
+        ))
+        .map_err(anyhow::Error::msg)?;
+    let ToolFlowOutcome::Waiting { snapshot, .. } = first else {
+        anyhow::bail!("park.flow must park");
+    };
+    assert_eq!(recorder.sessions().len(), 1, "the first agent step ran");
+
+    // The resume leg arrives under a frame with no session: its agent step
+    // (`post`) refuses instead of running on `flowtool::c1`.
+    let out = RUNTIME.block_on(within(
+        ToolCallFrame::new(None, "c1"),
+        h.pack
+            .resume_flow_for_tool("park.flow", snapshot, json!({ "text": "1" })),
+    ));
+    assert!(format!("{out:?}").contains("has no session"), "{out:?}");
+    assert_eq!(
+        recorder.sessions().len(),
+        1,
+        "the resumed agent must not run"
+    );
     Ok(())
 }

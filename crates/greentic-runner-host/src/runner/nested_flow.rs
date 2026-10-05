@@ -58,8 +58,12 @@ pub(crate) const MAX_NESTED_FLOW_TOOL_DEPTH: u8 = 3;
 pub(crate) struct NestedFlowFrame {
     /// 1 for a flow tool called by a top-level agent, 2 inside that, ...
     pub(crate) depth: u8,
-    /// The conversation session a `dw.agent` in this flow runs under.
-    pub(crate) agent_session: String,
+    /// The flow tool this frame runs, for the refusal text.
+    pub(crate) flow_id: String,
+    /// The conversation session a `dw.agent` in this flow runs under; `None`
+    /// when the calling agent had no session of its own, in which case a
+    /// `dw.agent` refuses rather than run on a key shared across callers.
+    pub(crate) agent_session: Option<String>,
 }
 
 tokio::task_local! {
@@ -72,6 +76,13 @@ fn current_depth() -> u8 {
 
 /// The frame a `flow:` tool's engine runs under, or the refusal once the
 /// nesting limit is reached.
+///
+/// The depth is a task-local, so it is carried across `.await` only: a
+/// `tokio::spawn` (or `spawn_blocking`) between a [`scope`] and the next
+/// `enter` starts counting from 0 again. Nothing on the call path spawns
+/// today (the nested engine, the agent loop and the flow-tool dispatch all
+/// run inline), and `a_spawned_task_does_not_inherit_the_depth` pins the
+/// limit so a future spawn there is noticed.
 pub(crate) fn enter(flow_id: &str) -> Result<NestedFlowFrame, String> {
     let depth = current_depth();
     if depth >= MAX_NESTED_FLOW_TOOL_DEPTH {
@@ -82,6 +93,7 @@ pub(crate) fn enter(flow_id: &str) -> Result<NestedFlowFrame, String> {
     }
     Ok(NestedFlowFrame {
         depth: depth + 1,
+        flow_id: flow_id.to_string(),
         agent_session: nested_agent_session(flow_id),
     })
 }
@@ -93,31 +105,76 @@ pub(crate) async fn scope<F: std::future::Future>(frame: NestedFlowFrame, fut: F
 
 /// The session a `dw.agent` node runs under: the flow context's own when it
 /// has one (every ingress turn), else the enclosing flow tool's derived
-/// session, else `""` (today's value for a direct flow run).
+/// session, else `""` (today's value for a direct flow run). The refusal is
+/// for a flow tool whose calling agent had no session: see
+/// [`NestedFlowFrame::agent_session`]. This is the one place a nested
+/// `dw.agent` gets its session, on the call and on the resume alike.
 #[cfg_attr(not(feature = "agentic-worker"), allow(dead_code))]
-pub(crate) fn agent_session_for(ctx_session: Option<&str>) -> String {
+pub(crate) fn agent_session_for(ctx_session: Option<&str>) -> Result<String, String> {
     if let Some(session) = ctx_session.filter(|s| !s.is_empty()) {
-        return session.to_string();
+        return Ok(session.to_string());
     }
-    FRAME
-        .try_with(|frame| frame.agent_session.clone())
-        .unwrap_or_default()
+    match FRAME.try_with(Clone::clone) {
+        Ok(NestedFlowFrame {
+            agent_session: Some(session),
+            ..
+        }) => Ok(session),
+        Ok(NestedFlowFrame { flow_id, .. }) => Err(format!(
+            "flow tool '{flow_id}' refused: the calling agent has no session, so its \
+             dw.agent has no conversation of its own to run under"
+        )),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+/// Keep a model-chosen call id inert inside a session string: anything
+/// outside `[A-Za-z0-9_.-]` becomes `_`, so it can carry neither the `::`
+/// separator nor a `::flowtool::` marker. Distinct ids may map to one token
+/// (`a::b`, `a__b`); both still sit under the calling agent's own session.
+fn sanitise_call_id(call_id: &str) -> String {
+    call_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The one derivation, used on the call and on the resume of a parked call:
+/// both legs carry one call id.
+fn nested_session_from(session: Option<&str>, call_id: &str) -> String {
+    let call_id = sanitise_call_id(call_id);
+    match session {
+        Some(session) => format!("{session}::flowtool::{call_id}"),
+        None => format!("flowtool::{call_id}"),
+    }
 }
 
 /// Distinct from the caller's session (whose lock the caller holds across
-/// this call), scoped to the caller's conversation, and the same on the
-/// call and on the resume of a parked call: both legs carry one call id.
-fn nested_agent_session(flow_id: &str) -> String {
+/// this call), scoped to the caller's conversation. `None` when a tool call
+/// is current but its agent has no session: the result would be
+/// `flowtool::<call id>`, and providers that use the tool NAME as the call
+/// id make that one constant per tool, shared by every caller of the tenant.
+fn nested_agent_session(flow_id: &str) -> Option<String> {
     match calling_tool() {
-        Some((Some(session), call_id)) => format!("{session}::flowtool::{call_id}"),
-        Some((None, call_id)) => format!("flowtool::{call_id}"),
-        None => format!("flowtool::{flow_id}::{}", ulid::Ulid::new()),
+        Some((Some(session), call_id)) => Some(nested_session_from(Some(&session), &call_id)),
+        Some((None, _)) => None,
+        None => Some(format!("flowtool::{flow_id}::{}", ulid::Ulid::new())),
     }
 }
 
 #[cfg(feature = "agentic-worker")]
 fn calling_tool() -> Option<(Option<String>, String)> {
-    greentic_aw_runtime::current_tool_call().map(|frame| (frame.session_id, frame.call_id))
+    greentic_aw_runtime::current_tool_call().map(|frame| {
+        (
+            frame.session_id().map(str::to_string),
+            frame.call_id().to_string(),
+        )
+    })
 }
 
 #[cfg(not(feature = "agentic-worker"))]
@@ -225,7 +282,8 @@ mod tests {
     fn frame(depth: u8, session: &str) -> NestedFlowFrame {
         NestedFlowFrame {
             depth,
-            agent_session: session.into(),
+            flow_id: "f".into(),
+            agent_session: Some(session.into()),
         }
     }
 
@@ -239,13 +297,16 @@ mod tests {
             )
         })
         .await;
-        assert_eq!(seen, ("ctx".into(), "nested".into(), "nested".into()));
+        assert_eq!(
+            seen,
+            (Ok("ctx".into()), Ok("nested".into()), Ok("nested".into()))
+        );
     }
 
     #[tokio::test]
     async fn outside_a_flow_tool_the_session_is_unchanged() {
-        assert_eq!(agent_session_for(None), "");
-        assert_eq!(agent_session_for(Some("s")), "s");
+        assert_eq!(agent_session_for(None), Ok(String::new()));
+        assert_eq!(agent_session_for(Some("s")), Ok("s".to_string()));
     }
 
     #[tokio::test]
@@ -255,6 +316,59 @@ mod tests {
         assert_eq!(inner.depth, 3);
         let refused = scope(frame(MAX_NESTED_FLOW_TOOL_DEPTH, "x"), async { enter("f") }).await;
         assert!(refused.unwrap_err().contains("nested"));
+    }
+
+    #[tokio::test]
+    async fn the_limit_refuses_with_a_readable_error() {
+        let refused = scope(frame(MAX_NESTED_FLOW_TOOL_DEPTH, "x"), async {
+            enter("loop")
+        })
+        .await
+        .unwrap_err();
+        assert!(refused.contains("flow tool 'loop' refused"), "{refused}");
+        assert!(refused.contains("the limit is 3"), "{refused}");
+    }
+
+    /// The depth lives in a task-local, which `tokio::spawn` does not carry:
+    /// a spawn between `scope` and the next `enter` restarts the count. This
+    /// pins the documented limit; if the host ever spawns on that path the
+    /// cap needs another carrier.
+    #[tokio::test]
+    async fn a_spawned_task_does_not_inherit_the_depth() {
+        let (here, spawned) = scope(frame(MAX_NESTED_FLOW_TOOL_DEPTH, "x"), async {
+            let here = enter("f").is_err();
+            let spawned = tokio::spawn(async { enter("f").map(|f| f.depth) })
+                .await
+                .unwrap();
+            (here, spawned)
+        })
+        .await;
+        assert!(here, "inside the scope the limit holds");
+        assert_eq!(spawned, Ok(1), "a spawned task starts again from depth 0");
+    }
+
+    #[test]
+    fn a_call_id_is_sanitised_to_a_session_safe_token() {
+        assert_eq!(sanitise_call_id("call_1-a.b"), "call_1-a.b");
+        assert_eq!(sanitise_call_id("a::b"), "a__b");
+        assert_eq!(sanitise_call_id("x::flowtool::y"), "x__flowtool__y");
+        assert_eq!(sanitise_call_id("a b/\u{e9}"), "a_b__");
+        assert!(!sanitise_call_id("::").contains(':'));
+    }
+
+    #[test]
+    fn the_session_is_built_from_the_sanitised_id_the_same_way_every_time() {
+        let a = nested_session_from(Some("s"), "x::flowtool::y");
+        assert_eq!(a, nested_session_from(Some("s"), "x::flowtool::y"));
+        assert_eq!(a, "s::flowtool::x__flowtool__y");
+        // The only `::flowtool::` marker is the one this code wrote, so the
+        // model cannot make one session read as another's.
+        assert_eq!(a.matches("::flowtool::").count(), 1);
+        assert_ne!(a, nested_session_from(Some("s"), "y"));
+        assert_ne!(
+            nested_session_from(Some("s"), "a::b"),
+            nested_session_from(Some("s::flowtool::a"), "b")
+        );
     }
 
     #[test]
