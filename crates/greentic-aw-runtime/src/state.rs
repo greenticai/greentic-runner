@@ -73,31 +73,68 @@ impl ConversationState {
         }
     }
 
-    /// Truncate oldest user-assistant pairs until the count of non-system
-    /// messages is at or below `max_turns`.
+    /// Truncate the oldest messages until the count of non-system messages is
+    /// at or below `max_turns`.
     ///
-    /// System messages are preserved relative to neighbours — truncation
-    /// drops the oldest non-system message first, repeatedly, until the
-    /// target is reached.
+    /// System messages are always kept. The unit of removal is a GROUP: an
+    /// assistant turn carrying `tool_calls` goes together with the `Tool`
+    /// results that answer it (a provider refuses a `tool` message with no
+    /// preceding `tool_calls`, and an assistant `tool_calls` turn with no
+    /// answer), and a stray `Tool` is removed alone. The group holding the
+    /// parked flow tool's call is never removed, so the result stays
+    /// answerable; if only protected groups remain, truncation stops short of
+    /// `max_turns`.
     pub fn truncate_history(&mut self, max_turns: u32) {
         let max = max_turns as usize;
-        while self
-            .messages
-            .iter()
-            .filter(|m| !matches!(m, ChatMessage::System { .. }))
-            .count()
-            > max
-        {
-            if let Some(position) = self
+        let pending_id = self.pending_tool.as_ref().map(|p| p.call_id.clone());
+        loop {
+            let non_system = self
                 .messages
                 .iter()
-                .position(|m| !matches!(m, ChatMessage::System { .. }))
-            {
-                self.messages.remove(position);
-            } else {
-                break;
+                .filter(|m| !matches!(m, ChatMessage::System { .. }))
+                .count();
+            if non_system <= max {
+                return;
             }
+            let Some((start, end)) = self.oldest_removable_group(pending_id.as_deref()) else {
+                return;
+            };
+            self.messages.drain(start..end);
         }
+    }
+
+    /// `[start, end)` of the oldest non-system group that does not hold
+    /// `protected_call_id`.
+    fn oldest_removable_group(&self, protected_call_id: Option<&str>) -> Option<(usize, usize)> {
+        let mut i = 0;
+        while i < self.messages.len() {
+            if matches!(self.messages[i], ChatMessage::System { .. }) {
+                i += 1;
+                continue;
+            }
+            let mut end = i + 1;
+            if matches!(&self.messages[i],
+                ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+            {
+                while matches!(self.messages.get(end), Some(ChatMessage::Tool { .. })) {
+                    end += 1;
+                }
+            }
+            let holds_protected = protected_call_id.is_some_and(|id| {
+                self.messages[i..end].iter().any(|m| match m {
+                    ChatMessage::Assistant { tool_calls, .. } => {
+                        tool_calls.iter().any(|c| c.call_id == id)
+                    }
+                    ChatMessage::Tool { call_id, .. } => call_id == id,
+                    _ => false,
+                })
+            });
+            if !holds_protected {
+                return Some((i, end));
+            }
+            i = end;
+        }
+        None
     }
 }
 
@@ -401,5 +438,130 @@ mod tests {
         let old = r#"{"call_id":"c","tool_name":"t","flow_ref":"f","flow_snapshot":{},"iterations_used":1,"expires_at":"2026-10-05T00:00:00Z"}"#;
         let p: PendingToolCall = serde_json::from_str(old).unwrap();
         assert!(p.presentation.is_none() && p.parked_at.is_none() && p.side_turns == 0);
+    }
+
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage::User {
+            content: text.into(),
+        }
+    }
+
+    fn asst_text(text: &str) -> ChatMessage {
+        ChatMessage::Assistant {
+            content: text.into(),
+            tool_calls: vec![],
+        }
+    }
+
+    fn asst_calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage::Assistant {
+            content: String::new(),
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCallRecord {
+                    call_id: (*id).into(),
+                    extension_id: "flow:form".into(),
+                    tool_name: "form".into(),
+                    args: serde_json::json!({}),
+                })
+                .collect(),
+        }
+    }
+
+    fn tool(id: &str) -> ChatMessage {
+        ChatMessage::Tool {
+            call_id: id.into(),
+            content: serde_json::json!({}),
+        }
+    }
+
+    /// Every assistant `tool_calls` id is answered by exactly one directly
+    /// following `Tool`, and every `Tool` answers the assistant before it.
+    fn pairing_is_valid(messages: &[ChatMessage]) -> bool {
+        let mut i = 0;
+        while i < messages.len() {
+            match &messages[i] {
+                ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                    let mut wanted: Vec<&str> =
+                        tool_calls.iter().map(|c| c.call_id.as_str()).collect();
+                    let mut j = i + 1;
+                    while let Some(ChatMessage::Tool { call_id, .. }) = messages.get(j) {
+                        match wanted.iter().position(|w| w == call_id) {
+                            Some(pos) => {
+                                wanted.remove(pos);
+                            }
+                            None => return false,
+                        }
+                        j += 1;
+                    }
+                    if !wanted.is_empty() {
+                        return false;
+                    }
+                    i = j;
+                }
+                ChatMessage::Tool { .. } => return false,
+                _ => i += 1,
+            }
+        }
+        true
+    }
+
+    fn pending_for(call_id: &str, now: DateTime<Utc>) -> PendingToolCall {
+        PendingToolCall {
+            call_id: call_id.into(),
+            tool_name: "form".into(),
+            extension_id: "flow:form".into(),
+            args: serde_json::json!({}),
+            flow_ref: "form".into(),
+            flow_snapshot: serde_json::json!({}),
+            iterations_used: 0,
+            expires_at: PendingToolCall::expiry_from(now),
+            presentation: None,
+            parked_at: Some(now),
+            side_turns: 0,
+        }
+    }
+
+    #[test]
+    fn truncate_never_leaves_an_orphan_tool_or_a_split_group() {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = vec![
+            user("a"),
+            asst_calls(&["c1", "c2"]),
+            tool("c1"),
+            tool("c2"),
+            user("b"),
+            asst_text("r"),
+        ];
+        s.truncate_history(3);
+        assert!(pairing_is_valid(&s.messages), "{:?}", s.messages);
+        assert!(!matches!(
+            s.messages.first(),
+            Some(ChatMessage::Tool { .. })
+        ));
+    }
+
+    #[test]
+    fn truncate_keeps_the_group_holding_the_pending_call() {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.pending_tool = Some(pending_for("c1", Utc::now()));
+        s.messages = vec![
+            user("a"),
+            asst_calls(&["c1"]),
+            tool("c1"),
+            user("q1"),
+            asst_text("r1"),
+            user("q2"),
+            asst_text("r2"),
+        ];
+        s.truncate_history(2);
+        assert!(
+            s.messages.iter().any(|m| matches!(m,
+                ChatMessage::Assistant { tool_calls, .. }
+                    if tool_calls.iter().any(|c| c.call_id == "c1"))),
+            "{:?}",
+            s.messages
+        );
+        assert!(pairing_is_valid(&s.messages), "{:?}", s.messages);
     }
 }
