@@ -513,6 +513,15 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                 }
             };
             if let Some(handler) = handler {
+                // The agent runtime's flow tools run over this same pack; lend
+                // them the handler (held weakly) so a dw.agent inside a flow
+                // tool runs. The desktop host dispatches in-process only.
+                if greentic_runner_host::runner::nested_flow::nested_flow_agents_enabled() {
+                    pack.set_nested_flow_handlers(
+                        greentic_runner_host::runner::nested_flow::NestedFlowHandlers::default()
+                            .with_agent(&handler),
+                    );
+                }
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into desktop FlowEngine");
             }

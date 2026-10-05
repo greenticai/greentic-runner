@@ -46,6 +46,49 @@ impl NestedFlowHandlers {
     }
 }
 
+/// The opt-out for lending the `dw.agent` handler to flow-tool engines.
+/// `GREENTIC_AW_NESTED_FLOW_AGENTS=0|false|off|no` (case-insensitive) turns it
+/// off, restoring the pre-lending behaviour where a `dw.agent` inside a flow
+/// tool fails with "no AgentNodeHandler configured". Anything else, including
+/// unset, leaves it on. Read once by the host where it registers.
+pub const NESTED_FLOW_AGENTS_ENV: &str = "GREENTIC_AW_NESTED_FLOW_AGENTS";
+
+/// Pure form of [`nested_flow_agents_enabled`] over an env getter.
+#[must_use]
+pub fn nested_flow_agents_enabled_from(get_env: impl Fn(&str) -> Option<String>) -> bool {
+    match get_env(NESTED_FLOW_AGENTS_ENV) {
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// Whether the host lends the `dw.agent` handler to flow-tool engines (see
+/// [`NESTED_FLOW_AGENTS_ENV`]).
+#[must_use]
+pub fn nested_flow_agents_enabled() -> bool {
+    nested_flow_agents_enabled_from(|key| std::env::var(key).ok())
+}
+
+/// What the host lends flow-tool engines for its `dw.agent` dispatch mode.
+/// Over NATS (`GREENTIC_AW_DISPATCH=nats`) a nested engine has no remote
+/// dispatch handler, so running the agent in-process there would silently
+/// override the operator's choice; it gets nothing and keeps failing loudly.
+#[cfg(feature = "agentic-worker")]
+pub(crate) fn for_dispatch(
+    dispatch: crate::runner::agent_node::DwAgentDispatch,
+    agent: Option<&Arc<dyn AgentNodeHandler>>,
+) -> Option<NestedFlowHandlers> {
+    match (dispatch, agent) {
+        (crate::runner::agent_node::DwAgentDispatch::InProcess, Some(handler)) => {
+            Some(NestedFlowHandlers::default().with_agent(handler))
+        }
+        _ => None,
+    }
+}
+
 /// How many `flow:` tool engines may be nested inside each other. Each level
 /// loads a whole `PackRuntime` and runs an agent loop, and an agent may bind
 /// the flow tool that contains it, so the chain must end somewhere the
@@ -265,6 +308,34 @@ mod tests {
             _: Option<&serde_json::Value>,
         ) -> anyhow::Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn only_in_process_dispatch_lends_the_handler() {
+        use crate::runner::agent_node::DwAgentDispatch;
+        let handler: Arc<dyn AgentNodeHandler> = Arc::new(Noop);
+        assert!(for_dispatch(DwAgentDispatch::InProcess, Some(&handler)).is_some());
+        assert!(for_dispatch(DwAgentDispatch::Nats, Some(&handler)).is_none());
+        assert!(for_dispatch(DwAgentDispatch::InProcess, None).is_none());
+    }
+
+    #[test]
+    fn the_opt_out_reads_only_the_documented_off_values() {
+        let with = |v: Option<&'static str>| {
+            nested_flow_agents_enabled_from(move |k| {
+                assert_eq!(k, NESTED_FLOW_AGENTS_ENV);
+                v.map(str::to_string)
+            })
+        };
+        assert!(with(None));
+        assert!(with(Some("1")));
+        assert!(with(Some("true")));
+        assert!(with(Some("")));
+        assert!(with(Some("garbage")));
+        for off in ["0", "false", "FALSE", "off", "Off", "no", " no "] {
+            assert!(!with(Some(off)), "{off:?} must disable");
         }
     }
 
