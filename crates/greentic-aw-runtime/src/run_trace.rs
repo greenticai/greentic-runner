@@ -93,7 +93,7 @@ impl std::fmt::Debug for RunTrace {
 /// Replace control characters and angle brackets with spaces, collapse runs of
 /// whitespace, and cap the length. Angle brackets go so a summary cannot close
 /// or open the delimiter block; newlines go so it cannot start a fresh line.
-fn sanitise(text: &str, max_chars: usize) -> String {
+pub(crate) fn sanitise(text: &str, max_chars: usize) -> String {
     let flat: String = text
         .chars()
         .map(|c| {
