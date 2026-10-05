@@ -383,26 +383,47 @@ mod aw {
             {
                 observers.push(entry.value().clone());
             }
-            let step_result = match observers.len() {
-                0 => self.runtime.step(tenant, session_id, agent_id, input).await,
-                1 => {
-                    self.runtime
-                        .step_with_observer(
-                            tenant,
-                            session_id,
-                            agent_id,
-                            input,
-                            observers.remove(0),
-                        )
-                        .await
+            // Shared context (Phase A2): this is the ONE place the run's first
+            // context opens — fresh trace, read-write, bound to this step's
+            // tenant. It does not set the caller policy; `run_step` does that
+            // for every agent turn, including ones that never come through this
+            // handler (graph turns, playbook turns, designer hosts).
+            let open_run_context =
+                crate::runner::run_context_policy::should_open_scope(&self.runtime, agent_id);
+            let step = async move {
+                match observers.len() {
+                    0 => self.runtime.step(tenant, session_id, agent_id, input).await,
+                    1 => {
+                        self.runtime
+                            .step_with_observer(
+                                tenant,
+                                session_id,
+                                agent_id,
+                                input,
+                                observers.remove(0),
+                            )
+                            .await
+                    }
+                    _ => {
+                        let composite: Arc<dyn StepObserver> =
+                            Arc::new(crate::http::agent_stream::CompositeObserver::new(observers));
+                        self.runtime
+                            .step_with_observer(tenant, session_id, agent_id, input, composite)
+                            .await
+                    }
                 }
-                _ => {
-                    let composite: Arc<dyn StepObserver> =
-                        Arc::new(crate::http::agent_stream::CompositeObserver::new(observers));
-                    self.runtime
-                        .step_with_observer(tenant, session_id, agent_id, input, composite)
-                        .await
-                }
+            };
+            let step_result = if open_run_context {
+                greentic_aw_runtime::RunContext::scope(
+                    greentic_aw_runtime::RunContext::new(
+                        tenant_id,
+                        Arc::new(greentic_aw_runtime::RunTrace::new()),
+                    ),
+                    step,
+                )
+                .await
+            } else {
+                step.await
             };
 
             match step_result {
