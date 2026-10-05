@@ -492,6 +492,24 @@ impl AgentRuntime {
         kb.search_bound(&ctx, query, binding).await
     }
 
+    /// The card of the session's live parked `flow:` tool, if any. A host uses
+    /// it to keep the card on offer when a turn fails after the park was kept
+    /// (an LLM error or a lock timeout during a side turn), so the user's next
+    /// submit is not lost. `None` when nothing is parked, the park expired, or
+    /// the state cannot be read.
+    pub async fn parked_card(
+        &self,
+        tenant: &TenantContext,
+        session_id: &str,
+    ) -> Option<serde_json::Value> {
+        let state = self.state_store.load(tenant, session_id).await.ok()?;
+        let pending = state.pending_tool?;
+        if pending.is_expired(chrono::Utc::now()) {
+            return None;
+        }
+        pending.presentation
+    }
+
     /// Execute one agentic step against the given session.
     /// Implementation lives in [`r#loop::run_step`].
     pub async fn step(

@@ -170,6 +170,16 @@ mod aw {
     /// flow output, so internal failure modes do not leak to end users.
     const SANITISED_ERROR_REPLY: &str = "Something went wrong. Please try again.";
 
+    /// A turn failed (an LLM error, a lock timeout) while the agent still holds
+    /// a parked `flow:` tool: turn the sanitised error output into a park that
+    /// re-offers the card. The engine then keeps its await armed, so the user's
+    /// next card submit resumes the tool instead of being read as typed text.
+    fn reoffer_parked_card(out: &mut Value, card: Value) {
+        out["terminated_by"] = json!("awaiting_tool_input");
+        out["pending_presentation"] = card;
+        out["side_turn"] = json!(true);
+    }
+
     /// Build the structured JSON output emitted by a `DwAgent` node when a
     /// guardrail blocks the step.
     ///
@@ -359,6 +369,7 @@ mod aw {
             let tenant = TenantContext::new(tenant_id, env_id)
                 .with_project_id(self.project_id.clone())
                 .with_caller(verified_caller);
+            let tenant_for_card = tenant.clone();
             let input = AgentInput {
                 text: user_text,
                 conversational,
@@ -489,6 +500,10 @@ mod aw {
                         .unwrap_or(false)
                     {
                         out["error_detail"] = json!(format!("{error} || {error:?}"));
+                    }
+                    if let Some(card) = self.runtime.parked_card(&tenant_for_card, session_id).await
+                    {
+                        reoffer_parked_card(&mut out, card);
                     }
                     Ok(out)
                 }
@@ -2835,6 +2850,28 @@ mod aw {
             }
         }
         agents
+    }
+
+    #[cfg(test)]
+    mod parked_card_tests {
+        use serde_json::json;
+
+        #[test]
+        fn a_failed_turn_with_a_kept_park_offers_its_reply_then_the_card() {
+            let mut out = json!({
+                "reply": super::SANITISED_ERROR_REPLY,
+                "trail": [],
+                "terminated_by": "error"
+            });
+            let card = json!({ "type": "AdaptiveCard", "body": [] });
+            super::reoffer_parked_card(&mut out, card.clone());
+            assert_eq!(out["terminated_by"], "awaiting_tool_input");
+            assert_eq!(out["reply"], super::SANITISED_ERROR_REPLY);
+            let rendered = crate::runner::engine::rendered_park(&out);
+            let items = rendered.as_array().expect("reply + card");
+            assert_eq!(items[0]["reply"], super::SANITISED_ERROR_REPLY);
+            assert_eq!(items[1], card);
+        }
     }
 
     #[cfg(test)]

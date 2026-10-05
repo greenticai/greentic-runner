@@ -39,23 +39,52 @@ pub(crate) const BEHIND_SUSPENSION_ERROR: &str = "another step is waiting for th
 /// messages appended after it keep the transcript provider-valid.
 pub(crate) const AWAITING_PLACEHOLDER: &str = "awaiting_user_input";
 
-/// Record `content` as the result of `call_id`: replace the `Tool` message
-/// already answering it (the park placeholder) in place, or push one when
-/// there is none (a park recorded without a placeholder).
+/// Index of the LATEST assistant turn carrying a tool call `call_id`. Matching
+/// on the call id alone would hit an older turn when a backend reuses ids.
+fn latest_assistant_with(messages: &[ChatMessage], call_id: &str) -> Option<usize> {
+    messages.iter().rposition(|m| {
+        matches!(m, ChatMessage::Assistant { tool_calls, .. }
+            if tool_calls.iter().any(|c| c.call_id == call_id))
+    })
+}
+
+/// End of the run of `Tool` messages answering the assistant turn at `at`.
+fn tool_run_end(messages: &[ChatMessage], at: usize) -> usize {
+    let mut end = at + 1;
+    while matches!(messages.get(end), Some(ChatMessage::Tool { .. })) {
+        end += 1;
+    }
+    end
+}
+
+/// Record `content` as the result of `call_id`: replace the `Tool` already
+/// answering the latest assistant turn that made the call (the park
+/// placeholder) in place, or add one at the end of that turn's results when
+/// there is none. If that assistant turn is no longer in history nothing is
+/// added: a `Tool` with no assistant turn before it is refused by the provider.
 pub(crate) fn patch_tool_result(state: &mut ConversationState, call_id: &str, content: Value) {
-    let existing = state.messages.iter_mut().find_map(|m| match m {
-        ChatMessage::Tool {
-            call_id: id,
-            content,
-        } if id == call_id => Some(content),
-        _ => None,
-    });
+    let Some(at) = latest_assistant_with(&state.messages, call_id) else {
+        return;
+    };
+    let end = tool_run_end(&state.messages, at);
+    let existing = state.messages[at + 1..end]
+        .iter_mut()
+        .find_map(|m| match m {
+            ChatMessage::Tool {
+                call_id: id,
+                content,
+            } if id == call_id => Some(content),
+            _ => None,
+        });
     match existing {
         Some(slot) => *slot = content,
-        None => state.messages.push(ChatMessage::Tool {
-            call_id: call_id.to_string(),
-            content,
-        }),
+        None => state.messages.insert(
+            end,
+            ChatMessage::Tool {
+                call_id: call_id.to_string(),
+                content,
+            },
+        ),
     }
 }
 
@@ -77,6 +106,13 @@ pub(crate) enum Taken {
     /// The park STAYS and this turn answers the typed message as a side turn.
     Side,
 }
+
+/// The note added to the system prompt of the turn that RESUMES a flow tool
+/// after one or more side turns, so the model answers about the finished step
+/// and not the last side question.
+pub(crate) const RESUME_AFTER_SIDE_TURNS_NOTE: &str = "The form step the user was asked to \
+complete has now finished; its result is the tool result in the conversation. \
+Reply about that result, not about the earlier side questions.";
 
 /// The note added to the system prompt of a side turn.
 pub(crate) const SIDE_TURN_NOTE: &str = "A form step is waiting for the user to \
@@ -165,19 +201,16 @@ fn ensure_placeholder(state: &mut ConversationState) -> bool {
     let Some(call_id) = state.pending_tool.as_ref().map(|p| p.call_id.clone()) else {
         return false;
     };
-    if state
-        .messages
+    let Some(at) = latest_assistant_with(&state.messages, &call_id) else {
+        return false;
+    };
+    let end = tool_run_end(&state.messages, at);
+    if state.messages[at + 1..end]
         .iter()
         .any(|m| matches!(m, ChatMessage::Tool { call_id: id, .. } if *id == call_id))
     {
         return true;
     }
-    let Some(at) = state.messages.iter().position(|m| {
-        matches!(m, ChatMessage::Assistant { tool_calls, .. }
-            if tool_calls.iter().any(|c| c.call_id == call_id))
-    }) else {
-        return false;
-    };
     state.messages.insert(
         at + 1,
         ChatMessage::Tool {
@@ -346,21 +379,92 @@ mod tests {
     #[test]
     fn patch_replaces_the_placeholder_in_place() {
         let mut s = state_with(vec![
+            asst(&["c1"]),
             tool("c1", json!({ "status": AWAITING_PLACEHOLDER })),
             ChatMessage::User {
                 content: "q".into(),
             },
         ]);
         patch_tool_result(&mut s, "c1", json!({ "ok": true }));
-        assert_eq!(s.messages.len(), 2);
-        assert!(matches!(&s.messages[0],
+        assert_eq!(s.messages.len(), 3);
+        assert!(matches!(&s.messages[1],
             ChatMessage::Tool { content, .. } if content == &json!({ "ok": true })));
     }
 
+    fn asst(ids: &[&str]) -> ChatMessage {
+        ChatMessage::Assistant {
+            content: String::new(),
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCallRecord {
+                    call_id: (*id).into(),
+                    extension_id: "flow:form".into(),
+                    tool_name: "form".into(),
+                    args: json!({}),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
-    fn patch_pushes_when_there_is_no_placeholder() {
+    fn patch_adds_the_result_after_its_assistant_turn_when_there_is_no_placeholder() {
+        let mut s = state_with(vec![asst(&["c1"])]);
+        patch_tool_result(&mut s, "c1", json!({ "status": "cancelled" }));
+        assert_eq!(s.messages.len(), 2);
+    }
+
+    #[test]
+    fn patch_never_adds_an_orphan_when_the_assistant_turn_is_gone() {
         let mut s = state_with(vec![]);
         patch_tool_result(&mut s, "c1", json!({ "status": "cancelled" }));
-        assert_eq!(s.messages.len(), 1);
+        assert!(s.messages.is_empty());
+    }
+
+    /// A backend that reuses call ids: the result must land on the Tool that
+    /// answers the LATEST assistant turn carrying the id, not an older one.
+    #[test]
+    fn patch_targets_the_latest_assistant_turn_when_a_call_id_is_reused() {
+        let old = json!({ "old": true });
+        let mut s = state_with(vec![
+            asst(&["c1"]),
+            tool("c1", old.clone()),
+            ChatMessage::User {
+                content: "next".into(),
+            },
+            asst(&["c1"]),
+            tool("c1", json!({ "status": AWAITING_PLACEHOLDER })),
+        ]);
+        patch_tool_result(&mut s, "c1", json!({ "new": true }));
+        assert!(matches!(&s.messages[1], ChatMessage::Tool { content, .. } if content == &old));
+        assert!(matches!(&s.messages[4],
+            ChatMessage::Tool { content, .. } if content == &json!({ "new": true })));
+    }
+
+    #[test]
+    fn ensure_placeholder_answers_the_latest_assistant_turn_when_a_call_id_is_reused() {
+        let mut s = state_with(vec![
+            asst(&["c1"]),
+            tool("c1", json!({ "old": true })),
+            ChatMessage::User {
+                content: "next".into(),
+            },
+            asst(&["c1"]),
+        ]);
+        s.pending_tool = Some(crate::state::PendingToolCall {
+            call_id: "c1".into(),
+            tool_name: "form".into(),
+            extension_id: "flow:form".into(),
+            args: json!({}),
+            flow_ref: "form".into(),
+            flow_snapshot: json!({}),
+            iterations_used: 0,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            presentation: Some(json!({})),
+            parked_at: None,
+            side_turns: 0,
+        });
+        assert!(ensure_placeholder(&mut s));
+        assert_eq!(s.messages.len(), 5);
+        assert!(matches!(&s.messages[4], ChatMessage::Tool { .. }));
     }
 }

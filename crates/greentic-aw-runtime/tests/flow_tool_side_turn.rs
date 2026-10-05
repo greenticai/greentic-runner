@@ -114,6 +114,7 @@ impl FlowInvoker for ScriptedFlows {
 struct RecordingLlm {
     responses: Mutex<Vec<LlmResponse>>,
     histories: Mutex<Vec<Vec<ChatMessage>>>,
+    prompts: Mutex<Vec<String>>,
 }
 
 impl RecordingLlm {
@@ -121,6 +122,7 @@ impl RecordingLlm {
         Self {
             responses: Mutex::new(responses),
             histories: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
         }
     }
     fn calls(&self) -> usize {
@@ -134,6 +136,7 @@ impl LlmBackend for RecordingLlm {
         req: LlmRequest,
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
         self.histories.lock().unwrap().push(req.history.clone());
+        self.prompts.lock().unwrap().push(req.system_prompt.clone());
         let next = if !pairing_is_valid(&req.history) {
             Err(LlmError::Transport(format!(
                 "tool-call pairing broken: {:?}",
@@ -690,4 +693,54 @@ async fn a_denied_side_message_keeps_the_park_untouched() {
     let after = h.state().await;
     assert_eq!(after.pending_tool, before.pending_tool);
     assert_eq!(after.messages.len(), before.messages.len());
+}
+
+/// The resume turn after side turns is told the form has finished, so the
+/// model answers about the booking rather than the last side question.
+#[tokio::test]
+async fn a_resume_after_side_turns_tells_the_model_the_form_finished() {
+    let (h, llm, _flows) = parked(
+        vec![final_reply("one"), final_reply("booked")],
+        vec![FlowInvokeOutcome::Completed(json!({ "room": "101" }))],
+    )
+    .await;
+    h.step("q1", None).await;
+    h.step("", submit()).await;
+
+    let prompts = llm.prompts.lock().unwrap().clone();
+    let last = prompts.last().expect("resume turn prompt");
+    assert!(
+        last.contains("has now finished"),
+        "resume after a side turn must carry the cue: {last}"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_without_side_turns_carries_no_cue() {
+    let (h, llm, _flows) = parked(
+        vec![final_reply("booked")],
+        vec![FlowInvokeOutcome::Completed(json!({ "room": "101" }))],
+    )
+    .await;
+    h.step("", submit()).await;
+    let prompts = llm.prompts.lock().unwrap().clone();
+    assert!(!prompts.last().unwrap().contains("has now finished"));
+}
+
+/// After an error the host can still re-offer the card: the park is reported
+/// while live and gone once cancelled or expired.
+#[tokio::test]
+async fn parked_card_reports_a_live_park_only() {
+    let (h, _llm, _flows) = parked(vec![], vec![]).await;
+    assert_eq!(
+        h.rt.parked_card(&h.tc, SESSION).await,
+        Some(json!({ "card": CARD_A }))
+    );
+    let mut state = h.state().await;
+    if let Some(p) = state.pending_tool.as_mut() {
+        p.expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    }
+    h.store.save(&h.tc, SESSION, &state).await.unwrap();
+    assert_eq!(h.rt.parked_card(&h.tc, SESSION).await, None);
+    assert_eq!(h.rt.parked_card(&h.tc, "no-such-session").await, None);
 }

@@ -166,6 +166,10 @@ pub async fn run_step(
         crate::flow_suspend::Taken::Side => (None, None, true),
     };
 
+    let resumed_after_side_turns = resuming
+        .as_ref()
+        .is_some_and(|resume| resume.pending.side_turns > 0);
+
     // --- Assemble guardrail chain (once per step, before any message push) ---
     // Mandatory refs from the platform policy are resolved first; if any
     // mandatory guardrail cannot be resolved the agent is blocked (fail-closed).
@@ -353,6 +357,17 @@ pub async fn run_step(
     // exists and when to call it. Applied only for conversational agents. ---
     let system_prompt = if conv_active {
         crate::end_conversation::augment_system_prompt(&system_prompt)
+    } else {
+        system_prompt
+    };
+
+    // The turn that resumes a flow after side turns tells the model the step
+    // just finished (its history ends in the last side answer otherwise).
+    let system_prompt = if resumed_after_side_turns {
+        format!(
+            "{system_prompt}\n\n{}",
+            crate::flow_suspend::RESUME_AFTER_SIDE_TURNS_NOTE
+        )
     } else {
         system_prompt
     };
