@@ -153,7 +153,7 @@ async fn a_completed_tool_is_traced_without_its_args_and_shown_to_the_next_reque
 
     let trace = Arc::new(RunTrace::new());
     RunContext::scope(
-        RunContext::new(trace.clone()),
+        RunContext::new("acme", trace.clone()),
         rt.step(
             tc,
             "s",

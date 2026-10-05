@@ -71,7 +71,19 @@ pub async fn run_step(
 
     // The run this step belongs to, if the caller opened one (see
     // `RunContext::scope`). None is today's behaviour exactly.
-    let run_trace = crate::run_trace::RunContext::current().map(|c| c.trace().clone());
+    // A context bound to another tenant is ignored, never shared across tenants.
+    let run_trace = crate::run_trace::RunContext::current().and_then(|c| {
+        if c.tenant_id() == tenant.tenant_id {
+            Some(c.trace().clone())
+        } else {
+            warn!(
+                context_tenant = c.tenant_id(),
+                step_tenant = %tenant.tenant_id,
+                "ignoring a run context bound to another tenant"
+            );
+            None
+        }
+    });
 
     // --- Cost budget gate (spec Decision 14) ---
     if let Some(cap) = config.limits.daily_token_cap_per_tenant {
@@ -2082,7 +2094,7 @@ mod tests {
         let trace = Arc::new(crate::run_trace::RunTrace::new());
         trace.append("outer", "tool", "refund flow approved 40 USD");
         crate::run_trace::RunContext::scope(
-            crate::run_trace::RunContext::new(trace),
+            crate::run_trace::RunContext::new("acme", trace),
             runtime.step(
                 tc.clone(),
                 "sess-trace",
@@ -2129,7 +2141,7 @@ mod tests {
         let runtime = runtime_for_prompt_tests(llm, &tc);
         let trace = Arc::new(crate::run_trace::RunTrace::new());
         crate::run_trace::RunContext::scope(
-            crate::run_trace::RunContext::new(trace.clone()),
+            crate::run_trace::RunContext::new("acme", trace.clone()),
             runtime.step(
                 tc.clone(),
                 "sess-rec",
@@ -2147,5 +2159,31 @@ mod tests {
         assert_eq!(events[0].actor, "a");
         assert_eq!(events[0].kind, "reply");
         assert_eq!(events[0].summary, "all done");
+    }
+
+    #[tokio::test]
+    async fn a_context_for_another_tenant_is_ignored() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        trace.append("outer", "tool", "other tenant secret");
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("other", trace.clone()),
+            runtime.step(
+                tc.clone(),
+                "sess-foreign",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(prompts[0], "sys");
+        assert_eq!(trace.events().len(), 1, "no event may be recorded");
     }
 }

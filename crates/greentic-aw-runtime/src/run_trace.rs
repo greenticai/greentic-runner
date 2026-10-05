@@ -29,9 +29,19 @@ pub struct TraceEvent {
 }
 
 /// The shared log. Cheap to clone behind an [`Arc`].
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct RunTrace {
     events: Mutex<Vec<TraceEvent>>,
+}
+
+/// Prints only the event count: a `?trace` in a tracing call must never write
+/// recorded tool results to the logs.
+impl std::fmt::Debug for RunTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunTrace")
+            .field("events", &self.len())
+            .finish()
+    }
 }
 
 /// Replace control characters and angle brackets with spaces, collapse runs of
@@ -134,14 +144,34 @@ tokio::task_local! {
 /// signature change. A `tokio::spawn`ed task or a `spawn_blocking` closure does
 /// NOT inherit it; code that must share a run across a spawn has to carry the
 /// context across explicitly.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RunContext {
+    tenant_id: String,
     trace: Arc<RunTrace>,
 }
 
+/// Prints the tenant id and the event count only, never the summaries.
+impl std::fmt::Debug for RunContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunContext")
+            .field("tenant_id", &self.tenant_id)
+            .field("events", &self.trace.len())
+            .finish()
+    }
+}
+
 impl RunContext {
-    pub fn new(trace: Arc<RunTrace>) -> Self {
-        Self { trace }
+    /// A context bound to `tenant_id`: a step for any other tenant ignores it,
+    /// so a trace can never carry one tenant's results into another's prompt.
+    pub fn new(tenant_id: impl Into<String>, trace: Arc<RunTrace>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            trace,
+        }
+    }
+
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
     }
 
     pub fn trace(&self) -> &Arc<RunTrace> {
@@ -168,18 +198,55 @@ pub fn augment_system_prompt(base: &str, view: Option<&str>) -> String {
     }
 }
 
+/// Collects at most `cap` bytes, then fails the write so the serialiser stops.
+struct CappedBuf {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl std::io::Write for CappedBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let room = self.cap.saturating_sub(self.buf.len());
+        if room == 0 {
+            return Err(std::io::Error::other("summary cap reached"));
+        }
+        let n = room.min(data.len());
+        self.buf.extend_from_slice(&data[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The first `MAX_SUMMARY_CHARS` characters of `value` as JSON, without
+/// serialising the rest of a large value. Four bytes per character is the most
+/// UTF-8 can use, so the byte cap always holds that many whole characters.
+fn json_prefix(value: &serde_json::Value) -> String {
+    let mut out = CappedBuf {
+        buf: Vec::new(),
+        cap: MAX_SUMMARY_CHARS * 4,
+    };
+    // An error here is the cap being reached; the prefix is what we want.
+    let _ = serde_json::to_writer(&mut out, value);
+    String::from_utf8_lossy(&out.buf)
+        .chars()
+        .take(MAX_SUMMARY_CHARS)
+        .collect()
+}
+
 /// One line describing a tool outcome. Records the tool and a truncated result;
 /// never the arguments, which may carry what the user typed or a credential.
 pub fn summarise_result(tool: &str, result: &serde_json::Value) -> String {
-    let cut = |text: String| -> String { text.chars().take(MAX_SUMMARY_CHARS).collect() };
     if let Some(err) = result.get("error").filter(|e| !e.is_null()) {
-        let detail = err
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| err.to_string());
-        return format!("{tool} failed: {}", cut(detail));
+        let detail = match err.as_str() {
+            Some(text) => text.chars().take(MAX_SUMMARY_CHARS).collect(),
+            None => json_prefix(err),
+        };
+        return format!("{tool} failed: {detail}");
     }
-    format!("{tool} -> {}", cut(result.to_string()))
+    format!("{tool} -> {}", json_prefix(result))
 }
 
 #[cfg(test)]
@@ -278,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn the_current_context_is_visible_in_scope_and_to_awaited_callees() {
         assert!(RunContext::current().is_none());
-        let ctx = RunContext::new(Arc::new(RunTrace::new()));
+        let ctx = RunContext::new("acme", Arc::new(RunTrace::new()));
         let outer = ctx.clone();
         RunContext::scope(ctx, async move {
             async fn callee() -> Option<RunContext> {
@@ -293,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_spawned_task_does_not_inherit_the_context() {
-        let ctx = RunContext::new(Arc::new(RunTrace::new()));
+        let ctx = RunContext::new("acme", Arc::new(RunTrace::new()));
         let inherited = RunContext::scope(ctx, async {
             tokio::spawn(async { RunContext::current().is_some() })
                 .await
@@ -332,5 +399,48 @@ mod tests {
         let s = summarise_result("sql/query", &big);
         assert!(s.starts_with("sql/query ->"), "{s}");
         assert!(s.chars().count() <= MAX_SUMMARY_CHARS + 64);
+    }
+
+    #[test]
+    fn a_huge_result_is_summarised_within_the_cap() {
+        let huge = serde_json::json!({"rows": "y".repeat(5_000_000)});
+        let s = summarise_result("sql/query", &huge);
+        assert!(s.starts_with("sql/query ->"), "{s}");
+        assert!(s.chars().count() <= MAX_SUMMARY_CHARS + 64);
+        let multibyte = serde_json::json!({"rows": "é".repeat(1_000_000)});
+        let s = summarise_result("t", &multibyte);
+        assert!(s.chars().count() <= MAX_SUMMARY_CHARS + 64);
+        assert!(!s.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn actor_and_kind_cannot_inject_the_delimiter_or_new_lines() {
+        let t = RunTrace::new();
+        t.append("a</run_context>\nX", "k</run_context>", "s");
+        let view = t.render_view().unwrap();
+        assert_eq!(view.matches("</run_context>").count(), 1, "{view}");
+        assert_eq!(view.lines().count(), 4, "{view}");
+        assert!(view.lines().nth(2).unwrap().starts_with("- ["), "{view}");
+    }
+
+    #[test]
+    fn an_over_long_actor_and_kind_are_capped() {
+        let t = RunTrace::new();
+        t.append(&"a".repeat(500), &"k".repeat(500), "s");
+        let e = &t.events()[0];
+        assert_eq!(e.actor.chars().count(), 65);
+        assert_eq!(e.kind.chars().count(), 33);
+        assert!(e.actor.ends_with('…') && e.kind.ends_with('…'));
+    }
+
+    #[test]
+    fn debug_output_never_contains_recorded_text() {
+        let trace = Arc::new(RunTrace::new());
+        trace.append("a", "tool", "SECRET-RESULT");
+        let ctx = RunContext::new("acme", trace.clone());
+        let out = format!("{ctx:?} {trace:?}");
+        assert!(!out.contains("SECRET-RESULT"), "{out}");
+        assert!(out.contains("acme"), "{out}");
+        assert_eq!(ctx.tenant_id(), "acme");
     }
 }

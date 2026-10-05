@@ -1130,7 +1130,7 @@ async fn a_tool_outcome_is_traced_and_shown_to_the_next_llm_request() {
     );
     let trace = Arc::new(greentic_aw_runtime::RunTrace::new());
     greentic_aw_runtime::RunContext::scope(
-        greentic_aw_runtime::RunContext::new(trace.clone()),
+        greentic_aw_runtime::RunContext::new("acme", trace.clone()),
         rt.step(
             tc,
             "s",
