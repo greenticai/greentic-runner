@@ -10,7 +10,7 @@ pub struct UserLedgerTarget {
     /// `{admin}/api/v1/ingest/ledger` — the client appends `/read`, `/append`.
     pub base_url: String,
     /// The unit's `gtm_` worker-usage token. Only ever sent as a header.
-    pub token: String,
+    pub token: secrecy::SecretString,
     /// The workspace slug the token belongs to; the door refuses any other.
     pub tenant_slug: String,
 }
