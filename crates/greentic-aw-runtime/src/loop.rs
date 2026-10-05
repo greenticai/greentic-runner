@@ -69,6 +69,10 @@ pub async fn run_step(
         .agent_config(&tenant, agent_id)
         .await?;
 
+    // The run this step belongs to, if the caller opened one (see
+    // `RunContext::scope`). None is today's behaviour exactly.
+    let run_trace = crate::run_trace::RunContext::current().map(|c| c.trace().clone());
+
     // --- Cost budget gate (spec Decision 14) ---
     if let Some(cap) = config.limits.daily_token_cap_per_tenant {
         let used = runtime.token_meter.current(&tenant).await?;
@@ -435,7 +439,10 @@ pub async fn run_step(
             tools_schema.push(crate::end_conversation::end_conversation_tool_schema());
         }
         let request = LlmRequest {
-            system_prompt: system_prompt.clone(),
+            system_prompt: crate::run_trace::augment_system_prompt(
+                &system_prompt,
+                run_trace.as_ref().and_then(|t| t.render_view()).as_deref(),
+            ),
             history: state.messages.clone(),
             tools: tools_schema,
             provider: config.llm.clone(),
@@ -2018,5 +2025,80 @@ mod tests {
         let seen = observer.guardrails.lock().unwrap();
         assert_eq!(seen.len(), 1, "a blocked denial must still be observed");
         assert_eq!(seen[0].action, crate::guardrail::GuardrailAction::Blocked);
+    }
+
+    fn runtime_for_prompt_tests(llm: Arc<MockLlmBackend>, tc: &TenantContext) -> AgentRuntime {
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        cp.insert(tc, "a", cfg());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+        AgentRuntime::new(
+            Arc::new(cp),
+            store,
+            ext,
+            llm,
+            telemetry,
+            Arc::new(crate::cost::MockTokenMeter::new(0)),
+            Arc::new(crate::mock::NoopToolLedger),
+            None,
+        )
+    }
+
+    fn one_reply(text: &str) -> Arc<MockLlmBackend> {
+        Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some(text.into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]))
+    }
+
+    #[tokio::test]
+    async fn a_run_trace_view_is_injected_into_the_system_prompt() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        trace.append("outer", "tool", "refund flow approved 40 USD");
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new(trace),
+            runtime.step(
+                tc.clone(),
+                "sess-trace",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert!(prompts[0].starts_with("sys"));
+        assert!(prompts[0].contains("<run_context>"));
+        assert!(prompts[0].contains("refund flow approved 40 USD"));
+    }
+
+    #[tokio::test]
+    async fn without_a_run_ctx_the_prompt_is_unchanged() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        runtime
+            .step(
+                tc.clone(),
+                "sess-none",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(prompts[0], "sys");
     }
 }
