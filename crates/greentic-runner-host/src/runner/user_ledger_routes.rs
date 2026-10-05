@@ -11,10 +11,21 @@
 //! `"none"` is dropped silently. Unlike that sidecar this one is size-bounded
 //! (`MAX_SIDECAR_BYTES`, `MAX_AGENTS`): over either cap the WHOLE sidecar
 //! reads as absent, i.e. fail closed (no agent gets the ledger). Warnings
-//! never include file contents. Absent means no agent uses the ledger. Unknown
-//! top-level fields do not exist in this flat shape: every key is an agent id.
-//! The sidecar only SELECTS agents and a mode; the host binding is the
-//! capability. This module is ungated and carries only the wire spelling.
+//! carry no file contents except an offending agent id (a key of the file);
+//! the malformed-JSON warn logs only serde's error category, line and column,
+//! never its text (which can quote content). Absent means no agent uses the
+//! ledger. Unknown top-level fields do not exist in this flat shape: every key
+//! is an agent id.
+//!
+//! The sidecar decides Read vs ReadWrite DIRECTLY: `UserLedgerBinding::new`
+//! takes the agents map with no ceiling, so a pack alone can enable
+//! `read_write` for its own agents. The gates that remain are the door token's
+//! `ledger` purpose, the kill switch, the tenant match and the verified
+//! subject. Duplicate JSON keys resolve last-wins (the pack author's own
+//! declaration). `PackRuntime::user_ledger` caches the result of its first
+//! read for the life of the runtime, a failed read included (a hot reload
+//! builds a fresh one), like its run-context twin. This module is ungated and
+//! carries only the wire spelling.
 
 use std::collections::BTreeMap;
 
@@ -41,7 +52,14 @@ impl PackUserLedger {
             return None;
         }
         let raw: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)
-            .inspect_err(|e| tracing::warn!(error = %e, "user-ledger: malformed; ignoring sidecar"))
+            .inspect_err(|e| {
+                tracing::warn!(
+                    category = ?e.classify(),
+                    line = e.line(),
+                    column = e.column(),
+                    "user-ledger: malformed; ignoring sidecar"
+                )
+            })
             .ok()?;
         if raw.len() > MAX_AGENTS {
             tracing::warn!(
@@ -144,22 +162,15 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_key_resolves_to_the_last_value_and_never_escalates_past_it() {
+    fn a_duplicate_key_resolves_last_wins_so_a_trailing_none_withdraws_the_grant() {
         let rc = PackUserLedger::from_sidecar_bytes(br#"{"a":"read_write","a":"none"}"#).unwrap();
         assert_eq!(rc.agents().count(), 0);
     }
 
     #[test]
-    fn a_warning_never_carries_the_file_contents() {
-        // Structural: the module only logs error text from serde (which may
-        // quote a token) never the bytes; the secret below is a valid string
-        // value in a dropped entry and must not be a logged field. Checked by
-        // the source ratchet below rather than a log capture.
-        let src = include_str!("user_ledger_routes.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap();
-        assert!(!code.contains("from_utf8"));
-        assert!(!code.contains("%mode"));
-        assert!(!code.contains("?mode"));
-        assert!(!code.contains("?bytes"));
+    fn a_duplicate_key_resolves_last_wins_so_a_trailing_grant_stands() {
+        // The pack author's own declaration: documented, not an escalation.
+        let rc = PackUserLedger::from_sidecar_bytes(br#"{"a":"none","a":"read_write"}"#).unwrap();
+        assert_eq!(modes(&rc), vec![("a".into(), "read_write".into())]);
     }
 }
