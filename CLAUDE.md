@@ -173,8 +173,10 @@ expiry only up to `parked_at + 24h`; (4) a park with no stored card (`presentati
 an expired park, or the cap falls back to the cancel behaviour. Whether a message is a
 card submit at all is `engine::is_card_submit`: provider-stamped context keys
 (`universal`, `user_id`, `flow_hint`, `extensions`, `channel.*`, and `route`/`tenant` only
-when equal to the envelope identity) are NOT input; the explicit submit marker from the
-provider is a separate change. Design: `docs/superpowers/specs/2026-10-05-parked-flow-side-question-design.md`.
+when equal to the envelope identity) are NOT input. The order is: the provider's explicit
+`metadata.greentic_submit == "true"` marker (stamped by `messaging-provider-webchat` only on a
+message activity with object `value`, so a `data: {}` submit still counts), then
+`metadata.action`, then that key heuristic (the fallback for providers that do not stamp it). Design: `docs/superpowers/specs/2026-10-05-parked-flow-side-question-design.md`.
 
 The out-of-process (`DwAgentDispatch::Nats`) dispatch path supports the same
 conversational park-loop, identical in outcome to the in-process path. A fresh user turn
