@@ -4340,6 +4340,12 @@ pub(crate) fn tool_presentation(payload: &Value) -> Option<&Value> {
         .filter(|value| !value.is_null())
 }
 
+/// Envelope metadata key the webchat provider sets to `"true"` on a card submit
+/// (an activity carrying Action.Submit `data`, even `{}`) and never on typed
+/// text. Contract with `messaging-provider-webchat` (`SUBMIT_MARKER_KEY`). The
+/// `greentic_` prefix is one the provider never copies from client data.
+const SUBMIT_MARKER_KEY: &str = "greentic_submit";
+
 /// What a `dw.agent` parked on a `flow:` tool renders as the turn's output.
 /// The card alone for a plain park. For a SIDE turn (a typed message answered
 /// while the tool stays parked) the agent's reply followed by the card, as two
@@ -4476,6 +4482,14 @@ fn is_card_submit(entry: &Value) -> bool {
     if has_action {
         return true;
     }
+    // An explicit marker from the provider settles it, including a submit with
+    // no fields of its own that no key-shape heuristic can tell from typed text.
+    let marked = metadata
+        .and_then(|meta| meta.get(SUBMIT_MARKER_KEY))
+        .is_some_and(|value| value.as_str() == Some("true") || value.as_bool() == Some(true));
+    if marked {
+        return true;
+    }
     let envelope = entry
         .get("input")
         .filter(|v| v.is_object())
@@ -4491,6 +4505,7 @@ fn is_card_submit(entry: &Value) -> bool {
     let metadata_input = metadata.is_some_and(|meta| {
         meta.iter().any(|(key, value)| {
             key != "action"
+                && key != SUBMIT_MARKER_KEY
                 && !is_channel_context_key(key)
                 && !stamped_identity_matches(key, value, envelope)
         })
@@ -6207,7 +6222,7 @@ fn submitted_fields(entry: &Value) -> JsonMap<String, Value> {
     let mut fields = JsonMap::new();
     if let Some(Value::Object(meta)) = resolve_entry_metadata(entry) {
         for (key, value) in meta {
-            if key == "action" {
+            if key == "action" || key == SUBMIT_MARKER_KEY {
                 continue;
             }
             fields.insert(key.clone(), value.clone());
@@ -13271,6 +13286,37 @@ mod tests {
         assert!(is_card_submit(&typed));
         typed["input"]["metadata"] = json!({ "channel.x": "1" });
         assert!(!is_card_submit(&typed));
+    }
+
+    /// The webchat provider marks a card submit explicitly (`greentic_submit`),
+    /// so a submit that carries no fields of its own is still a submit.
+    #[test]
+    fn the_provider_submit_marker_makes_an_empty_submit_a_submit() {
+        let mut click = wrapped_typed_message("message");
+        let mut meta = provider_stamped_metadata();
+        meta["greentic_submit"] = json!("true");
+        click["input"]["metadata"] = meta;
+        assert!(is_card_submit(&click));
+        let flat = click["input"].clone();
+        assert!(is_card_submit(&flat));
+        // Without the marker the same envelope is typed text.
+        let mut typed = wrapped_typed_message("message");
+        typed["input"]["metadata"] = provider_stamped_metadata();
+        assert!(!is_card_submit(&typed));
+        // Only the string "true" counts.
+        let mut other = wrapped_typed_message("message");
+        let mut meta = provider_stamped_metadata();
+        meta["greentic_submit"] = json!("false");
+        other["input"]["metadata"] = meta;
+        assert!(!is_card_submit(&other));
+    }
+
+    #[test]
+    fn the_submit_marker_is_not_a_submitted_answer() {
+        let entry = json!({ "metadata": { "room": "101", "greentic_submit": "true" } });
+        let fields = submitted_fields(&entry);
+        assert!(fields.contains_key("room"));
+        assert!(!fields.contains_key("greentic_submit"));
     }
 
     /// `route` and `tenant` are only context when they carry the value the
