@@ -4363,8 +4363,24 @@ const ENVELOPE_TRANSPORT_KEYS: &[&str] = &[
 
 /// Channel context a provider may stamp on a message's `metadata` whether or
 /// not a card was submitted. Context, not input, so it never makes a typed
-/// message a submit. The webchat provider stamps all of these on every
-/// activity (`messaging-provider-webchat` `ops/envelope.rs`, `ops/ingest.rs`).
+/// message a submit.
+///
+/// The webchat provider (`messaging-provider-webchat` `ops/envelope.rs`,
+/// `ops/ingest.rs`) MAY stamp these on a Direct Line activity: `universal`,
+/// `env`, `locale`, `extensions`, `user_id`, `user_verified`, and `flow_hint`
+/// when the `X-Greentic-Flow` header is present. `team` is kept from the
+/// earlier allow-list. `route` and `tenant` are handled separately
+/// ([`stamped_identity_matches`]).
+///
+/// NONE of these is trustworthy: Action.Submit `data` is copied into
+/// `metadata` after the stamping, so a client can overwrite any of them (only
+/// `user_*`/`greentic_*` are protected). Safe here only because a client that
+/// can add keys can already send plain text or add `action`.
+///
+/// The failure direction matters: a card INPUT that shares one of these names
+/// is invisible to the classifier, so a click carrying only that input reads
+/// as typed text and the parked tool is cancelled (#811). The explicit submit
+/// marker (spec PR-2) is the real fix.
 #[cfg(any(feature = "agentic-worker", test))]
 const CHANNEL_CONTEXT_METADATA_KEYS: &[&str] = &[
     "locale",
@@ -4372,11 +4388,6 @@ const CHANNEL_CONTEXT_METADATA_KEYS: &[&str] = &[
     "env",
     "autoStart",
     "universal",
-    "tenant",
-    "tenant_id",
-    "tenant_channel_id",
-    "route",
-    "conversation_id",
     "user_id",
     "user_verified",
     "flow_hint",
@@ -4390,6 +4401,22 @@ const CHANNEL_CONTEXT_METADATA_PREFIX: &str = "channel.";
 #[cfg(any(feature = "agentic-worker", test))]
 fn is_channel_context_key(key: &str) -> bool {
     CHANNEL_CONTEXT_METADATA_KEYS.contains(&key) || key.starts_with(CHANNEL_CONTEXT_METADATA_PREFIX)
+}
+
+/// `route` (= conversation id = `session_id`) and `tenant` (= `tenant.tenant`)
+/// are context only when they carry the value the provider derives from the
+/// envelope itself. A card input that merely shares the name overwrites them
+/// with its own value and is therefore input, not context.
+#[cfg(any(feature = "agentic-worker", test))]
+fn stamped_identity_matches(key: &str, value: &Value, envelope: &Value) -> bool {
+    let Some(value) = value.as_str() else {
+        return false;
+    };
+    match key {
+        "route" => envelope.get("session_id").and_then(Value::as_str) == Some(value),
+        "tenant" => envelope.pointer("/tenant/tenant").and_then(Value::as_str) == Some(value),
+        _ => false,
+    }
 }
 
 /// Whether `map` is a `ChannelMessageEnvelope`: the three keys no card input
@@ -4437,8 +4464,11 @@ fn is_card_submit(entry: &Value) -> bool {
         })
     });
     let metadata_input = metadata.is_some_and(|meta| {
-        meta.keys()
-            .any(|key| key != "action" && !is_channel_context_key(key))
+        meta.iter().any(|(key, value)| {
+            key != "action"
+                && !is_channel_context_key(key)
+                && !stamped_identity_matches(key, value, envelope)
+        })
     });
     root_input || metadata_input
 }
@@ -13097,8 +13127,7 @@ mod tests {
             "universal": "true",
             "env": "prod",
             "tenant": "acme",
-            "tenant_channel_id": "chan-1",
-            "route": "conv-1",
+            "route": "sess-1",
             "user_id": "user-1",
             "user_verified": "true",
             "flow_hint": "main",
@@ -13142,14 +13171,39 @@ mod tests {
         assert!(!is_card_submit(&typed));
     }
 
-    /// Known limitation (spec D1): a card whose ONLY input shares a name with
-    /// a provider-stamped key cannot be told from typed text without the
-    /// PR-2 submit marker. Pinned so changing it is deliberate.
+    /// `route` and `tenant` are only context when they carry the value the
+    /// provider derives from the envelope (`route` = conversation id =
+    /// `session_id`; `tenant` = `tenant.tenant`). A card input that merely
+    /// shares the name overwrites them with its own value, and that click
+    /// must stay a submit or the parked tool is cancelled by a button press.
     #[test]
-    fn a_lone_card_input_named_like_a_stamped_key_is_not_seen_as_a_submit() {
-        let mut click = wrapped_typed_message("");
-        click["input"]["metadata"] = json!({ "route": "billing" });
-        assert!(!is_card_submit(&click));
+    fn a_card_input_named_like_a_stamped_key_with_its_own_value_is_a_submit() {
+        for (key, value) in [("route", "billing"), ("tenant", "other-corp")] {
+            let mut click = wrapped_typed_message("");
+            click["input"]["metadata"] = json!({ key: value });
+            assert!(is_card_submit(&click), "{key}={value} must count as input");
+            let flat = click["input"].clone();
+            assert!(
+                is_card_submit(&flat),
+                "flat {key}={value} must count as input"
+            );
+        }
+        // The same keys carrying the envelope's own identity are context.
+        let mut typed = wrapped_typed_message("hi");
+        typed["input"]["metadata"] = json!({ "route": "sess-1", "tenant": "acme" });
+        assert!(!is_card_submit(&typed));
+    }
+
+    /// Stamped only on the auto-start envelope or never on the activities
+    /// path: not context for a message that can reach a parked node, so a card
+    /// input of that name is input.
+    #[test]
+    fn keys_the_activities_path_never_stamps_are_input() {
+        for key in ["tenant_id", "conversation_id", "tenant_channel_id"] {
+            let mut click = wrapped_typed_message("");
+            click["input"]["metadata"] = json!({ key: "x" });
+            assert!(is_card_submit(&click), "{key} must count as input");
+        }
     }
 
     /// The engine-level view of the same defect: a typed message in a channel
