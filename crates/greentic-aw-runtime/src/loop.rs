@@ -152,12 +152,19 @@ pub async fn run_step(
     // Its `call_id` has no tool result in history yet, and nothing may reach
     // the LLM until it does. Either resume the flow with the user's answer
     // (below, once the tool catalogs are resolved) or cancel it here.
-    let (resuming, cancelled_step) = crate::flow_suspend::take_pending(
+    let (resuming, cancelled_step, side_pending) = match crate::flow_suspend::take_pending(
         &mut state,
         message.resume_payload.clone(),
         chrono::Utc::now(),
         observer.as_ref(),
-    );
+        config.on_text_while_parked,
+    ) {
+        crate::flow_suspend::Taken::Nothing => (None, None, false),
+        crate::flow_suspend::Taken::Resume(resume) => (Some(resume), None, false),
+        crate::flow_suspend::Taken::Cancelled(step) => (None, Some(step), false),
+        // The park stays; this turn answers the typed message and re-offers it.
+        crate::flow_suspend::Taken::Side => (None, None, true),
+    };
 
     // --- Assemble guardrail chain (once per step, before any message push) ---
     // Mandatory refs from the platform policy are resolved first; if any
@@ -346,6 +353,13 @@ pub async fn run_step(
     // exists and when to call it. Applied only for conversational agents. ---
     let system_prompt = if conv_active {
         crate::end_conversation::augment_system_prompt(&system_prompt)
+    } else {
+        system_prompt
+    };
+
+    // A side turn tells the model a form step is pending.
+    let system_prompt = if side_pending {
+        format!("{system_prompt}\n\n{}", crate::flow_suspend::SIDE_TURN_NOTE)
     } else {
         system_prompt
     };
@@ -584,7 +598,9 @@ pub async fn run_step(
                 // --- A flow tool earlier in this batch parked on the user ---
                 // Every later call still gets a result so no tool_call dangles
                 // in history, but none of them runs: the user must answer first.
-                if suspension.is_some() {
+                // A side turn must not start a second flow while one is parked.
+                if suspension.is_some() || (side_pending && call.extension_id.starts_with("flow:"))
+                {
                     crate::flow_suspend::refuse_behind_suspension(
                         &mut state,
                         &mut trail,
@@ -891,6 +907,12 @@ pub async fn run_step(
                 });
             }
         };
+        let side_turn = side_pending
+            && crate::flow_suspend::finish_side_turn(
+                &mut state,
+                &mut terminated_by,
+                &mut suspension,
+            );
         state.messages.push(ChatMessage::Assistant {
             content: reply.clone(),
             tool_calls: vec![],
@@ -958,11 +980,13 @@ pub async fn run_step(
                 tokens_out: tokens_out_total,
                 iterations,
             },
-            pending_presentation: None,
-            side_turn: false,
+            pending_presentation: suspension,
+            side_turn,
         });
     }
 
+    let side_turn = side_pending
+        && crate::flow_suspend::finish_side_turn(&mut state, &mut terminated_by, &mut suspension);
     state.truncate_history(config.limits.max_history_turns);
     if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
         warn!(error = %e, "state save failed at end of step");
@@ -989,7 +1013,7 @@ pub async fn run_step(
             iterations,
         },
         pending_presentation: suspension,
-        side_turn: false,
+        side_turn,
     })
 }
 

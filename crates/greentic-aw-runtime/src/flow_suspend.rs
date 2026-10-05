@@ -21,8 +21,13 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::config::ParkedTextPolicy;
+use crate::error::TerminationReason;
 use crate::flow_source::FlowInvokeOutcome;
-use crate::state::{ChatMessage, ConversationState, PendingToolCall, ToolCallRecord};
+use crate::state::{
+    ChatMessage, ConversationState, MAX_SIDE_TURNS, PENDING_TOOL_MAX_AGE_SECS, PendingToolCall,
+    ToolCallRecord,
+};
 use crate::tenant::TenantContext;
 use crate::tool_session::ToolCatalogs;
 use crate::{AgentRuntime, AgentStep, StepObserver};
@@ -60,40 +65,159 @@ pub(crate) struct Resume {
     pub(crate) payload: Value,
 }
 
+/// What the start of a step found on the conversation's parked flow tool.
+pub(crate) enum Taken {
+    /// Nothing was parked.
+    Nothing,
+    /// The turn carries the user's answer: resume the flow.
+    Resume(Resume),
+    /// The park was cancelled (typed message, or expired); the trail step
+    /// records it. The turn proceeds as an ordinary message.
+    Cancelled(AgentStep),
+    /// The park STAYS and this turn answers the typed message as a side turn.
+    Side,
+}
+
+/// The note added to the system prompt of a side turn.
+pub(crate) const SIDE_TURN_NOTE: &str = "A form step is waiting for the user to \
+fill it in. Do not start that step again. Answer the user's question, then \
+mention that the form can be continued.";
+
 /// Take the conversation's pending flow tool, if any.
 ///
 /// Returns the resume to run when the suspension is live and the turn carries
-/// the user's answer. Otherwise the pending call is CANCELLED here — its
-/// `call_id` answered with `{"status": "cancelled", "reason": ...}` — and the
-/// returned trail step records it; the turn then proceeds as an ordinary
-/// message.
+/// the user's answer. With `policy == SideTurn`, a typed message on a live,
+/// re-offerable park leaves the park in place ([`Taken::Side`]). Otherwise the
+/// pending call is CANCELLED here — its `call_id` answered with
+/// `{"status": "cancelled", "reason": ...}` — and the returned trail step
+/// records it; the turn then proceeds as an ordinary message.
 pub(crate) fn take_pending(
     state: &mut ConversationState,
     resume_payload: Option<Value>,
     now: DateTime<Utc>,
     observer: &dyn StepObserver,
-) -> (Option<Resume>, Option<AgentStep>) {
+    policy: ParkedTextPolicy,
+) -> Taken {
+    let Some(pending) = state.pending_tool.as_ref() else {
+        return Taken::Nothing;
+    };
+    if policy == ParkedTextPolicy::SideTurn
+        && resume_payload.is_none()
+        && side_turn_allowed(pending, now)
+        && ensure_placeholder(state)
+    {
+        if let Some(pending) = state.pending_tool.as_mut() {
+            begin_side_turn(pending, now);
+        }
+        return Taken::Side;
+    }
     let Some(pending) = state.pending_tool.take() else {
-        return (None, None);
+        return Taken::Nothing;
     };
     let reason = if pending.is_expired(now) {
         "the step waiting for the user expired before they answered"
     } else if let Some(payload) = resume_payload {
-        return (Some(Resume { pending, payload }), None);
+        return Taken::Resume(Resume { pending, payload });
     } else {
         "the user sent a message instead of completing this step"
     };
     let result = json!({ "status": "cancelled", "reason": reason });
     observer.on_tool_result(&pending.tool_name, &pending.call_id, &result);
     patch_tool_result(state, &pending.call_id, result.clone());
-    let step = AgentStep::ToolCall {
+    Taken::Cancelled(AgentStep::ToolCall {
         name: pending.tool_name,
         call_id: pending.call_id,
         args: pending.args,
         result,
         duration_ms: 0,
+    })
+}
+
+/// Whether a typed message may be answered while `pending` stays parked: the
+/// park is live (idle expiry and the 24h age cap), under the side-turn cap,
+/// and carries the card to re-offer afterwards.
+fn side_turn_allowed(pending: &PendingToolCall, now: DateTime<Utc>) -> bool {
+    let within_age = pending
+        .parked_at
+        .is_none_or(|at| now < at + chrono::Duration::seconds(PENDING_TOOL_MAX_AGE_SECS));
+    !pending.is_expired(now)
+        && within_age
+        && pending.side_turns < MAX_SIDE_TURNS
+        && pending.presentation.is_some()
+}
+
+/// Count a side turn and refresh the idle expiry, never beyond
+/// `parked_at + PENDING_TOOL_MAX_AGE_SECS`.
+fn begin_side_turn(pending: &mut PendingToolCall, now: DateTime<Utc>) {
+    pending.side_turns += 1;
+    let idle = PendingToolCall::expiry_from(now);
+    pending.expires_at = match pending.parked_at {
+        Some(at) => idle.min(at + chrono::Duration::seconds(PENDING_TOOL_MAX_AGE_SECS)),
+        None => idle,
     };
-    (None, Some(step))
+}
+
+/// Make sure the parked call has a `Tool` result in history (a park recorded
+/// without a placeholder, e.g. under the cancel policy), inserting one right
+/// after the assistant turn that made the call. `false` when that turn is no
+/// longer in history, in which case the park cannot take a side turn.
+fn ensure_placeholder(state: &mut ConversationState) -> bool {
+    let Some(call_id) = state.pending_tool.as_ref().map(|p| p.call_id.clone()) else {
+        return false;
+    };
+    if state
+        .messages
+        .iter()
+        .any(|m| matches!(m, ChatMessage::Tool { call_id: id, .. } if *id == call_id))
+    {
+        return true;
+    }
+    let Some(at) = state.messages.iter().position(|m| {
+        matches!(m, ChatMessage::Assistant { tool_calls, .. }
+            if tool_calls.iter().any(|c| c.call_id == call_id))
+    }) else {
+        return false;
+    };
+    state.messages.insert(
+        at + 1,
+        ChatMessage::Tool {
+            call_id,
+            content: json!({ "status": AWAITING_PLACEHOLDER }),
+        },
+    );
+    true
+}
+
+/// After a side turn's loop: re-offer the stored card. Turns the step's end
+/// into `AwaitingToolInput` carrying that card, whatever stopped the loop
+/// (a final reply, the iteration cap, the timeout). Returns whether it did.
+/// If the model ended the conversation instead, the park is cancelled so no
+/// call stays pending behind a finished segment.
+pub(crate) fn finish_side_turn(
+    state: &mut ConversationState,
+    terminated_by: &mut TerminationReason,
+    suspension: &mut Option<Value>,
+) -> bool {
+    if matches!(terminated_by, TerminationReason::ConversationEnded) {
+        if let Some(pending) = state.pending_tool.take() {
+            patch_tool_result(
+                state,
+                &pending.call_id,
+                json!({ "status": "cancelled", "reason": "the conversation ended" }),
+            );
+        }
+        return false;
+    }
+    let Some(card) = state
+        .pending_tool
+        .as_ref()
+        .and_then(|p| p.presentation.clone())
+    else {
+        return false;
+    };
+    *terminated_by = TerminationReason::AwaitingToolInput;
+    *suspension = Some(card);
+    true
 }
 
 /// The most recent user message's text. A resumed turn carries a card submit

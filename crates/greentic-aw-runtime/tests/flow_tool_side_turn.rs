@@ -12,8 +12,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use greentic_aw_runtime::config::{GuardrailMode, GuardrailRef};
 use greentic_aw_runtime::cost::MockTokenMeter;
 use greentic_aw_runtime::error::{LlmError, TerminationReason};
+use greentic_aw_runtime::guardrail::{AcceptAllEvaluator, StaticGuardrailPolicy};
 use greentic_aw_runtime::llm::{LlmBackend, LlmRequest, LlmResponse};
 use greentic_aw_runtime::mock::{
     MockAgentStateStore, MockConfigProvider, MockTelemetry, NoopToolLedger,
@@ -200,7 +202,15 @@ struct Harness {
 }
 
 fn harness(llm: Arc<RecordingLlm>, flows: Arc<ScriptedFlows>, policy: ParkedTextPolicy) -> Harness {
-    let store = Arc::new(MockAgentStateStore::new());
+    harness_with_store(llm, flows, policy, Arc::new(MockAgentStateStore::new()))
+}
+
+fn harness_with_store(
+    llm: Arc<RecordingLlm>,
+    flows: Arc<ScriptedFlows>,
+    policy: ParkedTextPolicy,
+    store: Arc<MockAgentStateStore>,
+) -> Harness {
     let cp = MockConfigProvider::new();
     let tc = TenantContext::new("acme", "prod");
     cp.insert(
@@ -374,4 +384,310 @@ async fn a_submit_replaces_the_placeholder_instead_of_adding_a_second_result() {
         Some(&json!({ "room": "101" }))
     );
     assert!(pairing_is_valid(&state.messages));
+}
+
+const CARD_A: &str = "A";
+
+/// Park a `form` flow under the side-turn policy and return the harness.
+async fn parked(
+    llm_script: Vec<LlmResponse>,
+    resume: Vec<FlowInvokeOutcome>,
+) -> (Harness, Arc<RecordingLlm>, Arc<ScriptedFlows>) {
+    let mut script = vec![tool_calls(vec![call("c1", "form")])];
+    script.extend(llm_script);
+    let llm = Arc::new(RecordingLlm::new(script));
+    let flows = Arc::new(ScriptedFlows::new(vec![waiting(CARD_A)], resume));
+    let h = harness(llm.clone(), flows.clone(), ParkedTextPolicy::SideTurn);
+    h.step("book me a room", None).await;
+    (h, llm, flows)
+}
+
+fn submit() -> Option<Value> {
+    Some(json!({ "metadata": { "action": "submit" } }))
+}
+
+#[tokio::test]
+async fn a_typed_message_is_answered_and_the_card_stays_parked() {
+    let (h, llm, flows) = parked(vec![final_reply("the signature is in Settings")], vec![]).await;
+
+    let out = h.step("how do I get a mail signature?", None).await;
+
+    assert_eq!(out.reply, "the signature is in Settings");
+    assert_eq!(out.terminated_by, TerminationReason::AwaitingToolInput);
+    assert!(out.side_turn);
+    assert_eq!(out.pending_presentation, Some(json!({ "card": CARD_A })));
+    assert_eq!(llm.calls(), 2);
+    assert!(flows.resumed.lock().unwrap().is_empty());
+    let state = h.state().await;
+    let pending = state.pending_tool.as_ref().expect("still parked");
+    assert_eq!(pending.side_turns, 1);
+    assert!(state.messages.iter().all(|m| !matches!(m,
+        ChatMessage::Tool { content, .. } if content["status"] == "cancelled")));
+    assert!(pairing_is_valid(&state.messages));
+}
+
+#[tokio::test]
+async fn two_side_turns_then_a_submit_resumes_the_flow() {
+    let (h, _llm, flows) = parked(
+        vec![
+            final_reply("one"),
+            final_reply("two"),
+            final_reply("booked"),
+        ],
+        vec![FlowInvokeOutcome::Completed(json!({ "room": "101" }))],
+    )
+    .await;
+
+    h.step("q1", None).await;
+    h.step("q2", None).await;
+    let out = h.step("", submit()).await;
+
+    assert_eq!(out.reply, "booked");
+    assert!(!out.side_turn);
+    {
+        let resumed = flows.resumed.lock().unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].1, json!({ "snap": CARD_A }), "original snapshot");
+    }
+    let state = h.state().await;
+    assert!(state.pending_tool.is_none());
+    assert_eq!(tool_count(&state.messages, "c1"), 1);
+    assert_eq!(
+        tool_result(&state.messages, "c1"),
+        Some(&json!({ "room": "101" }))
+    );
+    assert!(pairing_is_valid(&state.messages));
+}
+
+#[tokio::test]
+async fn a_side_turn_cannot_start_another_flow() {
+    let (h, _llm, flows) = parked(
+        vec![
+            tool_calls(vec![call("c2", "form")]),
+            final_reply("I cannot open another form right now"),
+        ],
+        vec![],
+    )
+    .await;
+
+    let out = h.step("open the form again", None).await;
+
+    assert!(out.side_turn);
+    assert_eq!(
+        flows.invoked.lock().unwrap().len(),
+        1,
+        "no second invocation"
+    );
+    let state = h.state().await;
+    assert_eq!(
+        tool_result(&state.messages, "c2"),
+        Some(&json!({ "error": "another step is waiting for the user" }))
+    );
+    assert!(state.pending_tool.is_some());
+    assert!(pairing_is_valid(&state.messages));
+}
+
+#[tokio::test]
+async fn the_message_after_the_cap_cancels_the_park() {
+    let (h, _llm, _flows) = parked(
+        vec![final_reply("answer"), final_reply("after the cap")],
+        vec![],
+    )
+    .await;
+    let mut state = h.state().await;
+    if let Some(p) = state.pending_tool.as_mut() {
+        p.side_turns = greentic_aw_runtime::state::MAX_SIDE_TURNS;
+    }
+    h.store.save(&h.tc, SESSION, &state).await.unwrap();
+
+    let out = h.step("one more", None).await;
+
+    assert!(!out.side_turn);
+    let state = h.state().await;
+    assert!(state.pending_tool.is_none());
+    assert_eq!(
+        tool_result(&state.messages, "c1").map(|v| v["status"].clone()),
+        Some(json!("cancelled"))
+    );
+    assert!(pairing_is_valid(&state.messages));
+}
+
+#[tokio::test]
+async fn side_turns_never_extend_the_park_past_24_hours() {
+    let (h, _llm, _flows) = parked(vec![final_reply("answer")], vec![]).await;
+    let now = chrono::Utc::now();
+    let mut state = h.state().await;
+    if let Some(p) = state.pending_tool.as_mut() {
+        p.parked_at = Some(now - chrono::Duration::hours(23) - chrono::Duration::minutes(30));
+        p.expires_at = now + chrono::Duration::minutes(10);
+    }
+    h.store.save(&h.tc, SESSION, &state).await.unwrap();
+
+    h.step("still there?", None).await;
+
+    let state = h.state().await;
+    let pending = state.pending_tool.expect("side turn keeps the park");
+    let cap = pending.parked_at.unwrap() + chrono::Duration::hours(24);
+    assert!(
+        pending.expires_at <= cap,
+        "expiry must not pass parked_at + 24h"
+    );
+}
+
+#[tokio::test]
+async fn a_park_older_than_24_hours_cancels_instead_of_side_turning() {
+    let (h, _llm, _flows) = parked(vec![final_reply("fresh answer")], vec![]).await;
+    let now = chrono::Utc::now();
+    let mut state = h.state().await;
+    if let Some(p) = state.pending_tool.as_mut() {
+        p.parked_at = Some(now - chrono::Duration::hours(25));
+        p.expires_at = now + chrono::Duration::minutes(30);
+    }
+    h.store.save(&h.tc, SESSION, &state).await.unwrap();
+
+    let out = h.step("hello", None).await;
+
+    assert!(!out.side_turn);
+    assert!(h.state().await.pending_tool.is_none());
+}
+
+#[tokio::test]
+async fn an_idle_expired_park_cancels_even_under_the_side_turn_policy() {
+    let (h, _llm, _flows) = parked(vec![final_reply("fresh answer")], vec![]).await;
+    let mut state = h.state().await;
+    if let Some(p) = state.pending_tool.as_mut() {
+        p.expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    }
+    h.store.save(&h.tc, SESSION, &state).await.unwrap();
+
+    let out = h.step("hello", None).await;
+
+    assert!(!out.side_turn);
+    assert!(h.state().await.pending_tool.is_none());
+}
+
+#[tokio::test]
+async fn an_llm_error_during_a_side_turn_keeps_the_park_and_a_valid_transcript() {
+    // Script: park, then NOTHING for the side turn (queue exhausted -> LLM error),
+    // then a normal answer on the next message.
+    let (h, _llm, _flows) = parked(vec![], vec![]).await;
+
+    let failed =
+        h.rt.step(
+            h.tc.clone(),
+            SESSION,
+            "a",
+            AgentInput {
+                text: "q".into(),
+                conversational: false,
+                resume_payload: None,
+            },
+        )
+        .await;
+    assert!(failed.is_err());
+
+    let state = h.state().await;
+    assert!(
+        state.pending_tool.is_some(),
+        "the park survives an LLM error"
+    );
+    assert!(pairing_is_valid(&state.messages));
+}
+
+/// A park recorded before placeholders existed (no `Tool` for the call and no
+/// stored card) cannot be re-offered, so it is cancelled rather than left
+/// dangling.
+#[tokio::test]
+async fn an_old_park_without_a_stored_card_is_cancelled() {
+    let llm = Arc::new(RecordingLlm::new(vec![
+        tool_calls(vec![call("c1", "form")]),
+        final_reply("ok"),
+    ]));
+    let flows = Arc::new(ScriptedFlows::new(vec![waiting(CARD_A)], vec![]));
+    let h = harness(llm, flows, ParkedTextPolicy::Cancel);
+    h.step("book me a room", None).await;
+    let mut state = h.state().await;
+    if let Some(p) = state.pending_tool.as_mut() {
+        p.presentation = None;
+        p.parked_at = None;
+    }
+    h.store.save(&h.tc, SESSION, &state).await.unwrap();
+
+    // Same state, now read by a worker configured for side turns.
+    let llm2 = Arc::new(RecordingLlm::new(vec![final_reply("ok")]));
+    let flows2 = Arc::new(ScriptedFlows::new(vec![], vec![]));
+    let h2 = harness_with_store(llm2, flows2, ParkedTextPolicy::SideTurn, h.store.clone());
+    let out = h2.step("hi", None).await;
+
+    assert!(!out.side_turn);
+    assert!(h2.state().await.pending_tool.is_none());
+    assert!(pairing_is_valid(&h2.state().await.messages));
+}
+
+/// A park written under the cancel policy has no placeholder. A worker now
+/// configured for side turns inserts one right after the assistant turn and
+/// answers.
+#[tokio::test]
+async fn a_park_without_a_placeholder_takes_a_side_turn_after_a_policy_switch() {
+    let llm = Arc::new(RecordingLlm::new(vec![tool_calls(vec![call(
+        "c1", "form",
+    )])]));
+    let flows = Arc::new(ScriptedFlows::new(vec![waiting(CARD_A)], vec![]));
+    let h = harness(llm, flows, ParkedTextPolicy::Cancel);
+    h.step("book me a room", None).await;
+    assert_eq!(tool_result(&h.state().await.messages, "c1"), None);
+
+    let llm2 = Arc::new(RecordingLlm::new(vec![final_reply("an answer")]));
+    let flows2 = Arc::new(ScriptedFlows::new(vec![], vec![]));
+    let h2 = harness_with_store(llm2, flows2, ParkedTextPolicy::SideTurn, h.store.clone());
+    let out = h2.step("a question", None).await;
+
+    assert!(out.side_turn);
+    let state = h2.state().await;
+    assert!(state.pending_tool.is_some());
+    assert_eq!(
+        tool_result(&state.messages, "c1"),
+        Some(&json!({ "status": "awaiting_user_input" }))
+    );
+    assert!(pairing_is_valid(&state.messages));
+}
+
+/// A guardrail that fail-closes the turn returns an error before anything is
+/// saved, so the park (and its counters) are exactly as before the message.
+#[tokio::test]
+async fn a_denied_side_message_keeps_the_park_untouched() {
+    let (h, _llm, _flows) = parked(vec![final_reply("never used")], vec![]).await;
+    let before = h.state().await;
+    let rt = h.rt.with_guardrails(
+        Arc::new(StaticGuardrailPolicy(vec![GuardrailRef {
+            cap_id: "greentic:guardrail/required".into(),
+            offer_id: None,
+            config: Value::Null,
+            mode: GuardrailMode::Enforce,
+        }])),
+        Arc::new(AcceptAllEvaluator),
+    );
+    let h = Harness {
+        rt,
+        store: h.store,
+        tc: h.tc,
+    };
+
+    let denied =
+        h.rt.step(
+            h.tc.clone(),
+            SESSION,
+            "a",
+            AgentInput {
+                text: "q".into(),
+                conversational: false,
+                resume_payload: None,
+            },
+        )
+        .await;
+
+    assert!(denied.is_err());
+    let after = h.state().await;
+    assert_eq!(after.pending_tool, before.pending_tool);
+    assert_eq!(after.messages.len(), before.messages.len());
 }

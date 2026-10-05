@@ -434,6 +434,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn a_pending_tool_stored_before_side_turns_still_deserialises() {
         let old = r#"{"call_id":"c","tool_name":"t","flow_ref":"f","flow_snapshot":{},"iterations_used":1,"expires_at":"2026-10-05T00:00:00Z"}"#;
         let p: PendingToolCall = serde_json::from_str(old).unwrap();
