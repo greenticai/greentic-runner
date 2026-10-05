@@ -313,11 +313,20 @@ impl ToolSession {
             }
         }
 
+        let frame = crate::tool_call_frame::ToolCallFrame::new(self.session_id.as_deref(), call_id)
+            .with_caller(self.tenant.caller_or_anonymous());
         let result = {
             let mut a2a = self.a2a.lock().await;
-            self.catalogs
-                .dispatch(self.ext_runtime.clone(), call, &self.tenant, Some(&mut a2a))
-                .await?
+            crate::tool_call_frame::within(
+                frame,
+                self.catalogs.dispatch(
+                    self.ext_runtime.clone(),
+                    call,
+                    &self.tenant,
+                    Some(&mut a2a),
+                ),
+            )
+            .await?
         };
 
         if let Some(session_id) = self.session_id.as_deref()

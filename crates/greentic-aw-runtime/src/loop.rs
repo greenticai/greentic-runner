@@ -780,10 +780,17 @@ async fn run_step_scoped(
                 // A `flow:` tool may PARK on the user (a card). It is the one
                 // prefix dispatched interactively; the rest stay one-shot.
                 let dispatched = if let Some(flow_ref) = call.extension_id.strip_prefix("flow:") {
-                    match crate::tools::dispatch_flow_tool_interactive(
-                        catalogs.flows.as_deref(),
-                        flow_ref,
-                        &call,
+                    // The host running this flow derives a nested agent's
+                    // session from the caller's session and this call id, and
+                    // its caller from the host-stamped one (`tool_call_frame`).
+                    match crate::tool_call_frame::within(
+                        crate::tool_call_frame::ToolCallFrame::new(Some(session_id), &call.call_id)
+                            .with_caller(tenant.caller_or_anonymous()),
+                        crate::tools::dispatch_flow_tool_interactive(
+                            catalogs.flows.as_deref(),
+                            flow_ref,
+                            &call,
+                        ),
                     )
                     .await
                     {
