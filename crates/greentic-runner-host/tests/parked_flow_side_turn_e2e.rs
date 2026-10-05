@@ -488,7 +488,6 @@ fn a_typed_question_is_answered_and_the_parked_form_still_resumes() -> Result<()
     // 1. the form opens
     let (_, agent) = turn(&s, json!({ "text": "I want to book a room" }))?;
     assert_eq!(agent["terminated_by"], "awaiting_tool_input", "{agent}");
-    eprintln!("PRESENTATION1 = {}", agent["pending_presentation"]);
     assert!(!agent["pending_presentation"].is_null(), "{agent}");
     assert!(agent.get("side_turn").is_none());
 
@@ -501,15 +500,13 @@ fn a_typed_question_is_answered_and_the_parked_form_still_resumes() -> Result<()
         "Open Settings, then Signatures, in Outlook."
     );
     assert!(!agent["pending_presentation"].is_null(), "{agent}");
-    let rendered = response.to_string();
-    assert!(
-        rendered.contains("Open Settings"),
-        "reply must be rendered: {rendered}"
-    );
-    assert!(
-        rendered.contains("pick a room"),
-        "card must be re-offered: {rendered}"
-    );
+    // One flat list: the agent's answer, then the re-offered card message.
+    let items = response["response"]
+        .as_array()
+        .expect("flat list of replies");
+    assert_eq!(items.len(), 2, "reply + card: {response}");
+    assert!(items[0].to_string().contains("Open Settings"), "{response}");
+    assert_eq!(items[1], json!({ "text": "pick a room" }), "{response}");
 
     // 3. the card submit resumes the SAME form
     let (response, agent) = turn(&s, provider_envelope("submit_room"))?;

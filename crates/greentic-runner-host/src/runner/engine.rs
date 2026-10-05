@@ -4350,6 +4350,7 @@ const SUBMIT_MARKER_KEY: &str = "greentic_submit";
 /// The card alone for a plain park. For a SIDE turn (a typed message answered
 /// while the tool stays parked) the agent's reply followed by the card, as two
 /// replies, so the user reads the answer and still sees the form to continue.
+/// The result is always ONE flat list (see the card-as-list note below).
 pub(crate) fn rendered_park(payload: &Value) -> Value {
     let Some(card) = tool_presentation(payload) else {
         return payload.clone();
@@ -4370,7 +4371,14 @@ pub(crate) fn rendered_park(payload: &Value) -> Value {
         map.remove("pending_presentation");
         map.remove("side_turn");
     }
-    Value::Array(vec![reply, card.clone()])
+    // One flat list: a card that is itself a list (`emit.response` renders its
+    // messages as one) contributes its items, so each stays its own reply.
+    let mut items = vec![reply];
+    match card {
+        Value::Array(cards) => items.extend(cards.iter().cloned()),
+        single => items.push(single.clone()),
+    }
+    Value::Array(items)
 }
 
 /// Keys of a `ChannelMessageEnvelope` that the TRANSPORT owns. On the
@@ -13127,6 +13135,24 @@ mod tests {
         assert_eq!(items[0]["reply"], "the signature is in Settings");
         assert!(items[0].get("pending_presentation").is_none());
         assert_eq!(items[1], out["pending_presentation"]);
+    }
+
+    /// `emit.response` renders its messages as an ARRAY, so a parked card is
+    /// often a list. The side-turn output must stay one flat list of replies
+    /// (`normalize_replies` turns each top-level item into one activity); a
+    /// nested list would reach the channel as a single activity holding an array.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_side_turn_with_a_list_card_renders_one_flat_list() {
+        let mut out = side_turn_output();
+        out["pending_presentation"] = json!([{ "text": "pick a room" }, { "text": "or cancel" }]);
+        let rendered = rendered_park(&out);
+        let items = rendered.as_array().expect("flat list");
+        assert_eq!(items.len(), 3, "reply + both card messages: {rendered}");
+        assert_eq!(items[0]["reply"], "the signature is in Settings");
+        assert_eq!(items[1], json!({ "text": "pick a room" }));
+        assert_eq!(items[2], json!({ "text": "or cancel" }));
+        assert!(items.iter().all(|item| !item.is_array()), "no nested list");
     }
 
     /// A typed message answered as a side turn leaves the flow parked at the
