@@ -32,6 +32,9 @@ const BREAKER_THRESHOLD: u32 = 3;
 const BREAKER_SUSPEND: Duration = Duration::from_secs(30);
 /// Largest response body read; the door's read answer is far below this.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// The door rejects a `limit` outside this range; clamp before sending.
+const MIN_LIMIT: u32 = 1;
+const MAX_LIMIT: u32 = 50;
 
 /// Consecutive-failure counter plus the suspension deadline shared by every
 /// cause. Times are `tokio::time::Instant` so paused-time tests can drive it.
@@ -129,6 +132,9 @@ impl HttpUserLedger {
         let token = required("token", target.token.expose_secret())?;
         let tenant_slug = required("tenant_slug", &target.tenant_slug)?;
         let base = Url::parse(&raw).map_err(|_| UserLedgerTargetError::BadUrl)?;
+        if !base.username().is_empty() || base.password().is_some() {
+            return Err(UserLedgerTargetError::UnsafeEndpoint);
+        }
         if !crate::billing::worker_usage::endpoint_is_safe(base.as_str()) {
             return Err(UserLedgerTargetError::UnsafeEndpoint);
         }
@@ -193,7 +199,8 @@ impl HttpUserLedger {
         };
         let status = resp.status();
         if status.is_success() {
-            self.breaker.record_success();
+            // Success is recorded by the caller once the body (if any) has
+            // been read: a proxy that sends headers and stalls must count.
             return Ok(resp);
         }
         match status.as_u16() {
@@ -220,33 +227,40 @@ impl HttpUserLedger {
                 );
             }
             500..=599 => self.breaker.record_failure(Instant::now()),
-            // The door answered: not a failure run. The body is never read.
+            // A 4xx/3xx deliberately resets the failure run: the door answered. The body is never read.
             _ => self.breaker.record_success(),
         }
         Err(LedgerError::Refused(status.as_u16()))
     }
 }
 
+/// Why a body could not be read: only a stall/transport failure counts
+/// toward the breaker.
+enum BodyError {
+    TooLarge,
+    Stalled,
+}
+
 /// Read the body, refusing more than [`MAX_RESPONSE_BYTES`] without ever
 /// buffering past the cap.
-async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, LedgerError> {
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, BodyError> {
     if resp
         .content_length()
         .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
     {
-        return Err(LedgerError::Unavailable("response too large".into()));
+        return Err(BodyError::TooLarge);
     }
     let mut buf: Vec<u8> = Vec::new();
     loop {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                    return Err(LedgerError::Unavailable("response too large".into()));
+                    return Err(BodyError::TooLarge);
                 }
                 buf.extend_from_slice(&chunk);
             }
             Ok(None) => return Ok(buf),
-            Err(_) => return Err(LedgerError::Unavailable("response body unreadable".into())),
+            Err(_) => return Err(BodyError::Stalled),
         }
     }
 }
@@ -254,12 +268,23 @@ async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, LedgerError
 impl UserLedger for HttpUserLedger {
     fn read<'a>(&'a self, subject: &'a str, limit: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
         Box::pin(async move {
+            let limit = limit.clamp(MIN_LIMIT, MAX_LIMIT);
             let body =
                 json!({ "tenant_slug": self.tenant_slug, "subject": subject, "limit": limit });
             let resp = self.post("read", body).await?;
-            let bytes = read_capped(resp).await?;
+            let bytes = match read_capped(resp).await {
+                Ok(bytes) => bytes,
+                Err(BodyError::TooLarge) => {
+                    return Err(LedgerError::Unavailable("response too large".into()));
+                }
+                Err(BodyError::Stalled) => {
+                    self.breaker.record_failure(Instant::now());
+                    return Err(LedgerError::Unavailable("response body unreadable".into()));
+                }
+            };
             let parsed: ReadResp = serde_json::from_slice(&bytes)
                 .map_err(|_| LedgerError::Unavailable("response not understood".into()))?;
+            self.breaker.record_success();
             Ok(parsed.events)
         })
     }
@@ -273,7 +298,9 @@ impl UserLedger for HttpUserLedger {
         Box::pin(async move {
             let body = json!({ "tenant_slug": self.tenant_slug, "subject": subject,
                                "kind": kind, "summary": summary });
-            self.post("append", body).await.map(|_| ())
+            self.post("append", body).await?;
+            self.breaker.record_success();
+            Ok(())
         })
     }
 }
@@ -295,7 +322,12 @@ pub struct UserLedgerTarget {
 impl std::fmt::Debug for UserLedgerTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UserLedgerTarget")
-            .field("base_url", &self.base_url)
+            .field(
+                "host",
+                &Url::parse(&self.base_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string)),
+            )
             .field("token", &"<redacted>")
             .field("tenant_slug", &self.tenant_slug)
             .finish()
@@ -453,11 +485,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_rate_limit_suspends_for_retry_after_within_a_cap() {
+    /// Makes one 429 call over real HTTP, then freezes the clock so the
+    /// suspension window can be probed with `advance`, exactly.
+    async fn rate_limited_with(retry_after: Option<&str>) -> HttpUserLedger {
         let server = MockServer::start().await;
+        let mut resp = ResponseTemplate::new(429);
+        if let Some(v) = retry_after {
+            resp = resp.insert_header("retry-after", v);
+        }
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "7"))
+            .respond_with(resp)
             .expect(1)
             .mount(&server)
             .await;
@@ -467,23 +504,197 @@ mod tests {
             Err(LedgerError::Refused(429))
         ));
         assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
-        // Retry-After honoured: ~7 s; a huge value is capped at 300 s.
-        let until = l.breaker.lock().suspended_until.unwrap();
-        let left = until - Instant::now();
-        assert!(
-            left <= Duration::from_secs(7) && left > Duration::from_secs(5),
-            "{left:?}"
-        );
+        tokio::time::pause();
+        l
+    }
 
+    async fn suspended_for(l: &HttpUserLedger, secs: u64) {
+        tokio::time::advance(Duration::from_secs(secs - 2)).await;
+        assert!(l.breaker.suspended(Instant::now()), "still suspended");
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(!l.breaker.suspended(Instant::now()), "suspension over");
+        // Back to the real clock: the next probe makes a real request.
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_suspends_for_retry_after_within_a_cap() {
+        let l = rate_limited_with(Some("7")).await;
+        suspended_for(&l, 7).await;
+        // A huge value is capped at 300 s.
+        let l = rate_limited_with(Some("999999")).await;
+        suspended_for(&l, 300).await;
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_without_a_usable_retry_after_suspends_for_sixty_seconds() {
+        let l = rate_limited_with(None).await;
+        suspended_for(&l, 60).await;
+        // HTTP-date form is not understood: same default.
+        let l = rate_limited_with(Some("Wed, 21 Oct 2026 07:28:00 GMT")).await;
+        suspended_for(&l, 60).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_token_recovers_after_five_minutes() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "999999"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "events": [] })))
+            .expect(1)
             .mount(&server)
             .await;
         let l = ledger(&server);
-        let _ = l.read("s", 20).await;
-        let left = l.breaker.lock().suspended_until.unwrap() - Instant::now();
-        assert!(left <= RATE_SUSPEND_MAX, "{left:?}");
+        assert!(matches!(
+            l.read("s", 20).await,
+            Err(LedgerError::Refused(401))
+        ));
+        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(299)).await;
+        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        // Real clock again for the socket: the window already expired.
+        tokio::time::resume();
+        assert!(l.read("s", 20).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_breaker_window_ends_after_thirty_seconds_over_http() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(3)
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "events": [] })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let l = ledger(&server);
+        for _ in 0..3 {
+            assert!(matches!(
+                l.read("s", 20).await,
+                Err(LedgerError::Refused(503))
+            ));
+        }
+        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+        assert!(l.read("s", 20).await.unwrap().is_empty());
+    }
+
+    /// 5xx, 5xx, 2xx, 5xx: the success breaks the run, so no suspension.
+    #[tokio::test]
+    async fn a_success_between_server_errors_resets_the_run_over_http() {
+        let server = MockServer::start().await;
+        for (status, n) in [(503u16, 2u64), (200, 1), (503, 1)] {
+            let t = if status == 200 {
+                ResponseTemplate::new(200).set_body_json(json!({ "events": [] }))
+            } else {
+                ResponseTemplate::new(status)
+            };
+            Mock::given(method("POST"))
+                .respond_with(t)
+                .up_to_n_times(n)
+                .expect(n)
+                .mount(&server)
+                .await;
+        }
+        let l = ledger(&server);
+        assert!(matches!(
+            l.read("s", 20).await,
+            Err(LedgerError::Refused(503))
+        ));
+        assert!(matches!(
+            l.read("s", 20).await,
+            Err(LedgerError::Refused(503))
+        ));
+        assert!(l.read("s", 20).await.unwrap().is_empty());
+        assert!(matches!(
+            l.read("s", 20).await,
+            Err(LedgerError::Refused(503))
+        ));
+        assert!(!l.breaker.suspended(Instant::now()));
+    }
+
+    /// Headers arrive, then the body stalls past the request timeout, three
+    /// times: each counts toward the breaker, then the client stops asking.
+    #[tokio::test]
+    async fn a_stalled_body_counts_toward_the_breaker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 50\r\n\r\n{")
+                        .await;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                });
+            }
+        });
+        let l =
+            HttpUserLedger::new(target(&format!("http://{addr}/api/v1/ingest/ledger"))).unwrap();
+        for _ in 0..3 {
+            match l.read("s", 20).await {
+                Err(LedgerError::Unavailable(m)) => assert_eq!(m, "response body unreadable"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+    }
+
+    #[tokio::test]
+    async fn the_limit_is_clamped_to_the_doors_range() {
+        for (asked, sent) in [(0u32, 1u32), (20, 20), (50, 50), (9999, 50)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_json(
+                    json!({ "tenant_slug": "alpha", "subject": "s", "limit": sent }),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "events": [] })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            ledger(&server).read("s", asked).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn userinfo_in_the_base_url_is_refused_and_the_target_debug_prints_the_host_only() {
+        for base in [
+            "https://user:pw@admin.example/ledger",
+            "https://user@admin.example/ledger",
+            "https://:pw@admin.example/ledger",
+        ] {
+            assert!(matches!(
+                HttpUserLedger::new(target(base)),
+                Err(UserLedgerTargetError::UnsafeEndpoint)
+            ));
+        }
+        let d = format!("{:?}", target("https://admin.example/p/ath?k=querysecret"));
+        assert!(d.contains("admin.example"));
+        assert!(
+            !d.contains("querysecret") && !d.contains("/p/ath") && !d.contains("gtm_secret"),
+            "{d}"
+        );
     }
 
     #[tokio::test]
