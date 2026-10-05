@@ -148,25 +148,46 @@ tokio::task_local! {
 pub struct RunContext {
     tenant_id: String,
     trace: Arc<RunTrace>,
+    /// What this level may do with the trace (spec §4.4).
+    mode: crate::share_policy::ShareMode,
+    /// The bindings of the agent whose tools are being dispatched. Set by
+    /// `run_step` for every agent turn; `None` means every binding is `none`.
+    caller_policy: Option<Arc<crate::share_policy::BindingModes>>,
 }
 
-/// Prints the tenant id and the event count only, never the summaries.
+/// Prints the tenant id, the mode and the event count only, never summaries.
 impl std::fmt::Debug for RunContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunContext")
             .field("tenant_id", &self.tenant_id)
+            .field("mode", &self.mode)
             .field("events", &self.trace.len())
             .finish()
     }
 }
 
 impl RunContext {
-    /// A context bound to `tenant_id`: a step for any other tenant ignores it,
-    /// so a trace can never carry one tenant's results into another's prompt.
+    /// A read-write context bound to `tenant_id`: a step for any other tenant
+    /// ignores it, so a trace can never carry one tenant's results into
+    /// another's prompt.
     pub fn new(tenant_id: impl Into<String>, trace: Arc<RunTrace>) -> Self {
         Self {
             tenant_id: tenant_id.into(),
             trace,
+            mode: crate::share_policy::ShareMode::ReadWrite,
+            caller_policy: None,
+        }
+    }
+
+    /// A context that shares nothing: an empty trace nobody else holds, mode
+    /// `None`. A task-local cannot be unset, only shadowed; this is the shadow
+    /// a `none` binding runs under, so the real trace is unreachable below it.
+    pub fn detached(tenant_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            trace: Arc::new(RunTrace::new()),
+            mode: crate::share_policy::ShareMode::None,
+            caller_policy: None,
         }
     }
 
@@ -178,6 +199,53 @@ impl RunContext {
         &self.trace
     }
 
+    pub fn mode(&self) -> crate::share_policy::ShareMode {
+        self.mode
+    }
+
+    pub fn caller_policy(&self) -> Option<&Arc<crate::share_policy::BindingModes>> {
+        self.caller_policy.as_ref()
+    }
+
+    #[must_use]
+    pub fn with_mode(mut self, mode: crate::share_policy::ShareMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_caller_policy(
+        mut self,
+        policy: Option<Arc<crate::share_policy::BindingModes>>,
+    ) -> Self {
+        self.caller_policy = policy;
+        self
+    }
+
+    /// The context a nested call reached through `binding` runs under:
+    /// `min(this level's mode, the caller's mode for the binding)`, where a
+    /// binding the policy does not name is `None`. `None` yields
+    /// [`RunContext::detached`]. The callee's own `run_step` sets its policy,
+    /// so the caller's is not passed down.
+    pub fn for_nested_binding(&self, binding: &str) -> RunContext {
+        use crate::share_policy::ShareMode;
+        let configured = self
+            .caller_policy
+            .as_ref()
+            .and_then(|policy| policy.get(binding).copied())
+            .unwrap_or(ShareMode::None);
+        let mode = ShareMode::for_binding(binding, configured).min(self.mode);
+        if mode == ShareMode::None {
+            return RunContext::detached(self.tenant_id.clone());
+        }
+        RunContext {
+            tenant_id: self.tenant_id.clone(),
+            trace: self.trace.clone(),
+            mode,
+            caller_policy: None,
+        }
+    }
+
     /// Run `fut` with `ctx` as the current run context.
     pub async fn scope<F: std::future::Future>(ctx: RunContext, fut: F) -> F::Output {
         CURRENT.scope(ctx, fut).await
@@ -186,6 +254,16 @@ impl RunContext {
     /// The run context of the enclosing [`RunContext::scope`], if any.
     pub fn current() -> Option<RunContext> {
         CURRENT.try_with(Clone::clone).ok()
+    }
+}
+
+/// Run a nested call reached through `binding` under the context it is
+/// entitled to (see [`RunContext::for_nested_binding`]). With no current
+/// context this is exactly `fut.await`.
+pub async fn under_binding<F: std::future::Future>(binding: &str, fut: F) -> F::Output {
+    match RunContext::current() {
+        Some(ctx) => RunContext::scope(ctx.for_nested_binding(binding), fut).await,
+        None => fut.await,
     }
 }
 
@@ -442,5 +520,83 @@ mod tests {
         assert!(!out.contains("SECRET-RESULT"), "{out}");
         assert!(out.contains("acme"), "{out}");
         assert_eq!(ctx.tenant_id(), "acme");
+    }
+
+    use crate::share_policy::{BindingModes, ShareMode};
+
+    fn caller(binding: &str, mode: ShareMode) -> Option<Arc<BindingModes>> {
+        let mut m = BindingModes::new();
+        m.insert(binding.to_string(), mode);
+        Some(Arc::new(m))
+    }
+
+    #[test]
+    fn a_new_context_is_read_write_with_no_policy() {
+        let ctx = RunContext::new("acme", Arc::new(RunTrace::new()));
+        assert_eq!(ctx.mode(), ShareMode::ReadWrite);
+        assert!(ctx.caller_policy().is_none());
+    }
+
+    #[test]
+    fn no_caller_policy_means_a_detached_nested_context() {
+        let trace = Arc::new(RunTrace::new());
+        trace.append("outer", "reply", "seed");
+        let ctx = RunContext::new("acme", trace.clone());
+        let nested = ctx.for_nested_binding("flow:x");
+        assert_eq!(nested.mode(), ShareMode::None);
+        assert_eq!(nested.tenant_id(), "acme");
+        assert!(
+            !Arc::ptr_eq(nested.trace(), &trace),
+            "the real trace must be unreachable"
+        );
+        assert!(nested.trace().is_empty());
+    }
+
+    #[test]
+    fn the_nested_mode_is_the_stricter_of_caller_and_binding() {
+        let trace = Arc::new(RunTrace::new());
+        let rw = RunContext::new("acme", trace.clone())
+            .with_caller_policy(caller("flow:x", ShareMode::Read));
+        let nested = rw.for_nested_binding("flow:x");
+        assert_eq!(nested.mode(), ShareMode::Read);
+        assert!(Arc::ptr_eq(nested.trace(), &trace));
+        assert!(
+            nested.caller_policy().is_none(),
+            "the callee sets its own policy"
+        );
+
+        let read = RunContext::new("acme", trace.clone())
+            .with_mode(ShareMode::Read)
+            .with_caller_policy(caller("flow:x", ShareMode::ReadWrite));
+        assert_eq!(read.for_nested_binding("flow:x").mode(), ShareMode::Read);
+    }
+
+    #[test]
+    fn a2a_is_detached_even_when_configured() {
+        let ctx = RunContext::new("acme", Arc::new(RunTrace::new()))
+            .with_caller_policy(caller("a2a:recipe", ShareMode::ReadWrite));
+        assert_eq!(ctx.for_nested_binding("a2a:recipe").mode(), ShareMode::None);
+    }
+
+    #[tokio::test]
+    async fn under_binding_without_a_context_opens_none() {
+        let seen = under_binding("flow:x", async { RunContext::current().is_some() }).await;
+        assert!(!seen);
+    }
+
+    #[tokio::test]
+    async fn under_binding_shadows_and_restores() {
+        let ctx = RunContext::new("acme", Arc::new(RunTrace::new()))
+            .with_caller_policy(caller("flow:x", ShareMode::Read));
+        RunContext::scope(ctx, async {
+            let inner = under_binding("flow:x", async { RunContext::current() })
+                .await
+                .expect("shadowed context");
+            assert_eq!(inner.mode(), ShareMode::Read);
+            let after = RunContext::current().expect("outer restored");
+            assert_eq!(after.mode(), ShareMode::ReadWrite);
+            assert!(after.caller_policy().is_some());
+        })
+        .await;
     }
 }
