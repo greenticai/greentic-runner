@@ -257,7 +257,7 @@ fn required_id(field: &'static str, value: &str) -> Result<String, WorkerUsageEr
 
 /// `https` anywhere, or `http` to a loopback host (which cannot leave the
 /// machine). Same rule greentic-start applies to the staged block.
-fn endpoint_is_safe(endpoint: &str) -> bool {
+pub(crate) fn endpoint_is_safe(endpoint: &str) -> bool {
     let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };

@@ -35,7 +35,7 @@ use crate::run_trace::sanitise;
 use crate::tenant::TenantContext;
 
 pub mod http;
-pub use http::UserLedgerTarget;
+pub use http::{HttpUserLedger, UserLedgerTarget, UserLedgerTargetError};
 
 /// Events read per turn.
 pub const READ_LIMIT: u32 = 20;
