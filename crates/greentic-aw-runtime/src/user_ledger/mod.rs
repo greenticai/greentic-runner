@@ -776,6 +776,34 @@ mod tests {
         assert!(binding.turn_for_enabled(&who, "helper", false).is_none());
     }
 
+    /// The ledger must receive the GUARDED reply. The behavioural pin is
+    /// `tests/guardrail_e2e.rs::the_user_ledger_records_the_guarded_reply`,
+    /// which skips when the PII guardrail WASM is not built; this pins the
+    /// order in the source so the rule holds without it (same approach as the
+    /// run trace's reply record).
+    #[test]
+    fn the_reply_is_recorded_after_the_outbound_guardrail_chain() {
+        let src = include_str!("../loop.rs");
+        let prod = &src[..src
+            .find("#[cfg(all(test, feature = \"test-mock\"))]")
+            .expect("loop.rs test marker")];
+        let outbound = prod
+            .find("crate::guardrail::GuardrailDirection::Outbound,")
+            .expect("outbound chain call");
+        let record = prod
+            .find("turn.record_reply(&reply)")
+            .expect("ledger record");
+        assert!(
+            outbound < record,
+            "the ledger must record after the outbound chain"
+        );
+        assert_eq!(
+            prod.matches("record_reply(").count(),
+            1,
+            "exactly one ledger record"
+        );
+    }
+
     #[test]
     fn a_summary_is_the_sanitised_bounded_reply() {
         assert_eq!(summary_of("  "), None);

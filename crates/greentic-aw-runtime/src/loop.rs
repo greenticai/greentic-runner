@@ -416,16 +416,50 @@ async fn run_step_scoped(
         system_prompt
     };
 
+    // --- User ledger (shared context, Phase C): what this signed-in user did
+    // in any unit of the environment. Off unless the host installed a ledger,
+    // the pack names this agent, the caller is provider-verified and this is
+    // a TOP-LEVEL step (`turn_for` refuses inside a tool call frame, i.e. a
+    // nested agent of a `flow:` tool). `turn_for` must run here, on the
+    // step's own task: the nested check reads a task-local that a
+    // `tokio::spawn` would lose. The read runs alongside the catalog
+    // resolution (same task, no spawn) so the lock-held wait it can add is at
+    // most `READ_TIMEOUT` minus that time; a slow, failing or suspended
+    // ledger injects nothing and never fails the turn.
+    //
+    // Not subject to the #828 share modes in this version: the ledger is
+    // keyed by the verified caller, not by the run, and nested agents never
+    // see it. The view goes into this step's system prompt only and is never
+    // appended to the run trace.
+    let ledger_turn = runtime
+        .user_ledger
+        .as_ref()
+        .and_then(|binding| binding.turn_for(&tenant, agent_id));
+
     // Resolve the per-tenant tool catalogs (MCP, component, flow, playbook,
     // SoRLa, A2A)
     // once per step. Every source is infallible (degrades to an empty catalog
     // on any admin/server failure) and TTL-cached, so a stable config does not
     // re-hit the network across iterations. `None` source → no tools of that
     // prefix. `ToolCatalogs` is shared with `AgentRuntime::tool_session`, so
-    // an external loop resolves exactly what this one does.
-    let catalogs =
-        crate::tool_session::ToolCatalogs::resolve(runtime, &tenant, &config.tools, &config.llm)
-            .await;
+    // an external loop resolves exactly what this one does. The user ledger
+    // read (above) runs alongside it.
+    let ledger_read = async {
+        match &ledger_turn {
+            Some(turn) => turn.read_view().await,
+            None => None,
+        }
+    };
+    let (ledger_view, catalogs) = tokio::join!(
+        ledger_read,
+        crate::tool_session::ToolCatalogs::resolve(runtime, &tenant, &config.tools, &config.llm),
+    );
+    // Prompt block order: the agent's prompt, long-term facts, knowledge
+    // chunks, the conversational note, then `<user_history>` (bounded by
+    // `user_ledger::MAX_VIEW_CHARS`), and last, per iteration, the run
+    // context `<run_context>` (bounded by `run_trace::MAX_VIEW_CHARS`).
+    let system_prompt =
+        crate::run_trace::augment_system_prompt(&system_prompt, ledger_view.as_deref());
 
     // Preflight: surface declared tools that won't reach the LLM. Without this
     // the runtime drops unresolved tools silently (per-tool debug warns) and the
@@ -1035,6 +1069,15 @@ async fn run_step_scoped(
             && let Some(t) = &record_to
         {
             t.append(agent_id, "reply", &reply);
+        }
+        // The GUARDED reply only (spec 4.1): never tool results, arguments or
+        // the user's message. Background, bounded, never fails the turn.
+        // `ledger_turn` was decided on this task before anything spawned; the
+        // append itself may spawn. Only a read-write binding appends.
+        if !reply.is_empty()
+            && let Some(turn) = &ledger_turn
+        {
+            turn.record_reply(&reply);
         }
 
         runtime.telemetry.record_step(&StepTelemetryCtx {

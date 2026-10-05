@@ -260,6 +260,9 @@ pub struct AgentRuntime {
     /// (shared context, Phase A2). `None` means every NESTED binding is `none`
     /// (a top-level turn under an open context still injects and records).
     pub(crate) share_policy: Option<Arc<crate::share_policy::SharePolicy>>,
+    /// The user ledger (shared context, Phase C): a durable, per verified
+    /// end-user history shared by the environment's units. `None` = off.
+    pub(crate) user_ledger: Option<Arc<crate::user_ledger::UserLedgerBinding>>,
 }
 
 impl AgentRuntime {
@@ -298,6 +301,7 @@ impl AgentRuntime {
             knowledge: None,
             short_term_memory: None,
             share_policy: None,
+            user_ledger: None,
         }
     }
 
@@ -380,6 +384,23 @@ impl AgentRuntime {
     /// The installed sharing policy, if any.
     pub fn share_policy(&self) -> Option<&Arc<crate::share_policy::SharePolicy>> {
         self.share_policy.as_ref()
+    }
+
+    /// Install the user ledger. Defaults off; the runner host installs one
+    /// only when the embedding host passed a door target AND a pack names the
+    /// agent (`assets/user-ledger.json`).
+    #[must_use]
+    pub fn with_user_ledger(
+        mut self,
+        binding: Option<Arc<crate::user_ledger::UserLedgerBinding>>,
+    ) -> Self {
+        self.user_ledger = binding;
+        self
+    }
+
+    /// The installed user ledger, if any.
+    pub fn user_ledger(&self) -> Option<&Arc<crate::user_ledger::UserLedgerBinding>> {
+        self.user_ledger.as_ref()
     }
 
     pub(crate) fn share_modes_for(
