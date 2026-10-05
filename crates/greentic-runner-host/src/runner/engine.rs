@@ -1486,9 +1486,7 @@ impl FlowEngine {
                     // must answer, and channels render the turn output as they
                     // would a card node's. The full envelope (carrying the
                     // card as `pending_presentation`) stays the node output.
-                    let rendered = tool_presentation(&output.payload)
-                        .cloned()
-                        .unwrap_or_else(|| output.payload.clone());
+                    let rendered = rendered_park(&output.payload);
                     let output_value = state.finalize_with(Some(rendered));
                     return Ok(FlowExecution::waiting(
                         output_value,
@@ -4340,6 +4338,33 @@ pub(crate) fn tool_presentation(payload: &Value) -> Option<&Value> {
     payload
         .get("pending_presentation")
         .filter(|value| !value.is_null())
+}
+
+/// What a `dw.agent` parked on a `flow:` tool renders as the turn's output.
+/// The card alone for a plain park. For a SIDE turn (a typed message answered
+/// while the tool stays parked) the agent's reply followed by the card, as two
+/// replies, so the user reads the answer and still sees the form to continue.
+pub(crate) fn rendered_park(payload: &Value) -> Value {
+    let Some(card) = tool_presentation(payload) else {
+        return payload.clone();
+    };
+    let side_reply = payload
+        .get("side_turn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && payload
+            .get("reply")
+            .and_then(Value::as_str)
+            .is_some_and(|reply| !reply.trim().is_empty());
+    if !side_reply {
+        return card.clone();
+    }
+    let mut reply = payload.clone();
+    if let Some(map) = reply.as_object_mut() {
+        map.remove("pending_presentation");
+        map.remove("side_turn");
+    }
+    Value::Array(vec![reply, card.clone()])
 }
 
 /// Keys of a `ChannelMessageEnvelope` that the TRANSPORT owns. On the
@@ -13057,6 +13082,82 @@ mod tests {
         rt.block_on(engine.resume(conv_ctx(), wait.snapshot, json!({ "text": "never mind" })))
             .unwrap();
         assert_eq!(*handler.resumes.lock().unwrap(), vec![None, None]);
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    fn side_turn_output() -> serde_json::Value {
+        json!({
+            "reply": "the signature is in Settings",
+            "trail": [],
+            "terminated_by": "awaiting_tool_input",
+            "side_turn": true,
+            "pending_presentation": { "type": "AdaptiveCard", "body": [{ "text": "Room?" }] }
+        })
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_plain_park_still_renders_only_the_card() {
+        let out = awaiting_tool_output();
+        assert_eq!(rendered_park(&out), out["pending_presentation"]);
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_side_turn_park_renders_the_reply_then_the_card() {
+        let out = side_turn_output();
+        let rendered = rendered_park(&out);
+        let items = rendered.as_array().expect("reply + card");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["reply"], "the signature is in Settings");
+        assert!(items[0].get("pending_presentation").is_none());
+        assert_eq!(items[1], out["pending_presentation"]);
+    }
+
+    /// A typed message answered as a side turn leaves the flow parked at the
+    /// agent node with the await re-armed, so the NEXT card submit still
+    /// reaches the agent as a resume payload.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_side_turn_keeps_the_await_armed_so_a_submit_still_resumes() {
+        let handler = std::sync::Arc::new(ToolParkAgentHandler::new(vec![
+            awaiting_tool_output(),
+            side_turn_output(),
+            json!({ "reply": "booked", "trail": [], "terminated_by": "final_reply" }),
+        ]));
+        let engine = conv_engine_with(conversational_dw_flow(false), handler.clone());
+        let rt = Runtime::new().unwrap();
+        let first = rt
+            .block_on(engine.execute(conv_ctx(), json!({ "text": "book a room" })))
+            .unwrap();
+        let FlowStatus::Waiting(wait) = first.status else {
+            panic!("expected a park");
+        };
+        let second = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                wait.snapshot,
+                json!({ "text": "how do I get a signature?" }),
+            ))
+            .unwrap();
+        assert!(
+            second.output.is_array(),
+            "reply and card: {}",
+            second.output
+        );
+        let FlowStatus::Waiting(wait) = second.status else {
+            panic!("the side turn must keep the flow parked");
+        };
+        rt.block_on(engine.resume(
+            conv_ctx(),
+            wait.snapshot,
+            json!({ "metadata": { "action": "submit" } }),
+        ))
+        .unwrap();
+        let resumes = handler.resumes.lock().unwrap();
+        assert_eq!(resumes.len(), 3);
+        assert!(resumes[0].is_none() && resumes[1].is_none());
+        assert!(resumes[2].is_some(), "the submit must resume the tool");
     }
 
     /// What `greentic-start` really hands the engine for a typed message: the

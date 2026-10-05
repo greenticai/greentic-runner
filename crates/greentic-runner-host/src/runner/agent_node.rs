@@ -439,6 +439,11 @@ mod aw {
                     if let Some(presentation) = output.pending_presentation {
                         node_output["pending_presentation"] = presentation;
                     }
+                    // A typed message answered while the tool stays parked:
+                    // `reply` is the answer and the card follows it.
+                    if output.side_turn {
+                        node_output["side_turn"] = json!(true);
+                    }
                     Ok(node_output)
                 }
                 Err(AgentError::GuardrailDenied {
