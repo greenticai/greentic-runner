@@ -441,7 +441,12 @@ impl RevisionHostOptions {
     ///
     /// Nothing happens unless a pack also names an agent in
     /// `assets/user-ledger.json`, and only a turn whose caller the provider
-    /// verified, outside any tool call, touches the ledger. A target that
+    /// verified, outside any tool call, touches the ledger. That sidecar alone
+    /// decides `read` versus `read_write` for the pack's own agents: there is
+    /// no host-side ceiling on the mode. The gates are the door token's
+    /// `ledger` purpose (the admin refuses a token without it), the
+    /// `GREENTIC_AW_USER_LEDGER` kill switch, the tenant match between the
+    /// runtime and the turn, and a provider-verified subject. A target that
     /// fails validation (blank field, cleartext URL off loopback, userinfo in
     /// the URL) is one warning and the runtime loads without the ledger;
     /// validate early with

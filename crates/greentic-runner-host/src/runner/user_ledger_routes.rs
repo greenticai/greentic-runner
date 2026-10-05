@@ -79,7 +79,7 @@ impl PackUserLedger {
                 }
                 Some("none") => {}
                 _ => tracing::warn!(
-                    agent = %agent_id,
+                    agent = ?agent_id,
                     "user-ledger: unknown mode (expected none, read or read_write); agent dropped"
                 ),
             }

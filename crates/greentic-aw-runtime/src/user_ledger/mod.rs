@@ -245,6 +245,46 @@ pub fn summary_of(reply: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Appends spawned and not yet finished, across the process. Read only by
+/// [`appends_settled`], a test hook.
+static IN_FLIGHT_APPENDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one spawned append for [`appends_settled`]; released on drop, so a
+/// timed-out or cancelled append is released too.
+struct InFlightAppend;
+
+impl InFlightAppend {
+    fn enter() -> Self {
+        IN_FLIGHT_APPENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for InFlightAppend {
+    fn drop(&mut self) {
+        IN_FLIGHT_APPENDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// TEST HOOK. Wait until every append this process spawned has finished (or
+/// `within` elapses); `true` when none is left. An append is counted before
+/// [`LedgerTurn::record_reply`] returns, so awaiting this after a turn
+/// observes that turn's append deterministically. Process-wide: appends of
+/// concurrent turns are waited for too.
+#[doc(hidden)]
+pub async fn appends_settled(within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if IN_FLIGHT_APPENDS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// One runtime's ledger: the store, the tenant it is bound to, and which
 /// agents use it.
 pub struct UserLedgerBinding {
@@ -379,6 +419,7 @@ impl LedgerTurn {
         };
         let ledger = Arc::clone(&self.binding.ledger);
         let subject = self.subject.clone();
+        let in_flight = InFlightAppend::enter();
         runtime.spawn(async move {
             match tokio::time::timeout(
                 APPEND_TIMEOUT,
@@ -393,6 +434,7 @@ impl LedgerTurn {
                 Ok(_) => {}
             }
             drop(permit);
+            drop(in_flight);
         });
     }
 }
@@ -689,6 +731,44 @@ mod tests {
             tenant_slug: "acme".into(),
         };
         assert!(!format!("{t:?}").contains("gtm_secret"));
+    }
+
+    /// An append that takes a little real time, and counts itself.
+    struct SlowLedger(std::sync::atomic::AtomicUsize);
+
+    impl UserLedger for SlowLedger {
+        fn read<'a>(&'a self, _s: &'a str, _l: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn append<'a>(&'a self, _s: &'a str, _k: &'a str, _m: &'a str) -> LedgerFuture<'a, ()> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// The test hook observes an append from the moment `record_reply`
+    /// returns until it has finished.
+    #[tokio::test]
+    async fn appends_settled_waits_for_the_spawned_append() {
+        let ledger = std::sync::Arc::new(SlowLedger(std::sync::atomic::AtomicUsize::new(0)));
+        let binding = std::sync::Arc::new(UserLedgerBinding::new(
+            "acme",
+            ledger.clone(),
+            HashMap::from([("helper".to_string(), LedgerMode::ReadWrite)]),
+        ));
+        let turn = binding
+            .turn_for(&caller(true, Some("u-1")), "helper")
+            .unwrap();
+        turn.record_reply("hello");
+        assert!(
+            !appends_settled(Duration::ZERO).await,
+            "counted before record_reply returned"
+        );
+        assert!(appends_settled(Duration::from_secs(10)).await);
+        assert_eq!(ledger.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// An append that never returns.

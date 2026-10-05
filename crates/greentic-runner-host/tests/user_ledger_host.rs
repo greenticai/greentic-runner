@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use greentic_aw_runtime::ToolCallFrame;
 use greentic_aw_runtime::VerifiedCaller;
 use greentic_aw_runtime::tool_call_frame::within;
-use greentic_aw_runtime::user_ledger::UserLedgerTarget;
+use greentic_aw_runtime::user_ledger::{UserLedgerTarget, appends_settled};
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 use greentic_runner_host::config::{
     FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
@@ -74,6 +74,12 @@ const PACK_ID: &str = "user.ledger.host";
 const TENANT: &str = "demo";
 const LEDGER_PATH: &str = "/api/v1/ingest/ledger";
 const REPLY: &str = "Your order ships on Tuesday.";
+/// What the LLM answers the OUTER turn of the nested test, so its append is
+/// told apart from any (wrong) nested append.
+const OUTER_REPLY: &str = "Your refund was approved.";
+/// Generous bound for [`appends_settled`]: an append is at most
+/// `APPEND_TIMEOUT` (3 s).
+const SETTLE: Duration = Duration::from_secs(10);
 const TOKEN: &str = "gtm_host_test_token";
 
 fn workspace_root() -> PathBuf {
@@ -283,6 +289,12 @@ async fn door_and_llm() -> MockServer {
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
         .mount(&server)
         .await;
+    llm_answering(REPLY).mount(&server).await;
+    server
+}
+
+/// An OpenAI-shaped chat completion that always answers `reply`.
+fn llm_answering(reply: &str) -> Mock {
     Mock::given(method("POST"))
         .and(path_regex("chat/completions$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -292,14 +304,11 @@ async fn door_and_llm() -> MockServer {
             "model": "mock-model",
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": REPLY },
+                "message": { "role": "assistant", "content": reply },
                 "finish_reason": "stop"
             }],
             "usage": { "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8 }
         })))
-        .mount(&server)
-        .await;
-    server
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -437,8 +446,11 @@ async fn a_nested_agent_never_touches_the_ledger_while_the_outer_turn_does() -> 
         nested_text.contains(REPLY),
         "the nested agent must really have answered: {nested_text}"
     );
-    // Give a (wrongly) spawned append every chance to land.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // An append is counted before the turn returns, so this deterministically
+    // waits out any (wrong) nested append; the short sleep is belt and braces
+    // for the recorder.
+    assert!(appends_settled(SETTLE).await, "appends did not settle");
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let after_nested = calls(&server).await;
     assert!(after_nested.llm >= 1, "nested agent ran: {after_nested:?}");
     assert_eq!(
@@ -448,19 +460,30 @@ async fn a_nested_agent_never_touches_the_ledger_while_the_outer_turn_does() -> 
     );
 
     // OUTER (positive control): same runtime, same agent, same verified user,
-    // no tool call frame. Reads once, appends its reply once.
+    // no tool call frame. Reads once, appends its reply once. The LLM now
+    // answers OUTER_REPLY, so the append is provably the outer turn's.
+    llm_answering(OUTER_REPLY)
+        .with_priority(1)
+        .mount(&server)
+        .await;
     let output = outer_turn(&runtime, &serde_json::to_value(alice())?).await?;
-    assert!(output.to_string().contains(REPLY), "{output}");
+    assert!(output.to_string().contains(OUTER_REPLY), "{output}");
+    assert!(appends_settled(SETTLE).await, "appends did not settle");
     let after_outer = settle(&server, |c| c.appends >= 1).await;
-    assert_eq!(after_outer.reads, 1, "{after_outer:?}");
-    assert_eq!(after_outer.appends, 1, "{after_outer:?}");
+    assert_eq!(
+        (after_outer.reads, after_outer.appends),
+        (1, 1),
+        "{after_outer:?}"
+    );
 
     // The calls carry the host's token and slug and the verified subject.
     let requests = server.received_requests().await.unwrap_or_default();
-    let append = requests
+    let appends: Vec<_> = requests
         .iter()
-        .find(|r| r.url.path().ends_with("/append"))
-        .context("append request")?;
+        .filter(|r| r.url.path().ends_with("/append"))
+        .collect();
+    assert_eq!(appends.len(), 1);
+    let append = appends[0];
     assert_eq!(
         append
             .headers
@@ -471,9 +494,11 @@ async fn a_nested_agent_never_touches_the_ledger_while_the_outer_turn_does() -> 
     let body: Value = serde_json::from_slice(&append.body)?;
     assert_eq!(body["subject"], "alice", "{body}");
     assert_eq!(body["tenant_slug"], "demo-slug", "{body}");
+    let summary = body["summary"].as_str().unwrap_or("");
+    assert!(summary.contains(OUTER_REPLY), "{body}");
     assert!(
-        body["summary"].as_str().unwrap_or("").contains(REPLY),
-        "{body}"
+        !summary.contains(REPLY),
+        "the nested reply was appended: {body}"
     );
     Ok(())
 }
@@ -488,7 +513,8 @@ async fn without_the_host_option_a_verified_turn_makes_no_ledger_call() -> Resul
     let runtime = load(&temp, RevisionHostOptions::default()).await?;
     let output = outer_turn(&runtime, &serde_json::to_value(alice())?).await?;
     assert!(output.to_string().contains(REPLY), "{output}");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(appends_settled(SETTLE).await, "appends did not settle");
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let now = calls(&server).await;
     assert!(now.llm >= 1, "{now:?}");
     assert_eq!((now.reads, now.appends), (0, 0), "{now:?}");

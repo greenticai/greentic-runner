@@ -40,7 +40,7 @@ pub(crate) fn ledger_modes_from_packs<'a>(
             };
             if !known.contains(agent_id.as_str()) {
                 tracing::warn!(
-                    agent = %agent_id,
+                    agent = ?agent_id,
                     "user-ledger: sidecar names an agent this runtime does not carry"
                 );
             }
@@ -182,7 +182,12 @@ mod tests {
     /// every turn of another tenant, so a wrong value here is a ledger that
     /// silently never runs.
     #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
     fn the_binding_is_bound_to_the_runtimes_tenant() {
+        // `turn_for` reads the kill switch; clear it so the shell cannot
+        // decide (SAFETY: #[serial] serializes env-mutating tests).
+        unsafe { std::env::remove_var("GREENTIC_AW_USER_LEDGER") };
         let (_d, pack) = pack_with(Some(r#"{"helper":"read"}"#));
         let binding = user_ledger_binding(
             "acme",
@@ -199,7 +204,6 @@ mod tests {
         let acme =
             greentic_aw_runtime::TenantContext::new("acme", "e").with_caller(Some(caller.clone()));
         let other = greentic_aw_runtime::TenantContext::new("other", "e").with_caller(Some(caller));
-        // The kill switch can only turn the ledger off; it is unset here.
         assert!(binding.turn_for(&acme, "helper").is_some());
         assert!(binding.turn_for(&other, "helper").is_none());
         assert!(
@@ -235,7 +239,11 @@ mod tests {
     /// shows as a ledger that never runs.
     #[test]
     fn every_wiring_call_in_runtime_rs_receives_the_target() {
-        let src = include_str!("../runtime.rs");
+        // Whitespace-normalised, so rustfmt and re-indentation cannot break it.
+        let src = include_str!("../runtime.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut calls = 0;
         for needle in [
             "build_agent_node_wiring_metered(",
@@ -260,7 +268,7 @@ mod tests {
             "the option field and both forwarding parameters"
         );
         assert!(
-            src.contains("approval_inbox,\n            #[cfg(feature = \"agentic-worker\")]\n            user_ledger,\n        )"),
+            src.contains("approval_inbox, #[cfg(feature = \"agentic-worker\")] user_ledger, )"),
             "load_revision_impl must forward the target to from_packs_with_rollout"
         );
     }
