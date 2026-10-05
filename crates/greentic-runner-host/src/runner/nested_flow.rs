@@ -229,15 +229,15 @@ pub(crate) fn agent_session_for(ctx_session: Option<&str>) -> Result<String, Str
     }
 }
 
+/// The longest call id kept in a session string, after sanitising.
+const MAX_CALL_ID_LEN: usize = 128;
+
 /// Keep a model-chosen call id inert inside a session string: anything
 /// outside `[A-Za-z0-9_.-]` becomes `_`, so it can carry neither the `::`
 /// separator nor a `::flowtool::` marker, and it is cut to `MAX_CALL_ID_LEN`
 /// characters (after sanitising, so the call and the resume cut it alike).
 /// Distinct ids may map to one token (`a::b`, `a__b`, or two ids sharing their
 /// first 128 characters); both still sit under the calling agent's own session.
-/// The longest call id kept in a session string, after sanitising.
-const MAX_CALL_ID_LEN: usize = 128;
-
 fn sanitise_call_id(call_id: &str) -> String {
     call_id
         .chars()
