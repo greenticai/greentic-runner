@@ -504,3 +504,153 @@ async fn a_tool_session_flow_call_shares_per_the_context_policy() {
     let p = session_call(None).await;
     assert_eq!(p[0], "sys-leaf", "no caller policy fails closed");
 }
+
+/// Fail-open pin for the legacy resume branch: a call parked without an
+/// `extension_id` and with no caller policy for its binding must run `none`.
+#[tokio::test]
+async fn a_legacy_parked_call_with_no_policy_shares_nothing() {
+    let p = resumed_call(None, true).await;
+    assert_eq!(p[0], "sys-leaf", "legacy branch fails closed: {}", p[0]);
+}
+
+use greentic_aw_runtime::{
+    PlaybookOperation, PlaybookSource, PlaybookToolSource, PlaybookTurnFn, PlaybookTurnRequest,
+    PlaybookTurnResult,
+};
+
+struct OnePlaybook;
+
+impl PlaybookSource for OnePlaybook {
+    fn list_playbooks(&self) -> Vec<PlaybookOperation> {
+        vec![PlaybookOperation {
+            playbook_id: "p".into(),
+            description: "p".into(),
+            parameters: json!({ "type": "object" }),
+            instructions: "pb".into(),
+            llm: Default::default(),
+            allow_list: vec![],
+            guardrails: vec![],
+        }]
+    }
+}
+
+/// The playbook's own runtime, standing in for runner-host's `build_turn`
+/// (its agent id is `playbook.p`). It may call flow `x` (agent `leaf`).
+fn playbook_runtime(
+    inner_policy: Option<Arc<SharePolicy>>,
+    leaf: Arc<AgentRuntime>,
+) -> (Arc<AgentRuntime>, Arc<MockLlmBackend>) {
+    let llm = Arc::new(MockLlmBackend::new(vec![
+        call("flow:x", "x"),
+        reply("pb done"),
+    ]));
+    let flows = FlowToolSource::new(Arc::new(LeafFlow {
+        leaf,
+        park_first: AtomicBool::new(false),
+    }));
+    let rt = runtime(
+        vec![agent("playbook.p", vec![tool("flow:x", "x")])],
+        llm.clone(),
+    )
+    .with_flow_source(Some(Arc::new(flows)))
+    .with_share_policy(inner_policy);
+    (Arc::new(rt), llm)
+}
+
+struct ChainRun {
+    playbook_prompts: Vec<String>,
+    leaf_prompts: Vec<String>,
+    trace: Arc<RunTrace>,
+}
+
+async fn chain(outer_mode: Option<ShareMode>, inner_policy: Option<Arc<SharePolicy>>) -> ChainRun {
+    let (leaf, leaf_llm) = leaf_runtime();
+    let (pb, pb_llm) = playbook_runtime(inner_policy, leaf);
+    let turn: PlaybookTurnFn = Arc::new(move |req: PlaybookTurnRequest| {
+        let pb = pb.clone();
+        Box::pin(async move {
+            let out = pb
+                .step(req.tenant.clone(), "s-pb", "playbook.p", input())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(PlaybookTurnResult { reply: out.reply })
+        })
+    });
+    let outer_llm = Arc::new(MockLlmBackend::new(vec![
+        call("playbook:p", "run"),
+        reply("outer done"),
+    ]));
+    let outer = runtime(
+        vec![agent("outer", vec![tool("playbook:p", "run")])],
+        outer_llm,
+    )
+    .with_playbook_source(Some(Arc::new(PlaybookToolSource::new(
+        Arc::new(OnePlaybook),
+        turn,
+    ))))
+    .with_share_policy(outer_mode.and_then(|m| policy("outer", "playbook:p", m)));
+    let trace = seeded();
+    RunContext::scope(
+        RunContext::new(TENANT, trace.clone()),
+        outer.step(tc(), "s-outer-pb", "outer", input()),
+    )
+    .await
+    .unwrap();
+    ChainRun {
+        playbook_prompts: prompts(&pb_llm),
+        leaf_prompts: prompts(&leaf_llm),
+        trace,
+    }
+}
+
+#[tokio::test]
+async fn a_playbook_shares_nothing_unless_its_binding_says_so() {
+    let run = chain(None, None).await;
+    assert_eq!(
+        run.playbook_prompts[0], "sys-playbook.p",
+        "default none: no view"
+    );
+    assert!(!run.trace.events().iter().any(|e| e.actor == "playbook.p"));
+
+    let run = chain(Some(ShareMode::Read), None).await;
+    assert!(
+        run.playbook_prompts[0].contains(SEED),
+        "{}",
+        run.playbook_prompts[0]
+    );
+    assert!(
+        !run.trace.events().iter().any(|e| e.actor == "playbook.p"),
+        "read records nothing"
+    );
+}
+
+/// outer read_write -> playbook:p read -> playbook's flow:x read_write => leaf runs
+/// under `min` = read: it sees the view and records nothing.
+#[tokio::test]
+async fn the_stricter_mode_wins_down_a_chain() {
+    let run = chain(
+        Some(ShareMode::Read),
+        policy("playbook.p", "flow:x", ShareMode::ReadWrite),
+    )
+    .await;
+    assert!(
+        run.leaf_prompts[0].contains(SEED),
+        "{}",
+        run.leaf_prompts[0]
+    );
+    let events = run.trace.events();
+    assert!(
+        !events.iter().any(|e| e.actor == "leaf"),
+        "read, not read_write"
+    );
+    assert!(!events.iter().any(|e| e.actor == "playbook.p"));
+}
+
+/// The production shape: runner-host's `build_turn` installs no policy on the
+/// playbook's runtime, so its own `flow:` calls share nothing.
+#[tokio::test]
+async fn a_playbooks_own_flow_calls_share_nothing_without_a_policy() {
+    let run = chain(Some(ShareMode::ReadWrite), None).await;
+    assert!(run.playbook_prompts[0].contains(SEED));
+    assert_eq!(run.leaf_prompts[0], "sys-leaf");
+}

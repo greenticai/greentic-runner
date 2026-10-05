@@ -597,3 +597,61 @@ fn tool_result_of(out: &greentic_aw_runtime::AgentOutput) -> serde_json::Value {
         })
         .expect("the a2a tool must have been dispatched")
 }
+
+/// `a2a:` never receives the run context: the remote agent gets the model's
+/// arguments and nothing from the trace.
+///
+/// Honest label: this passes without the Task 6 change, and the caller policy
+/// set below is overwritten by `run_step`, so it pins only "no trace content in
+/// the request body", not the `for_binding` exclusion itself.
+#[tokio::test]
+async fn an_a2a_call_carries_nothing_from_the_run_context() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "message": { "messageId": "m-2", "role": "ROLE_AGENT", "parts": [{ "text": "ok" }] } }
+        })))
+        .mount(&server)
+        .await;
+    let source = Arc::new(A2aToolSource::new(vec![("recipe".into(), server.uri())]).unwrap());
+    let llm = Arc::new(RecordingLlmBackend::new(vec![
+        Ok(call_recipe_agent()),
+        Ok(final_reply("done")),
+    ]));
+    let (rt, tc) = build_runtime(llm, Some(source), cfg(vec![recipe_tool_ref()]));
+    let mut modes = greentic_aw_runtime::BindingModes::new();
+    modes.insert(
+        "a2a:recipe".into(),
+        greentic_aw_runtime::ShareMode::ReadWrite,
+    );
+    let trace = Arc::new(greentic_aw_runtime::RunTrace::new());
+    trace.append("host", "reply", "SEED-A2A");
+    greentic_aw_runtime::RunContext::scope(
+        greentic_aw_runtime::RunContext::new("acme", trace)
+            .with_caller_policy(Some(Arc::new(modes))),
+        rt.step(
+            tc,
+            "s-a2a-ctx",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+                resume_payload: None,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let rpc = requests
+        .iter()
+        .find(|r| r.url.path() == RPC_PATH)
+        .expect("the agent must have been called");
+    let body = String::from_utf8_lossy(&rpc.body).to_string();
+    assert!(!body.contains("SEED-A2A"), "{body}");
+    assert!(!body.contains("run_context"), "{body}");
+}
