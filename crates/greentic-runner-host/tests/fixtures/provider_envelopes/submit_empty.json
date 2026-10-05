@@ -1,0 +1,26 @@
+{
+  "id": "webchat-conv-1",
+  "tenant": {
+    "env": "prod",
+    "tenant": "acme",
+    "tenant_id": "acme",
+    "attempt": 0
+  },
+  "channel": "conv-1",
+  "session_id": "conv-1",
+  "from": {
+    "id": "guest-abc",
+    "kind": "user"
+  },
+  "text": "message",
+  "metadata": {
+    "env": "prod",
+    "greentic_submit": "true",
+    "locale": "en-US",
+    "route": "conv-1",
+    "tenant": "acme",
+    "universal": "true",
+    "user_id": "guest-abc",
+    "user_verified": "false"
+  }
+}
