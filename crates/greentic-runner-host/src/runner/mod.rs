@@ -18,6 +18,7 @@ pub mod engine;
 #[cfg(feature = "agentic-worker")]
 pub(crate) mod run_context_policy;
 pub mod run_context_routes;
+pub mod user_ledger_routes;
 // `ext_llm_port` uses `greentic_llm::ProviderKind` directly (not just the
 // agentic-worker types), and `greentic-llm` is an optional dependency pulled
 // in only by the `greentic-llm-backend` feature — mirroring the gate on

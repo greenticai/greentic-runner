@@ -165,6 +165,9 @@ pub struct PackRuntime {
     /// Lazily-parsed `assets/run-context.json` sidecar — see
     /// [`PackRuntime::run_context`]. Twin of `a2a_routes`, read on first use.
     run_context: std::sync::OnceLock<Option<crate::runner::run_context_routes::PackRunContext>>,
+    /// Lazily-parsed `assets/user-ledger.json` sidecar — see
+    /// [`PackRuntime::user_ledger`].
+    user_ledger: std::sync::OnceLock<Option<crate::runner::user_ledger_routes::PackUserLedger>>,
     /// Handlers a `flow:` tool's per-call engine borrows from the host that
     /// wired the top-level engine — see [`crate::runner::nested_flow`].
     /// Write-once; empty means "nested engines get no handler" (the
@@ -2459,6 +2462,7 @@ impl PackRuntime {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            user_ledger: std::sync::OnceLock::new(),
             nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
@@ -3855,6 +3859,22 @@ impl PackRuntime {
             .as_ref()
     }
 
+    /// Agents that use the user ledger, from the optional
+    /// `assets/user-ledger.json` sidecar. `None` when the pack carries none
+    /// (or it was malformed/oversized): then no agent uses the ledger.
+    pub fn user_ledger(&self) -> Option<&crate::runner::user_ledger_routes::PackUserLedger> {
+        self.user_ledger
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::user_ledger_routes::USER_LEDGER_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::user_ledger_routes::PackUserLedger::from_sidecar_bytes(
+                            &bytes,
+                        )
+                    })
+            })
+            .as_ref()
+    }
+
     /// SoR requirements from the optional `assets/sorla-routes.json` sidecar.
     ///
     /// `None` when the pack carries none — a pack built before the feature,
@@ -4227,6 +4247,7 @@ impl PackRuntime {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            user_ledger: std::sync::OnceLock::new(),
             nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
@@ -6335,6 +6356,7 @@ pub(crate) mod tests {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            user_ledger: std::sync::OnceLock::new(),
             nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
@@ -6686,6 +6708,50 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pack = pack_runtime_for_dir(dir.path());
         assert!(pack.a2a_routes().is_none());
+    }
+
+    #[test]
+    fn the_user_ledger_sidecar_is_read_from_the_pack_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/user-ledger.json"),
+            br#"{"helper":"read_write"}"#,
+        )
+        .unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        let declared = pack.user_ledger().expect("sidecar");
+        assert_eq!(declared.agents().count(), 1);
+        let empty = tempfile::tempdir().unwrap();
+        assert!(pack_runtime_for_dir(empty.path()).user_ledger().is_none());
+    }
+
+    #[test]
+    fn the_user_ledger_sidecar_is_read_from_a_gtpack_archive() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("worker.gtpack");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("assets/user-ledger.json", options)
+            .unwrap();
+        writer.write_all(br#"{"helper":"read"}"#).unwrap();
+        writer.finish().unwrap();
+        let pack = pack_runtime_for_dir(&archive_path);
+        assert_eq!(pack.user_ledger().map(|l| l.agents().count()), Some(1));
+    }
+
+    #[test]
+    fn a_malformed_user_ledger_sidecar_fails_closed_without_taking_the_pack_down() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/user-ledger.json"), b"{not json").unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.user_ledger().is_none());
+        assert!(pack.a2a_routes().is_none(), "other sidecars unaffected");
     }
 }
 
