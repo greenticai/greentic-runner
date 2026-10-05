@@ -2465,16 +2465,6 @@ impl PackRuntime {
         })
     }
 
-    /// Bind this pack instance to the deployed unit it belongs to (the
-    /// revision's `bundle_id`), so every extension credential its components
-    /// read resolves that unit's own value before the value shared by every
-    /// unit of the same pack.
-    ///
-    /// Called by `TenantRuntime::load_revision` through `load_pack_runtime`,
-    /// before the `Arc<PackRuntime>` is created — the same seam
-    /// [`set_runtime_config_non_secret`](Self::set_runtime_config_non_secret)
-    /// uses. `None` is the legacy tenant-only path, which keeps the bare pack
-    /// scope.
     /// Lend this pack's flow-tool engines the host's node handlers. Called
     /// once per pack by the host after it wired its top-level engine; a
     /// second call keeps the first registration and warns.
@@ -2490,6 +2480,16 @@ impl PackRuntime {
         }
     }
 
+    /// Bind this pack instance to the deployed unit it belongs to (the
+    /// revision's `bundle_id`), so every extension credential its components
+    /// read resolves that unit's own value before the value shared by every
+    /// unit of the same pack.
+    ///
+    /// Called by `TenantRuntime::load_revision` through `load_pack_runtime`,
+    /// before the `Arc<PackRuntime>` is created — the same seam
+    /// [`set_runtime_config_non_secret`](Self::set_runtime_config_non_secret)
+    /// uses. `None` is the legacy tenant-only path, which keeps the bare pack
+    /// scope.
     pub fn set_unit_id(&mut self, unit_id: Option<String>) {
         self.unit_id = unit_id;
     }
@@ -2642,16 +2642,23 @@ impl PackRuntime {
     async fn execute_flow_inner(
         &self,
         flow_id: &str,
-        input: serde_json::Value,
+        mut input: serde_json::Value,
     ) -> Result<FlowExecution> {
+        let frame = crate::runner::nested_flow::enter(flow_id).map_err(anyhow::Error::msg)?;
         let (pack, engine) = self.load_flow_engine().await?;
+        // The input is the model's tool arguments: the caller it names is
+        // replaced by the OUTER step's host-stamped one BEFORE `caller_block`
+        // reads it (see `nested_flow::pin_caller`).
+        crate::runner::nested_flow::pin_caller(&mut input);
         // Same single establishment point as the ingress path, for callers
         // that drive a flow directly — see `crate::caller_identity`.
         // Cloned rather than borrowed: `input` is moved into the run below,
         // and the context must outlive that move.
         let caller_block = crate::caller_identity::caller_block(&input).cloned();
         let ctx = self.direct_flow_ctx(&pack, flow_id, caller_block.as_ref());
-        engine.execute(ctx, input).await
+        // `ctx.session_id` stays `None` on purpose; a `dw.agent` in this flow
+        // reads its session from the frame (`nested_flow::agent_session_for`).
+        crate::runner::nested_flow::scope(frame, engine.execute(ctx, input)).await
     }
 
     #[allow(dead_code)]
@@ -2728,7 +2735,7 @@ impl PackRuntime {
         &self,
         flow_id: &str,
         snapshot: serde_json::Value,
-        input: serde_json::Value,
+        mut input: serde_json::Value,
     ) -> Result<ToolFlowOutcome, String> {
         let snapshot: FlowSnapshot = serde_json::from_value(snapshot)
             .map_err(|e| format!("flow '{flow_id}': unreadable resume snapshot: {e}"))?;
@@ -2738,14 +2745,18 @@ impl PackRuntime {
                 snapshot.flow_id
             ));
         }
+        let frame = crate::runner::nested_flow::enter(flow_id)?;
         let (pack, engine) = self.load_flow_engine().await.map_err(|e| e.to_string())?;
+        // Same rule as the call: the resume input is model-reachable text, so
+        // its caller is the outer step's, substituted before it is read.
+        crate::runner::nested_flow::pin_caller(&mut input);
         let caller_block = crate::caller_identity::caller_block(&input).cloned();
         let snapshot_flow = snapshot.flow_id.clone();
         let ctx = self.direct_flow_ctx(&pack, &snapshot_flow, caller_block.as_ref());
-        let execution = engine
-            .resume(ctx, snapshot, input)
-            .await
-            .map_err(|e| e.to_string())?;
+        let execution =
+            crate::runner::nested_flow::scope(frame, engine.resume(ctx, snapshot, input))
+                .await
+                .map_err(|e| e.to_string())?;
         tool_flow_outcome(flow_id, execution)
     }
 
