@@ -25,12 +25,12 @@ use greentic_aw_runtime::state::{AgentStateStore, ToolCallRecord};
 use greentic_aw_runtime::tenant::{TenantContext, VerifiedCaller};
 use greentic_aw_runtime::tool_call_frame::within;
 use greentic_aw_runtime::user_ledger::{
-    LedgerError, LedgerEvent, LedgerFuture, MAX_IN_FLIGHT_APPENDS,
+    LedgerError, LedgerEvent, LedgerFuture, LedgerMode, MAX_IN_FLIGHT_APPENDS, UserLedger,
 };
 use greentic_aw_runtime::{
     AgentConfig, AgentInput, AgentLimits, AgentRuntime, FlowInvokeOutcome, FlowInvoker,
-    FlowOperation, FlowToolSource, LedgerMode, LlmProviderRef, RunContext, RunTrace, ShareMode,
-    ToolCallFrame, ToolRef, UserLedger, UserLedgerBinding,
+    FlowOperation, FlowToolSource, LlmProviderRef, RunContext, RunTrace, ShareMode, ToolCallFrame,
+    ToolRef, UserLedgerBinding,
 };
 use serde_json::{Value, json};
 
@@ -174,12 +174,12 @@ fn with_ledger(rt: AgentRuntime, ledger: Arc<StubLedger>, mode: LedgerMode) -> A
 }
 
 fn history() -> Vec<LedgerEvent> {
-    vec![LedgerEvent {
-        unit: "unit-1".into(),
-        kind: "reply".into(),
-        summary: "PREVIOUS-BOOKING".into(),
-        at: "2026-10-05T10:00:00Z".into(),
-    }]
+    vec![LedgerEvent::new(
+        "unit-1",
+        "reply",
+        "PREVIOUS-BOOKING",
+        "2026-10-05T10:00:00Z",
+    )]
 }
 
 async fn settle() {

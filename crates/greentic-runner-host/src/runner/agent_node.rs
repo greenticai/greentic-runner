@@ -4876,11 +4876,11 @@ mod aw {
             }
 
             fn target() -> Option<greentic_aw_runtime::user_ledger::UserLedgerTarget> {
-                Some(greentic_aw_runtime::user_ledger::UserLedgerTarget {
-                    base_url: "https://admin.example/api/v1/ingest/ledger".into(),
-                    token: "gtm_t".into(),
-                    tenant_slug: "alpha".into(),
-                })
+                Some(greentic_aw_runtime::user_ledger::UserLedgerTarget::new(
+                    "https://admin.example/api/v1/ingest/ledger",
+                    "gtm_t",
+                    "alpha",
+                ))
             }
 
             async fn build(

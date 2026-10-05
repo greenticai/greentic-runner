@@ -15,11 +15,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use greentic_aw_runtime::user_ledger::{HttpUserLedger, UserLedgerTarget};
-use greentic_aw_runtime::{LedgerMode, UserLedger, UserLedgerBinding};
+use greentic_aw_runtime::UserLedgerBinding;
+use greentic_aw_runtime::user_ledger::{HttpUserLedger, LedgerMode, UserLedger, UserLedgerTarget};
 
-/// Agent id → mode across one revision's packs; the first pack naming an
-/// agent wins, as for A2A routes. An agent the runtime does not carry is
+/// Agent id → mode across one revision's packs. When several packs name the
+/// same agent with different modes the MOST RESTRICTIVE wins (`read` beats
+/// `read_write`), so pack order can only ever downgrade. An agent the runtime does not carry is
 /// warned about (almost always a key written under the display name).
 pub(crate) fn ledger_modes_from_packs<'a>(
     packs: &[Arc<crate::pack::PackRuntime>],
@@ -32,12 +33,15 @@ pub(crate) fn ledger_modes_from_packs<'a>(
             continue;
         };
         for (agent_id, mode) in declared.agents() {
-            if modes.contains_key(agent_id) {
-                continue;
-            }
             let Some(mode) = LedgerMode::parse(mode) else {
                 continue;
             };
+            if let Some(existing) = modes.get_mut(agent_id) {
+                if mode == LedgerMode::Read {
+                    *existing = LedgerMode::Read;
+                }
+                continue;
+            }
             if !known.contains(agent_id.as_str()) {
                 tracing::warn!(
                     agent = ?agent_id,
@@ -93,11 +97,7 @@ mod tests {
     }
 
     fn target(base: &str) -> Option<UserLedgerTarget> {
-        Some(UserLedgerTarget {
-            base_url: base.into(),
-            token: "gtm_t".into(),
-            tenant_slug: "alpha".into(),
-        })
+        Some(UserLedgerTarget::new(base, "gtm_t", "alpha"))
     }
 
     #[test]
@@ -153,29 +153,29 @@ mod tests {
                 "{unsafe_base} must not build a binding"
             );
         }
-        let blank_token = Some(UserLedgerTarget {
-            base_url: "https://a.example/l".into(),
-            token: "  ".into(),
-            tenant_slug: "alpha".into(),
-        });
+        let blank_token = Some(UserLedgerTarget::new("https://a.example/l", "  ", "alpha"));
         assert!(user_ledger_binding("acme", &[with], ["helper"], blank_token).is_none());
     }
 
     #[test]
-    fn the_first_pack_naming_an_agent_wins() {
-        let (_d1, p1) = pack_with(Some(r#"{"helper":"read"}"#));
-        let (_d2, p2) = pack_with(Some(r#"{"helper":"read_write","other":"read_write"}"#));
-        let modes = ledger_modes_from_packs(&[p1, p2], ["helper"]);
-        assert_eq!(
-            modes.get("helper"),
-            Some(&greentic_aw_runtime::LedgerMode::Read)
-        );
-        assert_eq!(
-            modes.get("other"),
-            Some(&greentic_aw_runtime::LedgerMode::ReadWrite),
-            "an agent only a later pack names still gets that pack's mode"
-        );
-        assert_eq!(modes.len(), 2);
+    fn the_most_restrictive_mode_wins_across_packs_in_either_order() {
+        use greentic_aw_runtime::user_ledger::LedgerMode;
+        let (_d1, read) = pack_with(Some(r#"{"helper":"read"}"#));
+        let (_d2, write) = pack_with(Some(r#"{"helper":"read_write","other":"read_write"}"#));
+        for packs in [[read.clone(), write.clone()], [write.clone(), read.clone()]] {
+            let modes = ledger_modes_from_packs(&packs, ["helper"]);
+            assert_eq!(
+                modes.get("helper"),
+                Some(&LedgerMode::Read),
+                "read beats read_write"
+            );
+            assert_eq!(
+                modes.get("other"),
+                Some(&LedgerMode::ReadWrite),
+                "an agent only one pack names gets that pack's mode"
+            );
+            assert_eq!(modes.len(), 2);
+        }
     }
 
     /// The binding's tenant is the one the host passed: the binding refuses
@@ -220,11 +220,11 @@ mod tests {
             "acme",
             &[pack],
             ["helper"],
-            Some(UserLedgerTarget {
-                base_url: "https://admin.example/secret-path/ledger".into(),
-                token: "gtm_SECRET".into(),
-                tenant_slug: "alpha".into(),
-            }),
+            Some(UserLedgerTarget::new(
+                "https://admin.example/secret-path/ledger",
+                "gtm_SECRET",
+                "alpha",
+            )),
         )
         .unwrap();
         let text = format!("{binding:?}");

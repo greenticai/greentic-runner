@@ -412,11 +412,7 @@ async fn outer_turn(runtime: &TenantRuntime, caller: &Value) -> Result<Value> {
 }
 
 fn target(server: &MockServer) -> UserLedgerTarget {
-    UserLedgerTarget {
-        base_url: format!("{}{LEDGER_PATH}", server.uri()),
-        token: TOKEN.into(),
-        tenant_slug: "demo-slug".into(),
-    }
+    UserLedgerTarget::new(format!("{}{LEDGER_PATH}", server.uri()), TOKEN, "demo-slug")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

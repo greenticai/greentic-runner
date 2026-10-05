@@ -694,7 +694,7 @@ struct RecordingLedger {
     appends: std::sync::Mutex<Vec<String>>,
 }
 
-impl greentic_aw_runtime::UserLedger for RecordingLedger {
+impl greentic_aw_runtime::user_ledger::UserLedger for RecordingLedger {
     fn read<'a>(
         &'a self,
         _s: &'a str,
@@ -742,14 +742,14 @@ async fn the_user_ledger_records_the_guarded_reply() {
         Arc::new(RawEmailLlm),
     );
     let ledger = Arc::new(RecordingLedger::default());
-    let dyn_ledger: Arc<dyn greentic_aw_runtime::UserLedger> = ledger.clone();
+    let dyn_ledger: Arc<dyn greentic_aw_runtime::user_ledger::UserLedger> = ledger.clone();
     let runtime =
         runtime.with_user_ledger(Some(Arc::new(greentic_aw_runtime::UserLedgerBinding::new(
             "test-tenant",
             dyn_ledger,
             std::collections::HashMap::from([(
                 "pii-agent".to_string(),
-                greentic_aw_runtime::LedgerMode::ReadWrite,
+                greentic_aw_runtime::user_ledger::LedgerMode::ReadWrite,
             )]),
         ))));
     let tc = tc.with_caller(Some(greentic_aw_runtime::VerifiedCaller {

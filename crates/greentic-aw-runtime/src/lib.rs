@@ -132,7 +132,7 @@ pub use tool_call_frame::{ToolCallFrame, current_tool_call};
 pub use tool_session::{ToolSession, ToolSessionError, ToolSessionSchema};
 pub use tool_wire_name::{ToolNameCodec, is_wire_safe, wire_tool_name};
 pub use tools::{KvToolLedger, RedisToolLedger, ToolLedger};
-pub use user_ledger::{LedgerMode, UserLedger, UserLedgerBinding, UserLedgerTarget};
+pub use user_ledger::{UserLedgerBinding, UserLedgerTarget};
 
 use std::sync::Arc;
 

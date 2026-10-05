@@ -75,13 +75,31 @@ impl LedgerMode {
     }
 }
 
-/// One event as the door returns it.
+/// One event as the door returns it. Non-exhaustive: build one with
+/// [`LedgerEvent::new`] outside this crate.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+#[non_exhaustive]
 pub struct LedgerEvent {
     pub unit: String,
     pub kind: String,
     pub summary: String,
     pub at: String,
+}
+
+impl LedgerEvent {
+    pub fn new(
+        unit: impl Into<String>,
+        kind: impl Into<String>,
+        summary: impl Into<String>,
+        at: impl Into<String>,
+    ) -> Self {
+        Self {
+            unit: unit.into(),
+            kind: kind.into(),
+            summary: summary.into(),
+            at: at.into(),
+        }
+    }
 }
 
 /// Never prints the summary text: it is end-user derived.
@@ -135,15 +153,16 @@ pub trait UserLedger: Send + Sync {
 
 /// The subject a ledger may be keyed by, or `None`. Gates on the
 /// provider-verified flag FIRST: an unverified block can carry a
-/// self-declared `sub` (WebChat's anonymous visitors do). The door documents
-/// NFC for consumers, so the key is the NFC form of `sub` (checked AFTER
-/// normalising, so the byte cap is the one the door sees).
+/// self-declared `sub` (WebChat's anonymous visitors do). The key is `sub`
+/// VERBATIM: OIDC compares `sub` exactly, so folding canonically-equivalent
+/// spellings (NFC/NFD) could merge two distinct identities into one ledger.
+/// Two spellings of one user's `sub` are two ledgers (the safe failure).
 pub fn verified_subject(tenant: &TenantContext) -> Option<String> {
     let caller = tenant.caller.as_ref()?;
     if !caller.user_verified {
         return None;
     }
-    let sub: String = caller.sub.as_deref()?.nfc().collect();
+    let sub = caller.sub.clone()?;
     let well_formed = !sub.is_empty()
         && sub.len() <= MAX_SUBJECT_BYTES
         && sub.trim() == sub
@@ -180,7 +199,7 @@ fn is_invisible_format(c: char) -> bool {
 /// or control character, `sanitise`, then neutralise the three characters that
 /// could forge an entry line or leave a quoted summary: `[` -> `(`, `]` -> `)`,
 /// `"` -> `'`. Every field of a ledger event was written by another unit, so
-/// all of them go through this. Rendered text only: the SUBJECT stays NFC.
+/// all of them go through this. Rendered text only: the SUBJECT is never folded.
 fn quote_safe(text: &str, max_chars: usize) -> String {
     let folded: String = text
         .nfkc()
@@ -245,14 +264,17 @@ pub fn summary_of(reply: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+#[cfg(any(test, feature = "test-mock"))]
 /// Appends spawned and not yet finished, across the process. Read only by
-/// [`appends_settled`], a test hook.
+/// [`appends_settled`], a test hook (not compiled into production builds).
 static IN_FLIGHT_APPENDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Counts one spawned append for [`appends_settled`]; released on drop, so a
 /// timed-out or cancelled append is released too.
+#[cfg(any(test, feature = "test-mock"))]
 struct InFlightAppend;
 
+#[cfg(any(test, feature = "test-mock"))]
 impl InFlightAppend {
     fn enter() -> Self {
         IN_FLIGHT_APPENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -260,6 +282,7 @@ impl InFlightAppend {
     }
 }
 
+#[cfg(any(test, feature = "test-mock"))]
 impl Drop for InFlightAppend {
     fn drop(&mut self) {
         IN_FLIGHT_APPENDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -271,6 +294,7 @@ impl Drop for InFlightAppend {
 /// [`LedgerTurn::record_reply`] returns, so awaiting this after a turn
 /// observes that turn's append deterministically. Process-wide: appends of
 /// concurrent turns are waited for too.
+#[cfg(any(test, feature = "test-mock"))]
 #[doc(hidden)]
 pub async fn appends_settled(within: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + within;
@@ -419,6 +443,7 @@ impl LedgerTurn {
         };
         let ledger = Arc::clone(&self.binding.ledger);
         let subject = self.subject.clone();
+        #[cfg(any(test, feature = "test-mock"))]
         let in_flight = InFlightAppend::enter();
         runtime.spawn(async move {
             match tokio::time::timeout(
@@ -434,6 +459,7 @@ impl LedgerTurn {
                 Ok(_) => {}
             }
             drop(permit);
+            #[cfg(any(test, feature = "test-mock"))]
             drop(in_flight);
         });
     }
@@ -471,13 +497,16 @@ mod tests {
         assert_eq!(verified_subject(&TenantContext::new("acme", "prod")), None);
     }
 
+    /// The subject is used verbatim: two canonically-equivalent spellings are
+    /// two distinct subjects (OIDC compares `sub` exactly), and both are valid.
     #[test]
-    fn the_subject_is_nfc_normalised_so_both_spellings_share_one_key() {
-        // "e" + combining acute vs the precomposed "é".
+    fn canonically_equivalent_subjects_stay_distinct() {
+        // "e" + combining acute (NFD) vs the precomposed "é" (NFC).
         let decomposed = verified_subject(&caller(true, Some("cafe\u{301}")));
         let precomposed = verified_subject(&caller(true, Some("caf\u{e9}")));
-        assert_eq!(decomposed, Some("caf\u{e9}".to_string()));
-        assert_eq!(decomposed, precomposed);
+        assert_eq!(decomposed, Some("cafe\u{301}".to_string()));
+        assert_eq!(precomposed, Some("caf\u{e9}".to_string()));
+        assert_ne!(decomposed, precomposed);
     }
 
     #[test]

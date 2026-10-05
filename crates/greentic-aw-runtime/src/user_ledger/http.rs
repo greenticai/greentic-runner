@@ -310,6 +310,7 @@ impl UserLedger for HttpUserLedger {
 /// `base_url` = the worker-usage endpoint with its last segment swapped for
 /// `ledger` (`{admin}/api/v1/ingest/ledger`).
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct UserLedgerTarget {
     /// `{admin}/api/v1/ingest/ledger` — the client appends `/read`, `/append`.
     pub base_url: String,
@@ -317,6 +318,21 @@ pub struct UserLedgerTarget {
     pub token: secrecy::SecretString,
     /// The workspace slug the token belongs to; the door refuses any other.
     pub tenant_slug: String,
+}
+
+impl UserLedgerTarget {
+    /// The target for one unit; validate with [`HttpUserLedger::new`].
+    pub fn new(
+        base_url: impl Into<String>,
+        token: impl Into<secrecy::SecretString>,
+        tenant_slug: impl Into<String>,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            token: token.into(),
+            tenant_slug: tenant_slug.into(),
+        }
+    }
 }
 
 impl std::fmt::Debug for UserLedgerTarget {

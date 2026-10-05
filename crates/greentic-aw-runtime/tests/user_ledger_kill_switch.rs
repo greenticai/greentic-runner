@@ -16,10 +16,9 @@ use greentic_aw_runtime::mock::{
     MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, NoopToolLedger,
 };
 use greentic_aw_runtime::tenant::{TenantContext, VerifiedCaller};
-use greentic_aw_runtime::user_ledger::{LedgerEvent, LedgerFuture};
+use greentic_aw_runtime::user_ledger::{LedgerEvent, LedgerFuture, LedgerMode, UserLedger};
 use greentic_aw_runtime::{
-    AgentConfig, AgentInput, AgentLimits, AgentRuntime, LedgerMode, LlmProviderRef, UserLedger,
-    UserLedgerBinding,
+    AgentConfig, AgentInput, AgentLimits, AgentRuntime, LlmProviderRef, UserLedgerBinding,
 };
 
 /// Counts every call; answers with one event so a read would show.
@@ -32,12 +31,12 @@ impl UserLedger for CountingLedger {
     fn read<'a>(&'a self, _s: &'a str, _l: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
         *self.calls.lock().unwrap() += 1;
         Box::pin(async {
-            Ok(vec![LedgerEvent {
-                unit: "u".into(),
-                kind: "reply".into(),
-                summary: "PREVIOUS-BOOKING".into(),
-                at: "2026-10-05T10:00:00Z".into(),
-            }])
+            Ok(vec![LedgerEvent::new(
+                "u",
+                "reply",
+                "PREVIOUS-BOOKING",
+                "2026-10-05T10:00:00Z",
+            )])
         })
     }
     fn append<'a>(&'a self, _s: &'a str, _k: &'a str, _m: &'a str) -> LedgerFuture<'a, ()> {
