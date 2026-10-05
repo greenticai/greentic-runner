@@ -1093,3 +1093,67 @@ async fn end_conversation_ignored_when_not_conversational() {
     assert_eq!(out.terminated_by, TerminationReason::FinalReply);
     assert_eq!(out.reply, "real reply");
 }
+
+#[tokio::test]
+async fn a_tool_outcome_is_traced_and_shown_to_the_next_llm_request() {
+    // Dispatch fails (for_test runtime has no extensions), which exercises the
+    // dispatch-failure trace site. The next request must carry the rebuilt view.
+    let allowed = vec![ToolRef {
+        extension_id: "http".into(),
+        tool_name: "fetch".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
+    }];
+    let llm = Arc::new(MockLlmBackend::new(vec![
+        Ok(tool_call_with_args(
+            "c1",
+            "http",
+            "fetch",
+            serde_json::json!({ "secret": "TOPSECRET-ARG" }),
+        )),
+        Ok(final_reply("recovered")),
+    ]));
+    let cp = MockConfigProvider::new();
+    let tc = TenantContext::new("acme", "prod");
+    cp.insert(&tc, "a", cfg(4, 60_000, allowed, None));
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+    let rt = AgentRuntime::new(
+        Arc::new(cp),
+        Arc::new(MockAgentStateStore::new()),
+        ext,
+        llm.clone(),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    );
+    let trace = Arc::new(greentic_aw_runtime::RunTrace::new());
+    greentic_aw_runtime::RunContext::scope(
+        greentic_aw_runtime::RunContext::new("acme", trace.clone()),
+        rt.step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+                resume_payload: None,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let events = trace.events();
+    assert_eq!(events[0].kind, "tool");
+    assert!(
+        events[0].summary.starts_with("fetch"),
+        "{}",
+        events[0].summary
+    );
+    assert!(!events.iter().any(|e| e.summary.contains("TOPSECRET-ARG")));
+    let prompts = llm.seen_system_prompts.lock().unwrap();
+    assert!(!prompts[0].contains("<run_context>"));
+    assert!(prompts[1].contains("<run_context>"), "{}", prompts[1]);
+    assert!(prompts[1].contains("fetch"));
+}

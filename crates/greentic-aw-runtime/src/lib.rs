@@ -49,6 +49,7 @@ pub mod mcp_source;
 pub mod mcp_store_pull;
 pub mod memory;
 pub mod playbook_source;
+pub mod run_trace;
 pub mod scoped_secrets;
 pub mod short_term;
 pub mod sorla_source;
@@ -112,6 +113,7 @@ pub use playbook_source::{
     PlaybookSource, PlaybookToolCatalog, PlaybookToolEntry, PlaybookToolSource, PlaybookTurnFn,
     PlaybookTurnRequest, PlaybookTurnResult,
 };
+pub use run_trace::{RunContext, RunTrace};
 pub use sorla_source::{
     SorlaToolCatalog, SorlaToolEntry, SorlaToolSource, SorxInvoker, SorxOperation,
 };

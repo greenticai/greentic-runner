@@ -69,6 +69,22 @@ pub async fn run_step(
         .agent_config(&tenant, agent_id)
         .await?;
 
+    // The run this step belongs to, if the caller opened one (see
+    // `RunContext::scope`). None is today's behaviour exactly.
+    // A context bound to another tenant is ignored, never shared across tenants.
+    let run_trace = crate::run_trace::RunContext::current().and_then(|c| {
+        if c.tenant_id() == tenant.tenant_id {
+            Some(c.trace().clone())
+        } else {
+            warn!(
+                context_tenant = c.tenant_id(),
+                step_tenant = %tenant.tenant_id,
+                "ignoring a run context bound to another tenant"
+            );
+            None
+        }
+    });
+
     // --- Cost budget gate (spec Decision 14) ---
     if let Some(cap) = config.limits.daily_token_cap_per_tenant {
         let used = runtime.token_meter.current(&tenant).await?;
@@ -435,7 +451,10 @@ pub async fn run_step(
             tools_schema.push(crate::end_conversation::end_conversation_tool_schema());
         }
         let request = LlmRequest {
-            system_prompt: system_prompt.clone(),
+            system_prompt: crate::run_trace::augment_system_prompt(
+                &system_prompt,
+                run_trace.as_ref().and_then(|t| t.render_view()).as_deref(),
+            ),
             history: state.messages.clone(),
             tools: tools_schema,
             provider: config.llm.clone(),
@@ -743,6 +762,13 @@ pub async fn run_step(
                         // Surface the failure so audit/stream observers see a matching
                         // outcome instead of a dangling call.
                         observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
+                        if let Some(t) = &run_trace {
+                            t.append(
+                                agent_id,
+                                "tool",
+                                &crate::run_trace::summarise_result(&call.tool_name, &err_obs),
+                            );
+                        }
                         trail.push(AgentStep::ToolCall {
                             name: call.tool_name.clone(),
                             call_id: call.call_id.clone(),
@@ -757,6 +783,13 @@ pub async fn run_step(
                 let duration_ms = t0.elapsed().as_millis() as u64;
 
                 observer.on_tool_result(&call.tool_name, &call.call_id, &result);
+                if let Some(t) = &run_trace {
+                    t.append(
+                        agent_id,
+                        "tool",
+                        &crate::run_trace::summarise_result(&call.tool_name, &result),
+                    );
+                }
 
                 // Record successful result in ledger (best-effort).
                 if let Err(e) = runtime
@@ -879,6 +912,12 @@ pub async fn run_step(
                     warn!(error = %e, "long-term ingest skipped: tenant conversion failed");
                 }
             }
+        }
+
+        if !reply.is_empty()
+            && let Some(t) = &run_trace
+        {
+            t.append(agent_id, "reply", &reply);
         }
 
         runtime.telemetry.record_step(&StepTelemetryCtx {
@@ -2018,5 +2057,133 @@ mod tests {
         let seen = observer.guardrails.lock().unwrap();
         assert_eq!(seen.len(), 1, "a blocked denial must still be observed");
         assert_eq!(seen[0].action, crate::guardrail::GuardrailAction::Blocked);
+    }
+
+    fn runtime_for_prompt_tests(llm: Arc<MockLlmBackend>, tc: &TenantContext) -> AgentRuntime {
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        cp.insert(tc, "a", cfg());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+        AgentRuntime::new(
+            Arc::new(cp),
+            store,
+            ext,
+            llm,
+            telemetry,
+            Arc::new(crate::cost::MockTokenMeter::new(0)),
+            Arc::new(crate::mock::NoopToolLedger),
+            None,
+        )
+    }
+
+    fn one_reply(text: &str) -> Arc<MockLlmBackend> {
+        Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some(text.into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]))
+    }
+
+    #[tokio::test]
+    async fn a_run_trace_view_is_injected_into_the_system_prompt() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        trace.append("outer", "tool", "refund flow approved 40 USD");
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", trace),
+            runtime.step(
+                tc.clone(),
+                "sess-trace",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert!(prompts[0].starts_with("sys"));
+        assert!(prompts[0].contains("<run_context>"));
+        assert!(prompts[0].contains("refund flow approved 40 USD"));
+    }
+
+    #[tokio::test]
+    async fn without_a_run_ctx_the_prompt_is_unchanged() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        runtime
+            .step(
+                tc.clone(),
+                "sess-none",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(prompts[0], "sys");
+    }
+
+    #[tokio::test]
+    async fn the_final_reply_is_recorded_on_the_trace() {
+        let llm = one_reply("all done");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm, &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", trace.clone()),
+            runtime.step(
+                tc.clone(),
+                "sess-rec",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let events = trace.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "a");
+        assert_eq!(events[0].kind, "reply");
+        assert_eq!(events[0].summary, "all done");
+    }
+
+    #[tokio::test]
+    async fn a_context_for_another_tenant_is_ignored() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        trace.append("outer", "tool", "other tenant secret");
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("other", trace.clone()),
+            runtime.step(
+                tc.clone(),
+                "sess-foreign",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(prompts[0], "sys");
+        assert_eq!(trace.events().len(), 1, "no event may be recorded");
     }
 }
