@@ -831,3 +831,217 @@ fn the_refusal_also_holds_on_the_resume_of_a_parked_call() -> Result<()> {
     );
     Ok(())
 }
+
+// ------------------------------------- Task 6: inheritance, parking, regression
+
+/// Phase A2: the run context reaches the nested agent (every hop is an
+/// `.await`; no spawn between the flow tool and the agent node).
+#[test]
+fn the_run_context_reaches_the_nested_agent() -> Result<()> {
+    let h = harness()?;
+    let recorder = Arc::new(Recorder::replying(json!({ "reply": "ok" })));
+    let handler: Arc<dyn AgentNodeHandler> = recorder.clone();
+    register(&h.pack, &handler);
+
+    RUNTIME
+        .block_on(greentic_aw_runtime::RunContext::scope(
+            greentic_aw_runtime::RunContext::new(
+                "demo",
+                Arc::new(greentic_aw_runtime::RunTrace::new()),
+            ),
+            within(
+                ToolCallFrame::new(Some("s-outer"), "c1"),
+                h.pack.run_flow_for_tool("agent.flow", json!({})),
+            ),
+        ))
+        .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(*recorder.saw_run_context.lock().unwrap(), vec![true]);
+    assert_eq!(
+        recorder.sessions(),
+        vec!["s-outer::flowtool::c1".to_string()]
+    );
+    Ok(())
+}
+
+/// A nested agent that parks on its own flow tool parks the outer flow tool:
+/// interactively it is `Waiting`, one-shot it is the existing refusal.
+#[test]
+fn a_nested_agent_that_parks_parks_the_flow_tool() -> Result<()> {
+    let h = harness()?;
+    let recorder = Arc::new(Recorder::replying(json!({
+        "reply": "pick a slot",
+        "terminated_by": "awaiting_tool_input",
+    })));
+    let handler: Arc<dyn AgentNodeHandler> = recorder.clone();
+    register(&h.pack, &handler);
+
+    let interactive = RUNTIME
+        .block_on(within(
+            ToolCallFrame::new(Some("s-outer"), "c1"),
+            h.pack
+                .run_flow_for_tool_interactive("agent.flow", json!({})),
+        ))
+        .map_err(anyhow::Error::msg)?;
+    assert!(
+        matches!(interactive, ToolFlowOutcome::Waiting { .. }),
+        "{interactive:?}"
+    );
+
+    let one_shot = RUNTIME.block_on(within(
+        ToolCallFrame::new(Some("s-outer"), "c2"),
+        h.pack.run_flow_for_tool("agent.flow", json!({})),
+    ));
+    assert!(
+        result_text(&one_shot).contains("tried to pause"),
+        "{one_shot:?}"
+    );
+    assert_eq!(
+        recorder.sessions(),
+        vec![
+            "s-outer::flowtool::c1".to_string(),
+            "s-outer::flowtool::c2".to_string()
+        ]
+    );
+    Ok(())
+}
+
+/// The regression the fix exists for: an agent calls a `flow:` tool whose
+/// flow contains a `dw.agent`, and gets that agent's reply back as the tool
+/// result. Outer agent = real `AgentRuntime` on a scripted LLM; nested agent
+/// = the recording stub the host lent the flow engine.
+#[test]
+fn an_agent_gets_the_nested_agents_reply_through_a_flow_tool() -> Result<()> {
+    use greentic_aw_runtime::cost::MockTokenMeter;
+    use greentic_aw_runtime::llm::LlmResponse;
+    use greentic_aw_runtime::mock::{
+        MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, NoopToolLedger,
+    };
+    use greentic_aw_runtime::state::{AgentStateStore, ChatMessage, ToolCallRecord};
+    use greentic_aw_runtime::tenant::TenantContext;
+    use greentic_aw_runtime::{
+        AgentConfig, AgentInput, AgentLimits, AgentRuntime, FlowToolSource, LlmProviderRef, ToolRef,
+    };
+    use greentic_runner_host::runner::flow_invoker::PackRuntimeFlowInvoker;
+
+    let h = harness()?;
+    let recorder = Arc::new(Recorder::replying(json!({ "reply": "nested-says-hi" })));
+    let handler: Arc<dyn AgentNodeHandler> = recorder.clone();
+    register(&h.pack, &handler);
+
+    let tc = TenantContext::new("demo", "local");
+    let cp = MockConfigProvider::new();
+    cp.insert(
+        &tc,
+        "outer",
+        AgentConfig {
+            agent_id: "outer".into(),
+            system_prompt: "sys".into(),
+            tools: vec![ToolRef {
+                extension_id: "flow:agent.flow".into(),
+                tool_name: "agent.flow".into(),
+                description: None,
+                input_schema: None,
+                usage_note: None,
+            }],
+            llm: LlmProviderRef {
+                provider: "mock".into(),
+                model: "m".into(),
+                credential_ref: None,
+            },
+            limits: AgentLimits {
+                max_iter: 4,
+                timeout: std::time::Duration::from_secs(60),
+                ..AgentLimits::default()
+            },
+            memory: None,
+            knowledge: None,
+            guardrails: vec![],
+            conversational: false,
+            opening_message: None,
+        },
+    );
+    let store = Arc::new(MockAgentStateStore::new());
+    let llm = Arc::new(MockLlmBackend::new(vec![
+        Ok(LlmResponse {
+            content: None,
+            tool_calls: vec![ToolCallRecord {
+                call_id: "c1".into(),
+                extension_id: "flow:agent.flow".into(),
+                tool_name: "agent.flow".into(),
+                args: json!({}),
+            }],
+            tokens_in: 1,
+            tokens_out: 1,
+        }),
+        Ok(LlmResponse {
+            content: Some("the helper said hi".into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        }),
+    ]));
+    let flows = Arc::new(FlowToolSource::new(Arc::new(PackRuntimeFlowInvoker::new(
+        vec![Arc::clone(&h.pack)],
+        "demo".into(),
+    ))));
+    let outer = AgentRuntime::new(
+        Arc::new(cp),
+        store.clone(),
+        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()?),
+        llm,
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    )
+    .with_flow_source(Some(flows));
+
+    let out = RUNTIME.block_on(outer.step(
+        tc.clone(),
+        "s-outer",
+        "outer",
+        AgentInput {
+            text: "ask the helper".into(),
+            conversational: false,
+            resume_payload: None,
+        },
+    ))?;
+    assert_eq!(out.reply, "the helper said hi");
+
+    let state = RUNTIME.block_on(store.load(&tc, "s-outer"))?;
+    let tool_result = state
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            ChatMessage::Tool { call_id, content } if call_id == "c1" => Some(content.clone()),
+            _ => None,
+        })
+        .context("tool result for c1")?;
+    assert!(
+        tool_result.to_string().contains("nested-says-hi"),
+        "{tool_result}"
+    );
+    assert_eq!(
+        recorder.sessions(),
+        vec!["s-outer::flowtool::c1".to_string()]
+    );
+    Ok(())
+}
+
+/// Negative control for the inheritance test: with no scope the recorder sees
+/// no run context, so `vec![true]` above is not vacuous.
+#[test]
+fn without_a_run_context_scope_the_nested_agent_sees_none() -> Result<()> {
+    let h = harness()?;
+    let recorder = Arc::new(Recorder::replying(json!({ "reply": "ok" })));
+    let handler: Arc<dyn AgentNodeHandler> = recorder.clone();
+    register(&h.pack, &handler);
+
+    RUNTIME
+        .block_on(h.pack.run_flow_for_tool("agent.flow", json!({})))
+        .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(*recorder.saw_run_context.lock().unwrap(), vec![false]);
+    Ok(())
+}
