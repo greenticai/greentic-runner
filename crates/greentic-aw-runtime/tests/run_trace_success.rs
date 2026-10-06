@@ -177,5 +177,7 @@ async fn a_completed_tool_is_traced_without_its_args_and_shown_to_the_next_reque
     assert!(!events.iter().any(|e| e.summary.contains("TOPSECRET-ARG")));
     let prompts = llm.prompts.lock().unwrap();
     assert!(prompts[1].contains("<run_context>"), "{}", prompts[1]);
-    assert!(prompts[1].contains(r#"{"ok":1}"#), "{}", prompts[1]);
+    // The owner sees only the narrow form; the raw result stays on the event.
+    assert!(prompts[1].contains("x ok"), "{}", prompts[1]);
+    assert!(!prompts[1].contains(r#"{"ok":1}"#), "{}", prompts[1]);
 }

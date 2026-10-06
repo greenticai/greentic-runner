@@ -11,6 +11,7 @@
 //! data, not instructions. It is never durable and never sent to a remote
 //! party (`a2a:`).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Most events kept; the oldest are dropped first.
@@ -25,7 +26,52 @@ pub const MAX_VIEW_CHARS: usize = 2000;
 pub struct TraceEvent {
     pub actor: String,
     pub kind: String,
+    /// The full (truncated, sanitised) summary. For a tool outcome this is the
+    /// RAW tool output: it is never rendered into a prompt and must not be
+    /// logged.
     pub summary: String,
+    /// The step that recorded a tool outcome (its own history holds the result).
+    pub owner: Option<StepId>,
+    /// What EVERY step sees in the rendered view: `<tool> ok|failed`.
+    pub shared_summary: Option<String>,
+}
+
+static NEXT_STEP: AtomicU64 = AtomicU64::new(1);
+
+/// Identifies one `run_step` invocation inside a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StepId(u64);
+
+impl StepId {
+    /// A process-unique id.
+    pub fn fresh() -> Self {
+        Self(NEXT_STEP.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Whether a tool call succeeded, as recorded across an agent boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Ok,
+    Failed,
+}
+
+impl ToolOutcome {
+    /// `Failed` when the result carries a non-null `"error"`.
+    pub fn of(result: &serde_json::Value) -> Self {
+        if result.get("error").is_some_and(|e| !e.is_null()) {
+            Self::Failed
+        } else {
+            Self::Ok
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// The shared log. Cheap to clone behind an [`Arc`].
@@ -77,20 +123,52 @@ impl RunTrace {
         self.events.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record one event. Actor and kind are sanitised too: a nested agent id is
-    /// author-controlled text.
-    pub fn append(&self, actor: &str, kind: &str, summary: &str) {
-        let event = TraceEvent {
-            actor: sanitise(actor, 64),
-            kind: sanitise(kind, 32),
-            summary: sanitise(summary, MAX_SUMMARY_CHARS),
-        };
+    fn push(&self, event: TraceEvent) {
         let mut events = self.lock();
         events.push(event);
         if events.len() > MAX_EVENTS {
             let excess = events.len() - MAX_EVENTS;
             events.drain(..excess);
         }
+    }
+
+    /// Record an event every agent in the run may read in full (a guarded
+    /// reply). Never use it for a raw tool result: see
+    /// [`RunTrace::append_tool_outcome`]. Actor and kind are sanitised too: a
+    /// nested agent id is author-controlled text.
+    pub fn append(&self, actor: &str, kind: &str, summary: &str) {
+        self.push(TraceEvent {
+            actor: sanitise(actor, 64),
+            kind: sanitise(kind, 32),
+            summary: sanitise(summary, MAX_SUMMARY_CHARS),
+            owner: None,
+            shared_summary: None,
+        });
+    }
+
+    /// Record a tool outcome. `detail` (see [`summarise_result`]) is shown only
+    /// to `owner`, the step that called the tool and already holds the result
+    /// in its own history. Every other agent sees `<tool> ok|failed`: a raw
+    /// result has passed no outbound guardrail, so it must not cross an agent
+    /// boundary (spec 4.1).
+    pub fn append_tool_outcome(
+        &self,
+        owner: StepId,
+        actor: &str,
+        tool: &str,
+        outcome: ToolOutcome,
+        detail: &str,
+    ) {
+        self.push(TraceEvent {
+            actor: sanitise(actor, 64),
+            kind: sanitise("tool", 32),
+            summary: sanitise(detail, MAX_SUMMARY_CHARS),
+            owner: Some(owner),
+            shared_summary: Some(sanitise(
+                &format!("{tool} {}", outcome.word()),
+                MAX_SUMMARY_CHARS,
+            )),
+        });
     }
 
     pub fn len(&self) -> usize {
@@ -101,13 +179,27 @@ impl RunTrace {
         self.lock().is_empty()
     }
 
+    /// A copy of the stored events. `summary` holds RAW (truncated) tool output:
+    /// do not log it or render it into a prompt.
     pub fn events(&self) -> Vec<TraceEvent> {
         self.lock().clone()
     }
 
-    /// A delimited block of the newest events that fit the view budget, oldest
-    /// first, or `None` when nothing was recorded.
+    /// The view an outsider gets: [`RunTrace::render_view_for`] with no viewer.
     pub fn render_view(&self) -> Option<String> {
+        self.render_view_for(None)
+    }
+
+    /// A delimited block of the newest events that fit the view budget, oldest
+    /// first, as `viewer` may see them, or `None` when nothing was recorded.
+    ///
+    /// A tool outcome renders as its narrow `<tool> ok|failed` form for EVERY
+    /// viewer, its owner included: the owner's own history already holds the
+    /// raw result, so the detail would only duplicate tokens and promote
+    /// untrusted tool output into the system prompt. The raw (truncated)
+    /// summary stays on the stored event. `viewer` is kept so callers need not
+    /// change should a future event kind be viewer-specific.
+    pub fn render_view_for(&self, _viewer: Option<StepId>) -> Option<String> {
         let events = self.lock();
         if events.is_empty() {
             return None;
@@ -115,7 +207,8 @@ impl RunTrace {
         let mut lines: Vec<String> = Vec::new();
         let mut used = 0usize;
         for e in events.iter().rev() {
-            let line = format!("- [{}/{}] {}", e.actor, e.kind, e.summary);
+            let text = e.shared_summary.as_deref().unwrap_or(e.summary.as_str());
+            let line = format!("- [{}/{}] {}", e.actor, e.kind, text);
             used += line.chars().count() + 1;
             if used > MAX_VIEW_CHARS && !lines.is_empty() {
                 break;
@@ -148,25 +241,49 @@ tokio::task_local! {
 pub struct RunContext {
     tenant_id: String,
     trace: Arc<RunTrace>,
+    /// What this level may do with the trace (spec §4.4).
+    mode: crate::share_policy::ShareMode,
+    /// The bindings of the agent whose tools are being dispatched. Set by
+    /// `run_step` for every agent turn; `None` means every binding is `none`.
+    caller_policy: Option<Arc<crate::share_policy::BindingModes>>,
 }
 
-/// Prints the tenant id and the event count only, never the summaries.
+/// Prints the tenant id, the mode and the event count only, never summaries.
 impl std::fmt::Debug for RunContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunContext")
             .field("tenant_id", &self.tenant_id)
+            .field("mode", &self.mode)
             .field("events", &self.trace.len())
             .finish()
     }
 }
 
 impl RunContext {
-    /// A context bound to `tenant_id`: a step for any other tenant ignores it,
-    /// so a trace can never carry one tenant's results into another's prompt.
+    /// A read-write context bound to `tenant_id`: a step for any other tenant
+    /// ignores it, so a trace can never carry one tenant's results into
+    /// another's prompt.
+    ///
+    /// Warning: a host that builds a context itself bypasses the pack sidecar
+    /// and the `GREENTIC_AW_RUN_CONTEXT` kill switch (both live in runner-host).
     pub fn new(tenant_id: impl Into<String>, trace: Arc<RunTrace>) -> Self {
         Self {
             tenant_id: tenant_id.into(),
             trace,
+            mode: crate::share_policy::ShareMode::ReadWrite,
+            caller_policy: None,
+        }
+    }
+
+    /// A context that shares nothing: an empty trace nobody else holds, mode
+    /// `None`. A task-local cannot be unset, only shadowed; this is the shadow
+    /// a `none` binding runs under, so the real trace is unreachable below it.
+    pub fn detached(tenant_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            trace: Arc::new(RunTrace::new()),
+            mode: crate::share_policy::ShareMode::None,
+            caller_policy: None,
         }
     }
 
@@ -178,6 +295,57 @@ impl RunContext {
         &self.trace
     }
 
+    pub fn mode(&self) -> crate::share_policy::ShareMode {
+        self.mode
+    }
+
+    pub fn caller_policy(&self) -> Option<&Arc<crate::share_policy::BindingModes>> {
+        self.caller_policy.as_ref()
+    }
+
+    /// Warning: a host that sets a mode itself bypasses the pack sidecar and the
+    /// `GREENTIC_AW_RUN_CONTEXT` kill switch (both live in runner-host).
+    #[must_use]
+    pub fn with_mode(mut self, mode: crate::share_policy::ShareMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Warning: a host that sets a policy itself bypasses the pack sidecar and
+    /// the `GREENTIC_AW_RUN_CONTEXT` kill switch (both live in runner-host).
+    #[must_use]
+    pub fn with_caller_policy(
+        mut self,
+        policy: Option<Arc<crate::share_policy::BindingModes>>,
+    ) -> Self {
+        self.caller_policy = policy;
+        self
+    }
+
+    /// The context a nested call reached through `binding` runs under:
+    /// `min(this level's mode, the caller's mode for the binding)`, where a
+    /// binding the policy does not name is `None`. `None` yields
+    /// [`RunContext::detached`]. The callee's own `run_step` sets its policy,
+    /// so the caller's is not passed down.
+    pub fn for_nested_binding(&self, binding: &str) -> RunContext {
+        use crate::share_policy::ShareMode;
+        let configured = self
+            .caller_policy
+            .as_ref()
+            .and_then(|policy| policy.get(binding).copied())
+            .unwrap_or(ShareMode::None);
+        let mode = ShareMode::for_binding(binding, configured).min(self.mode);
+        if mode == ShareMode::None {
+            return RunContext::detached(self.tenant_id.clone());
+        }
+        RunContext {
+            tenant_id: self.tenant_id.clone(),
+            trace: self.trace.clone(),
+            mode,
+            caller_policy: None,
+        }
+    }
+
     /// Run `fut` with `ctx` as the current run context.
     pub async fn scope<F: std::future::Future>(ctx: RunContext, fut: F) -> F::Output {
         CURRENT.scope(ctx, fut).await
@@ -186,6 +354,16 @@ impl RunContext {
     /// The run context of the enclosing [`RunContext::scope`], if any.
     pub fn current() -> Option<RunContext> {
         CURRENT.try_with(Clone::clone).ok()
+    }
+}
+
+/// Run a nested call reached through `binding` under the context it is
+/// entitled to (see [`RunContext::for_nested_binding`]). With no current
+/// context this is exactly `fut.await`.
+pub async fn under_binding<F: std::future::Future>(binding: &str, fut: F) -> F::Output {
+    match RunContext::current() {
+        Some(ctx) => RunContext::scope(ctx.for_nested_binding(binding), fut).await,
+        None => fut.await,
     }
 }
 
@@ -442,5 +620,144 @@ mod tests {
         assert!(!out.contains("SECRET-RESULT"), "{out}");
         assert!(out.contains("acme"), "{out}");
         assert_eq!(ctx.tenant_id(), "acme");
+    }
+
+    use crate::share_policy::{BindingModes, ShareMode};
+
+    fn caller(binding: &str, mode: ShareMode) -> Option<Arc<BindingModes>> {
+        let mut m = BindingModes::new();
+        m.insert(binding.to_string(), mode);
+        Some(Arc::new(m))
+    }
+
+    #[test]
+    fn a_new_context_is_read_write_with_no_policy() {
+        let ctx = RunContext::new("acme", Arc::new(RunTrace::new()));
+        assert_eq!(ctx.mode(), ShareMode::ReadWrite);
+        assert!(ctx.caller_policy().is_none());
+    }
+
+    #[test]
+    fn no_caller_policy_means_a_detached_nested_context() {
+        let trace = Arc::new(RunTrace::new());
+        trace.append("outer", "reply", "seed");
+        let ctx = RunContext::new("acme", trace.clone());
+        let nested = ctx.for_nested_binding("flow:x");
+        assert_eq!(nested.mode(), ShareMode::None);
+        assert_eq!(nested.tenant_id(), "acme");
+        assert!(
+            !Arc::ptr_eq(nested.trace(), &trace),
+            "the real trace must be unreachable"
+        );
+        assert!(nested.trace().is_empty());
+    }
+
+    #[test]
+    fn the_nested_mode_is_the_stricter_of_caller_and_binding() {
+        let trace = Arc::new(RunTrace::new());
+        let rw = RunContext::new("acme", trace.clone())
+            .with_caller_policy(caller("flow:x", ShareMode::Read));
+        let nested = rw.for_nested_binding("flow:x");
+        assert_eq!(nested.mode(), ShareMode::Read);
+        assert!(Arc::ptr_eq(nested.trace(), &trace));
+        assert!(
+            nested.caller_policy().is_none(),
+            "the callee sets its own policy"
+        );
+
+        let read = RunContext::new("acme", trace.clone())
+            .with_mode(ShareMode::Read)
+            .with_caller_policy(caller("flow:x", ShareMode::ReadWrite));
+        assert_eq!(read.for_nested_binding("flow:x").mode(), ShareMode::Read);
+    }
+
+    #[test]
+    fn a2a_is_detached_even_when_configured() {
+        let ctx = RunContext::new("acme", Arc::new(RunTrace::new()))
+            .with_caller_policy(caller("a2a:recipe", ShareMode::ReadWrite));
+        assert_eq!(ctx.for_nested_binding("a2a:recipe").mode(), ShareMode::None);
+    }
+
+    #[tokio::test]
+    async fn under_binding_without_a_context_opens_none() {
+        let seen = under_binding("flow:x", async { RunContext::current().is_some() }).await;
+        assert!(!seen);
+    }
+
+    #[tokio::test]
+    async fn under_binding_shadows_and_restores() {
+        let ctx = RunContext::new("acme", Arc::new(RunTrace::new()))
+            .with_caller_policy(caller("flow:x", ShareMode::Read));
+        RunContext::scope(ctx, async {
+            let inner = under_binding("flow:x", async { RunContext::current() })
+                .await
+                .expect("shadowed context");
+            assert_eq!(inner.mode(), ShareMode::Read);
+            let after = RunContext::current().expect("outer restored");
+            assert_eq!(after.mode(), ShareMode::ReadWrite);
+            assert!(after.caller_policy().is_some());
+        })
+        .await;
+    }
+
+    #[test]
+    fn a_tool_outcome_is_narrow_for_every_viewer_its_owner_included() {
+        let t = RunTrace::new();
+        let me = StepId::fresh();
+        let other = StepId::fresh();
+        t.append_tool_outcome(
+            me,
+            "inner",
+            "lookup",
+            ToolOutcome::Ok,
+            "lookup -> SECRET-42",
+        );
+        t.append("inner", "reply", "found it");
+        for view in [
+            t.render_view_for(Some(me)),
+            t.render_view_for(Some(other)),
+            t.render_view_for(None),
+            t.render_view(),
+        ] {
+            let v = view.expect("view");
+            assert!(!v.contains("SECRET-42"), "{v}");
+            assert!(v.contains("lookup ok"), "{v}");
+            assert!(
+                v.contains("found it"),
+                "the reply crosses the boundary: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_tool_says_so_without_its_error_text() {
+        let t = RunTrace::new();
+        t.append_tool_outcome(
+            StepId::fresh(),
+            "inner",
+            "flow:x",
+            ToolOutcome::Failed,
+            "flow:x failed: db password wrong",
+        );
+        let v = t.render_view().expect("view");
+        assert!(v.contains("flow:x failed"), "{v}");
+        assert!(!v.contains("password"), "{v}");
+    }
+
+    #[test]
+    fn outcome_reads_the_error_key() {
+        assert_eq!(
+            ToolOutcome::of(&serde_json::json!({"ok": 1})),
+            ToolOutcome::Ok
+        );
+        assert_eq!(
+            ToolOutcome::of(&serde_json::json!({"error": null})),
+            ToolOutcome::Ok
+        );
+        assert_eq!(
+            ToolOutcome::of(&serde_json::json!({"error": "x"})),
+            ToolOutcome::Failed
+        );
+        assert_ne!(StepId::fresh(), StepId::fresh());
     }
 }

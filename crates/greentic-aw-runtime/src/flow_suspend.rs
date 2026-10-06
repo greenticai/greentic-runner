@@ -293,8 +293,20 @@ pub(crate) async fn resume_pending(
     let t0 = Instant::now();
     let outcome = match catalogs.flows.as_deref() {
         Some(cat) => {
-            cat.resume(&pending.flow_ref, pending.flow_snapshot.clone(), payload)
-                .await
+            // The parked call's binding; a call parked by a runtime older than
+            // `extension_id` (`#[serde(default)]`) has it empty. The policy is
+            // the RESUMING step's (set by `run_step`), so a sidecar changed
+            // between park and resume applies to the resume.
+            let binding = if pending.extension_id.is_empty() {
+                format!("flow:{}", pending.flow_ref)
+            } else {
+                pending.extension_id.clone()
+            };
+            crate::run_trace::under_binding(
+                &binding,
+                cat.resume(&pending.flow_ref, pending.flow_snapshot.clone(), payload),
+            )
+            .await
         }
         None => FlowInvokeOutcome::Completed(json!({
             "error": format!("unknown flow tool '{}'", pending.flow_ref)

@@ -349,4 +349,118 @@ mod tests {
         // of a `playbooks` one is the property.
         let _ = build_turn(host);
     }
+
+    struct RefundSource;
+    impl greentic_aw_runtime::PlaybookSource for RefundSource {
+        fn list_playbooks(&self) -> Vec<greentic_aw_runtime::PlaybookOperation> {
+            vec![greentic_aw_runtime::PlaybookOperation {
+                playbook_id: "refund".into(),
+                description: "Refund".into(),
+                parameters: serde_json::json!({ "type": "object" }),
+                instructions: "Follow the refund policy.".into(),
+                llm: PlaybookLlmRequirement::default(),
+                allow_list: vec![],
+                guardrails: vec![],
+            }]
+        }
+    }
+
+    /// The real `build_turn` awaits its nested step inline, so it inherits the
+    /// caller's context; the `playbook:` arm narrows it to the binding's mode.
+    async fn inner_prompt(mode: Option<greentic_aw_runtime::ShareMode>) -> String {
+        use greentic_aw_runtime::llm::LlmResponse;
+        use greentic_aw_runtime::mock::{MockConfigProvider, MockLlmBackend};
+        use greentic_aw_runtime::state::ToolCallRecord;
+
+        let inner_llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("refunded".into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]));
+        let host = PlaybookTurnHost {
+            state_store: Arc::new(greentic_aw_runtime::mock::MockAgentStateStore::new()),
+            ext_runtime: Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
+            llm: inner_llm.clone(),
+            telemetry: Arc::new(greentic_aw_runtime::mock::MockTelemetry::new()),
+            token_meter: Arc::new(greentic_aw_runtime::cost::MockTokenMeter::new(0)),
+            ledger: Arc::new(greentic_aw_runtime::mock::NoopToolLedger),
+            mcp: None,
+            components: None,
+            flows: None,
+            sorla: None,
+            a2a: None,
+        };
+        let outer_llm = Arc::new(MockLlmBackend::new(vec![
+            Ok(LlmResponse {
+                content: None,
+                tool_calls: vec![ToolCallRecord {
+                    call_id: "c1".into(),
+                    extension_id: "playbook:refund".into(),
+                    tool_name: "run".into(),
+                    args: serde_json::json!({}),
+                }],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+            Ok(LlmResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+        ]));
+        let tenant = TenantContext::new("acme", "prod");
+        let cp = MockConfigProvider::new();
+        let mut cfg = config_for(&request(PlaybookLlmTier::Balanced), "outer");
+        cfg.system_prompt = "sys".into();
+        cfg.tools = vec![tool("playbook:refund", "run")];
+        cp.insert(&tenant, "outer", cfg);
+        let policy = mode.map(|m| {
+            let mut modes = greentic_aw_runtime::BindingModes::new();
+            modes.insert("playbook:refund".to_string(), m);
+            let mut agents = std::collections::HashMap::new();
+            agents.insert("outer".to_string(), modes);
+            Arc::new(greentic_aw_runtime::SharePolicy::new(agents))
+        });
+        let outer = AgentRuntime::new(
+            Arc::new(cp),
+            Arc::new(greentic_aw_runtime::mock::MockAgentStateStore::new()),
+            Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
+            outer_llm,
+            Arc::new(greentic_aw_runtime::mock::MockTelemetry::new()),
+            Arc::new(greentic_aw_runtime::cost::MockTokenMeter::new(0)),
+            Arc::new(greentic_aw_runtime::mock::NoopToolLedger),
+            None,
+        )
+        .with_playbook_source(Some(Arc::new(
+            greentic_aw_runtime::PlaybookToolSource::new(Arc::new(RefundSource), build_turn(host)),
+        )))
+        .with_share_policy(policy);
+        let trace = Arc::new(greentic_aw_runtime::RunTrace::new());
+        trace.append("host", "reply", "SEED-PB");
+        greentic_aw_runtime::RunContext::scope(
+            greentic_aw_runtime::RunContext::new("acme", trace),
+            outer.step(tenant, "s-outer", "outer", AgentInput::default()),
+        )
+        .await
+        .unwrap();
+        inner_llm.seen_system_prompts.lock().unwrap()[0].clone()
+    }
+
+    #[tokio::test]
+    async fn the_real_playbook_turn_sees_the_caller_only_when_its_binding_allows() {
+        let read = inner_prompt(Some(greentic_aw_runtime::ShareMode::Read)).await;
+        assert!(read.contains("SEED-PB"), "{read}");
+        assert_eq!(
+            inner_prompt(None).await,
+            "Follow the refund policy.",
+            "default none"
+        );
+        assert_eq!(
+            inner_prompt(Some(greentic_aw_runtime::ShareMode::None)).await,
+            "Follow the refund policy.",
+            "an explicit none binding"
+        );
+    }
 }

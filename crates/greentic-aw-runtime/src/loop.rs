@@ -55,7 +55,43 @@ fn preflight_warn_tools(agent_id: &str, missing: &[crate::tools::MissingTool], d
     );
 }
 
+/// One agent turn.
+///
+/// When a run context is open, the turn runs under a re-scoped copy whose
+/// `caller_policy` is THIS agent's bindings, so every nested call it makes —
+/// a new `flow:` call, the resume of a parked one, a `playbook:` call — is
+/// judged against the agent that made it. This is the only place that sets
+/// the policy for an agent turn. A context bound to another tenant is
+/// replaced by a detached one, so nothing below can reach its trace.
 pub async fn run_step(
+    runtime: &AgentRuntime,
+    tenant: TenantContext,
+    session_id: &str,
+    agent_id: &str,
+    message: AgentInput,
+    observer: Arc<dyn StepObserver>,
+) -> Result<AgentOutput, AgentError> {
+    let Some(ctx) = crate::run_trace::RunContext::current() else {
+        return run_step_scoped(runtime, tenant, session_id, agent_id, message, observer).await;
+    };
+    let ctx = if ctx.tenant_id() == tenant.tenant_id {
+        ctx.with_caller_policy(runtime.share_modes_for(agent_id))
+    } else {
+        warn!(
+            context_tenant = ctx.tenant_id(),
+            step_tenant = %tenant.tenant_id,
+            "ignoring a run context bound to another tenant"
+        );
+        crate::run_trace::RunContext::detached(tenant.tenant_id.clone())
+    };
+    crate::run_trace::RunContext::scope(
+        ctx,
+        run_step_scoped(runtime, tenant, session_id, agent_id, message, observer),
+    )
+    .await
+}
+
+async fn run_step_scoped(
     runtime: &AgentRuntime,
     tenant: TenantContext,
     session_id: &str,
@@ -70,20 +106,21 @@ pub async fn run_step(
         .await?;
 
     // The run this step belongs to, if the caller opened one (see
-    // `RunContext::scope`). None is today's behaviour exactly.
-    // A context bound to another tenant is ignored, never shared across tenants.
-    let run_trace = crate::run_trace::RunContext::current().and_then(|c| {
-        if c.tenant_id() == tenant.tenant_id {
-            Some(c.trace().clone())
-        } else {
-            warn!(
-                context_tenant = c.tenant_id(),
-                step_tenant = %tenant.tenant_id,
-                "ignoring a run context bound to another tenant"
-            );
-            None
-        }
+    // `RunContext::scope`). `run_step` has already replaced a context bound to
+    // another tenant with a detached one; the tenant check stays as a second
+    // guard. A `none`-mode context is treated exactly like no context.
+    let run_ctx = crate::run_trace::RunContext::current().filter(|c| {
+        c.tenant_id() == tenant.tenant_id && c.mode() != crate::share_policy::ShareMode::None
     });
+    let run_trace = run_ctx.as_ref().map(|c| c.trace().clone());
+    // Only a read-write context records; a read-only one shows the view.
+    let record_to = run_ctx
+        .as_ref()
+        .filter(|c| c.mode() == crate::share_policy::ShareMode::ReadWrite)
+        .map(|c| c.trace().clone());
+    // Who this step is, for the owned tool outcomes it records and the view it
+    // reads: a raw result is shown only to the step that called the tool.
+    let step_id = crate::run_trace::StepId::fresh();
 
     // --- Cost budget gate (spec Decision 14) ---
     if let Some(cap) = config.limits.daily_token_cap_per_tenant {
@@ -483,7 +520,10 @@ pub async fn run_step(
         let request = LlmRequest {
             system_prompt: crate::run_trace::augment_system_prompt(
                 &system_prompt,
-                run_trace.as_ref().and_then(|t| t.render_view()).as_deref(),
+                run_trace
+                    .as_ref()
+                    .and_then(|t| t.render_view_for(Some(step_id)))
+                    .as_deref(),
             ),
             history: state.messages.clone(),
             tools: tools_schema,
@@ -811,10 +851,12 @@ pub async fn run_step(
                         // Surface the failure so audit/stream observers see a matching
                         // outcome instead of a dangling call.
                         observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
-                        if let Some(t) = &run_trace {
-                            t.append(
+                        if let Some(t) = &record_to {
+                            t.append_tool_outcome(
+                                step_id,
                                 agent_id,
-                                "tool",
+                                &call.tool_name,
+                                crate::run_trace::ToolOutcome::Failed,
                                 &crate::run_trace::summarise_result(&call.tool_name, &err_obs),
                             );
                         }
@@ -832,10 +874,12 @@ pub async fn run_step(
                 let duration_ms = t0.elapsed().as_millis() as u64;
 
                 observer.on_tool_result(&call.tool_name, &call.call_id, &result);
-                if let Some(t) = &run_trace {
-                    t.append(
+                if let Some(t) = &record_to {
+                    t.append_tool_outcome(
+                        step_id,
                         agent_id,
-                        "tool",
+                        &call.tool_name,
+                        crate::run_trace::ToolOutcome::of(&result),
                         &crate::run_trace::summarise_result(&call.tool_name, &result),
                     );
                 }
@@ -970,7 +1014,7 @@ pub async fn run_step(
         }
 
         if !reply.is_empty()
-            && let Some(t) = &run_trace
+            && let Some(t) = &record_to
         {
             t.append(agent_id, "reply", &reply);
         }
@@ -2146,6 +2190,33 @@ mod tests {
         })]))
     }
 
+    /// The reply recorded on the run trace must be the GUARDED one, so the
+    /// record has to come after the outbound chain. A behavioural test needs a
+    /// real guardrail WASM (`tests/guardrail_e2e.rs`, skipped when it is not
+    /// built); this pins the ordering in the source so the pin holds without it.
+    #[test]
+    fn the_reply_is_recorded_after_the_outbound_guardrail_chain() {
+        let src = include_str!("loop.rs");
+        let prod = &src[..src
+            .find("#[cfg(all(test, feature = \"test-mock\"))]")
+            .unwrap()];
+        let outbound = prod
+            .find("crate::guardrail::GuardrailDirection::Outbound,")
+            .expect("outbound chain call");
+        let record = prod
+            .find("t.append(agent_id, \"reply\", &reply)")
+            .expect("reply record");
+        assert!(
+            outbound < record,
+            "the reply must be recorded after the outbound chain"
+        );
+        assert_eq!(
+            prod.matches("t.append(agent_id, \"reply\"").count(),
+            1,
+            "exactly one reply record"
+        );
+    }
+
     #[tokio::test]
     async fn a_run_trace_view_is_injected_into_the_system_prompt() {
         let llm = one_reply("ok");
@@ -2245,5 +2316,90 @@ mod tests {
         let prompts = llm.seen_system_prompts.lock().unwrap();
         assert_eq!(prompts[0], "sys");
         assert_eq!(trace.events().len(), 1, "no event may be recorded");
+    }
+
+    fn seeded_trace() -> Arc<crate::run_trace::RunTrace> {
+        let t = Arc::new(crate::run_trace::RunTrace::new());
+        t.append("outer", "reply", "SEED-EVENT");
+        t
+    }
+
+    fn hi() -> AgentInput {
+        AgentInput {
+            text: "hi".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_none_mode_context_neither_injects_nor_records() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = seeded_trace();
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", trace.clone())
+                .with_mode(crate::share_policy::ShareMode::None),
+            runtime.step(tc.clone(), "sess-mode-none", "a", hi()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(llm.seen_system_prompts.lock().unwrap()[0], "sys");
+        assert_eq!(trace.events().len(), 1, "a none-mode step records nothing");
+    }
+
+    #[tokio::test]
+    async fn a_detached_context_shadows_the_open_one() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let outer = seeded_trace();
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", outer.clone()),
+            crate::run_trace::RunContext::scope(
+                crate::run_trace::RunContext::detached("acme"),
+                runtime.step(tc.clone(), "sess-detached", "a", hi()),
+            ),
+        )
+        .await
+        .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(
+            prompts[0], "sys",
+            "the outer view must not leak through the shadow"
+        );
+        assert_eq!(outer.events().len(), 1, "nothing reaches the outer trace");
+    }
+
+    #[tokio::test]
+    async fn a_read_mode_context_injects_but_records_nothing() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = seeded_trace();
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", trace.clone())
+                .with_mode(crate::share_policy::ShareMode::Read),
+            runtime.step(tc.clone(), "sess-read", "a", hi()),
+        )
+        .await
+        .unwrap();
+        assert!(llm.seen_system_prompts.lock().unwrap()[0].contains("SEED-EVENT"));
+        assert_eq!(trace.events().len(), 1, "a read-only step records nothing");
+    }
+
+    #[test]
+    fn the_runtime_hands_out_its_policy_per_agent() {
+        let tc = TenantContext::new("acme", "prod");
+        let mut modes = crate::share_policy::BindingModes::new();
+        modes.insert("flow:x".into(), crate::share_policy::ShareMode::Read);
+        let mut agents = std::collections::HashMap::new();
+        agents.insert("a".to_string(), modes);
+        let runtime = runtime_for_prompt_tests(one_reply("ok"), &tc).with_share_policy(Some(
+            Arc::new(crate::share_policy::SharePolicy::new(agents)),
+        ));
+        assert!(runtime.share_policy().is_some());
+        assert!(runtime.share_modes_for("a").is_some());
+        assert!(runtime.share_modes_for("b").is_none());
     }
 }

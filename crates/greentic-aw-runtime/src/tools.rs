@@ -578,10 +578,16 @@ pub(crate) async fn dispatch_flow_tool_interactive(
             serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") }),
         );
     };
-    match cat
-        .dispatch_interactive(flow_ref, &call.args.to_string())
-        .await
-    {
+    // A nested flow is `.await`ed here, so it inherits the run context; it
+    // runs under what the caller's policy grants this binding (shared
+    // context, Phase A2). Nothing changes when no context is open.
+    let args = call.args.to_string();
+    let outcome = crate::run_trace::under_binding(
+        &call.extension_id,
+        cat.dispatch_interactive(flow_ref, &args),
+    )
+    .await;
+    match outcome {
         crate::flow_source::FlowInvokeOutcome::Completed(value) => FlowToolDispatch::Value(value),
         crate::flow_source::FlowInvokeOutcome::Waiting {
             snapshot,
@@ -715,7 +721,11 @@ pub async fn dispatch_tool_call_in_conversation(
 
     if let Some(flow_ref) = call.extension_id.strip_prefix("flow:") {
         let value = match flows.as_deref() {
-            Some(cat) => cat.dispatch(flow_ref, &call.args.to_string()).await,
+            Some(cat) => {
+                let args = call.args.to_string();
+                crate::run_trace::under_binding(&call.extension_id, cat.dispatch(flow_ref, &args))
+                    .await
+            }
             None => {
                 tracing::warn!(flow = %flow_ref, "flow call has no catalog wired; returning error value");
                 serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") })
@@ -728,7 +738,17 @@ pub async fn dispatch_tool_call_in_conversation(
         // unknown playbook, unreadable arguments and a failed turn all into an
         // `{"error": ...}` value, so one skill cannot end the caller's step.
         let value = match playbooks.as_deref() {
-            Some(cat) => cat.dispatch(playbook_id, &call.args.to_string()).await,
+            Some(cat) => {
+                // A playbook turn is `.await`ed here and would inherit the
+                // whole run context; spec section 4.4 makes it `none` unless
+                // the caller's policy names this binding.
+                let args = call.args.to_string();
+                crate::run_trace::under_binding(
+                    &call.extension_id,
+                    cat.dispatch(playbook_id, &args),
+                )
+                .await
+            }
             None => {
                 tracing::warn!(
                     playbook = %playbook_id,
@@ -740,6 +760,12 @@ pub async fn dispatch_tool_call_in_conversation(
         return Ok(value);
     }
 
+    // `a2a:` never receives the run context (spec section 4.1): the call leaves
+    // this process over HTTP and nothing on this path reads
+    // `RunContext::current()`. Do not wrap it in `under_binding`;
+    // `ShareMode::for_binding` forces `None` for this prefix in case someone
+    // does. Pinned by `an_a2a_call_carries_nothing_from_the_run_context`
+    // (tests/a2a_loop.rs).
     if let Some(agent_id) = call.extension_id.strip_prefix("a2a:") {
         let value = match a2a.as_deref() {
             Some(catalog) => match a2a_continuations {

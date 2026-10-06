@@ -162,6 +162,9 @@ pub struct PackRuntime {
     /// Lazily-parsed `assets/a2a-routes.json` sidecar — see
     /// [`PackRuntime::a2a_routes`]. Twin of `mcp_routes`, read on first use.
     a2a_routes: std::sync::OnceLock<Option<crate::runner::a2a_pack_routes::PackA2aRoutes>>,
+    /// Lazily-parsed `assets/run-context.json` sidecar — see
+    /// [`PackRuntime::run_context`]. Twin of `a2a_routes`, read on first use.
+    run_context: std::sync::OnceLock<Option<crate::runner::run_context_routes::PackRunContext>>,
     /// Lazily-parsed `assets/sorla-routes.json` sidecar — see
     /// [`PackRuntime::sorla_routes`]. Twin of `mcp_routes`, read on first use.
     sorla_routes: std::sync::OnceLock<Option<crate::runner::sorla_pack_routes::PackSorlaRoutes>>,
@@ -2450,6 +2453,7 @@ impl PackRuntime {
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
+            run_context: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
@@ -3793,6 +3797,27 @@ impl PackRuntime {
             .as_ref()
     }
 
+    /// Per-binding sharing modes from the optional `assets/run-context.json`
+    /// sidecar (shared context, Phase A2). `None` when the pack carries none,
+    /// which means every binding of every agent is `none`.
+    ///
+    /// Parsed at most once per `PackRuntime` (lazily), but
+    /// `share_policy_from_packs` (agent_node.rs) calls it for EVERY pack at
+    /// each agent-runtime build, so the sidecar is in practice read when a
+    /// runtime is built, not only when an agent first shares.
+    pub fn run_context(&self) -> Option<&crate::runner::run_context_routes::PackRunContext> {
+        self.run_context
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::run_context_routes::RUN_CONTEXT_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::run_context_routes::PackRunContext::from_sidecar_bytes(
+                            &bytes,
+                        )
+                    })
+            })
+            .as_ref()
+    }
+
     /// SoR requirements from the optional `assets/sorla-routes.json` sidecar.
     ///
     /// `None` when the pack carries none — a pack built before the feature,
@@ -4164,6 +4189,7 @@ impl PackRuntime {
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
+            run_context: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
@@ -6270,6 +6296,7 @@ pub(crate) mod tests {
             runtime_refs: None,
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
+            run_context: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
             cache,

@@ -190,12 +190,31 @@ fn write_signed_extension_dir(wasm_src: &std::path::Path, dest_dir: &std::path::
 }
 
 /// Return the path to the built extension.wasm, or `None` if not present.
+///
+/// `PII_WASM` (a path to the `.wasm`) is tried first, then the sibling-checkout
+/// layout. With `REQUIRE_PII_WASM=1` a missing WASM panics instead of letting
+/// the tests skip, so CI cannot pass vacuously.
 fn pii_wasm_src() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("PII_WASM")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+    {
+        return Some(p);
+    }
     // CARGO_MANIFEST_DIR = <runner-root>/.worktrees/guardrail-capability/crates/greentic-aw-runtime
     // 5 levels up = <greentic-workspace-root>
     let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../../../component-guardrail-pii/dist/greentic.guardrail-pii/extension.wasm");
-    if p.exists() { Some(p) } else { None }
+    if p.exists() {
+        return Some(p);
+    }
+    if std::env::var("REQUIRE_PII_WASM").is_ok_and(|v| v == "1") {
+        panic!(
+            "REQUIRE_PII_WASM=1 but the component-guardrail-pii WASM was not found; \
+             set PII_WASM to the extension.wasm path or build the sibling checkout"
+        );
+    }
+    None
 }
 
 // ─── Smoke: verify signature chain works and the capability lands in registry ─
@@ -514,6 +533,24 @@ fn build_full_runtime(
     guardrail_config: serde_json::Value,
     mode: GuardrailMode,
 ) -> (AgentRuntime, TenantContext) {
+    build_full_runtime_with_llm(
+        wasm_src,
+        tmp,
+        ext_dir,
+        guardrail_config,
+        mode,
+        Arc::new(EchoLlmBackend),
+    )
+}
+
+fn build_full_runtime_with_llm(
+    wasm_src: &std::path::Path,
+    tmp: &tempfile::TempDir,
+    ext_dir: &std::path::Path,
+    guardrail_config: serde_json::Value,
+    mode: GuardrailMode,
+    llm: Arc<dyn LlmBackend>,
+) -> (AgentRuntime, TenantContext) {
     let paths = DiscoveryPaths::new(tmp.path().to_path_buf());
     // Root the trust store at the tempdir — see the note on the direct
     // construction above. Every caller of this helper registers a freshly
@@ -569,7 +606,7 @@ fn build_full_runtime(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
         ext_runtime,
-        Arc::new(EchoLlmBackend),
+        llm,
         Arc::new(MockTelemetry::new()),
         Arc::new(MockTokenMeter::new(0)),
         Arc::new(NoopToolLedger),
@@ -579,4 +616,74 @@ fn build_full_runtime(
 
     let _ = wasm_src; // consumed via write_signed_extension_dir; kept in signature for clarity
     (runtime, tc)
+}
+
+/// An LLM whose final reply always carries a raw email address, whatever the
+/// input was. With it, a masked recorded reply can only come from the OUTBOUND
+/// guardrail chain, not from inbound masking of the user's message.
+struct RawEmailLlm;
+
+impl LlmBackend for RawEmailLlm {
+    fn complete<'a>(
+        &'a self,
+        _req: LlmRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Ok(LlmResponse {
+                content: Some("reach them at raw@leak.com".into()),
+                tool_calls: vec![],
+                tokens_in: 1,
+                tokens_out: 1,
+            })
+        })
+    }
+}
+
+/// The reply recorded on the run trace is the GUARDED reply: what crosses an
+/// agent boundary has passed the producing agent's guardrails. The LLM emits a
+/// raw email regardless of input, so the mask can only be the outbound chain's.
+/// Skips when the PII guardrail WASM is not built beside the workspace.
+#[tokio::test]
+async fn the_trace_records_the_guarded_reply() {
+    let Some(wasm_src) = pii_wasm_src() else {
+        eprintln!("SKIP: component-guardrail-pii WASM not found");
+        return;
+    };
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let ext_dir = tmp.path().join("greentic.guardrail-pii");
+    std::fs::create_dir_all(&ext_dir).expect("create ext subdir");
+    write_signed_extension_dir(&wasm_src, &ext_dir);
+    let (runtime, tc) = build_full_runtime_with_llm(
+        &wasm_src,
+        &tmp,
+        &ext_dir,
+        serde_json::Value::Null,
+        GuardrailMode::Enforce,
+        Arc::new(RawEmailLlm),
+    );
+    let trace = Arc::new(greentic_aw_runtime::RunTrace::new());
+    let output = greentic_aw_runtime::RunContext::scope(
+        greentic_aw_runtime::RunContext::new("test-tenant", trace.clone()),
+        runtime.step(
+            tc,
+            "session-trace-guarded",
+            "pii-agent",
+            AgentInput {
+                text: "hello".into(),
+                conversational: false,
+                resume_payload: None,
+            },
+        ),
+    )
+    .await
+    .expect("step must succeed");
+    assert!(!output.reply.contains("raw@leak.com"), "{}", output.reply);
+    let events = trace.events();
+    let reply = events
+        .iter()
+        .find(|e| e.kind == "reply")
+        .expect("reply event");
+    assert!(!reply.summary.contains("raw@leak.com"), "{}", reply.summary);
 }
