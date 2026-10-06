@@ -62,6 +62,7 @@ async fn the_kill_switch_makes_zero_ledger_calls() {
         &TenantContext::new("acme", "prod"),
         "helper",
         AgentConfig {
+            on_text_while_parked: Default::default(),
             agent_id: "helper".into(),
             system_prompt: "sys-helper".into(),
             tools: vec![],
