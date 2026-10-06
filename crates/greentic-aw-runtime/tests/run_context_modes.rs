@@ -55,6 +55,7 @@ fn tool(ext: &str, name: &str) -> ToolRef {
 
 fn agent(id: &str, tools: Vec<ToolRef>) -> AgentConfig {
     AgentConfig {
+        on_text_while_parked: Default::default(),
         agent_id: id.into(),
         system_prompt: format!("sys-{id}"),
         tools,
