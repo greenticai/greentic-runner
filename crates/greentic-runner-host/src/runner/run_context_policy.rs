@@ -206,6 +206,7 @@ mod tests {
             &TenantContext::new("acme", "prod"),
             "a",
             AgentConfig {
+                on_text_while_parked: Default::default(),
                 agent_id: "a".into(),
                 system_prompt: "sys".into(),
                 tools: vec![ToolRef {

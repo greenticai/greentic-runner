@@ -30,6 +30,7 @@ fn tc() -> TenantContext {
 
 fn agent(id: &str) -> AgentConfig {
     AgentConfig {
+        on_text_while_parked: Default::default(),
         agent_id: id.into(),
         system_prompt: format!("sys-{id}"),
         tools: vec![],
