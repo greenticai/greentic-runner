@@ -111,6 +111,7 @@ fn runtime(llm: Vec<LlmResponse>, flows: Arc<FrameRecorder>) -> (AgentRuntime, T
         &tc,
         "a",
         AgentConfig {
+            on_text_while_parked: Default::default(),
             agent_id: "a".into(),
             system_prompt: "sys".into(),
             tools: vec![tool()],

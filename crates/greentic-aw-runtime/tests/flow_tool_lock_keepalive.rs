@@ -126,6 +126,7 @@ fn runtime(park_first: bool) -> (AgentRuntime, TenantContext, Arc<SlowFlow>) {
         &tc,
         "a",
         AgentConfig {
+            on_text_while_parked: Default::default(),
             agent_id: "a".into(),
             system_prompt: "sys".into(),
             tools: vec![ToolRef {

@@ -991,6 +991,7 @@ fn an_agent_gets_the_nested_agents_reply_through_a_flow_tool() -> Result<()> {
         &tc,
         "outer",
         AgentConfig {
+            on_text_while_parked: Default::default(),
             agent_id: "outer".into(),
             system_prompt: "sys".into(),
             tools: vec![ToolRef {
