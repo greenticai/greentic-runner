@@ -1886,6 +1886,7 @@ mod aw {
         ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
         unit: Option<String>,
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
     ) -> Option<Arc<AgentRuntime>> {
         use std::time::Duration;
 
@@ -2034,6 +2035,16 @@ mod aw {
             &packs,
             merged_agents.keys().map(String::as_str),
         );
+        // Shared context (Phase C): the user ledger, when the host passed a
+        // door target AND a pack names an agent. Computed here, beside
+        // `share_policy`, because `merged_agents` is moved just below. Bound to
+        // `tenant`, the tenant this runtime's turns run under.
+        let ledger_binding = crate::runner::user_ledger_policy::user_ledger_binding(
+            &tenant,
+            &packs,
+            merged_agents.keys().map(String::as_str),
+            user_ledger,
+        );
         let agent_count = merged_agents.len();
         let overlay = ManifestToolOverlayProvider::new(
             HostConfigProvider::new(merged_agents),
@@ -2141,7 +2152,8 @@ mod aw {
         .with_sorla_source(sorla)
         .with_a2a_source(a2a)
         .with_playbook_source(playbooks)
-        .with_share_policy(share_policy);
+        .with_share_policy(share_policy)
+        .with_user_ledger(ledger_binding);
 
         // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
         // `dw.agent` workers ground on the ingested corpus exactly as the
@@ -2229,6 +2241,7 @@ mod aw {
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
     ) -> Option<AgentNodeWiring> {
         // The deployed unit (`bundle_id`) doubles as the MCP credential scope:
         // the same identity billing attributes this runtime's spend to.
@@ -2243,6 +2256,7 @@ mod aw {
             ledger,
             project_id.clone(),
             billing_meter,
+            user_ledger,
         )
         .await?;
         let handler: Arc<dyn AgentNodeHandler> = Arc::new(RuntimeAgentNodeHandler::new(
@@ -2363,6 +2377,8 @@ mod aw {
             stream_observers,
             project_id,
             resolve_billing_meter(None),
+            // The un-metered wrappers carry no host seam: no user ledger.
+            None,
         )
         .await
     }
@@ -2411,6 +2427,7 @@ mod aw {
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
     ) -> Option<AgentNodeWiring> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
@@ -2438,6 +2455,7 @@ mod aw {
             stream_observers,
             project_id,
             billing_meter,
+            user_ledger,
         )
         .await
     }
@@ -2508,6 +2526,8 @@ mod aw {
             stream_observers,
             project_id,
             resolve_billing_meter(None),
+            // The un-metered wrappers carry no host seam: no user ledger.
+            None,
         )
         .await
     }
@@ -2526,6 +2546,7 @@ mod aw {
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
     ) -> Option<AgentNodeWiring> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
@@ -2566,6 +2587,7 @@ mod aw {
             stream_observers,
             project_id,
             billing_meter,
+            user_ledger,
         )
         .await
     }
@@ -3178,6 +3200,7 @@ mod aw {
                 // No host-installed meter: the env-configured sink, exactly
                 // what every builder resolved before the seam existed.
                 resolve_billing_meter(None),
+                None,
             )
             .await
             .expect("handler should build from mock stores")
@@ -3285,6 +3308,7 @@ mod aw {
                 None,
                 Some("support-bot".to_string()),
                 chosen,
+                None,
             )
             .await
             .expect("handler should build from mock stores")
@@ -4395,6 +4419,7 @@ mod aw {
                     ledger,
                     None,
                     None,
+                    None,
                 )
                 .await
             }
@@ -4752,6 +4777,7 @@ mod aw {
                     Arc::new(NoopToolLedger),
                     Some("worker-a".to_string()),
                     None,
+                    None,
                 )
                 .await
                 .expect("runtime should build")
@@ -4808,6 +4834,7 @@ mod aw {
                     Arc::new(NoopToolLedger),
                     Some("worker-a".to_string()),
                     None,
+                    None,
                 )
                 .await
                 .expect("runtime should build")
@@ -4830,6 +4857,106 @@ mod aw {
             assert!(
                 build(without.path()).await.share_policy().is_none(),
                 "control"
+            );
+        }
+
+        /// Wiring guard: the in-process runtime carries the user ledger only
+        /// when the host passed a target AND the pack names an agent. A dropped
+        /// `.with_user_ledger(..)` would only show as a ledger that never runs.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn the_in_process_runtime_carries_the_user_ledger_binding() {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+                std::env::remove_var("GREENTIC_AW_USER_LEDGER");
+            }
+
+            fn target() -> Option<greentic_aw_runtime::user_ledger::UserLedgerTarget> {
+                Some(greentic_aw_runtime::user_ledger::UserLedgerTarget::new(
+                    "https://admin.example/api/v1/ingest/ledger",
+                    "gtm_t",
+                    "alpha",
+                ))
+            }
+
+            async fn build(
+                pack_dir: &std::path::Path,
+                user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+            ) -> Arc<AgentRuntime> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                let secrets: crate::secrets::DynSecretsManager =
+                    Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+                let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(pack_dir));
+                super::build_runtime_with_stores(
+                    agents,
+                    "t1".to_string(),
+                    secrets,
+                    None,
+                    vec![pack],
+                    Arc::new(MockAgentStateStore::new()),
+                    Arc::new(MockTokenMeter::new(0)),
+                    Arc::new(NoopToolLedger),
+                    Some("worker-a".to_string()),
+                    None,
+                    user_ledger,
+                )
+                .await
+                .expect("runtime should build")
+            }
+
+            let with_sidecar = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(with_sidecar.path().join("assets")).unwrap();
+            std::fs::write(
+                with_sidecar.path().join("assets/user-ledger.json"),
+                br#"{"greeter":"read_write"}"#,
+            )
+            .unwrap();
+            let rt = build(with_sidecar.path(), target()).await;
+            let binding = rt
+                .user_ledger()
+                .expect("a target plus a sidecar naming the agent must install a binding");
+            // Bound to the tenant the runtime was built for ("t1").
+            let alice = greentic_aw_runtime::VerifiedCaller {
+                user_verified: true,
+                sub: Some("alice".into()),
+                ..Default::default()
+            };
+            assert!(
+                binding
+                    .turn_for(
+                        &TenantContext::new("t1", "e").with_caller(Some(alice.clone())),
+                        "greeter"
+                    )
+                    .is_some(),
+                "the binding must serve a verified turn of the runtime's own tenant"
+            );
+            assert!(
+                binding
+                    .turn_for(
+                        &TenantContext::new("other", "e").with_caller(Some(alice)),
+                        "greeter"
+                    )
+                    .is_none()
+            );
+            assert!(
+                build(with_sidecar.path(), None)
+                    .await
+                    .user_ledger()
+                    .is_none(),
+                "control: a sidecar with no host target is off"
+            );
+            let without = tempfile::tempdir().unwrap();
+            assert!(
+                build(without.path(), target())
+                    .await
+                    .user_ledger()
+                    .is_none(),
+                "control: a target with no sidecar is off"
             );
         }
 

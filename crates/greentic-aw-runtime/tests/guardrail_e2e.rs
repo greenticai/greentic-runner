@@ -687,3 +687,100 @@ async fn the_trace_records_the_guarded_reply() {
         .expect("reply event");
     assert!(!reply.summary.contains("raw@leak.com"), "{}", reply.summary);
 }
+
+/// Records every append (reads answer nothing).
+#[derive(Default)]
+struct RecordingLedger {
+    appends: std::sync::Mutex<Vec<String>>,
+}
+
+impl greentic_aw_runtime::user_ledger::UserLedger for RecordingLedger {
+    fn read<'a>(
+        &'a self,
+        _s: &'a str,
+        _l: u32,
+    ) -> greentic_aw_runtime::user_ledger::LedgerFuture<
+        'a,
+        Vec<greentic_aw_runtime::user_ledger::LedgerEvent>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn append<'a>(
+        &'a self,
+        _s: &'a str,
+        _k: &'a str,
+        summary: &'a str,
+    ) -> greentic_aw_runtime::user_ledger::LedgerFuture<'a, ()> {
+        self.appends
+            .lock()
+            .expect("appends lock")
+            .push(summary.to_string());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The user ledger records the GUARDED reply (spec 4.1): what the user was
+/// shown, never the raw LLM text. The LLM emits a raw email regardless of
+/// input, so the mask can only be the outbound chain's. Skips when the PII
+/// guardrail WASM is not built beside the workspace.
+#[tokio::test]
+async fn the_user_ledger_records_the_guarded_reply() {
+    let Some(wasm_src) = pii_wasm_src() else {
+        eprintln!("SKIP: component-guardrail-pii WASM not found");
+        return;
+    };
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let ext_dir = tmp.path().join("greentic.guardrail-pii");
+    std::fs::create_dir_all(&ext_dir).expect("create ext subdir");
+    write_signed_extension_dir(&wasm_src, &ext_dir);
+    let (runtime, tc) = build_full_runtime_with_llm(
+        &wasm_src,
+        &tmp,
+        &ext_dir,
+        serde_json::Value::Null,
+        GuardrailMode::Enforce,
+        Arc::new(RawEmailLlm),
+    );
+    let ledger = Arc::new(RecordingLedger::default());
+    let dyn_ledger: Arc<dyn greentic_aw_runtime::user_ledger::UserLedger> = ledger.clone();
+    let runtime =
+        runtime.with_user_ledger(Some(Arc::new(greentic_aw_runtime::UserLedgerBinding::new(
+            "test-tenant",
+            dyn_ledger,
+            std::collections::HashMap::from([(
+                "pii-agent".to_string(),
+                greentic_aw_runtime::user_ledger::LedgerMode::ReadWrite,
+            )]),
+        ))));
+    let tc = tc.with_caller(Some(greentic_aw_runtime::VerifiedCaller {
+        user_verified: true,
+        sub: Some("sub-1".into()),
+        ..greentic_aw_runtime::VerifiedCaller::default()
+    }));
+    let output = runtime
+        .step(
+            tc,
+            "session-ledger-guarded",
+            "pii-agent",
+            AgentInput {
+                text: "hello".into(),
+                conversational: false,
+                resume_payload: None,
+            },
+        )
+        .await
+        .expect("step must succeed");
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!output.reply.contains("raw@leak.com"), "{}", output.reply);
+    let appends = ledger.appends.lock().expect("appends lock").clone();
+    assert_eq!(appends.len(), 1, "{appends:?}");
+    assert!(!appends[0].contains("raw@leak.com"), "{}", appends[0]);
+    assert_eq!(
+        Some(appends[0].clone()),
+        greentic_aw_runtime::user_ledger::summary_of(&output.reply),
+        "the ledger gets what the user saw"
+    );
+}

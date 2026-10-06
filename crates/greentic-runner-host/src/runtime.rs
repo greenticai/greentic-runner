@@ -363,6 +363,8 @@ pub struct RevisionHostOptions {
     billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
     run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
     approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
+    #[cfg(feature = "agentic-worker")]
+    user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
 }
 
 impl std::fmt::Debug for RevisionHostOptions {
@@ -372,6 +374,8 @@ impl std::fmt::Debug for RevisionHostOptions {
         out.field("billing_meter", &self.billing_meter.is_some());
         out.field("run_outcome_sink", &self.run_outcome_sink.is_some());
         out.field("approval_inbox", &self.approval_inbox.is_some());
+        #[cfg(feature = "agentic-worker")]
+        out.field("user_ledger", &self.user_ledger.is_some());
         out.finish()
     }
 }
@@ -425,6 +429,37 @@ impl RevisionHostOptions {
         target: crate::runner::approval_http::ApprovalInboxTarget,
     ) -> Self {
         self.approval_inbox = Some(target);
+        self
+    }
+
+    /// Read and append this unit's user ledger (shared context, Phase C) at
+    /// the admin's ledger door. greentic-start builds the target from the same
+    /// staged `metering` block as the approval inbox: `base_url` is the
+    /// worker-usage endpoint with its last segment swapped for `ledger`,
+    /// `token` the unit's metering token, `tenant_slug` the block's slug. The
+    /// runner never reads that block itself.
+    ///
+    /// Nothing happens unless a pack also names an agent in
+    /// `assets/user-ledger.json`, and only a turn whose caller the provider
+    /// verified, outside any tool call, touches the ledger. That sidecar alone
+    /// decides `read` versus `read_write` for the pack's own agents: there is
+    /// no host-side ceiling on the mode. The gates are the door token's
+    /// `ledger` purpose (the admin refuses a token without it), the
+    /// `GREENTIC_AW_USER_LEDGER` kill switch, the tenant match between the
+    /// runtime and the turn, and a provider-verified subject. A target that
+    /// fails validation (blank field, cleartext URL off loopback, userinfo in
+    /// the URL) is one warning and the runtime loads without the ledger;
+    /// validate early with
+    /// [`greentic_aw_runtime::user_ledger::HttpUserLedger::new`]. The admin
+    /// refuses a token without the `ledger` purpose, and the client then
+    /// stops asking for a while. `GREENTIC_AW_USER_LEDGER=0` turns it off.
+    #[cfg(feature = "agentic-worker")]
+    #[must_use]
+    pub fn with_user_ledger(
+        mut self,
+        target: greentic_aw_runtime::user_ledger::UserLedgerTarget,
+    ) -> Self {
+        self.user_ledger = Some(target);
         self
     }
 }
@@ -555,6 +590,8 @@ impl TenantRuntime {
             None,
             None,
             None,
+            #[cfg(feature = "agentic-worker")]
+            None,
         )
         .await
     }
@@ -627,6 +664,8 @@ impl TenantRuntime {
             options.billing_meter,
             options.run_outcome_sink,
             options.approval_inbox,
+            #[cfg(feature = "agentic-worker")]
+            options.user_ledger,
         )
         .await
     }
@@ -654,6 +693,9 @@ impl TenantRuntime {
         >,
         run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
         approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
+        #[cfg(feature = "agentic-worker")] user_ledger: Option<
+            greentic_aw_runtime::user_ledger::UserLedgerTarget,
+        >,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -757,6 +799,8 @@ impl TenantRuntime {
             billing_meter,
             run_outcome_sink,
             approval_inbox,
+            #[cfg(feature = "agentic-worker")]
+            user_ledger,
         )
         .await
     }
@@ -879,6 +923,9 @@ impl TenantRuntime {
             None,
             None,
             None,
+            // ... and no host-provided user ledger target.
+            #[cfg(feature = "agentic-worker")]
+            None,
         )
         .await
     }
@@ -908,6 +955,9 @@ impl TenantRuntime {
         >,
         run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
         approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
+        #[cfg(feature = "agentic-worker")] user_ledger: Option<
+            greentic_aw_runtime::user_ledger::UserLedgerTarget,
+        >,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
@@ -1147,6 +1197,7 @@ impl TenantRuntime {
                     stream_observers.clone(),
                     agent_project_id.clone(),
                     billing_meter.clone(),
+                    user_ledger.clone(),
                 )
                 .await
             } else {
@@ -1162,6 +1213,7 @@ impl TenantRuntime {
                         stream_observers.clone(),
                         agent_project_id.clone(),
                         billing_meter.clone(),
+                        user_ledger.clone(),
                     )
                     .await
                 }
@@ -1177,6 +1229,7 @@ impl TenantRuntime {
                         stream_observers.clone(),
                         agent_project_id.clone(),
                         billing_meter.clone(),
+                        user_ledger.clone(),
                     )
                     .await
                 }
