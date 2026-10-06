@@ -165,6 +165,11 @@ pub struct PackRuntime {
     /// Lazily-parsed `assets/run-context.json` sidecar — see
     /// [`PackRuntime::run_context`]. Twin of `a2a_routes`, read on first use.
     run_context: std::sync::OnceLock<Option<crate::runner::run_context_routes::PackRunContext>>,
+    /// Handlers a `flow:` tool's per-call engine borrows from the host that
+    /// wired the top-level engine — see [`crate::runner::nested_flow`].
+    /// Write-once; empty means "nested engines get no handler" (the
+    /// pre-existing behaviour).
+    nested_flow_handlers: std::sync::OnceLock<crate::runner::nested_flow::NestedFlowHandlers>,
     /// Lazily-parsed `assets/sorla-routes.json` sidecar — see
     /// [`PackRuntime::sorla_routes`]. Twin of `mcp_routes`, read on first use.
     sorla_routes: std::sync::OnceLock<Option<crate::runner::sorla_pack_routes::PackSorlaRoutes>>,
@@ -2454,9 +2459,25 @@ impl PackRuntime {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
+    }
+
+    /// Lend this pack's flow-tool engines the host's node handlers. Called
+    /// once per pack by the host after it wired its top-level engine; a
+    /// second call keeps the first registration and warns.
+    pub fn set_nested_flow_handlers(
+        &self,
+        handlers: crate::runner::nested_flow::NestedFlowHandlers,
+    ) {
+        if self.nested_flow_handlers.set(handlers).is_err() {
+            tracing::warn!(
+                pack_id = self.metadata.pack_id.as_str(),
+                "nested flow-tool handlers already registered for this pack; keeping the first"
+            );
+        }
     }
 
     /// Bind this pack instance to the deployed unit it belongs to (the
@@ -2581,7 +2602,12 @@ impl PackRuntime {
             )
             .await?,
         );
-        let engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
+        let mut engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
+        // Read from `self` (the pack the host built its agent runtime over),
+        // not from the freshly loaded `pack`, whose slot is empty.
+        if let Some(handlers) = self.nested_flow_handlers.get() {
+            handlers.install_on(&mut engine);
+        }
         Ok((pack, engine))
     }
 
@@ -2616,16 +2642,23 @@ impl PackRuntime {
     async fn execute_flow_inner(
         &self,
         flow_id: &str,
-        input: serde_json::Value,
+        mut input: serde_json::Value,
     ) -> Result<FlowExecution> {
+        let frame = crate::runner::nested_flow::enter(flow_id).map_err(anyhow::Error::msg)?;
         let (pack, engine) = self.load_flow_engine().await?;
+        // The input is the model's tool arguments: the caller it names is
+        // replaced by the OUTER step's host-stamped one BEFORE `caller_block`
+        // reads it (see `nested_flow::pin_caller`).
+        crate::runner::nested_flow::pin_caller(&mut input);
         // Same single establishment point as the ingress path, for callers
         // that drive a flow directly — see `crate::caller_identity`.
         // Cloned rather than borrowed: `input` is moved into the run below,
         // and the context must outlive that move.
         let caller_block = crate::caller_identity::caller_block(&input).cloned();
         let ctx = self.direct_flow_ctx(&pack, flow_id, caller_block.as_ref());
-        engine.execute(ctx, input).await
+        // `ctx.session_id` stays `None` on purpose; a `dw.agent` in this flow
+        // reads its session from the frame (`nested_flow::agent_session_for`).
+        crate::runner::nested_flow::scope(frame, engine.execute(ctx, input)).await
     }
 
     #[allow(dead_code)]
@@ -2702,7 +2735,7 @@ impl PackRuntime {
         &self,
         flow_id: &str,
         snapshot: serde_json::Value,
-        input: serde_json::Value,
+        mut input: serde_json::Value,
     ) -> Result<ToolFlowOutcome, String> {
         let snapshot: FlowSnapshot = serde_json::from_value(snapshot)
             .map_err(|e| format!("flow '{flow_id}': unreadable resume snapshot: {e}"))?;
@@ -2712,14 +2745,18 @@ impl PackRuntime {
                 snapshot.flow_id
             ));
         }
+        let frame = crate::runner::nested_flow::enter(flow_id)?;
         let (pack, engine) = self.load_flow_engine().await.map_err(|e| e.to_string())?;
+        // Same rule as the call: the resume input is model-reachable text, so
+        // its caller is the outer step's, substituted before it is read.
+        crate::runner::nested_flow::pin_caller(&mut input);
         let caller_block = crate::caller_identity::caller_block(&input).cloned();
         let snapshot_flow = snapshot.flow_id.clone();
         let ctx = self.direct_flow_ctx(&pack, &snapshot_flow, caller_block.as_ref());
-        let execution = engine
-            .resume(ctx, snapshot, input)
-            .await
-            .map_err(|e| e.to_string())?;
+        let execution =
+            crate::runner::nested_flow::scope(frame, engine.resume(ctx, snapshot, input))
+                .await
+                .map_err(|e| e.to_string())?;
         tool_flow_outcome(flow_id, execution)
     }
 
@@ -4190,6 +4227,7 @@ impl PackRuntime {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
         })
@@ -6297,6 +6335,7 @@ pub(crate) mod tests {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
             unit_id: None,
             cache,

@@ -278,6 +278,7 @@ pub(crate) fn last_user_text(state: &ConversationState) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resume_pending(
     runtime: &AgentRuntime,
+    lock: &crate::state::SessionLock,
     tenant: &TenantContext,
     session_id: &str,
     catalogs: &ToolCatalogs,
@@ -304,7 +305,22 @@ pub(crate) async fn resume_pending(
             };
             crate::run_trace::under_binding(
                 &binding,
-                cat.resume(&pending.flow_ref, pending.flow_snapshot.clone(), payload),
+                // Same frame as the call that parked (same call id), so the
+                // host resumes a nested agent under the session it parked in.
+                // The resume can run a nested agent turn too: keep the
+                // caller's lock alive while it is pending.
+                crate::lock_keepalive::keep_alive(
+                    lock,
+                    crate::lock_keepalive::LOCK_KEEPALIVE_INTERVAL,
+                    crate::tool_call_frame::within(
+                        crate::tool_call_frame::ToolCallFrame::new(
+                            Some(session_id),
+                            &pending.call_id,
+                        )
+                        .with_caller(tenant.caller_or_anonymous()),
+                        cat.resume(&pending.flow_ref, pending.flow_snapshot.clone(), payload),
+                    ),
+                ),
             )
             .await
         }

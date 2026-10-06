@@ -1041,6 +1041,13 @@ impl TenantRuntime {
         // off by default (zero behaviour change).
         let audit_nats_client = dispatch_nats_client.clone();
 
+        // The dw.agent handler, kept so flow-tool engines can borrow it
+        // (`runner::nested_flow`) once the dispatch mode is known below.
+        #[cfg(feature = "agentic-worker")]
+        let mut nested_agent_handler: Option<
+            Arc<dyn crate::runner::agent_node::AgentNodeHandler>,
+        > = None;
+
         #[cfg(feature = "agentic-worker")]
         {
             use crate::runner::agent_node::{
@@ -1181,6 +1188,7 @@ impl TenantRuntime {
                 .as_ref()
                 .map(|wiring| Arc::clone(&wiring.runtime));
             if let Some(wiring) = agent_handler {
+                nested_agent_handler = Some(Arc::clone(&wiring.handler));
                 engine.set_agent_node_handler(wiring.handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
             }
@@ -1401,6 +1409,28 @@ impl TenantRuntime {
             let dw_dispatch =
                 crate::runner::agent_node::dw_agent_dispatch_mode(|k| std::env::var(k).ok());
             engine.set_dw_agent_dispatch(dw_dispatch);
+            // Lend the handler to flow-tool engines, on the SAME
+            // `Arc<PackRuntime>`s the agent runtime's flow invoker holds (the
+            // slot lives on the instance). Only for in-process dispatch: over
+            // NATS a nested engine has no remote handler and must keep
+            // failing loudly. `GREENTIC_AW_NESTED_FLOW_AGENTS=0` opts out.
+            // The opt-out is reported only when it changed something: with
+            // nothing to lend (NATS, no handler) there is nothing opted out of.
+            if let Some(handlers) =
+                crate::runner::nested_flow::for_dispatch(dw_dispatch, nested_agent_handler.as_ref())
+            {
+                if crate::runner::nested_flow::nested_flow_agents_enabled() {
+                    for pack in &pack_runtimes {
+                        pack.set_nested_flow_handlers(handlers.clone());
+                    }
+                    tracing::info!("dw.agent handler lent to flow-tool engines");
+                } else {
+                    tracing::info!(
+                        env = crate::runner::nested_flow::NESTED_FLOW_AGENTS_ENV,
+                        "dw.agent handler not lent to flow-tool engines (opted out)"
+                    );
+                }
+            }
             if matches!(
                 dw_dispatch,
                 crate::runner::agent_node::DwAgentDispatch::Nats

@@ -1934,7 +1934,13 @@ impl FlowEngine {
             .agent_node_handler
             .as_ref()
             .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")?;
-        let session_id = ctx.session_id.unwrap_or("");
+        // Inside a `flow:` tool the flow context has no session; the nested
+        // agent then runs under the session the tool call derived
+        // (`nested_flow`), never `""` (one conversation shared by every user
+        // of the tenant) and never the caller's (whose lock it holds).
+        let session_owned = crate::runner::nested_flow::agent_session_for(ctx.session_id)
+            .map_err(anyhow::Error::msg)?;
+        let session_id = session_owned.as_str();
         let started = std::time::Instant::now();
         let mut result = handler
             .execute_with_resume(
