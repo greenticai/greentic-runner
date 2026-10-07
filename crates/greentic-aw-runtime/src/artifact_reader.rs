@@ -56,8 +56,13 @@ pub struct ArtifactBytes {
 pub enum ArtifactError {
     #[error("artifact not found")]
     NotFound,
+    /// HTTP 401: the door does not accept the token.
     #[error("artifact door refused the credential")]
     Unauthorized,
+    /// HTTP 403: the token is valid but lacks the `artifacts` purpose, the
+    /// commonest misconfiguration, so it is kept apart from `Unauthorized`.
+    #[error("artifact door token does not grant the artifacts purpose")]
+    PurposeNotGranted,
     #[error("artifact exceeds the size limit")]
     TooLarge,
     #[error("artifact door unavailable: {0}")]
@@ -71,6 +76,22 @@ pub trait ArtifactReader: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<ArtifactBytes, ArtifactError>> + Send + 'a>>;
 }
 
+/// Why a reader could not be built. Never carries the token or the endpoint.
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactClientError {
+    #[error("artifact door token is empty")]
+    EmptyToken,
+    #[error("artifact door token contains a control character")]
+    InvalidToken,
+    #[error("artifact http client could not be built")]
+    Client,
+}
+
+/// Reads one artifact from the admin door.
+///
+/// Memory: one read can hold roughly 14 MB of raw response body, a 14 MB base64
+/// string and the 10 MB decoded bytes at the same time. The CALLER (the Task 6
+/// wiring) must bound the number of concurrent reads.
 pub struct HttpArtifactReader {
     client: reqwest::Client,
     endpoint: String,
@@ -90,23 +111,41 @@ impl HttpArtifactReader {
     /// `endpoint` is the door base (`.../api/v1/ingest/artifacts`); `get` posts to
     /// `<endpoint>/get`. The endpoint must be https (or loopback http); any other
     /// scheme makes every read fail rather than send the token in the clear.
-    pub fn new(endpoint: String, token: String) -> Self {
+    ///
+    /// Fails for an empty token, a token with control characters, or a client
+    /// that cannot be built (never falling back to a default client, which has
+    /// no redirect policy and no timeouts).
+    pub fn new(endpoint: String, token: String) -> Result<Self, ArtifactClientError> {
         Self::with_timeouts(endpoint, token, CONNECT_TIMEOUT, TOTAL_TIMEOUT)
     }
 
-    fn with_timeouts(endpoint: String, token: String, connect: Duration, total: Duration) -> Self {
+    fn with_timeouts(
+        endpoint: String,
+        token: String,
+        connect: Duration,
+        total: Duration,
+    ) -> Result<Self, ArtifactClientError> {
+        if token.trim().is_empty() {
+            return Err(ArtifactClientError::EmptyToken);
+        }
+        if token.chars().any(char::is_control) {
+            return Err(ArtifactClientError::InvalidToken);
+        }
         // A redirect would resend the bearer token to wherever it points.
         let client = reqwest::Client::builder()
             .connect_timeout(connect)
             .timeout(total)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default();
-        Self {
+            // A builder failure cannot be provoked from a test; by construction
+            // it is an error here, never a default client (no redirects policy,
+            // no timeouts).
+            .map_err(|_| ArtifactClientError::Client)?;
+        Ok(Self {
             client,
             endpoint,
             token,
-        }
+        })
     }
 
     fn get_url(&self) -> Result<reqwest::Url, ArtifactError> {
@@ -134,14 +173,36 @@ fn is_artifact_ref(s: &str) -> bool {
     })
 }
 
+/// Unicode format (Cf) characters and line/paragraph separators (Zl, Zp):
+/// invisible, and able to reorder or hide text around them.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+        | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
 fn clean_name(name: Option<String>) -> Option<String> {
     let cleaned: String = name?
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible(*c))
         .take(MAX_NAME_CHARS)
         .collect();
-    let cleaned = cleaned.trim().to_string();
-    (!cleaned.is_empty()).then_some(cleaned)
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty() && cleaned != "." && cleaned != "..").then(|| cleaned.to_string())
+}
+
+/// Trim, ASCII-lowercase and drop any `;` parameters, then require a v1 type.
+/// Returns the canonical allow-list entry, never the door's own text.
+fn canonical_mime(raw: &str) -> Option<&'static str> {
+    let base = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    ALLOWED_MIME.iter().copied().find(|m| *m == base)
 }
 
 #[derive(serde::Deserialize)]
@@ -195,7 +256,8 @@ impl ArtifactReader for HttpArtifactReader {
                 .map_err(|e| ArtifactError::Unavailable(e.without_url().to_string()))?;
             match response.status().as_u16() {
                 200 => {}
-                401 | 403 => return Err(ArtifactError::Unauthorized),
+                401 => return Err(ArtifactError::Unauthorized),
+                403 => return Err(ArtifactError::PurposeNotGranted),
                 404 => return Err(ArtifactError::NotFound),
                 413 => return Err(ArtifactError::TooLarge),
                 // 415, 422, 429, 503, redirects and anything else: not served.
@@ -204,11 +266,11 @@ impl ArtifactReader for HttpArtifactReader {
             let raw = read_capped(response).await?;
             let body: GetBody = serde_json::from_slice(&raw)
                 .map_err(|_| ArtifactError::Unavailable("door sent an unreadable answer".into()))?;
-            if !ALLOWED_MIME.contains(&body.mime_type.as_str()) {
+            let Some(mime_type) = canonical_mime(&body.mime_type) else {
                 return Err(ArtifactError::Unavailable(
                     "door sent an unsupported media type".into(),
                 ));
-            }
+            };
             if body.size_bytes > MAX_ARTIFACT_BYTES as u64 {
                 return Err(ArtifactError::TooLarge);
             }
@@ -224,7 +286,7 @@ impl ArtifactReader for HttpArtifactReader {
                 ));
             }
             Ok(ArtifactBytes {
-                mime_type: body.mime_type,
+                mime_type: mime_type.to_string(),
                 name: clean_name(body.name),
                 bytes,
             })
@@ -251,7 +313,7 @@ mod tests {
     }
 
     async fn reader_for(server: &MockServer) -> HttpArtifactReader {
-        HttpArtifactReader::new(format!("{}/artifacts", server.uri()), "gtm_secret".into())
+        HttpArtifactReader::new(format!("{}/artifacts", server.uri()), "gtm_secret".into()).unwrap()
     }
 
     #[tokio::test]
@@ -278,7 +340,7 @@ mod tests {
         for (status, want) in [
             (404u16, "NotFound"),
             (401, "Unauthorized"),
-            (403, "Unauthorized"),
+            (403, "PurposeNotGranted"),
             (413, "TooLarge"),
             (415, "Unavailable"),
             (422, "Unavailable"),
@@ -477,7 +539,8 @@ mod tests {
             "gtm_secret".into(),
             Duration::from_millis(200),
             Duration::from_millis(300),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             reader.get(&aid('a')).await,
             Err(ArtifactError::Unavailable(_))
@@ -490,7 +553,8 @@ mod tests {
         let reader = HttpArtifactReader::new(
             "http://127.0.0.1:1/artifacts".into(),
             "gtm_topsecret".into(),
-        );
+        )
+        .unwrap();
         let err = reader.get(&aid('a')).await.unwrap_err();
         let text = format!("{err} {err:?}");
         assert!(
@@ -501,7 +565,8 @@ mod tests {
         let reader = HttpArtifactReader::new(
             "http://admin.example/artifacts".into(),
             "gtm_topsecret".into(),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             reader.get(&aid('a')).await,
             Err(ArtifactError::Unavailable(_))
@@ -511,7 +576,69 @@ mod tests {
     #[test]
     fn debug_never_prints_the_token() {
         let reader =
-            HttpArtifactReader::new("https://admin.example/x".into(), "gtm_topsecret".into());
+            HttpArtifactReader::new("https://admin.example/x".into(), "gtm_topsecret".into())
+                .unwrap();
         assert!(!format!("{reader:?}").contains("topsecret"));
+    }
+
+    async fn one_mime(mime: &str) -> Result<ArtifactBytes, ArtifactError> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(mime, &[1])))
+            .mount(&server)
+            .await;
+        reader_for(&server).await.get(&aid('f')).await
+    }
+
+    #[tokio::test]
+    async fn mime_is_normalised_and_returned_canonical() {
+        for (raw, want) in [
+            ("text/plain; charset=utf-8", "text/plain"),
+            ("Image/PNG", "image/png"),
+            ("application/json;charset=UTF-8", "application/json"),
+            ("  image/png ", "image/png"),
+            ("image/png; <script>", "image/png"),
+        ] {
+            assert_eq!(one_mime(raw).await.unwrap().mime_type, want, "{raw:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_mimes_are_refused() {
+        let long = format!("image/png{}", "x".repeat(10_000));
+        for raw in [
+            "text/html",
+            "image/svg+xml",
+            "image/png/x",
+            "",
+            "image/png\nx",
+            long.as_str(),
+        ] {
+            assert!(
+                matches!(one_mime(raw).await, Err(ArtifactError::Unavailable(_))),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn construction_refuses_bad_tokens_without_echoing_them() {
+        for bad in ["", "   ", "gtm_a\nb", "gtm_a\u{0}b", "gtm_a\tb"] {
+            let err =
+                HttpArtifactReader::new("https://admin.example/x".into(), bad.into()).unwrap_err();
+            let text = format!("{err} {err:?}");
+            assert!(!text.contains("gtm_a"), "{text}");
+        }
+    }
+
+    #[test]
+    fn names_lose_format_and_bidi_characters_and_dot_names() {
+        let hostile = "a\u{202E}b\u{200B}c\u{2066}d\u{FEFF}e\u{2028}f\u{2029}g";
+        assert_eq!(clean_name(Some(hostile.into())).as_deref(), Some("abcdefg"));
+        assert_eq!(clean_name(Some(".".into())), None);
+        assert_eq!(clean_name(Some(" .. ".into())), None);
+        let long = format!("{} tail", "x".repeat(119));
+        let got = clean_name(Some(long)).unwrap();
+        assert_eq!(got, "x".repeat(119));
     }
 }

@@ -75,7 +75,9 @@ pub mod mock;
 pub mod serve;
 
 pub use a2a_source::{A2aRoute, A2aToolCatalog, A2aToolEntry, A2aToolSource};
-pub use artifact_reader::{ArtifactBytes, ArtifactError, ArtifactReader, HttpArtifactReader};
+pub use artifact_reader::{
+    ArtifactBytes, ArtifactClientError, ArtifactError, ArtifactReader, HttpArtifactReader,
+};
 pub use attachments::{AttachmentKind, AttachmentRef};
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
