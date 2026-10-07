@@ -17,6 +17,12 @@
 //! - **Only the guarded reply crosses** (spec §4.1): [`LedgerTurn::record_reply`]
 //!   is called after the outbound guardrail chain, with the reply alone — never
 //!   tool results, tool arguments or the user's message.
+//! - **Only a turn the visitor took is recorded.** A turn whose input carries
+//!   no visitor content ([`visitor_spoke`]: blank text and no submit payload —
+//!   the auto-start turn a WebChat conversation opens with) still READS the
+//!   history, so its greeting can use it, but appends nothing: its reply
+//!   answers nobody, and appending it would add an empty-handed row to the
+//!   visitor's history in every unit on every conversation open.
 //! - **Untrusted on the way back.** Another unit wrote what is read, so the
 //!   view is sanitised, bounded and labelled as data, not instructions.
 //!
@@ -31,6 +37,7 @@ use std::time::Duration;
 use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::AgentInput;
 use crate::run_trace::sanitise;
 use crate::tenant::TenantContext;
 
@@ -258,6 +265,19 @@ pub fn render_view(events: &[LedgerEvent]) -> Option<String> {
     Some(out)
 }
 
+/// Whether `input` carries anything the visitor did: text with at least one
+/// character that is neither whitespace nor an invisible format character, or
+/// a submit payload (a card submit arrives with empty text). `false` is the
+/// opening turn a channel starts on its own; such a turn appends nothing. The
+/// one place this rule is decided: [`UserLedgerBinding::turn_for`] calls it.
+pub fn visitor_spoke(input: &AgentInput) -> bool {
+    input.resume_payload.is_some()
+        || input
+            .text
+            .chars()
+            .any(|c| !c.is_whitespace() && !is_invisible_format(c))
+}
+
 /// The summary appended for a guarded reply, or `None` for a blank one.
 pub fn summary_of(reply: &str) -> Option<String> {
     let s = sanitise(reply, APPEND_SUMMARY_CHARS);
@@ -349,12 +369,19 @@ impl UserLedgerBinding {
     /// e.g. a `dw.agent` in a `flow:` tool's flow). Nested is refused because
     /// the runtime does not yet apply the binding's share mode to the ledger,
     /// and a nested agent's reply is, to the outer agent, a tool result.
+    ///
+    /// `input` is the turn's raw input, before any guardrail: a turn in which
+    /// the visitor said nothing ([`visitor_spoke`] is `false`) gets a handle
+    /// that reads but never appends, whatever the agent's mode. Taking the
+    /// input here, rather than at the append, is what makes the rule
+    /// impossible to skip at a call site.
     pub fn turn_for(
         self: &Arc<Self>,
         tenant: &TenantContext,
         agent_id: &str,
+        input: &AgentInput,
     ) -> Option<LedgerTurn> {
-        self.turn_for_enabled(tenant, agent_id, user_ledger_enabled())
+        self.turn_for_enabled(tenant, agent_id, input, user_ledger_enabled())
     }
 
     /// [`Self::turn_for`] with the kill switch passed in, so it is testable
@@ -363,6 +390,7 @@ impl UserLedgerBinding {
         self: &Arc<Self>,
         tenant: &TenantContext,
         agent_id: &str,
+        input: &AgentInput,
         enabled: bool,
     ) -> Option<LedgerTurn> {
         let mode = *self.agents.get(agent_id)?;
@@ -390,6 +418,7 @@ impl UserLedgerBinding {
             binding: Arc::clone(self),
             subject,
             mode,
+            visitor_spoke: visitor_spoke(input),
         })
     }
 }
@@ -399,6 +428,8 @@ pub struct LedgerTurn {
     binding: Arc<UserLedgerBinding>,
     subject: String,
     mode: LedgerMode,
+    /// [`visitor_spoke`] for this turn's input; `false` blocks the append.
+    visitor_spoke: bool,
 }
 
 impl LedgerTurn {
@@ -426,8 +457,9 @@ impl LedgerTurn {
 
     /// Append `reply` (the GUARDED reply) in the background when this turn may
     /// write. Dropped, with a warning, when too many appends are in flight.
+    /// A turn the visitor did not take ([`visitor_spoke`]) never writes.
     pub fn record_reply(&self, reply: &str) {
-        if self.mode != LedgerMode::ReadWrite {
+        if self.mode != LedgerMode::ReadWrite || !self.visitor_spoke {
             return;
         }
         let Some(summary) = summary_of(reply) else {
@@ -470,6 +502,14 @@ impl LedgerTurn {
 mod tests {
     use super::*;
     use crate::tenant::{TenantContext, VerifiedCaller};
+
+    /// An input the visitor typed.
+    fn said() -> AgentInput {
+        AgentInput {
+            text: "hi".into(),
+            ..Default::default()
+        }
+    }
 
     fn caller(verified: bool, sub: Option<&str>) -> TenantContext {
         TenantContext::new("acme", "prod").with_caller(Some(VerifiedCaller {
@@ -625,17 +665,17 @@ mod tests {
         ));
         assert!(
             binding
-                .turn_for(&caller(true, Some("u-1")), "helper")
+                .turn_for(&caller(true, Some("u-1")), "helper", &said())
                 .is_some()
         );
         assert!(
             binding
-                .turn_for(&caller(true, Some("u-1")), "other")
+                .turn_for(&caller(true, Some("u-1")), "other", &said())
                 .is_none()
         );
         assert!(
             binding
-                .turn_for(&caller(false, Some("u-1")), "helper")
+                .turn_for(&caller(false, Some("u-1")), "helper", &said())
                 .is_none()
         );
         let foreign = TenantContext::new("globex", "prod").with_caller(Some(VerifiedCaller {
@@ -643,7 +683,7 @@ mod tests {
             sub: Some("u-1".into()),
             ..VerifiedCaller::default()
         }));
-        assert!(binding.turn_for(&foreign, "helper").is_none());
+        assert!(binding.turn_for(&foreign, "helper", &said()).is_none());
     }
 
     /// A nested agent inside a `flow:` tool runs on the same runtime (and so
@@ -660,11 +700,11 @@ mod tests {
         ));
         let who = caller(true, Some("u-1"));
         assert!(
-            binding.turn_for(&who, "helper").is_some(),
+            binding.turn_for(&who, "helper", &said()).is_some(),
             "control: top level"
         );
         let nested = within(ToolCallFrame::new(Some("s1"), "c1"), async {
-            binding.turn_for(&who, "helper").is_some()
+            binding.turn_for(&who, "helper", &said()).is_some()
         })
         .await;
         assert!(!nested, "inside a tool call frame the ledger is off");
@@ -680,7 +720,7 @@ mod tests {
             HashMap::from([("helper".to_string(), LedgerMode::ReadWrite)]),
         ));
         let turn = binding
-            .turn_for(&caller(true, Some("u-1")), "helper")
+            .turn_for(&caller(true, Some("u-1")), "helper", &said())
             .unwrap();
         turn.record_reply("hello");
     }
@@ -789,7 +829,7 @@ mod tests {
             HashMap::from([("helper".to_string(), LedgerMode::ReadWrite)]),
         ));
         let turn = binding
-            .turn_for(&caller(true, Some("u-1")), "helper")
+            .turn_for(&caller(true, Some("u-1")), "helper", &said())
             .unwrap();
         turn.record_reply("hello");
         assert!(
@@ -798,6 +838,65 @@ mod tests {
         );
         assert!(appends_settled(Duration::from_secs(10)).await);
         assert_eq!(ledger.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn visitor_spoke_is_false_only_with_no_text_and_no_submit() {
+        let text = |t: &str| AgentInput {
+            text: t.into(),
+            ..Default::default()
+        };
+        for blank in [
+            "",
+            " ",
+            "\n\t\r ",
+            "\u{200B}",
+            "\u{FEFF} \u{2060}",
+            "\u{E0041}",
+        ] {
+            assert!(!visitor_spoke(&text(blank)), "{blank:?} is not content");
+        }
+        for said in ["hi", " ok ", "\u{200B}x", "0", "?"] {
+            assert!(visitor_spoke(&text(said)), "{said:?} is content");
+        }
+        let submit = AgentInput {
+            resume_payload: Some(serde_json::json!({ "choice": "yes" })),
+            ..Default::default()
+        };
+        assert!(
+            visitor_spoke(&submit),
+            "a submit with empty text is content"
+        );
+        let conversational_only = AgentInput {
+            conversational: true,
+            ..Default::default()
+        };
+        assert!(!visitor_spoke(&conversational_only));
+    }
+
+    /// A handle for a turn the visitor did not take reads but never appends,
+    /// even in read-write mode.
+    #[tokio::test]
+    async fn a_silent_turn_reads_but_never_appends() {
+        let ledger = std::sync::Arc::new(SlowLedger(std::sync::atomic::AtomicUsize::new(0)));
+        let binding = std::sync::Arc::new(UserLedgerBinding::new(
+            "acme",
+            ledger.clone(),
+            HashMap::from([("helper".to_string(), LedgerMode::ReadWrite)]),
+        ));
+        let silent = AgentInput::default();
+        let turn = binding
+            .turn_for(&caller(true, Some("u-1")), "helper", &silent)
+            .expect("a silent turn still gets a handle, to read");
+        assert_eq!(turn.mode(), LedgerMode::ReadWrite);
+        let _ = turn.read_view().await;
+        turn.record_reply("Hello! How can I help?");
+        assert!(appends_settled(Duration::from_secs(10)).await);
+        assert_eq!(
+            ledger.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no append for a turn with no visitor content"
+        );
     }
 
     /// An append that never returns.
@@ -820,7 +919,7 @@ mod tests {
             HashMap::from([("helper".to_string(), LedgerMode::ReadWrite)]),
         ));
         let turn = binding
-            .turn_for(&caller(true, Some("u-1")), "helper")
+            .turn_for(&caller(true, Some("u-1")), "helper", &said())
             .unwrap();
         for _ in 0..MAX_IN_FLIGHT_APPENDS {
             turn.record_reply("hello");
@@ -881,8 +980,16 @@ mod tests {
             HashMap::from([("helper".to_string(), LedgerMode::ReadWrite)]),
         ));
         let who = caller(true, Some("u-1"));
-        assert!(binding.turn_for_enabled(&who, "helper", true).is_some());
-        assert!(binding.turn_for_enabled(&who, "helper", false).is_none());
+        assert!(
+            binding
+                .turn_for_enabled(&who, "helper", &said(), true)
+                .is_some()
+        );
+        assert!(
+            binding
+                .turn_for_enabled(&who, "helper", &said(), false)
+                .is_none()
+        );
     }
 
     /// The ledger must receive the GUARDED reply. The behavioural pin is

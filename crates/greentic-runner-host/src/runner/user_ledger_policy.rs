@@ -204,10 +204,14 @@ mod tests {
         let acme =
             greentic_aw_runtime::TenantContext::new("acme", "e").with_caller(Some(caller.clone()));
         let other = greentic_aw_runtime::TenantContext::new("other", "e").with_caller(Some(caller));
-        assert!(binding.turn_for(&acme, "helper").is_some());
-        assert!(binding.turn_for(&other, "helper").is_none());
+        let said = greentic_aw_runtime::AgentInput {
+            text: "hi".into(),
+            ..Default::default()
+        };
+        assert!(binding.turn_for(&acme, "helper", &said).is_some());
+        assert!(binding.turn_for(&other, "helper", &said).is_none());
         assert!(
-            binding.turn_for(&acme, "stranger").is_none(),
+            binding.turn_for(&acme, "stranger", &said).is_none(),
             "an agent the sidecar does not name"
         );
     }
