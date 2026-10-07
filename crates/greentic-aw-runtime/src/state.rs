@@ -183,6 +183,15 @@ pub struct PendingToolCall {
     /// Side turns answered since the park.
     #[serde(default)]
     pub side_turns: u32,
+    /// Files sent with an answer that parked this flow again (the flow takes
+    /// no files and the model is not called on a re-park): announced in this
+    /// call's result once it is answered.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unannounced_attachments: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl PendingToolCall {
@@ -358,6 +367,7 @@ mod tests {
             presentation: Some(serde_json::json!({ "card": "A" })),
             parked_at: Some(now),
             side_turns: 3,
+            unannounced_attachments: 2,
         };
         let back: PendingToolCall =
             serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
@@ -445,6 +455,7 @@ mod tests {
         let old = r#"{"call_id":"c","tool_name":"t","flow_ref":"f","flow_snapshot":{},"iterations_used":1,"expires_at":"2026-10-05T00:00:00Z"}"#;
         let p: PendingToolCall = serde_json::from_str(old).unwrap();
         assert!(p.presentation.is_none() && p.parked_at.is_none() && p.side_turns == 0);
+        assert_eq!(p.unannounced_attachments, 0);
     }
 
     fn user(text: &str) -> ChatMessage {
@@ -527,6 +538,7 @@ mod tests {
             presentation: None,
             parked_at: Some(now),
             side_turns: 0,
+            unannounced_attachments: 0,
         }
     }
 

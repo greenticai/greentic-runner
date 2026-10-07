@@ -88,6 +88,57 @@ pub(crate) fn patch_tool_result(state: &mut ConversationState, call_id: &str, co
     }
 }
 
+/// The key under which a parked call's result announces files the user sent
+/// with an answer to it.
+pub(crate) const ATTACHMENTS_NOTE_KEY: &str = "user_attachments_note";
+
+/// Announce `count` files the user sent with an answer to the parked call
+/// `call_id` (the flow takes no files) in that call's RESULT, with the fixed
+/// "not available" sentence: a count only, no name or id. The note lives in
+/// the tool result, so history truncation removes it with its group; a
+/// separate persisted system message would never be removed. A non-object
+/// result is kept under `result`. Nothing is done for 0 or when the call has
+/// no result in history.
+pub(crate) fn announce_unread_attachments(
+    state: &mut ConversationState,
+    call_id: &str,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+    let Some(at) = latest_assistant_with(&state.messages, call_id) else {
+        return;
+    };
+    let end = tool_run_end(&state.messages, at);
+    let Some(content) = state.messages[at + 1..end]
+        .iter_mut()
+        .find_map(|m| match m {
+            ChatMessage::Tool {
+                call_id: id,
+                content,
+            } if id == call_id => Some(content),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let note = Value::String(
+        crate::attachments_materialize::unreadable_note(count)
+            .trim()
+            .to_string(),
+    );
+    match content {
+        Value::Object(map) => {
+            map.insert(ATTACHMENTS_NOTE_KEY.to_string(), note);
+        }
+        other => {
+            let result = other.take();
+            *other = json!({ "result": result, ATTACHMENTS_NOTE_KEY: note });
+        }
+    }
+}
+
 /// A parked flow tool that this turn will resume.
 pub(crate) struct Resume {
     pub(crate) pending: PendingToolCall,
@@ -160,6 +211,11 @@ pub(crate) fn take_pending(
     let result = json!({ "status": "cancelled", "reason": reason });
     observer.on_tool_result(&pending.tool_name, &pending.call_id, &result);
     patch_tool_result(state, &pending.call_id, result.clone());
+    announce_unread_attachments(
+        state,
+        &pending.call_id,
+        pending.unannounced_attachments as usize,
+    );
     Taken::Cancelled(AgentStep::ToolCall {
         name: pending.tool_name,
         call_id: pending.call_id,
@@ -493,6 +549,7 @@ mod tests {
             presentation: Some(json!({})),
             parked_at: None,
             side_turns: 0,
+            unannounced_attachments: 0,
         });
         assert!(ensure_placeholder(&mut s));
         assert_eq!(s.messages.len(), 5);

@@ -165,7 +165,10 @@ marked.
   artifact port, so `put` answers `unsupported`.
 - **Answer to a parked flow tool** (a `resume_payload`): the answer goes to the
   flow, which takes no files; the agent gets the fixed "not available" notice
-  after the resumed tool's result.
+  inside the resumed call's result, under `user_attachments_note` (a
+  non-object result moves under `result`), so history truncation removes it
+  with that call. If the flow parks again the count waits on the pending call
+  and is announced when the call is answered (completed or cancelled).
 - **Agent-graph turns** (`dw.agent_graph`, `graph_node.rs`): the graph runs on
   text; attachments on the node are announced to its agents with the fixed
   "not available" notice appended to the user text.

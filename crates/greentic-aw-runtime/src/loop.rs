@@ -528,6 +528,8 @@ async fn run_step_scoped(
     if let Some(resume) = resuming {
         first_iter = resume.pending.iterations_used;
         iterations = first_iter;
+        let resumed_call_id = resume.pending.call_id.clone();
+        let carried_attachments = resume.pending.unannounced_attachments as usize;
         suspension = crate::flow_suspend::resume_pending(
             runtime,
             &lock,
@@ -543,14 +545,21 @@ async fn run_step_scoped(
         if suspension.is_some() {
             terminated_by = TerminationReason::AwaitingToolInput;
         }
-        // After the resumed tool's result, so the tool-call sequence stays
-        // intact. Fixed text, a count only: no name or id reaches the model.
-        if resume_attachment_count > 0 {
-            state.messages.push(ChatMessage::System {
-                content: crate::attachments_materialize::unreadable_note(resume_attachment_count)
-                    .trim()
-                    .to_string(),
-            });
+        // Files sent with the answer go nowhere (the flow takes none): the
+        // agent is told IN the resumed call's result (fixed text, a count
+        // only), so truncation removes the note with its group. On a re-park
+        // the model is not called: the count waits on the pending call.
+        match state.pending_tool.as_mut() {
+            Some(pending) if suspension.is_some() => {
+                pending.unannounced_attachments = pending
+                    .unannounced_attachments
+                    .saturating_add(u32::try_from(resume_attachment_count).unwrap_or(u32::MAX));
+            }
+            _ => crate::flow_suspend::announce_unread_attachments(
+                &mut state,
+                &resumed_call_id,
+                carried_attachments.saturating_add(resume_attachment_count),
+            ),
         }
     }
     // One memo per TURN, shared by every iteration's request (and by a
@@ -898,6 +907,7 @@ async fn run_step_scoped(
                                 presentation: Some(presentation.clone()),
                                 parked_at: Some(chrono::Utc::now()),
                                 side_turns: 0,
+                                unannounced_attachments: 0,
                             });
                             if config.on_text_while_parked
                                 == crate::config::ParkedTextPolicy::SideTurn
