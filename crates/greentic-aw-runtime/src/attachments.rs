@@ -45,11 +45,29 @@ pub struct AttachmentRef {
     pub text_ref: Option<String>,
 }
 
+/// Structured reason an attachment was not used. Carries no free text from the
+/// sender or the host except `Host`, whose code is host-supplied and must be
+/// mapped to a fixed sentence by the consumer before it reaches a prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkipCode {
+    Duplicate,
+    InvalidReference,
+    OverLimit,
+    /// No usable `artifact://` url and no host note.
+    NotStored,
+    /// The host's `attachment_notes[i].code`, or `None` when it sent none.
+    Host(Option<String>),
+}
+
 #[derive(Debug, Default)]
 pub struct ParsedAttachments {
     pub refs: Vec<AttachmentRef>,
-    /// Human-readable reasons for every attachment that was not used.
+    /// Human-readable reasons for every attachment that was not used. These
+    /// embed the sender's attachment name and the host's note text: for logs
+    /// and diagnostics only, NEVER for a model prompt (use `skipped_codes`).
     pub skipped: Vec<String>,
+    /// One entry per `skipped` entry, same order.
+    pub skipped_codes: Vec<SkipCode>,
 }
 
 fn kind_from_mime(mime: &str) -> AttachmentKind {
@@ -89,6 +107,7 @@ pub fn parse_flow_attachments(
             // Never echo the offending value: it may be arbitrarily long.
             out.skipped
                 .push(format!("{label}: not a valid artifact reference"));
+            out.skipped_codes.push(SkipCode::InvalidReference);
             continue;
         }
         if !is_artifact_ref(url) {
@@ -96,6 +115,11 @@ pub fn parse_flow_attachments(
             let note = notes_list.and_then(|l| l.get(index));
             let code = note.and_then(|n| n.get("code")).and_then(Value::as_str);
             let message = note.and_then(|n| n.get("message")).and_then(Value::as_str);
+            out.skipped_codes.push(match code {
+                Some(c) => SkipCode::Host(Some(c.to_string())),
+                None if message.is_some() => SkipCode::Host(None),
+                None => SkipCode::NotStored,
+            });
             out.skipped.push(match (code, message) {
                 (Some(code), Some(message)) => format!("{label}: {code} ({message})"),
                 (Some(code), None) => format!("{label}: {code}"),
@@ -107,12 +131,14 @@ pub fn parse_flow_attachments(
             out.skipped.push(format!(
                 "{label}: duplicate of an attachment already in this message"
             ));
+            out.skipped_codes.push(SkipCode::Duplicate);
             continue;
         }
         if out.refs.len() >= MAX_ATTACHMENTS {
             out.skipped.push(format!(
                 "{label}: more than {MAX_ATTACHMENTS} attachments in one message"
             ));
+            out.skipped_codes.push(SkipCode::OverLimit);
             continue;
         }
         let mime_type = item
@@ -350,5 +376,28 @@ mod tests {
         let parsed = parse_flow_attachments(&atts, &json!(null), &json!(null));
         assert_eq!(parsed.refs.len(), 1);
         assert_eq!(parsed.skipped.len(), 3);
+    }
+
+    #[test]
+    fn skip_codes_run_parallel_to_skip_reasons() {
+        let atts = json!([
+            {"mime_type":"image/png","url":null,"name":"x"},
+            {"mime_type":"image/png","url":null,"name":"y"},
+            img("artifact://short", "z"),
+            img(&aid('a'), "ok.png"),
+            img(&aid('a'), "dup.png")
+        ]);
+        let notes = json!([{"code":"too_large","message":"m"}]);
+        let parsed = parse_flow_attachments(&atts, &json!(null), &notes);
+        assert_eq!(parsed.skipped.len(), parsed.skipped_codes.len());
+        assert_eq!(
+            parsed.skipped_codes,
+            vec![
+                SkipCode::Host(Some("too_large".into())),
+                SkipCode::NotStored,
+                SkipCode::InvalidReference,
+                SkipCode::Duplicate
+            ]
+        );
     }
 }
