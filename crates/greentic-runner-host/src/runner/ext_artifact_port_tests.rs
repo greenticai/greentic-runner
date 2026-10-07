@@ -410,3 +410,57 @@ async fn a_bad_or_oversized_reply_is_refused() {
         );
     }
 }
+
+/// The bearer token must go to the door only, never through a proxy named by
+/// the process environment (reqwest reads it when the client is built).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn the_client_ignores_the_proxy_environment() {
+    let proxy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&proxy)
+        .await;
+    let door = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/artifacts/put"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": VALID_ID, "sha256": "aa", "size_bytes": 3,
+            "kind": "image", "mime_type": "image/png"
+        })))
+        .mount(&door)
+        .await;
+    let keys = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+    let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+    unsafe {
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("HTTP_PROXY", proxy.uri());
+        std::env::set_var("HTTPS_PROXY", proxy.uri());
+    }
+    let port = port_for(&door, "gtm_secret");
+    let got = put(port, "t1").await;
+    unsafe {
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+    assert!(
+        proxy.received_requests().await.unwrap().is_empty(),
+        "the bearer request went through the proxy"
+    );
+    assert!(got.is_ok(), "{got:?}");
+}

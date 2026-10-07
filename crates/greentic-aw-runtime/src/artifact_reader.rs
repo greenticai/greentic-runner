@@ -138,7 +138,9 @@ impl HttpArtifactReader {
             return Err(ArtifactClientError::InvalidToken);
         }
         // A redirect would resend the bearer token to wherever it points.
+        // The token must reach the door only: never via an env-named proxy.
         let client = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(connect)
             .timeout(total)
             .redirect(reqwest::redirect::Policy::none())
@@ -523,6 +525,55 @@ mod tests {
             reader_for(&server).await.get(&aid('a')).await,
             Err(ArtifactError::Unavailable(_))
         ));
+    }
+
+    /// The bearer token must go to the door only, never through a proxy named
+    /// by the process environment. reqwest reads `HTTP(S)_PROXY` when a client
+    /// is built, so the env is set around construction.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    async fn the_client_ignores_the_proxy_environment() {
+        let proxy = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&proxy)
+            .await;
+        let door = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("image/png", &[1])))
+            .mount(&door)
+            .await;
+        let keys = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in keys {
+            unsafe { std::env::remove_var(k) };
+        }
+        for k in ["HTTP_PROXY", "HTTPS_PROXY"] {
+            unsafe { std::env::set_var(k, proxy.uri()) };
+        }
+        let reader = reader_for(&door).await;
+        let got = reader.get(&aid('a')).await;
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        assert!(
+            proxy.received_requests().await.unwrap().is_empty(),
+            "the bearer request went through the proxy"
+        );
+        assert!(got.is_ok(), "{got:?}");
     }
 
     #[tokio::test]

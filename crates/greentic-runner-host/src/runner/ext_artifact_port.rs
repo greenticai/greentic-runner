@@ -80,7 +80,9 @@ impl HttpArtifactPort {
             return Err(ArtifactClientError::InvalidToken);
         }
         // A redirect would resend the bearer token to wherever it points.
+        // The token must reach the door only: never via an env-named proxy.
         let client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(TOTAL_TIMEOUT)
