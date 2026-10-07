@@ -13,20 +13,23 @@ could not store.
 ## Flow templates
 
 No engine change is involved: the envelope root is flattened into `entry`, and
-the template engine resolves `a.b[0].c` paths. So a flow reads:
+the template engine resolves `a.b[0].c` paths. So a flow reads the C1 fields:
 
 | expression | value |
 |---|---|
 | `{{entry.attachments}}` | the whole array (an exact expression keeps the JSON type) |
-| `{{entry.attachments[0].url}}` | the first file's `artifact://` id |
-| `{{entry.attachments[0].text}}` | a field on the first attachment, when the envelope carries it |
-| `{{in.extensions.artifacts}}` | the parallel metadata array |
+| `{{entry.attachments[0].url}}` | the first file's `artifact://` id, or `null` |
+| `{{entry.attachments[0].name}}` / `.mime_type` / `.size_bytes` | the first file's metadata |
+| `{{in.extensions.artifacts}}` | the parallel metadata array (`sha256`, `kind`, `text_ref`) |
 | `{{in.extensions.attachment_notes}}` | the notes for files that could not be stored |
 
-A path that does not resolve (no attachments, a missing index, a missing
-`extensions` key) renders as the empty string, like any missing path, and the
-`dw.agent` node reads an empty string as "no attachments".
-Pinned by the `templating::tests::*attachment*` tests in `greentic-runner-host`.
+The document TEXT is not in the envelope: only a `text_ref` (another artifact
+id) is, and only the agent's LLM backend reads it. A path that does not
+resolve (no attachments, a missing index, a missing `extensions` key) renders
+as the empty string, like any missing path, and the `dw.agent` node reads an
+empty string as "no attachments". Pinned by the `templating::tests::*attachment*`
+tests in `greentic-runner-host` (their fixtures also carry a non-contract `text`
+field, only to show that any field resolves).
 
 ## Who reads attachments: the `dw.agent` node only
 
@@ -35,12 +38,22 @@ greentic-dw-authoring maps from the envelope (contract C4b):
 `attachments` (`{{entry.attachments}}`), `attachment_meta`
 (`{{in.extensions.artifacts}}`) and `attachment_notes`
 (`{{in.extensions.attachment_notes}}`). Absent, `null`, `""` and non-arrays all
-mean "no attachments"; nothing there can fail the turn. A file the host could
-not store becomes a notice in the user text, taken from a fixed table of codes.
+mean "no attachments"; nothing there can fail the turn. Sender-chosen names are
+cleaned when parsed (controls, bidi, zero-width and line separators removed;
+at most 120 characters). A file the host could not store becomes a notice in
+the user text, taken from a fixed table of codes; a reason never carries the
+sender's name or the host's free text.
 
 The bytes are fetched only by the multi-provider backend (`GreenticLlmBackend`,
 feature `greentic-llm-backend`), once per turn, through an `ArtifactReader`
-(contract C3 `get`), at most 4 reads in flight per process.
+(contract C3 `get`), at most 4 reads in flight per process (a read waits for a
+permit; an acquire timeout is future work).
+
+If the model refuses the images it was sent (vision is advertised per
+PROVIDER, but some of its models take no images), the turn is retried ONCE
+without them and the agent gets the fixed note "The user attached N image(s)
+that you cannot see…". If the retry also fails, the original error is returned.
+A text-only failure is never retried here.
 
 ### Where the reader comes from (decided at the host, never below it)
 
@@ -48,17 +61,26 @@ feature `greentic-llm-backend`), once per turn, through an `ArtifactReader`
   greentic-start): ONLY `RevisionHostOptions::with_artifact_reader`, built from
   that unit's own door and token. No option means no reader; the
   `GREENTIC_ARTIFACT_*` variables are never read on this path.
-- **Single-tenant `HostBuilder` host** (local runs, the Test chat sidecar, the
-  designer's Run Demo): `HostBuilder::with_artifact_reader`, else the env
-  fallback `GREENTIC_ARTIFACT_ENDPOINT` (the door base, ending in `/artifacts`)
-  + `GREENTIC_ARTIFACT_TOKEN` (both required).
+- **Single-tenant `HostBuilder` host** (the designer's Run Demo, the
+  standalone runner): `HostBuilder::with_artifact_reader`. The env fallback,
+  `GREENTIC_ARTIFACT_ENDPOINT` (the door base, ending in `/artifacts`) +
+  `GREENTIC_ARTIFACT_TOKEN` (both required), is OPT-IN:
+  `HostBuilder::with_artifact_env_fallback(true)`, default off. It is for
+  single-tenant processes only: the standalone runner (`greentic_runner_host::run`,
+  i.e. the `greentic-runner` binary, which the Test chat sidecar runs) opts in;
+  the designer must never enable it.
 - **Multi-tenant `HostBuilder` host**: none. An injected reader is dropped with
   the warning `artifact_reader_multi_tenant_host`, and the env is not used in
-  its place.
+  its place, even when opted in.
 
 Without a reader every turn still runs, and each attachment becomes the fixed
 notice "The user attached N file(s), but attachments are not available in this
 deployment…".
+
+Both door clients (this reader and the extension artifact port below) share
+one endpoint rule (`greentic_aw_runtime::door_url`): `https`, or `http` to a
+loopback host only, and never userinfo in the URL. Any other endpoint gets no
+request at all, so the bearer token is never sent in clear text.
 
 ## Creating files (extensions)
 
@@ -70,40 +92,66 @@ rules as the reader:
 - deployed unit: `RevisionHostOptions::with_ext_artifact_port` (greentic-start
   builds it per unit, over that unit's door and token);
 - single-tenant `HostBuilder` host: `HostBuilder::with_ext_artifact_port`, else
-  the same two env variables (and `build()` must run inside a multi-thread
-  tokio runtime);
+  the same env fallback, only when opted in with
+  `with_artifact_env_fallback(true)` (and `build()` must run inside a
+  multi-thread tokio runtime);
 - multi-tenant host: none (warning `artifact_port_multi_tenant_host`).
 
 Without a port an extension's `put` answers `unsupported`. The door-backed port
 is `runner::ext_artifact_port::HttpArtifactPort`: no redirects, a 5 s connect /
-30 s total timeout, and a token that never appears in a log, an error or
-anything the extension sees.
+30 s total timeout, a reply capped at 16 KiB and accepted only with an
+`artifact://<64 hex>` id, a refusal when the CALLING thread runs on a
+current-thread runtime, and a token that never appears in a log, an error or
+anything the extension sees. A door refusal reaches the extension as the same
+`unavailable` whatever the cause; the host log carries a fixed debug-level
+reason (`unauthorized`, `purpose_not_granted`, `too_large`, `rate_limited`,
+`refused`).
+
+## Known v1 limitation: inbound guardrails do not see document text
+
+The inbound guardrail chain runs on the user's message TEXT only, in the agent
+loop (`crates/greentic-aw-runtime/src/loop.rs`, the "Inbound guardrail hook"
+that calls `crate::guardrail::run_chain` on `message.text`). Attachment
+document text is fetched later, inside the LLM backend
+(`crates/greentic-aw-runtime/src/llm_greentic.rs` `apply_attachments` →
+`crates/greentic-aw-runtime/src/attachments_materialize.rs` `push_document`),
+which holds neither the chain nor the guardrail evaluator. So a document's text
+reaches the model without passing the inbound guardrails. It is delimited and
+labelled as user data (nonce-marked block), which is a mitigation, not a
+guardrail. Closing this means handing the chain (or a guard callback) to the
+backend through `LlmRequest`, the follow-up.
 
 ## Paths NOT served in v1
 
-These paths do not receive attachments. Unless noted, nothing warns beyond a
-debug log.
+These paths do not read attachments. Where they receive some, the agent is told
+with a fixed notice (a count only, never a name or an id); the "silent" ones are
+marked.
 
 - **Other LLM backends.** `OpenAiLlmBackend` (`llm_openai.rs`) and the bridge
   `ExtensionLlmBackend` (`llm_extension.rs`) cannot open attachments. They
   append the SAME fixed "not available in this deployment" notice to the user
   message and send no `artifact://` id or file name to the provider.
-- **No reader on these entry points.** `greentic-runner-desktop`, the public
-  `TenantRuntime::load` / `TenantRuntime::from_packs`, and the public
+- **No reader or port on these entry points.** `greentic-runner-desktop`, the
+  public `TenantRuntime::load` / `TenantRuntime::from_packs`, and the public
   `build_agent_node_handler` / `build_agent_node_wiring` /
-  `build_agent_node_wiring_ephemeral` (and their `_ephemeral` handler) build no
-  reader and no extension artifact port. Attachments become the fixed notice,
-  and an extension's `put` answers `unsupported`. The env fallback does not
-  apply there: it is a single-tenant `HostBuilder` rule only.
+  `build_agent_node_wiring_ephemeral` (and `build_agent_node_handler_ephemeral`)
+  build no reader and no extension artifact port, and never read the env.
+  Attachments become the fixed notice; an extension's `put` answers
+  `unsupported`.
 - **Process-level extension runtimes** (`runner/mod.rs`, `graph_node.rs`): no
-  artifact port.
+  artifact port, so `put` answers `unsupported`.
+- **Answer to a parked flow tool** (a `resume_payload`): the answer goes to the
+  flow, which takes no files; the agent gets the fixed "not available" notice
+  after the resumed tool's result.
+- **Agent-graph turns** (`dw.agent_graph`, `graph_node.rs`): the graph runs on
+  text; attachments on the node are announced to its agents with the fixed
+  "not available" notice appended to the user text.
 - **NATS serve path** (`greentic-aw-runtime/src/serve.rs`): `extract_user_text`
-  builds the turn from `user_text` / `text` only.
+  builds the turn from `user_text` / `text` only. Silent: this path never sees
+  the attachment keys.
 - **Agent chat HTTP** (`greentic-runner-host/src/http/agent_chat.rs`,
-  `turn_payload`): the turn carries the text or the card submit only.
-- **Agent-graph turns** (`greentic-aw-runtime/src/graph/executor.rs`,
-  `start(.., user_text: &str)`): text only.
-- **Deep worker (`operala.call`) turns**: text only.
+  `turn_payload`): the turn carries the text or the card submit only. Silent.
+- **Deep worker (`operala.call`) turns**: text only. Silent.
 - **Provider-edge drops.** A file a provider could not hand over (too large,
   an unsupported type, a failed fetch, an exhausted quota, the door
   unavailable) is not silently dropped: the HOST leaves `url = null` and writes
