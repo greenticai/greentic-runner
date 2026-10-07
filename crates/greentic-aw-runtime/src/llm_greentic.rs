@@ -14,11 +14,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use greentic_llm::{
-    ChatMessage as GChatMessage, ChatRequest as GChatRequest, ChatResponse as GChatResponse,
-    Credential, LlmProvider, MessageRole, ProviderKind, RigBackend, ToolCall as GToolCall,
-    ToolDef as GToolDef,
+    ChatImage as GChatImage, ChatMessage as GChatMessage, ChatRequest as GChatRequest,
+    ChatResponse as GChatResponse, Credential, LlmProvider, MessageRole, ProviderKind, RigBackend,
+    ToolCall as GToolCall, ToolDef as GToolDef,
 };
 
+use crate::artifact_reader::ArtifactReader;
 use crate::error::LlmError;
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
 use crate::state::{ChatMessage, ToolCallRecord};
@@ -34,6 +35,9 @@ pub struct GreenticLlmBackend {
     api_key: String,
     base_url: Option<String>,
     cache: Mutex<HashMap<(String, String), Arc<dyn LlmProvider>>>,
+    /// Resolves attachment bytes for the current turn. `None`: attachments
+    /// are not materialised and the agent is told so (the turn still runs).
+    artifacts: Option<Arc<dyn ArtifactReader>>,
 }
 
 impl GreenticLlmBackend {
@@ -45,7 +49,25 @@ impl GreenticLlmBackend {
             api_key: api_key.into(),
             base_url: base_url.filter(|s| !s.trim().is_empty()),
             cache: Mutex::new(HashMap::new()),
+            artifacts: None,
         }
+    }
+
+    /// Inject the reader used to resolve attachment bytes for the current turn.
+    pub fn with_artifact_reader(mut self, reader: Arc<dyn ArtifactReader>) -> Self {
+        self.artifacts = Some(reader);
+        self
+    }
+
+    /// Test seam: serve `(provider, model)` from `p` instead of building a
+    /// `RigBackend`.
+    #[cfg(test)]
+    fn with_cached_provider(self, provider: &str, model: &str, p: Arc<dyn LlmProvider>) -> Self {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((provider.to_string(), model.to_string()), p);
+        self
     }
 
     /// Resolve (or build + cache) the greentic-llm provider for an agent's
@@ -92,7 +114,13 @@ impl LlmBackend for GreenticLlmBackend {
         Box::pin(async move {
             let provider =
                 self.provider_for(&request.provider.provider, &request.provider.model)?;
-            let chat_request = build_chat_request(&request);
+            // The vision gate runs BEFORE chat(): a provider without vision
+            // refuses any image with a hard error, so an image it cannot take
+            // is never sent and the agent is told instead.
+            let vision = provider.capabilities().vision;
+            let mut request = request;
+            let images = self.apply_attachments(&mut request.history, vision).await;
+            let chat_request = build_chat_request(&request, images);
             // Built from the list the model is shown: a sanitised wire name
             // cannot be split back apart by string surgery.
             let codec = ToolNameCodec::for_tools(&request.tools);
@@ -108,12 +136,76 @@ impl LlmBackend for GreenticLlmBackend {
     }
 }
 
+impl GreenticLlmBackend {
+    /// Materialise the attachments of the LAST user message only; an earlier
+    /// user message keeps a fixed marker so a long conversation never fetches
+    /// old files again. Mutates the REQUEST's copy of the history, never the
+    /// conversation state (the loop hands over a clone), so state keeps
+    /// references only. Returns the images for the last user message.
+    async fn apply_attachments(
+        &self,
+        history: &mut [ChatMessage],
+        vision: bool,
+    ) -> Vec<GChatImage> {
+        let last_user = history
+            .iter()
+            .rposition(|m| matches!(m, ChatMessage::User { .. }));
+        let mut images = Vec::new();
+        for (idx, msg) in history.iter_mut().enumerate() {
+            let ChatMessage::User {
+                content,
+                attachments,
+            } = msg
+            else {
+                continue;
+            };
+            if attachments.is_empty() {
+                continue;
+            }
+            if Some(idx) == last_user {
+                let m = crate::attachments_materialize::materialize(
+                    self.artifacts.as_deref(),
+                    attachments,
+                    vision,
+                )
+                .await;
+                content.push_str(&m.text);
+                images = m
+                    .images
+                    .into_iter()
+                    .map(|i| GChatImage {
+                        data_base64: i.data_base64,
+                        media_type: i.media_type,
+                    })
+                    .collect();
+            } else {
+                content.push_str(&format!(
+                    "\n[This message had {} attachment(s), handled in an earlier turn; they \
+                     are not repeated here.]",
+                    attachments.len()
+                ));
+            }
+            attachments.clear();
+        }
+        images
+    }
+}
+
 /// AW [`LlmRequest`] → greentic-llm [`ChatRequest`](greentic_llm::ChatRequest).
-fn build_chat_request(req: &LlmRequest) -> GChatRequest {
+/// `images` ride on the last user message (the current turn's).
+fn build_chat_request(req: &LlmRequest, images: Vec<GChatImage>) -> GChatRequest {
     let mut messages: Vec<GChatMessage> = Vec::with_capacity(req.history.len() + 1);
     messages.push(text_message(MessageRole::System, req.system_prompt.clone()));
     for msg in &req.history {
         messages.push(map_message(msg));
+    }
+    if !images.is_empty()
+        && let Some(m) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == MessageRole::User)
+    {
+        m.images = images;
     }
     let tools: Vec<GToolDef> = req
         .tools
@@ -240,7 +332,7 @@ mod tests {
                 parameters: json!({"type": "object"}),
             }],
         );
-        let chat = build_chat_request(&request);
+        let chat = build_chat_request(&request, Vec::new());
         assert_eq!(chat.messages.len(), 2);
         assert!(matches!(chat.messages[0].role, MessageRole::System));
         assert_eq!(chat.messages[0].content, "be helpful");
@@ -253,7 +345,7 @@ mod tests {
 
     #[test]
     fn build_chat_request_omits_tool_choice_without_tools() {
-        let chat = build_chat_request(&req(vec![], vec![]));
+        let chat = build_chat_request(&req(vec![], vec![]), Vec::new());
         assert!(chat.tools.is_empty());
         assert!(chat.tool_choice.is_none());
     }
@@ -364,3 +456,7 @@ mod tests {
         assert_eq!(resp.tokens_out, 17);
     }
 }
+
+#[cfg(test)]
+#[path = "llm_greentic_attachment_tests.rs"]
+mod attachment_tests;

@@ -16,6 +16,7 @@
 pub mod a2a_source;
 pub mod artifact_reader;
 pub mod attachments;
+pub mod attachments_materialize;
 pub mod billing;
 pub mod component_source;
 pub mod config;
