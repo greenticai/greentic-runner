@@ -1770,7 +1770,8 @@ mod aw {
     /// This path sees no agent configs, so the provider is whatever
     /// `GREENTIC_LLM_PROVIDER` names.
     pub(crate) fn in_process_llm_backend() -> Arc<dyn greentic_aw_runtime::LlmBackend> {
-        in_process_llm_backend_with_key(None, env_llm_provider())
+        // No host reader on this path: the env fallback (else none) applies.
+        in_process_llm_backend_with_key(None, env_llm_provider(), None)
     }
 
     /// In-process LLM backend, optionally given a store-resolved API key.
@@ -1788,9 +1789,15 @@ mod aw {
     /// empty bearer — which is what made `GREENTIC_LLM_API_KEY=ollama` a
     /// necessary workaround. For every key-requiring provider the behaviour is
     /// unchanged.
+    ///
+    /// `artifact_reader` is the reader the host injected for THIS runtime (see
+    /// `crate::runner::artifact_reader_wiring`); without one the env reader is
+    /// tried, else attachments become a fixed notice. Only the multi-provider
+    /// backend reads attachments.
     pub(crate) fn in_process_llm_backend_with_key(
         override_key: Option<String>,
         provider: Option<String>,
+        artifact_reader: Option<crate::host::ArtifactReaderPort>,
     ) -> Arc<dyn greentic_aw_runtime::LlmBackend> {
         use greentic_aw_runtime::{OpenAiLlmBackend, RetryingLlmBackend};
         use std::time::Duration;
@@ -1830,13 +1837,22 @@ mod aw {
                     provider = provider.as_deref().unwrap_or_default(),
                     "AW LLM via in-process greentic-llm (multi-provider)"
                 );
+                use crate::runner::artifact_reader_wiring::{
+                    attach_artifact_reader, select_artifact_reader,
+                };
                 return Arc::new(RetryingLlmBackend::new(
-                    greentic_aw_runtime::GreenticLlmBackend::new(api_key, base_url),
+                    attach_artifact_reader(
+                        greentic_aw_runtime::GreenticLlmBackend::new(api_key, base_url),
+                        select_artifact_reader(artifact_reader),
+                    ),
                     3,
                     Duration::from_millis(250),
                 ));
             }
         }
+        // Without the multi-provider backend nothing reads attachments.
+        #[cfg(not(feature = "greentic-llm-backend"))]
+        drop(artifact_reader);
         let openai_key = override_key
             .filter(|key| !key.trim().is_empty())
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
@@ -1968,6 +1984,7 @@ mod aw {
         unit: Option<String>,
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+        artifact_reader: Option<crate::host::ArtifactReaderPort>,
     ) -> Option<Arc<AgentRuntime>> {
         use std::time::Duration;
 
@@ -2074,6 +2091,7 @@ mod aw {
                 let llm = in_process_llm_backend_with_key(
                     store_key,
                     configured_llm_provider(&merged_agents),
+                    artifact_reader,
                 );
 
                 // Tier 2 of the extension LLM port: the worker's own resolved
@@ -2323,6 +2341,7 @@ mod aw {
         project_id: Option<String>,
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+        artifact_reader: Option<crate::host::ArtifactReaderPort>,
     ) -> Option<AgentNodeWiring> {
         // The deployed unit (`bundle_id`) doubles as the MCP credential scope:
         // the same identity billing attributes this runtime's spend to.
@@ -2338,6 +2357,7 @@ mod aw {
             project_id.clone(),
             billing_meter,
             user_ledger,
+            artifact_reader,
         )
         .await?;
         let handler: Arc<dyn AgentNodeHandler> = Arc::new(RuntimeAgentNodeHandler::new(
@@ -2458,7 +2478,9 @@ mod aw {
             stream_observers,
             project_id,
             resolve_billing_meter(None),
-            // The un-metered wrappers carry no host seam: no user ledger.
+            // The un-metered wrappers carry no host seam: no user ledger and
+            // no host artifact reader (the env fallback still applies).
+            None,
             None,
         )
         .await
@@ -2509,6 +2531,7 @@ mod aw {
         project_id: Option<String>,
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+        artifact_reader: Option<crate::host::ArtifactReaderPort>,
     ) -> Option<AgentNodeWiring> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
@@ -2537,6 +2560,7 @@ mod aw {
             project_id,
             billing_meter,
             user_ledger,
+            artifact_reader,
         )
         .await
     }
@@ -2607,7 +2631,9 @@ mod aw {
             stream_observers,
             project_id,
             resolve_billing_meter(None),
-            // The un-metered wrappers carry no host seam: no user ledger.
+            // The un-metered wrappers carry no host seam: no user ledger and
+            // no host artifact reader (the env fallback still applies).
+            None,
             None,
         )
         .await
@@ -2628,6 +2654,7 @@ mod aw {
         project_id: Option<String>,
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+        artifact_reader: Option<crate::host::ArtifactReaderPort>,
     ) -> Option<AgentNodeWiring> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
@@ -2669,6 +2696,7 @@ mod aw {
             project_id,
             billing_meter,
             user_ledger,
+            artifact_reader,
         )
         .await
     }
@@ -3589,6 +3617,7 @@ mod aw {
                 // what every builder resolved before the seam existed.
                 resolve_billing_meter(None),
                 None,
+                None,
             )
             .await
             .expect("handler should build from mock stores")
@@ -3696,6 +3725,7 @@ mod aw {
                 None,
                 Some("support-bot".to_string()),
                 chosen,
+                None,
                 None,
             )
             .await
@@ -4808,6 +4838,7 @@ mod aw {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             }
@@ -5166,6 +5197,7 @@ mod aw {
                     Some("worker-a".to_string()),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("runtime should build")
@@ -5221,6 +5253,7 @@ mod aw {
                     Arc::new(MockTokenMeter::new(0)),
                     Arc::new(NoopToolLedger),
                     Some("worker-a".to_string()),
+                    None,
                     None,
                     None,
                 )
@@ -5292,6 +5325,7 @@ mod aw {
                     Some("worker-a".to_string()),
                     None,
                     user_ledger,
+                    None,
                 )
                 .await
                 .expect("runtime should build")

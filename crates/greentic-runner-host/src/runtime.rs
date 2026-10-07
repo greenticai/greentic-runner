@@ -365,6 +365,8 @@ pub struct RevisionHostOptions {
     approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
     #[cfg(feature = "agentic-worker")]
     user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+    #[cfg(feature = "agentic-worker")]
+    artifact_reader: Option<crate::host::ArtifactReaderPort>,
 }
 
 impl std::fmt::Debug for RevisionHostOptions {
@@ -376,6 +378,8 @@ impl std::fmt::Debug for RevisionHostOptions {
         out.field("approval_inbox", &self.approval_inbox.is_some());
         #[cfg(feature = "agentic-worker")]
         out.field("user_ledger", &self.user_ledger.is_some());
+        #[cfg(feature = "agentic-worker")]
+        out.field("artifact_reader", &self.artifact_reader.is_some());
         out.finish()
     }
 }
@@ -462,6 +466,26 @@ impl RevisionHostOptions {
         self.user_ledger = Some(target);
         self
     }
+
+    /// Open this unit's message attachments through `reader` (contract C3 `get`
+    /// on the admin `artifacts` door). greentic-start builds it from the same
+    /// staged `metering` block as the other door targets, with the door base
+    /// `sibling_door(endpoint, "artifacts")` and the unit's metering token: the
+    /// token is this unit's, so the door reads only this unit's tenant.
+    ///
+    /// Per REVISION rather than a `HostBuilder` setting for the same reason as
+    /// the billing meter: one greentic-start process serves every unit, and
+    /// each unit has its own token. Without one, the runtime falls back to
+    /// `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN`, else runs with
+    /// no reader: each attachment is then a fixed notice to the agent and the
+    /// turn still runs. Only the multi-provider backend (`greentic-llm-backend`)
+    /// reads attachments.
+    #[cfg(feature = "agentic-worker")]
+    #[must_use]
+    pub fn with_artifact_reader(mut self, reader: crate::host::ArtifactReaderPort) -> Self {
+        self.artifact_reader = Some(reader);
+        self
+    }
 }
 
 /// Block on a future whether or not we're already inside a tokio runtime.
@@ -495,6 +519,53 @@ impl TenantRuntime {
             crate::http::agent_stream::StreamObserverRegistry,
         >,
     ) -> Result<Arc<Self>> {
+        Self::load_with_artifact_reader(
+            pack_path,
+            config,
+            mocks,
+            archive_source,
+            digest,
+            wasi_policy,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source,
+            // No host reader: the env fallback (else none) applies.
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers,
+        )
+        .await
+    }
+
+    /// [`load`](Self::load) plus the host's attachment reader
+    /// ([`crate::host::RunnerHost::artifact_reader`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn load_with_artifact_reader(
+        pack_path: &Path,
+        config: Arc<HostConfig>,
+        mocks: Option<Arc<MockLayer>>,
+        archive_source: Option<&Path>,
+        digest: Option<String>,
+        wasi_policy: Arc<RunnerWasiPolicy>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
+    ) -> Result<Arc<Self>> {
         let pack = Self::load_pack_runtime(
             pack_path,
             &config,
@@ -512,7 +583,7 @@ impl TenantRuntime {
             None,
         )
         .await?;
-        Self::from_packs(
+        Self::from_packs_with_artifact_reader(
             config,
             vec![(pack, digest)],
             mocks,
@@ -525,6 +596,8 @@ impl TenantRuntime {
             ext_llm_port,
             #[cfg(feature = "agentic-worker")]
             mcp_source,
+            #[cfg(feature = "agentic-worker")]
+            artifact_reader,
             #[cfg(feature = "agentic-worker")]
             stream_observers,
         )
@@ -589,6 +662,8 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             None,
             None,
+            None,
+            #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
             None,
@@ -666,6 +741,8 @@ impl TenantRuntime {
             options.approval_inbox,
             #[cfg(feature = "agentic-worker")]
             options.user_ledger,
+            #[cfg(feature = "agentic-worker")]
+            options.artifact_reader,
         )
         .await
     }
@@ -696,6 +773,7 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] user_ledger: Option<
             greentic_aw_runtime::user_ledger::UserLedgerTarget,
         >,
+        #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -792,6 +870,9 @@ impl TenantRuntime {
             None,
             #[cfg(feature = "agentic-worker")]
             None,
+            // The unit's own attachment reader (the revision's host options).
+            #[cfg(feature = "agentic-worker")]
+            artifact_reader,
             #[cfg(feature = "agentic-worker")]
             None,
             rollout,
@@ -901,6 +982,46 @@ impl TenantRuntime {
             crate::http::agent_stream::StreamObserverRegistry,
         >,
     ) -> Result<Arc<Self>> {
+        Self::from_packs_with_artifact_reader(
+            config,
+            packs,
+            mocks,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source,
+            // No host reader: the env fallback (else none) applies.
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers,
+        )
+        .await
+    }
+
+    /// [`from_packs`](Self::from_packs) plus the host's attachment reader.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn from_packs_with_artifact_reader(
+        config: Arc<HostConfig>,
+        packs: Vec<(Arc<PackRuntime>, Option<String>)>,
+        mocks: Option<Arc<MockLayer>>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
+    ) -> Result<Arc<Self>> {
         Self::from_packs_with_rollout(
             config,
             packs,
@@ -914,6 +1035,8 @@ impl TenantRuntime {
             ext_llm_port,
             #[cfg(feature = "agentic-worker")]
             mcp_source,
+            #[cfg(feature = "agentic-worker")]
+            artifact_reader,
             #[cfg(feature = "agentic-worker")]
             stream_observers,
             RolloutIds::default(),
@@ -946,6 +1069,7 @@ impl TenantRuntime {
         secrets_manager: DynSecretsManager,
         #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
         #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -1198,6 +1322,7 @@ impl TenantRuntime {
                     agent_project_id.clone(),
                     billing_meter.clone(),
                     user_ledger.clone(),
+                    artifact_reader.clone(),
                 )
                 .await
             } else {
@@ -1214,6 +1339,7 @@ impl TenantRuntime {
                         agent_project_id.clone(),
                         billing_meter.clone(),
                         user_ledger.clone(),
+                        artifact_reader.clone(),
                     )
                     .await
                 }
@@ -1230,6 +1356,7 @@ impl TenantRuntime {
                         agent_project_id.clone(),
                         billing_meter.clone(),
                         user_ledger.clone(),
+                        artifact_reader.clone(),
                     )
                     .await
                 }
