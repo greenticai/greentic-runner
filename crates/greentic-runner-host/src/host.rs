@@ -171,15 +171,19 @@ impl HostBuilder {
     ///
     /// A reader holds ONE door token, and the door decides the tenant from the
     /// token, so a host-wide reader is only accepted on a host with exactly
-    /// ONE tenant configuration (the designer's Run Demo host, a desktop run).
-    /// On a host with several tenants it is dropped at [`Self::build`] with a
-    /// warning: one tenant's agents must never read through another tenant's
-    /// token. A host serving many units injects per unit instead, with
-    /// [`crate::runtime::RevisionHostOptions::with_artifact_reader`].
+    /// ONE tenant configuration (the designer's Run Demo host, a local run,
+    /// the Test chat sidecar). Decided once, in [`Self::build`]:
     ///
-    /// When `None`, each runtime falls back to `GREENTIC_ARTIFACT_ENDPOINT` +
-    /// `GREENTIC_ARTIFACT_TOKEN` (both required), else runs without a reader:
-    /// attachments are then announced to the agent, never read.
+    /// - one tenant, a reader injected: that reader;
+    /// - one tenant, `None`: the env fallback, `GREENTIC_ARTIFACT_ENDPOINT` +
+    ///   `GREENTIC_ARTIFACT_TOKEN` (both required), else no reader;
+    /// - several tenants: NO reader. An injected one is dropped with a warning
+    ///   and the env is not used in its place: one tenant's agents must never
+    ///   read through another tenant's token. A host serving many units
+    ///   injects per unit instead, with
+    ///   [`crate::runtime::RevisionHostOptions::with_artifact_reader`].
+    ///
+    /// Without a reader attachments are announced to the agent, never read.
     #[cfg(feature = "agentic-worker")]
     pub fn with_artifact_reader(mut self, reader: Option<ArtifactReaderPort>) -> Self {
         self.artifact_reader = reader;
@@ -191,8 +195,17 @@ impl HostBuilder {
             bail!("at least one tenant configuration is required");
         }
         let wasi_policy = Arc::new(self.wasi_policy);
-        #[cfg(feature = "agentic-worker")]
-        let artifact_reader = single_tenant_reader(self.artifact_reader, self.configs.len());
+        #[cfg(all(feature = "agentic-worker", feature = "greentic-llm-backend"))]
+        let artifact_reader = host_artifact_reader(
+            self.artifact_reader,
+            self.configs.len(),
+            crate::runner::artifact_reader_wiring::artifact_reader_from_env,
+        );
+        // Without the multi-provider backend nothing reads attachments, so
+        // there is no env reader to fall back to.
+        #[cfg(all(feature = "agentic-worker", not(feature = "greentic-llm-backend")))]
+        let artifact_reader =
+            host_artifact_reader(self.artifact_reader, self.configs.len(), || None);
         let configs = self
             .configs
             .into_iter()
@@ -263,16 +276,18 @@ impl HostBuilder {
     }
 }
 
-/// A host-wide artifact reader is kept only on a single-tenant host; see
-/// [`HostBuilder::with_artifact_reader`].
+/// The reader a `HostBuilder` host hands its runtimes; see
+/// [`HostBuilder::with_artifact_reader`]. `env` is consulted ONLY for a
+/// single-tenant host with no injected reader.
 #[cfg(feature = "agentic-worker")]
-pub(crate) fn single_tenant_reader(
-    reader: Option<ArtifactReaderPort>,
+pub(crate) fn host_artifact_reader(
+    injected: Option<ArtifactReaderPort>,
     tenants: usize,
+    env: impl FnOnce() -> Option<ArtifactReaderPort>,
 ) -> Option<ArtifactReaderPort> {
-    match reader {
-        Some(reader) if tenants == 1 => Some(reader),
-        Some(_) => {
+    match (injected, tenants) {
+        (Some(reader), 1) => Some(reader),
+        (Some(_), _) => {
             tracing::warn!(
                 code = "artifact_reader_multi_tenant_host",
                 tenants,
@@ -281,7 +296,8 @@ pub(crate) fn single_tenant_reader(
             );
             None
         }
-        None => None,
+        (None, 1) => env(),
+        (None, _) => None,
     }
 }
 

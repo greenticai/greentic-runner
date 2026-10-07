@@ -475,11 +475,11 @@ impl RevisionHostOptions {
     ///
     /// Per REVISION rather than a `HostBuilder` setting for the same reason as
     /// the billing meter: one greentic-start process serves every unit, and
-    /// each unit has its own token. Without one, the runtime falls back to
-    /// `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN`, else runs with
-    /// no reader: each attachment is then a fixed notice to the agent and the
-    /// turn still runs. Only the multi-provider backend (`greentic-llm-backend`)
-    /// reads attachments.
+    /// each unit has its own token. Without one the unit has NO reader: the
+    /// `GREENTIC_ARTIFACT_*` env variables are never read on this path (they
+    /// would hand every unit of the process one token). Each attachment is
+    /// then a fixed notice to the agent and the turn still runs. Only the
+    /// multi-provider backend (`greentic-llm-backend`) reads attachments.
     #[cfg(feature = "agentic-worker")]
     #[must_use]
     pub fn with_artifact_reader(mut self, reader: crate::host::ArtifactReaderPort) -> Self {
@@ -535,7 +535,7 @@ impl TenantRuntime {
             ext_llm_port,
             #[cfg(feature = "agentic-worker")]
             mcp_source,
-            // No host reader: the env fallback (else none) applies.
+            // No host: no attachment reader.
             #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
@@ -545,7 +545,8 @@ impl TenantRuntime {
     }
 
     /// [`load`](Self::load) plus the host's attachment reader
-    /// ([`crate::host::RunnerHost::artifact_reader`]).
+    /// ([`crate::host::RunnerHost::artifact_reader`], already decided by the
+    /// host, env fallback included).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load_with_artifact_reader(
         pack_path: &Path,
@@ -995,7 +996,7 @@ impl TenantRuntime {
             ext_llm_port,
             #[cfg(feature = "agentic-worker")]
             mcp_source,
-            // No host reader: the env fallback (else none) applies.
+            // No host: no attachment reader.
             #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]

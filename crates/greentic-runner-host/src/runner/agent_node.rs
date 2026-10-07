@@ -1770,7 +1770,7 @@ mod aw {
     /// This path sees no agent configs, so the provider is whatever
     /// `GREENTIC_LLM_PROVIDER` names.
     pub(crate) fn in_process_llm_backend() -> Arc<dyn greentic_aw_runtime::LlmBackend> {
-        // No host reader on this path: the env fallback (else none) applies.
+        // No host on this path: no reader.
         in_process_llm_backend_with_key(None, env_llm_provider(), None)
     }
 
@@ -1790,10 +1790,10 @@ mod aw {
     /// necessary workaround. For every key-requiring provider the behaviour is
     /// unchanged.
     ///
-    /// `artifact_reader` is the reader the host injected for THIS runtime (see
-    /// `crate::runner::artifact_reader_wiring`); without one the env reader is
-    /// tried, else attachments become a fixed notice. Only the multi-provider
-    /// backend reads attachments.
+    /// `artifact_reader` is the reader decided for THIS runtime at the host
+    /// (see `crate::runner::artifact_reader_wiring`); it is installed as is,
+    /// never replaced by an env fallback. Without one, attachments become a
+    /// fixed notice. Only the multi-provider backend reads attachments.
     pub(crate) fn in_process_llm_backend_with_key(
         override_key: Option<String>,
         provider: Option<String>,
@@ -1837,13 +1837,11 @@ mod aw {
                     provider = provider.as_deref().unwrap_or_default(),
                     "AW LLM via in-process greentic-llm (multi-provider)"
                 );
-                use crate::runner::artifact_reader_wiring::{
-                    attach_artifact_reader, select_artifact_reader,
-                };
                 return Arc::new(RetryingLlmBackend::new(
-                    attach_artifact_reader(
-                        greentic_aw_runtime::GreenticLlmBackend::new(api_key, base_url),
-                        select_artifact_reader(artifact_reader),
+                    crate::runner::artifact_reader_wiring::greentic_backend(
+                        api_key,
+                        base_url,
+                        artifact_reader,
                     ),
                     3,
                     Duration::from_millis(250),
@@ -2479,7 +2477,7 @@ mod aw {
             project_id,
             resolve_billing_meter(None),
             // The un-metered wrappers carry no host seam: no user ledger and
-            // no host artifact reader (the env fallback still applies).
+            // no artifact reader (only a host decides one).
             None,
             None,
         )
@@ -2632,7 +2630,7 @@ mod aw {
             project_id,
             resolve_billing_meter(None),
             // The un-metered wrappers carry no host seam: no user ledger and
-            // no host artifact reader (the env fallback still applies).
+            // no artifact reader (only a host decides one).
             None,
             None,
         )
