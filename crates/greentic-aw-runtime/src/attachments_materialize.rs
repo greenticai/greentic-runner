@@ -464,8 +464,11 @@ fn sanitize_name(raw: Option<&str>) -> String {
 }
 
 /// Document text keeps its content and its `\n` / `\t`; U+2028 / U+2029
-/// become `\n`; every other stripped character is removed; the delimiters
-/// become parentheses, so a forged marker is not even visually plausible.
+/// become `\n`; ZWNJ (U+200C) and ZWJ (U+200D) are kept, because Persian and
+/// Indic words and emoji sequences need them (they cannot start or end a
+/// marker: only `OPEN` does, and it never survives); every other stripped
+/// character is removed; the delimiters become parentheses, so a forged
+/// marker is not even visually plausible.
 #[cfg(test)]
 fn sanitize_text(raw: &str) -> String {
     sanitized_chars(raw).collect()
@@ -473,7 +476,7 @@ fn sanitize_text(raw: &str) -> String {
 
 fn sanitized_chars(raw: &str) -> impl Iterator<Item = char> + '_ {
     raw.chars().filter_map(|c| match c {
-        '\n' | '\t' => Some(c),
+        '\n' | '\t' | '\u{200C}' | '\u{200D}' => Some(c),
         '\u{2028}' | '\u{2029}' => Some('\n'),
         OPEN => Some('('),
         CLOSE => Some(')'),
