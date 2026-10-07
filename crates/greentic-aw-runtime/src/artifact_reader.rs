@@ -233,6 +233,7 @@ impl ArtifactReader for HttpArtifactReader {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use wiremock::matchers::{body_json, header, method, path};
