@@ -183,6 +183,16 @@ pub fn unreadable_note(count: usize) -> String {
     )
 }
 
+/// The fixed sentence added when the model refused the images it was sent
+/// (vision is advertised per provider, but some of its models take no images):
+/// the turn is retried once without them. Only a count.
+pub fn images_unseen_note(count: usize) -> String {
+    format!(
+        "\n[The user attached {count} image(s) that you cannot see: this model did not \
+         accept images. Tell the user if it matters.]"
+    )
+}
+
 /// For a backend that cannot read attachments: every user message with
 /// attachments gets [`unreadable_note`] appended and loses its references, so
 /// neither a name nor an `artifact://` id reaches the provider.

@@ -246,3 +246,122 @@ async fn a_retry_after_a_provider_error_does_not_fetch_again() {
     );
     assert_eq!(last_user(&provider.requests()[1]).images.len(), 1);
 }
+
+/// Advertises vision (vision is per PROVIDER) but its model refuses images,
+/// or refuses everything.
+struct PickyProvider {
+    fail_always: bool,
+    captured: Mutex<Vec<GChatRequest>>,
+}
+
+impl PickyProvider {
+    fn new(fail_always: bool) -> Arc<Self> {
+        Arc::new(Self {
+            fail_always,
+            captured: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl LlmProvider for PickyProvider {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            chat: true,
+            tools: true,
+            streaming: false,
+            vision: true,
+            system_prompt: true,
+        }
+    }
+    fn provider_name(&self) -> &'static str {
+        "picky"
+    }
+    fn model(&self) -> &str {
+        "text-only-model"
+    }
+    async fn chat(&self, req: GChatRequest) -> Result<GChatResponse, GLlmError> {
+        let has_images = req.messages.iter().any(|m| !m.images.is_empty());
+        let first_call = {
+            let mut captured = self.captured.lock().unwrap();
+            captured.push(req);
+            captured.len() == 1
+        };
+        if self.fail_always {
+            return Err(GLlmError::UnsupportedCapability(if first_call {
+                "first refusal"
+            } else {
+                "second refusal"
+            }));
+        }
+        if has_images {
+            return Err(GLlmError::UnsupportedCapability("vision"));
+        }
+        Ok(GChatResponse {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        })
+    }
+    async fn chat_stream(&self, _req: GChatRequest) -> Result<ChatStream, GLlmError> {
+        Err(GLlmError::UnsupportedCapability("streaming"))
+    }
+}
+
+fn picky_backend(p: Arc<PickyProvider>) -> GreenticLlmBackend {
+    let reader = Arc::new(FakeReader::new().ok("artifact://a", "image/png", vec![1, 2, 3]));
+    GreenticLlmBackend::new("unused", None)
+        .with_cached_provider("deepseek", "m", p)
+        .with_artifact_reader(reader)
+}
+
+#[tokio::test]
+async fn a_model_that_refuses_images_is_retried_once_without_them_with_a_note() {
+    let p = PickyProvider::new(false);
+    let out = picky_backend(p.clone())
+        .complete(request(vec![user(
+            "look",
+            vec![image("artifact://a", "a.png")],
+        )]))
+        .await;
+    assert!(out.is_ok(), "{out:?}");
+    let sent = p.captured.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2, "one retry");
+    assert_eq!(last_user(&sent[0]).images.len(), 1);
+    assert!(last_user(&sent[1]).images.is_empty());
+    assert!(
+        last_user(&sent[1])
+            .content
+            .contains(&crate::attachments_materialize::images_unseen_note(1)),
+        "{}",
+        last_user(&sent[1]).content
+    );
+}
+
+#[tokio::test]
+async fn when_the_retry_also_fails_the_original_error_is_returned() {
+    let p = PickyProvider::new(true);
+    let err = picky_backend(p.clone())
+        .complete(request(vec![user(
+            "look",
+            vec![image("artifact://a", "a.png")],
+        )]))
+        .await
+        .unwrap_err();
+    assert_eq!(p.captured.lock().unwrap().len(), 2);
+    assert!(
+        matches!(&err, LlmError::BadRequest(m) if m.contains("first refusal")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_text_only_turn_error_is_not_retried() {
+    let p = PickyProvider::new(true);
+    let err = picky_backend(p.clone())
+        .complete(request(vec![user("hello", vec![])]))
+        .await;
+    assert!(err.is_err());
+    assert_eq!(p.captured.lock().unwrap().len(), 1);
+}

@@ -145,17 +145,37 @@ impl LlmBackend for GreenticLlmBackend {
             let images = self
                 .apply_attachments(&mut request.history, vision, &memo)
                 .await;
+            let image_count = images.len();
             let chat_request = build_chat_request(&request, images);
             // Built from the list the model is shown: a sanitised wire name
             // cannot be split back apart by string surgery.
             let codec = ToolNameCodec::for_tools(&request.tools);
-            let response = provider
-                .chat(chat_request)
-                .await
-                // greentic-llm errors are auth/config/transport-class; surface as
-                // BadRequest so `RetryingLlmBackend` does not loop on a
-                // deterministic failure.
-                .map_err(|e| LlmError::BadRequest(e.to_string()))?;
+            // greentic-llm errors are auth/config/transport-class; surface as
+            // BadRequest so `RetryingLlmBackend` does not loop on a
+            // deterministic failure.
+            let response = match provider.chat(chat_request).await {
+                Ok(response) => response,
+                Err(first) if image_count > 0 => {
+                    // Vision is advertised per PROVIDER, not per model: a model
+                    // that takes no images fails the call. Retry ONCE without
+                    // them, telling the agent; if that fails too, the original
+                    // error is what the caller sees.
+                    tracing::warn!(
+                        code = "images_refused_retry",
+                        images = image_count,
+                        "provider refused a request carrying images; retrying without them"
+                    );
+                    append_to_last_user(
+                        &mut request.history,
+                        &crate::attachments_materialize::images_unseen_note(image_count),
+                    );
+                    provider
+                        .chat(build_chat_request(&request, Vec::new()))
+                        .await
+                        .map_err(|_| LlmError::BadRequest(first.to_string()))?
+                }
+                Err(e) => return Err(LlmError::BadRequest(e.to_string())),
+            };
             Ok(map_response(response, &codec))
         })
     }
@@ -221,6 +241,17 @@ impl GreenticLlmBackend {
             attachments.clear();
         }
         images
+    }
+}
+
+/// Append `text` to the last user message of `history` (the current turn's).
+fn append_to_last_user(history: &mut [ChatMessage], text: &str) {
+    if let Some(ChatMessage::User { content, .. }) = history
+        .iter_mut()
+        .rev()
+        .find(|m| matches!(m, ChatMessage::User { .. }))
+    {
+        content.push_str(text);
     }
 }
 
