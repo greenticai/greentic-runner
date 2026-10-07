@@ -146,7 +146,10 @@ in the prompt:
   so it is the only backend that calls the guard.
 
 **Image content is not guardrail-inspected in v1**: an image is not text, and
-it reaches a vision model as sent.
+it reaches a vision model as sent. **Attachment NAMES are not
+guardrail-inspected either**: a name is cleaned when parsed (see above) and
+sits on its own fixed `name:` line inside the nonce-delimited document block,
+outside the text the guard checks.
 
 ## Paths NOT served in v1
 
