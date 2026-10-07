@@ -53,7 +53,11 @@ If the model refuses the images it was sent (vision is advertised per
 PROVIDER, but some of its models take no images), the turn is retried ONCE
 without them and the agent gets the fixed note "The user attached N image(s)
 that you cannot see…". If the retry also fails, the original error is returned.
-A text-only failure is never retried here.
+Only an error that reads as the request being refused is retried: a provider
+status 400, 415 or 422, or the provider refusing vision. A transport failure or
+timeout, 401/403/408/429 and any 5xx are never retried (they would only
+repeat, and a rate limit would be spent twice). A text-only failure is never
+retried here.
 
 ### Where the reader comes from (decided at the host, never below it)
 

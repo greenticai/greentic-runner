@@ -248,19 +248,31 @@ async fn a_retry_after_a_provider_error_does_not_fetch_again() {
     assert_eq!(last_user(&provider.requests()[1]).images.len(), 1);
 }
 
+/// How a [`PickyProvider`] fails.
+#[derive(Clone, Copy)]
+enum Picky {
+    /// Fails a request carrying images with this error; answers otherwise.
+    RefusesImages(fn() -> GLlmError),
+    /// Fails every request; the flag says whether it is the first call.
+    FailsAlways(fn(bool) -> GLlmError),
+}
+
 /// Advertises vision (vision is per PROVIDER) but its model refuses images,
-/// or refuses everything.
+/// or fails every call.
 struct PickyProvider {
-    fail_always: bool,
+    mode: Picky,
     captured: Mutex<Vec<GChatRequest>>,
 }
 
 impl PickyProvider {
-    fn new(fail_always: bool) -> Arc<Self> {
+    fn new(mode: Picky) -> Arc<Self> {
         Arc::new(Self {
-            fail_always,
+            mode,
             captured: Mutex::new(Vec::new()),
         })
+    }
+    fn calls(&self) -> usize {
+        self.captured.lock().unwrap().len()
     }
 }
 
@@ -288,15 +300,10 @@ impl LlmProvider for PickyProvider {
             captured.push(req);
             captured.len() == 1
         };
-        if self.fail_always {
-            return Err(GLlmError::UnsupportedCapability(if first_call {
-                "first refusal"
-            } else {
-                "second refusal"
-            }));
-        }
-        if has_images {
-            return Err(GLlmError::UnsupportedCapability("vision"));
+        match self.mode {
+            Picky::FailsAlways(err) => return Err(err(first_call)),
+            Picky::RefusesImages(err) if has_images => return Err(err()),
+            Picky::RefusesImages(_) => {}
         }
         Ok(GChatResponse {
             content: "ok".into(),
@@ -317,15 +324,21 @@ fn picky_backend(p: Arc<PickyProvider>) -> GreenticLlmBackend {
         .with_artifact_reader(reader)
 }
 
-#[tokio::test]
-async fn a_model_that_refuses_images_is_retried_once_without_them_with_a_note() {
-    let p = PickyProvider::new(false);
-    let out = picky_backend(p.clone())
-        .complete(request(vec![user(
-            "look",
-            vec![image("artifact://a", "a.png")],
-        )]))
-        .await;
+fn with_image() -> LlmRequest {
+    request(vec![user("look", vec![image("artifact://a", "a.png")])])
+}
+
+fn status(status: u16, body: &str) -> GLlmError {
+    GLlmError::Status {
+        status,
+        body: body.into(),
+    }
+}
+
+/// The retry is taken, once, without the images and with the fixed note.
+async fn assert_retried_without_images(refusal: fn() -> GLlmError) {
+    let p = PickyProvider::new(Picky::RefusesImages(refusal));
+    let out = picky_backend(p.clone()).complete(with_image()).await;
     assert!(out.is_ok(), "{out:?}");
     let sent = p.captured.lock().unwrap().clone();
     assert_eq!(sent.len(), 2, "one retry");
@@ -341,16 +354,57 @@ async fn a_model_that_refuses_images_is_retried_once_without_them_with_a_note() 
 }
 
 #[tokio::test]
+async fn a_model_that_refuses_images_is_retried_once_without_them_with_a_note() {
+    assert_retried_without_images(|| status(400, "image input is not supported")).await;
+    assert_retried_without_images(|| status(415, "")).await;
+    assert_retried_without_images(|| status(422, "images not allowed")).await;
+    assert_retried_without_images(|| GLlmError::UnsupportedCapability("vision")).await;
+}
+
+#[tokio::test]
+async fn an_error_that_is_not_an_image_refusal_is_never_retried() {
+    let not_refusals: [fn() -> GLlmError; 8] = [
+        || status(429, "rate limited"),
+        || status(401, "bad key"),
+        || status(403, "forbidden"),
+        || status(408, "request timeout"),
+        || status(500, "boom"),
+        || status(503, "unavailable"),
+        || GLlmError::Transport("operation timed out".into()),
+        || GLlmError::UnsupportedCapability("tools"),
+    ];
+    for refusal in not_refusals {
+        let expected = refusal().to_string();
+        let p = PickyProvider::new(Picky::RefusesImages(refusal));
+        let err = picky_backend(p.clone())
+            .complete(with_image())
+            .await
+            .unwrap_err();
+        assert_eq!(p.calls(), 1, "not retried: {expected}");
+        assert!(
+            matches!(&err, LlmError::BadRequest(m) if *m == expected),
+            "the error surfaces unchanged: {err:?} vs {expected}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn when_the_retry_also_fails_the_original_error_is_returned() {
-    let p = PickyProvider::new(true);
+    let p = PickyProvider::new(Picky::FailsAlways(|first| {
+        status(
+            400,
+            if first {
+                "first refusal"
+            } else {
+                "second refusal"
+            },
+        )
+    }));
     let err = picky_backend(p.clone())
-        .complete(request(vec![user(
-            "look",
-            vec![image("artifact://a", "a.png")],
-        )]))
+        .complete(with_image())
         .await
         .unwrap_err();
-    assert_eq!(p.captured.lock().unwrap().len(), 2);
+    assert_eq!(p.calls(), 2);
     assert!(
         matches!(&err, LlmError::BadRequest(m) if m.contains("first refusal")),
         "{err:?}"
@@ -359,12 +413,18 @@ async fn when_the_retry_also_fails_the_original_error_is_returned() {
 
 #[tokio::test]
 async fn a_text_only_turn_error_is_not_retried() {
-    let p = PickyProvider::new(true);
-    let err = picky_backend(p.clone())
-        .complete(request(vec![user("hello", vec![])]))
-        .await;
-    assert!(err.is_err());
-    assert_eq!(p.captured.lock().unwrap().len(), 1);
+    for err in [
+        (|_| status(400, "bad")) as fn(bool) -> GLlmError,
+        |_| GLlmError::UnsupportedCapability("vision"),
+        |_| status(429, "slow down"),
+    ] {
+        let p = PickyProvider::new(Picky::FailsAlways(err));
+        let out = picky_backend(p.clone())
+            .complete(request(vec![user("hello", vec![])]))
+            .await;
+        assert!(out.is_err());
+        assert_eq!(p.calls(), 1);
+    }
 }
 
 // ---- inbound guardrails over document text --------------------------------

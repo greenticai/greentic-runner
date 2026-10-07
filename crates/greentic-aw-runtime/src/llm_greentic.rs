@@ -157,11 +157,14 @@ impl LlmBackend for GreenticLlmBackend {
             // deterministic failure.
             let response = match provider.chat(chat_request).await {
                 Ok(response) => response,
-                Err(first) if image_count > 0 => {
+                Err(first) if image_count > 0 && refuses_images(&first) => {
                     // Vision is advertised per PROVIDER, not per model: a model
                     // that takes no images fails the call. Retry ONCE without
                     // them, telling the agent; if that fails too, the original
-                    // error is what the caller sees.
+                    // error is what the caller sees. Only an error that reads
+                    // as the request being refused is retried: a rate limit,
+                    // an auth failure, a timeout or a server error would only
+                    // repeat (and a rate limit would be spent twice).
                     tracing::warn!(
                         code = "images_refused_retry",
                         images = image_count,
@@ -246,6 +249,20 @@ impl GreenticLlmBackend {
         }
         images
     }
+}
+
+/// Whether `e` can be the model refusing the images it was sent: a provider
+/// status of 400, 415 or 422 (rig maps an HTTP status onto
+/// [`greentic_llm::LlmError::Status`]), or the provider refusing vision. Never
+/// a transport failure or timeout, 401/403/408/429, or a 5xx.
+fn refuses_images(e: &greentic_llm::LlmError) -> bool {
+    matches!(
+        e,
+        greentic_llm::LlmError::Status {
+            status: 400 | 415 | 422,
+            ..
+        } | greentic_llm::LlmError::UnsupportedCapability("vision")
+    )
 }
 
 /// Append `text` to the last user message of `history` (the current turn's).
