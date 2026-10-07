@@ -337,3 +337,34 @@ async fn a_hostile_endpoint_gets_no_request_and_a_fixed_error() {
         }
     }
 }
+
+/// What matters is the runtime the CALL runs on, not the stored one:
+/// `block_in_place` panics on a current-thread runtime even when the stored
+/// handle is multi-thread. The port refuses instead.
+#[test]
+fn a_call_from_a_current_thread_runtime_is_refused_even_with_a_multi_thread_handle() {
+    let stored = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let port = HttpArtifactPort::new(
+        "http://127.0.0.1:1/artifacts".into(),
+        "t".into(),
+        stored.handle().clone(),
+    )
+    .unwrap();
+    let caller = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = caller
+        .block_on(async { port.put("x", &ctx("acme"), request()) })
+        .unwrap_err();
+    match err {
+        ArtifactPortError::Unavailable(msg) => {
+            assert_eq!(msg, "artifact put needs a multi-thread runtime")
+        }
+        other => panic!("{other:?}"),
+    }
+}

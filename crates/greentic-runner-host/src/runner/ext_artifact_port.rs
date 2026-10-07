@@ -104,6 +104,20 @@ fn unavailable(reason: &str) -> ArtifactPortError {
     ArtifactPortError::Unavailable(reason.to_string())
 }
 
+/// Whether `block_in_place` + `handle.block_on` is safe from the CALLING
+/// context. `block_in_place` panics when the caller runs on a current-thread
+/// runtime, whatever the stored handle is, so the caller's runtime is checked
+/// first; a caller outside any runtime (a plain or blocking thread) is fine.
+/// The stored handle must also be multi-thread: a current-thread runtime is
+/// not driven from another thread.
+fn can_block_here(stored: &tokio::runtime::Handle) -> bool {
+    use tokio::runtime::RuntimeFlavor::CurrentThread;
+    let caller_ok = tokio::runtime::Handle::try_current()
+        .map(|current| current.runtime_flavor() != CurrentThread)
+        .unwrap_or(true);
+    caller_ok && stored.runtime_flavor() != CurrentThread
+}
+
 impl ArtifactPort for HttpArtifactPort {
     fn put(
         &self,
@@ -119,10 +133,7 @@ impl ArtifactPort for HttpArtifactPort {
         {
             return Err(unavailable("call carries no tenant"));
         }
-        if matches!(
-            self.handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::CurrentThread
-        ) {
+        if !can_block_here(&self.handle) {
             return Err(unavailable("artifact put needs a multi-thread runtime"));
         }
         // The same endpoint rule as the reader: https, or loopback http only,
