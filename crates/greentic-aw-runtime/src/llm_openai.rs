@@ -836,6 +836,7 @@ mod tests {
                 model: "gpt-4o".into(),
                 credential_ref: None,
             },
+            turn_attachments: Default::default(),
         };
         let value = serde_json::to_value(build_messages(&req)).unwrap();
         // [0] = system prompt, [1] = the assistant turn.

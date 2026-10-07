@@ -523,6 +523,12 @@ async fn run_step_scoped(
             terminated_by = TerminationReason::AwaitingToolInput;
         }
     }
+    // One memo per TURN, shared by every iteration's request (and by a
+    // retrying backend's re-sends): the current message's attachments are
+    // fetched once, and the memo is dropped when the turn ends. Never shared
+    // across turns or conversations (it holds bytes fetched under this turn's
+    // authorisation).
+    let turn_attachments = crate::attachments_materialize::TurnAttachments::for_turn();
     let iter_range = if suspension.is_some() {
         0..0
     } else {
@@ -565,6 +571,7 @@ async fn run_step_scoped(
             history: state.messages.clone(),
             tools: tools_schema,
             provider: config.llm.clone(),
+            turn_attachments: turn_attachments.clone(),
         };
 
         // Stream only when the observer actually consumes deltas. A

@@ -207,6 +207,7 @@ mod tests {
                 model: "gpt-4o".into(),
                 credential_ref: None,
             },
+            turn_attachments: Default::default(),
         }
     }
 

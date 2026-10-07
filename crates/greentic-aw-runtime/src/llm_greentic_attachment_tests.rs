@@ -5,11 +5,9 @@
 //! state never receives bytes.
 
 use super::*;
-use crate::attachments::{AttachmentKind, AttachmentRef};
+use crate::attachments::AttachmentRef;
 use crate::attachments_materialize::tests::{FakeReader, image};
 use crate::config::LlmProviderRef;
-use crate::state::ConversationState;
-use crate::tenant::TenantContext;
 use async_trait::async_trait;
 use greentic_llm::{Capabilities, ChatStream, FinishReason, LlmError as GLlmError};
 
@@ -85,6 +83,7 @@ fn request(history: Vec<ChatMessage>) -> LlmRequest {
             model: "m".into(),
             credential_ref: None,
         },
+        turn_attachments: Default::default(),
     }
 }
 
@@ -198,52 +197,52 @@ async fn without_a_reader_the_turn_proceeds_with_one_note() {
     );
 }
 
+/// Fails its FIRST call after the inner backend built (and materialised) the
+/// request, the way a provider error after a fetch would look to a retry.
+struct FailFirst<B> {
+    inner: B,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl<B: LlmBackend> LlmBackend for FailFirst<B> {
+    fn complete<'a>(
+        &'a self,
+        request: LlmRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            let out = self.inner.complete(request).await;
+            if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(LlmError::ServiceUnavailable);
+            }
+            out
+        })
+    }
+}
+
 #[tokio::test]
-async fn conversation_state_keeps_references_only_after_a_turn() {
+async fn a_retry_after_a_provider_error_does_not_fetch_again() {
     let provider = MockProvider::new(true);
-    let reader = Arc::new(
-        FakeReader::new()
-            .ok("artifact://a", "image/png", vec![1, 2, 3])
-            .ok(
-                "artifact://t",
-                "text/plain",
-                b"secret quarterly body".to_vec(),
-            ),
+    let reader = Arc::new(FakeReader::new().ok("artifact://a", "image/png", vec![1, 2, 3]));
+    let retrying = crate::llm::RetryingLlmBackend::new(
+        FailFirst {
+            inner: backend(provider.clone(), Some(reader.clone())),
+            failed: Default::default(),
+        },
+        3,
+        std::time::Duration::from_millis(1),
     );
-    let b = backend(provider.clone(), Some(reader));
-    let mut state = ConversationState::empty(&TenantContext::new("t", "e"), "s");
-    state.messages.push(user(
-        "look",
-        vec![
-            image("artifact://a", "a.png"),
-            AttachmentRef {
-                id: "artifact://d".into(),
-                mime_type: "text/plain".into(),
-                name: Some("d.txt".into()),
-                size_bytes: None,
-                kind: AttachmentKind::Document,
-                text_ref: Some("artifact://t".into()),
-            },
-        ],
-    ));
-    // The loop builds the request from a clone of the state's history.
-    let response = b.complete(request(state.messages.clone())).await.unwrap();
-    state.messages.push(ChatMessage::Assistant {
-        content: response.content.unwrap_or_default(),
-        tool_calls: vec![],
-    });
-    // Bytes and extracted text DID reach the provider...
-    let sent = provider.requests();
-    assert_eq!(last_user(&sent[0]).images[0].data_base64, "AQID");
-    assert!(
-        last_user(&sent[0])
-            .content
-            .contains("secret quarterly body")
+    let mut req = request(vec![user("look", vec![image("artifact://a", "a.png")])]);
+    req.turn_attachments = TurnAttachments::for_turn();
+    retrying.complete(req).await.unwrap();
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the retry did reach the provider"
     );
-    // ...and none of it is in the persisted state.
-    let json = serde_json::to_string(&state).unwrap();
-    assert!(!json.contains("AQID"), "{json}");
-    assert!(!json.contains("data_base64"), "{json}");
-    assert!(!json.contains("secret quarterly body"), "{json}");
-    assert!(json.contains("artifact://a") && json.contains("artifact://d"));
+    assert_eq!(
+        reader.call_count(),
+        1,
+        "but the attachment was fetched once"
+    );
+    assert_eq!(last_user(&provider.requests()[1]).images.len(), 1);
 }

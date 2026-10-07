@@ -20,6 +20,7 @@ use greentic_llm::{
 };
 
 use crate::artifact_reader::ArtifactReader;
+use crate::attachments_materialize::{TurnAttachments, TurnKey, materialize};
 use crate::error::LlmError;
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
 use crate::state::{ChatMessage, ToolCallRecord};
@@ -38,6 +39,14 @@ pub struct GreenticLlmBackend {
     /// Resolves attachment bytes for the current turn. `None`: attachments
     /// are not materialised and the agent is told so (the turn still runs).
     artifacts: Option<Arc<dyn ArtifactReader>>,
+    /// Makes the per-turn nonce of document-block markers. Injected only in
+    /// tests, to make the markers deterministic.
+    nonce_source: fn() -> String,
+}
+
+/// 122 random bits (a v4 UUID), as 32 lowercase hex characters.
+fn random_nonce() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 impl GreenticLlmBackend {
@@ -50,6 +59,7 @@ impl GreenticLlmBackend {
             base_url: base_url.filter(|s| !s.trim().is_empty()),
             cache: Mutex::new(HashMap::new()),
             artifacts: None,
+            nonce_source: random_nonce,
         }
     }
 
@@ -59,10 +69,22 @@ impl GreenticLlmBackend {
         self
     }
 
+    /// Test seam: make document-block nonces deterministic.
+    #[cfg(any(test, feature = "test-mock"))]
+    pub fn with_nonce_source(mut self, source: fn() -> String) -> Self {
+        self.nonce_source = source;
+        self
+    }
+
     /// Test seam: serve `(provider, model)` from `p` instead of building a
     /// `RigBackend`.
-    #[cfg(test)]
-    fn with_cached_provider(self, provider: &str, model: &str, p: Arc<dyn LlmProvider>) -> Self {
+    #[cfg(any(test, feature = "test-mock"))]
+    pub fn with_cached_provider(
+        self,
+        provider: &str,
+        model: &str,
+        p: Arc<dyn LlmProvider>,
+    ) -> Self {
         self.cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -119,7 +141,10 @@ impl LlmBackend for GreenticLlmBackend {
             // is never sent and the agent is told instead.
             let vision = provider.capabilities().vision;
             let mut request = request;
-            let images = self.apply_attachments(&mut request.history, vision).await;
+            let memo = request.turn_attachments.clone();
+            let images = self
+                .apply_attachments(&mut request.history, vision, &memo)
+                .await;
             let chat_request = build_chat_request(&request, images);
             // Built from the list the model is shown: a sanitised wire name
             // cannot be split back apart by string surgery.
@@ -146,6 +171,7 @@ impl GreenticLlmBackend {
         &self,
         history: &mut [ChatMessage],
         vision: bool,
+        memo: &TurnAttachments,
     ) -> Vec<GChatImage> {
         let last_user = history
             .iter()
@@ -163,12 +189,19 @@ impl GreenticLlmBackend {
                 continue;
             }
             if Some(idx) == last_user {
-                let m = crate::attachments_materialize::materialize(
-                    self.artifacts.as_deref(),
-                    attachments,
+                let key = TurnKey {
+                    last_user_index: idx,
                     vision,
-                )
-                .await;
+                };
+                let refs: &[_] = attachments;
+                let m = memo
+                    .get_or_materialize(key, || {
+                        let nonce = (self.nonce_source)();
+                        async move {
+                            materialize(self.artifacts.as_deref(), refs, vision, &nonce).await
+                        }
+                    })
+                    .await;
                 content.push_str(&m.text);
                 images = m
                     .images
@@ -315,6 +348,7 @@ mod tests {
                 model: "deepseek-chat".into(),
                 credential_ref: None,
             },
+            turn_attachments: Default::default(),
         }
     }
 

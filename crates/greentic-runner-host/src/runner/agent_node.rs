@@ -1261,6 +1261,7 @@ mod aw {
                 model: model.to_string(),
                 credential_ref: None,
             },
+            turn_attachments: Default::default(),
         }
     }
 

@@ -111,7 +111,9 @@ run_crate_tests() {
   # but that variant also pulls RocksDB and is routinely skipped, which would
   # leave the credit-budget gate in `loop.rs` -- the only thing stopping an
   # empty wallet from spending on LLM calls -- with no gate in any cheap step.
-  cargo test -p greentic-aw-runtime --features test-mock
+  # `greentic-llm-backend` adds the attachment vision-gate and per-turn
+  # materialisation tests (llm_greentic + attachments_materialize_loop).
+  cargo test -p greentic-aw-runtime --features test-mock,greentic-llm-backend
 }
 
 run_workspace_tests() {

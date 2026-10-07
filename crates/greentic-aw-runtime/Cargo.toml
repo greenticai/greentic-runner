@@ -107,6 +107,9 @@ thiserror           = { workspace = true }
 tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing             = { workspace = true }
 unicode-normalization = "0.1"
+# Unicode general categories (Cc/Cf/Zl/Zp) for sanitising attachment names
+# and document text. Already in the lock via jsonschema; no dependencies.
+unicode-general-category = "1"
 url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
 # ULID event ids for the worker-usage ingest door (the admin keys a

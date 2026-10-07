@@ -21,6 +21,12 @@ pub struct LlmRequest {
     /// Resolved provider + model — backend selects credentials/endpoint
     /// based on this.
     pub provider: crate::config::LlmProviderRef,
+    /// Per-TURN memo of the current user message's materialised attachments
+    /// (see [`crate::attachments_materialize::TurnAttachments`]). The loop
+    /// creates one per turn; `Default` is "no memo": a backend then
+    /// materialises on every call. Never serialised: it may hold bytes.
+    #[serde(skip)]
+    pub turn_attachments: crate::attachments_materialize::TurnAttachments,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,6 +200,7 @@ mod tests {
                 model: "x".into(),
                 credential_ref: None,
             },
+            turn_attachments: Default::default(),
         }
     }
 
@@ -265,6 +272,7 @@ mod tests {
                         model: "m".into(),
                         credential_ref: None,
                     },
+                    turn_attachments: Default::default(),
                 },
                 on_delta,
             )
