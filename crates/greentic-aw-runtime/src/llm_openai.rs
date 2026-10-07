@@ -588,10 +588,20 @@ fn build_messages(req: &LlmRequest) -> Vec<OaMessage> {
             ChatMessage::System { content } => out.push(OaMessage::System {
                 content: content.clone(),
             }),
-            // attachments unsupported on this backend
-            ChatMessage::User { content, .. } => out.push(OaMessage::User {
-                content: content.clone(),
-            }),
+            // This backend cannot open attachments: the agent gets the fixed
+            // notice, and no reference, id or name is sent.
+            ChatMessage::User {
+                content,
+                attachments,
+            } => {
+                let mut content = content.clone();
+                if !attachments.is_empty() {
+                    content.push_str(&crate::attachments_materialize::unreadable_note(
+                        attachments.len(),
+                    ));
+                }
+                out.push(OaMessage::User { content });
+            }
             ChatMessage::Assistant {
                 content,
                 tool_calls,
@@ -845,6 +855,50 @@ mod tests {
             value[1].get("tool_calls").is_none(),
             "empty tool_calls must be omitted, got: {}",
             value[1]
+        );
+    }
+
+    /// This backend cannot open attachments: the agent is told so with the
+    /// same fixed sentence the multi-provider backend uses, and no name or
+    /// reference of the file reaches the provider.
+    #[test]
+    fn attachments_are_announced_with_the_fixed_notice_and_never_sent() {
+        use crate::attachments::{AttachmentKind, AttachmentRef};
+        use crate::config::LlmProviderRef;
+        use crate::state::ChatMessage;
+        let file = |id: &str| AttachmentRef {
+            id: id.into(),
+            mime_type: "image/png".into(),
+            name: Some("secret-plan.png".into()),
+            size_bytes: None,
+            kind: AttachmentKind::Image,
+            text_ref: None,
+        };
+        let req = LlmRequest {
+            system_prompt: "sys".into(),
+            history: vec![ChatMessage::User {
+                content: "look".into(),
+                attachments: vec![file("artifact://a"), file("artifact://b")],
+            }],
+            tools: vec![],
+            provider: LlmProviderRef {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+                credential_ref: None,
+            },
+            turn_attachments: Default::default(),
+        };
+        let value = serde_json::to_value(build_messages(&req)).unwrap();
+        let content = value[1]["content"].as_str().unwrap();
+        assert!(content.starts_with("look"), "{content}");
+        assert!(
+            content.contains(&crate::attachments_materialize::unreadable_note(2)),
+            "{content}"
+        );
+        let all = value.to_string();
+        assert!(
+            !all.contains("secret-plan") && !all.contains("artifact://"),
+            "{all}"
         );
     }
 }

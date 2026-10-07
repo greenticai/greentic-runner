@@ -173,6 +173,33 @@ fn note(n: usize, kind: AttachmentKind, rest: &str) -> String {
     format!("\n[{} {rest}]", capitalised(&which(n, kind)))
 }
 
+/// The fixed sentence the agent gets when attachments cannot be opened at all
+/// (no reader, or a backend that cannot read them). Only a count: never a
+/// name, an id or a reason. Every backend uses this one sentence.
+pub fn unreadable_note(count: usize) -> String {
+    format!(
+        "\n[The user attached {count} file(s), but attachments are not available in this \
+         deployment, so you cannot open them. Tell the user if it matters.]"
+    )
+}
+
+/// For a backend that cannot read attachments: every user message with
+/// attachments gets [`unreadable_note`] appended and loses its references, so
+/// neither a name nor an `artifact://` id reaches the provider.
+pub fn announce_unreadable(history: &mut [crate::state::ChatMessage]) {
+    for msg in history.iter_mut() {
+        if let crate::state::ChatMessage::User {
+            content,
+            attachments,
+        } = msg
+            && !attachments.is_empty()
+        {
+            content.push_str(&unreadable_note(attachments.len()));
+            attachments.clear();
+        }
+    }
+}
+
 /// Resolve `refs` (the CURRENT message's attachments) into images and text.
 ///
 /// Three visible outcomes per attachment, never a silent drop: sent (an image,
@@ -190,11 +217,7 @@ pub async fn materialize(
         return out;
     }
     let Some(reader) = reader else {
-        out.text.push_str(&format!(
-            "\n[The user attached {} file(s), but attachments are not available in this \
-             deployment, so you cannot open them. Tell the user if it matters.]",
-            refs.len()
-        ));
+        out.text.push_str(&unreadable_note(refs.len()));
         return out;
     };
 
