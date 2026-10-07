@@ -251,3 +251,220 @@ async fn a_redaction_is_what_the_model_reads() {
     assert!(!content.contains("boss@corp.example"), "{content}");
     assert!(content.contains("[REDACTED_EMAIL]"), "{content}");
 }
+
+// ─── A parked flow tool, then its resume ──────────────────────────────────
+
+/// Calls the `flow:form` tool until a tool result follows the last user
+/// message, then answers "done". Records every request.
+#[derive(Default)]
+struct FlowThenReply {
+    captured: Mutex<Vec<ChatRequest>>,
+}
+
+#[async_trait]
+impl LlmProvider for FlowThenReply {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            chat: true,
+            tools: true,
+            streaming: false,
+            vision: true,
+            system_prompt: true,
+        }
+    }
+    fn provider_name(&self) -> &'static str {
+        "mock"
+    }
+    fn model(&self) -> &str {
+        "echo"
+    }
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, GLlmError> {
+        let last_user = req
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::User)
+            .unwrap_or(0);
+        let answered = req.messages[last_user..]
+            .iter()
+            .any(|m| m.role == MessageRole::Tool);
+        self.captured.lock().unwrap().push(req);
+        if answered {
+            return Ok(ChatResponse {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: None,
+            });
+        }
+        Ok(ChatResponse {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: greentic_aw_runtime::tool_wire_name::wire_tool_name("flow:form", "form"),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+        })
+    }
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, GLlmError> {
+        Err(GLlmError::UnsupportedCapability("streaming"))
+    }
+}
+
+/// A flow that parks on its first call and completes on its resume.
+struct ParkOnce;
+
+impl greentic_aw_runtime::FlowInvoker for ParkOnce {
+    fn list_flows(&self) -> Vec<greentic_aw_runtime::FlowOperation> {
+        vec![greentic_aw_runtime::FlowOperation {
+            flow_ref: "form".into(),
+            description: "form flow".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }]
+    }
+    fn invoke<'a>(
+        &'a self,
+        _flow_ref: &'a str,
+        _args_json: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+        Box::pin(async { Err("interactive only".to_string()) })
+    }
+    fn invoke_interactive<'a>(
+        &'a self,
+        _flow_ref: &'a str,
+        _args_json: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<greentic_aw_runtime::FlowInvokeOutcome, String>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Ok(greentic_aw_runtime::FlowInvokeOutcome::Waiting {
+                snapshot: serde_json::json!({ "snap": 1 }),
+                presentation: serde_json::json!({ "card": 1 }),
+            })
+        })
+    }
+    fn resume<'a>(
+        &'a self,
+        _flow_ref: &'a str,
+        _snapshot: serde_json::Value,
+        _input: serde_json::Value,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<greentic_aw_runtime::FlowInvokeOutcome, String>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Ok(greentic_aw_runtime::FlowInvokeOutcome::Completed(
+                serde_json::json!({ "room": "101" }),
+            ))
+        })
+    }
+}
+
+struct ResumeRun {
+    /// Every provider request: the parking turn's, then the resumed turn's.
+    sent: Vec<ChatRequest>,
+    parked: greentic_aw_runtime::AgentOutput,
+    resumed: greentic_aw_runtime::AgentOutput,
+}
+
+/// Turn 1 sends a document and calls a flow tool that parks; turn 2 resumes
+/// it (no new file). `None` when the PII WASM is not available.
+async fn run_park_then_resume(doc_text: &'static str) -> Option<ResumeRun> {
+    let Some(wasm_src) = pii_wasm_src() else {
+        eprintln!("SKIP: component-guardrail-pii WASM not found");
+        return None;
+    };
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let ext_dir = tmp.path().join("greentic.guardrail-pii");
+    std::fs::create_dir_all(&ext_dir).expect("create ext subdir");
+    write_signed_extension_dir(&wasm_src, &ext_dir);
+    let provider = Arc::new(FlowThenReply::default());
+    let backend = GreenticLlmBackend::new("unused", None)
+        .with_cached_provider("mock", "echo", provider.clone())
+        .with_artifact_reader(Arc::new(TextReader(doc_text)));
+    let (runtime, tc) = build_full_runtime_with_tools(
+        &wasm_src,
+        &tmp,
+        &ext_dir,
+        serde_json::json!({ "blocklist": ["forbidden"] }),
+        GuardrailMode::Enforce,
+        Arc::new(backend),
+        vec![greentic_aw_runtime::ToolRef {
+            extension_id: "flow:form".into(),
+            tool_name: "form".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        }],
+    );
+    let runtime = runtime.with_flow_source(Some(Arc::new(
+        greentic_aw_runtime::FlowToolSource::new(Arc::new(ParkOnce)),
+    )));
+    let parked = runtime
+        .step(
+            tc.clone(),
+            "session-resume-guard",
+            "pii-agent",
+            AgentInput {
+                text: "please read the file".into(),
+                attachments: vec![doc()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("parking turn");
+    let resumed = runtime
+        .step(
+            tc,
+            "session-resume-guard",
+            "pii-agent",
+            AgentInput {
+                resume_payload: Some(serde_json::json!({ "metadata": { "action": "submit" } })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("resumed turn");
+    let sent = provider.captured.lock().unwrap().clone();
+    Some(ResumeRun {
+        sent,
+        parked,
+        resumed,
+    })
+}
+
+#[tokio::test]
+async fn a_blocked_document_stays_withheld_when_a_parked_flow_tool_resumes() {
+    let Some(run) = run_park_then_resume("this file holds forbidden instructions").await else {
+        return;
+    };
+    assert_eq!(
+        run.parked.terminated_by,
+        greentic_aw_runtime::error::TerminationReason::AwaitingToolInput
+    );
+    assert_eq!(run.resumed.reply, "done");
+    assert_eq!(run.sent.len(), 2, "one request per turn");
+    for req in &run.sent {
+        let wire = format!("{:?}", req.messages);
+        assert!(!wire.contains("forbidden instructions"), "{wire}");
+        assert!(wire.contains("withheld by a content policy"), "{wire}");
+    }
+}
+
+#[tokio::test]
+async fn an_allowed_document_reaches_the_model_on_both_turns_of_a_resume() {
+    let Some(run) = run_park_then_resume("a harmless report").await else {
+        return;
+    };
+    assert_eq!(run.resumed.reply, "done");
+    assert_eq!(run.sent.len(), 2, "one request per turn");
+    for req in &run.sent {
+        let wire = format!("{:?}", req.messages);
+        assert!(wire.contains("a harmless report"), "{wire}");
+        assert!(!wire.contains("withheld by a content policy"), "{wire}");
+    }
+}

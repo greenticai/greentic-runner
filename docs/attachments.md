@@ -133,7 +133,10 @@ in the prompt:
 - Denials (blocked or monitored) reach the step observer like the message
   text's, as `inbound`.
 - It runs once per document per turn (inside the per-turn memo), not once per
-  tool iteration or retry. No guardrail configured means no guard, and the
+  tool iteration or retry. A turn that resumes a parked flow tool pushes no new
+  user message, so the backend materialises the previous message's documents
+  again: the guard runs on that turn too (only the message-text chain is
+  skipped on a resume). No guardrail configured means no guard, and the
   prompt is byte-identical to before.
 - Only the multi-provider backend (`GreenticLlmBackend`) reads document text,
   so it is the only backend that calls the guard.

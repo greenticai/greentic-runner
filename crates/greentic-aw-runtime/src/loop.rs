@@ -305,18 +305,16 @@ async fn run_step_scoped(
     // The SAME inbound chain that checked the message text checks every
     // attachment document's text, inside the backend, before it reaches the
     // prompt (once per turn: it runs within the per-turn attachment memo).
-    // Not on a resume: that answer goes to the flow, and its attachments are
-    // only announced.
-    let attachment_text_guard = if resuming.is_some() {
-        None
-    } else {
-        crate::attachment_guard::InboundChainGuard::for_turn(
-            &guardrail_chain,
-            &guardrail_ctx,
-            runtime.guardrail_evaluator.clone(),
-            observer.clone(),
-        )
-    };
+    // ALSO on a resume: no new user message is pushed then, but the last user
+    // message still carries its attachments, and the backend materialises
+    // them again for this turn, so they must pass the chain again. Only the
+    // message-text chain is skipped on a resume (the answer goes to the flow).
+    let attachment_text_guard = crate::attachment_guard::InboundChainGuard::for_turn(
+        &guardrail_chain,
+        &guardrail_ctx,
+        runtime.guardrail_evaluator.clone(),
+        observer.clone(),
+    );
 
     // Whether long-term memory is active for this turn (provider wired + the
     // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,

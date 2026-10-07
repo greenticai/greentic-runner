@@ -555,6 +555,18 @@ fn build_full_runtime_with_llm(
     mode: GuardrailMode,
     llm: Arc<dyn LlmBackend>,
 ) -> (AgentRuntime, TenantContext) {
+    build_full_runtime_with_tools(wasm_src, tmp, ext_dir, guardrail_config, mode, llm, vec![])
+}
+
+fn build_full_runtime_with_tools(
+    wasm_src: &std::path::Path,
+    tmp: &tempfile::TempDir,
+    ext_dir: &std::path::Path,
+    guardrail_config: serde_json::Value,
+    mode: GuardrailMode,
+    llm: Arc<dyn LlmBackend>,
+    tools: Vec<greentic_aw_runtime::ToolRef>,
+) -> (AgentRuntime, TenantContext) {
     let paths = DiscoveryPaths::new(tmp.path().to_path_buf());
     // Root the trust store at the tempdir — see the note on the direct
     // construction above. Every caller of this helper registers a freshly
@@ -584,7 +596,7 @@ fn build_full_runtime_with_llm(
     let agent_config = AgentConfig {
         agent_id: "pii-agent".into(),
         system_prompt: "You are a helpful assistant.".into(),
-        tools: vec![],
+        tools,
         guardrails: vec![],
         llm: LlmProviderRef {
             provider: "mock".into(),
