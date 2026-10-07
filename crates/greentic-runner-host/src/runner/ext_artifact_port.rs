@@ -13,7 +13,8 @@
 //! rules as the attachment reader, `crate::runner::artifact_reader_wiring`):
 //! a deployed unit gets ONLY the port passed with
 //! `RevisionHostOptions::with_ext_artifact_port`; a single-tenant
-//! `HostBuilder` host gets its injected port, else the env fallback
+//! `HostBuilder` host gets its injected port, else, only when it opted in with
+//! `HostBuilder::with_artifact_env_fallback(true)`, the env fallback
 //! ([`artifact_port_from_env`]); a multi-tenant host gets none.
 //! `build_ext_runtime` installs exactly the port it is handed.
 //!
@@ -185,8 +186,8 @@ impl ArtifactPort for HttpArtifactPort {
 }
 
 /// Env fallback, consulted ONLY by `crate::host::host_ext_artifact_port` for a
-/// single-tenant `HostBuilder` host with no injected port (local runs, the
-/// Test chat sidecar). Needs both `GREENTIC_ARTIFACT_ENDPOINT` and
+/// single-tenant `HostBuilder` host with no injected port that opted in with
+/// `HostBuilder::with_artifact_env_fallback(true)` (the standalone runner). Needs both `GREENTIC_ARTIFACT_ENDPOINT` and
 /// `GREENTIC_ARTIFACT_TOKEN`, and a running multi-thread tokio runtime to block
 /// on; anything missing means no port, never a panic.
 pub fn artifact_port_from_env() -> Option<ExtArtifactPort> {

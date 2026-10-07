@@ -210,10 +210,11 @@ fn a_single_tenant_host_uses_its_port_else_the_env_port() {
     let called = AtomicUsize::new(0);
     let host: ExtArtifactPort = Arc::new(Noop);
     let chosen =
-        crate::host::host_ext_artifact_port(Some(host.clone()), 1, env_probe(&called)).unwrap();
+        crate::host::host_ext_artifact_port(Some(host.clone()), 1, true, env_probe(&called))
+            .unwrap();
     assert!(Arc::ptr_eq(&chosen, &host));
     assert_eq!(called.load(Ordering::SeqCst), 0, "env not read");
-    assert!(crate::host::host_ext_artifact_port(None, 1, env_probe(&called)).is_some());
+    assert!(crate::host::host_ext_artifact_port(None, 1, true, env_probe(&called)).is_some());
     assert_eq!(called.load(Ordering::SeqCst), 1);
 }
 
@@ -221,8 +222,8 @@ fn a_single_tenant_host_uses_its_port_else_the_env_port() {
 fn a_multi_tenant_host_has_no_port_and_never_reads_the_env() {
     let called = AtomicUsize::new(0);
     let host: ExtArtifactPort = Arc::new(Noop);
-    assert!(crate::host::host_ext_artifact_port(Some(host), 2, env_probe(&called)).is_none());
-    assert!(crate::host::host_ext_artifact_port(None, 2, env_probe(&called)).is_none());
+    assert!(crate::host::host_ext_artifact_port(Some(host), 2, true, env_probe(&called)).is_none());
+    assert!(crate::host::host_ext_artifact_port(None, 2, true, env_probe(&called)).is_none());
     assert_eq!(called.load(Ordering::SeqCst), 0);
 }
 
@@ -367,4 +368,19 @@ fn a_call_from_a_current_thread_runtime_is_refused_even_with_a_multi_thread_hand
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// The env fallback is OPT-IN: a single-tenant host that did not opt in gets
+/// no env port, and a builder starts with the fallback off.
+#[test]
+fn the_env_port_fallback_is_off_unless_the_host_opts_in() {
+    let called = AtomicUsize::new(0);
+    assert!(crate::host::host_ext_artifact_port(None, 1, false, env_probe(&called)).is_none());
+    assert_eq!(called.load(Ordering::SeqCst), 0, "env not read");
+    assert!(!crate::host::HostBuilder::new().artifact_env_fallback_for_tests());
+    assert!(
+        crate::host::HostBuilder::new()
+            .with_artifact_env_fallback(true)
+            .artifact_env_fallback_for_tests()
+    );
 }

@@ -480,8 +480,9 @@ impl RevisionHostOptions {
     /// Per REVISION rather than a `HostBuilder` setting for the same reason as
     /// the billing meter: one greentic-start process serves every unit, and
     /// each unit has its own token. Without one the unit has NO reader: the
-    /// `GREENTIC_ARTIFACT_*` env variables are never read on this path (they
-    /// would hand every unit of the process one token). Each attachment is
+    /// `GREENTIC_ARTIFACT_*` env variables are never read on this path, even
+    /// when a `HostBuilder` opted in to the env fallback (they would hand every
+    /// unit of the process one token). Each attachment is
     /// then a fixed notice to the agent and the turn still runs. Only the
     /// multi-provider backend (`greentic-llm-backend`) reads attachments.
     #[cfg(feature = "agentic-worker")]

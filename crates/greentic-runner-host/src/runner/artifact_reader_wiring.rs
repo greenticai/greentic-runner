@@ -7,10 +7,13 @@
 //! - a deployed unit (the revision-keyed path): ONLY the reader passed with
 //!   `RevisionHostOptions::with_artifact_reader`. No option means no reader;
 //!   the env variables are never read there.
-//! - a `HostBuilder` host with exactly one tenant (local runs, the Test chat
-//!   sidecar, the designer's Run Demo): the injected reader, else the env
-//!   fallback ([`artifact_reader_from_env`]), resolved once in
-//!   `HostBuilder::build` (`crate::host::host_artifact_reader`).
+//! - a `HostBuilder` host with exactly one tenant (the designer's Run Demo,
+//!   the standalone runner): the injected reader, else, ONLY when the host
+//!   opted in with `HostBuilder::with_artifact_env_fallback(true)`, the env
+//!   fallback ([`artifact_reader_from_env`]); resolved once in
+//!   `HostBuilder::build` (`crate::host::host_artifact_reader`). The opt-in
+//!   is for single-tenant processes only (the standalone runner, `crate::run`,
+//!   which the Test chat sidecar runs); the designer must never enable it.
 //! - a `HostBuilder` host with several tenants: none. An injected reader is
 //!   dropped (warning `artifact_reader_multi_tenant_host`) and the env is NOT
 //!   used in its place: one tenant's agents must never read through another
@@ -90,7 +93,8 @@ fn non_blank_env(name: &str) -> Option<String> {
 
 /// Env fallback for the artifact reader, consulted ONLY by
 /// `crate::host::host_artifact_reader` for a single-tenant `HostBuilder` host
-/// with no injected reader (local runs, the Test chat sidecar, Run Demo).
+/// with no injected reader that opted in with
+/// `HostBuilder::with_artifact_env_fallback(true)` (the standalone runner).
 ///
 /// Both variables are required; either missing (or blank) means no reader. A
 /// reader that cannot be built (an unusable token, a client that cannot be
@@ -337,8 +341,9 @@ mod tests {
     fn on_a_single_tenant_host_the_injected_reader_wins_and_the_env_is_not_read() {
         let called = AtomicUsize::new(0);
         let host: Arc<dyn ArtifactReader> = Arc::new(CountingReader::default());
-        let chosen = crate::host::host_artifact_reader(Some(host.clone()), 1, env_probe(&called))
-            .expect("a reader");
+        let chosen =
+            crate::host::host_artifact_reader(Some(host.clone()), 1, true, env_probe(&called))
+                .expect("a reader");
         assert!(Arc::ptr_eq(&chosen, &host));
         assert_eq!(called.load(Ordering::SeqCst), 0);
     }
@@ -346,7 +351,7 @@ mod tests {
     #[test]
     fn on_a_single_tenant_host_without_an_injected_reader_the_env_is_the_fallback() {
         let called = AtomicUsize::new(0);
-        assert!(crate::host::host_artifact_reader(None, 1, env_probe(&called)).is_some());
+        assert!(crate::host::host_artifact_reader(None, 1, true, env_probe(&called)).is_some());
         assert_eq!(called.load(Ordering::SeqCst), 1);
     }
 
@@ -355,16 +360,30 @@ mod tests {
         let called = AtomicUsize::new(0);
         let host: Arc<dyn ArtifactReader> = Arc::new(CountingReader::default());
         assert!(
-            crate::host::host_artifact_reader(Some(host), 2, env_probe(&called)).is_none(),
+            crate::host::host_artifact_reader(Some(host), 2, true, env_probe(&called)).is_none(),
             "one tenant's agents must never read through another tenant's token"
         );
         assert_eq!(called.load(Ordering::SeqCst), 0, "the env is not consulted");
     }
 
     #[test]
+    fn the_env_reader_fallback_is_off_unless_the_host_opts_in() {
+        let called = AtomicUsize::new(0);
+        assert!(crate::host::host_artifact_reader(None, 1, false, env_probe(&called)).is_none());
+        assert_eq!(called.load(Ordering::SeqCst), 0, "env not read");
+    }
+
+    /// The standalone runner host is a single-tenant process and opts in.
+    #[test]
+    fn the_standalone_runner_opts_in_to_the_env_fallback() {
+        let src = squash(include_str!("../lib.rs"));
+        assert!(src.contains(".with_artifact_env_fallback(true)"));
+    }
+
+    #[test]
     fn a_multi_tenant_host_never_uses_the_env_reader() {
         let called = AtomicUsize::new(0);
-        assert!(crate::host::host_artifact_reader(None, 2, env_probe(&called)).is_none());
+        assert!(crate::host::host_artifact_reader(None, 2, true, env_probe(&called)).is_none());
         assert_eq!(called.load(Ordering::SeqCst), 0);
     }
 

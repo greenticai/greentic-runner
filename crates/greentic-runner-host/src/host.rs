@@ -81,6 +81,8 @@ pub struct HostBuilder {
     artifact_reader: Option<ArtifactReaderPort>,
     #[cfg(feature = "agentic-worker")]
     ext_artifact_port: Option<ExtArtifactPort>,
+    #[cfg(feature = "agentic-worker")]
+    artifact_env_fallback: bool,
 }
 
 impl HostBuilder {
@@ -99,6 +101,8 @@ impl HostBuilder {
             artifact_reader: None,
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            artifact_env_fallback: false,
         }
     }
 
@@ -187,8 +191,10 @@ impl HostBuilder {
     /// the Test chat sidecar). Decided once, in [`Self::build`]:
     ///
     /// - one tenant, a reader injected: that reader;
-    /// - one tenant, `None`: the env fallback, `GREENTIC_ARTIFACT_ENDPOINT` +
-    ///   `GREENTIC_ARTIFACT_TOKEN` (both required), else no reader;
+    /// - one tenant, `None`: no reader, unless the host opted in with
+    ///   [`Self::with_artifact_env_fallback`]; then the env fallback,
+    ///   `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN` (both
+    ///   required), else no reader;
     /// - several tenants: NO reader. An injected one is dropped with a warning
     ///   and the env is not used in its place: one tenant's agents must never
     ///   read through another tenant's token. A host serving many units
@@ -207,9 +213,11 @@ impl HostBuilder {
     /// [`Self::with_artifact_reader`], decided once in [`Self::build`]:
     ///
     /// - one tenant, a port injected: that port;
-    /// - one tenant, `None`: the env fallback, `GREENTIC_ARTIFACT_ENDPOINT` +
-    ///   `GREENTIC_ARTIFACT_TOKEN` (both required, and `build` must run inside
-    ///   a multi-thread tokio runtime), else no port;
+    /// - one tenant, `None`: no port, unless the host opted in with
+    ///   [`Self::with_artifact_env_fallback`]; then the env fallback,
+    ///   `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN` (both
+    ///   required, and `build` must run inside a multi-thread tokio runtime),
+    ///   else no port;
     /// - several tenants: NO port. An injected one is dropped with a warning
     ///   and the env is not used in its place. A host serving many units
     ///   injects per unit instead, with
@@ -222,6 +230,26 @@ impl HostBuilder {
         self
     }
 
+    /// Opt in to the `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN`
+    /// fallback for the attachment reader AND the extension artifact port.
+    /// Default `false`: without it the env variables are never read.
+    ///
+    /// SINGLE-TENANT PROCESS ONLY. The variables hold one unit's token, so only
+    /// a process that serves one tenant may read them (the standalone runner,
+    /// `crate::run`, opts in). The designer must never enable it: it embeds a
+    /// host per session and owns per-tenant credentials. Even when enabled, a
+    /// host with several tenant configurations gets no env reader or port.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_artifact_env_fallback(mut self, enabled: bool) -> Self {
+        self.artifact_env_fallback = enabled;
+        self
+    }
+
+    #[cfg(all(test, feature = "agentic-worker"))]
+    pub(crate) fn artifact_env_fallback_for_tests(&self) -> bool {
+        self.artifact_env_fallback
+    }
+
     pub fn build(self) -> Result<RunnerHost> {
         if self.configs.is_empty() {
             bail!("at least one tenant configuration is required");
@@ -231,17 +259,23 @@ impl HostBuilder {
         let artifact_reader = host_artifact_reader(
             self.artifact_reader,
             self.configs.len(),
+            self.artifact_env_fallback,
             crate::runner::artifact_reader_wiring::artifact_reader_from_env,
         );
         // Without the multi-provider backend nothing reads attachments, so
         // there is no env reader to fall back to.
         #[cfg(all(feature = "agentic-worker", not(feature = "greentic-llm-backend")))]
-        let artifact_reader =
-            host_artifact_reader(self.artifact_reader, self.configs.len(), || None);
+        let artifact_reader = host_artifact_reader(
+            self.artifact_reader,
+            self.configs.len(),
+            self.artifact_env_fallback,
+            || None,
+        );
         #[cfg(feature = "agentic-worker")]
         let ext_artifact_port = host_ext_artifact_port(
             self.ext_artifact_port,
             self.configs.len(),
+            self.artifact_env_fallback,
             crate::runner::ext_artifact_port::artifact_port_from_env,
         );
         let configs = self
@@ -318,11 +352,13 @@ impl HostBuilder {
 
 /// The reader a `HostBuilder` host hands its runtimes; see
 /// [`HostBuilder::with_artifact_reader`]. `env` is consulted ONLY for a
-/// single-tenant host with no injected reader.
+/// single-tenant host with no injected reader that opted in
+/// ([`HostBuilder::with_artifact_env_fallback`]).
 #[cfg(feature = "agentic-worker")]
 pub(crate) fn host_artifact_reader(
     injected: Option<ArtifactReaderPort>,
     tenants: usize,
+    env_fallback: bool,
     env: impl FnOnce() -> Option<ArtifactReaderPort>,
 ) -> Option<ArtifactReaderPort> {
     match (injected, tenants) {
@@ -336,18 +372,20 @@ pub(crate) fn host_artifact_reader(
             );
             None
         }
-        (None, 1) => env(),
+        (None, 1) if env_fallback => env(),
         (None, _) => None,
     }
 }
 
 /// The extension artifact port a `HostBuilder` host hands its runtimes; see
 /// [`HostBuilder::with_ext_artifact_port`]. `env` is consulted ONLY for a
-/// single-tenant host with no injected port.
+/// single-tenant host with no injected port that opted in
+/// ([`HostBuilder::with_artifact_env_fallback`]).
 #[cfg(feature = "agentic-worker")]
 pub(crate) fn host_ext_artifact_port(
     injected: Option<ExtArtifactPort>,
     tenants: usize,
+    env_fallback: bool,
     env: impl FnOnce() -> Option<ExtArtifactPort>,
 ) -> Option<ExtArtifactPort> {
     match (injected, tenants) {
@@ -361,7 +399,7 @@ pub(crate) fn host_ext_artifact_port(
             );
             None
         }
-        (None, 1) => env(),
+        (None, 1) if env_fallback => env(),
         (None, _) => None,
     }
 }

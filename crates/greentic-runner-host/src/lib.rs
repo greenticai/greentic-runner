@@ -564,6 +564,14 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
     if let Some(telemetry) = telemetry.clone() {
         builder = builder.with_telemetry(telemetry);
     }
+    // The standalone runner (the `greentic-runner` binary, also what the
+    // designer's Test chat sidecar runs) is a single-tenant process, so it may
+    // read the artifact door from GREENTIC_ARTIFACT_ENDPOINT / _TOKEN. A run
+    // bound to several tenants still gets none (the host's tenant guard).
+    #[cfg(feature = "agentic-worker")]
+    {
+        builder = builder.with_artifact_env_fallback(true);
+    }
     builder = builder
         .with_wasi_policy(wasi_policy.clone())
         .with_secrets_manager(
