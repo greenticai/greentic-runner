@@ -910,14 +910,23 @@ mod call_site_ratchet {
     const EXEMPT: &[(&str, usize, &str)] = &[
         (
             "src/runner/playbook_turn.rs",
-            1,
+            2,
             "a playbook turn, whose synthesised config is `knowledge: None` \
              because a playbook has no corpus of its own BY CONTRACT — the \
              document has no knowledge field at all, and knowledge reaches a \
              playbook as an entry in its tool allow-list like any other \
              capability. Mounting retrieval here would give a skill a corpus \
              its author never declared and its caller cannot see. Pinned by \
-             `playbook_turn::tests::a_playbook_turn_carries_no_memory_and_no_knowledge`",
+             `playbook_turn::tests::a_playbook_turn_carries_no_memory_and_no_knowledge`. \
+             The second is a test constructor: the OUTER agent of the run-context \
+             sharing tests, which answers from no corpus",
+        ),
+        (
+            "src/runner/run_context_policy.rs",
+            1,
+            "one test constructor: the policy tests only need a runtime to read \
+             its `SharePolicy` back, and answer from no corpus; the production \
+             path they model (`build_runtime_with_stores`) mounts",
         ),
         (
             "src/runner/graph_node.rs",
