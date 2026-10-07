@@ -21,10 +21,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::future::BoxFuture;
 use futures::{StreamExt, stream};
 use tokio::sync::OnceCell;
-use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::artifact_reader::{ArtifactBytes, ArtifactError, ArtifactReader};
-use crate::attachments::{AttachmentKind, AttachmentRef, MAX_ATTACHMENTS};
+use crate::attachments::{AttachmentKind, AttachmentRef, MAX_ATTACHMENTS, is_stripped};
 
 /// Most characters of one document's text put in front of the model.
 pub const DOC_CHAR_CAP: usize = 15_000;
@@ -463,20 +462,6 @@ fn push_document(
         ));
     }
     body.len()
-}
-
-/// Characters stripped everywhere: Unicode categories Cc (controls), Cf
-/// (format: bidi controls, zero-width characters, soft hyphen, BOM, TAG
-/// characters), Zl and Zp (line/paragraph separators), plus the whole TAG
-/// block U+E0000..=U+E007F (some of it is unassigned, hence not Cf).
-fn is_stripped(c: char) -> bool {
-    matches!(
-        get_general_category(c),
-        GeneralCategory::Control
-            | GeneralCategory::Format
-            | GeneralCategory::LineSeparator
-            | GeneralCategory::ParagraphSeparator
-    ) || ('\u{E0000}'..='\u{E007F}').contains(&c)
 }
 
 /// One line of display text: nothing stripped by `is_stripped` (so no

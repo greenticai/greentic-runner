@@ -11,16 +11,45 @@ use serde_json::Value;
 pub const MAX_ATTACHMENTS: usize = 5;
 
 const ARTIFACT_SCHEME: &str = "artifact://";
-/// Longest attachment name echoed into a skip reason.
-const MAX_LABEL_CHARS: usize = 60;
+/// Longest attachment name kept; a name is display text chosen by the sender.
+pub(crate) const MAX_NAME_CHARS: usize = 120;
 /// An artifact id is the lowercase hex SHA-256 of its content (contract C1/C2).
 const ARTIFACT_ID_LEN: usize = 64;
 
 /// `artifact://` followed by exactly 64 characters of `[0-9a-f]`; nothing else.
-fn is_artifact_ref(s: &str) -> bool {
+/// The ONE definition of a valid artifact reference.
+pub(crate) fn is_artifact_ref(s: &str) -> bool {
     s.strip_prefix(ARTIFACT_SCHEME).is_some_and(|id| {
         id.len() == ARTIFACT_ID_LEN && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     })
+}
+
+/// Characters stripped everywhere: Unicode categories Cc (controls), Cf
+/// (format: bidi controls, zero-width characters, soft hyphen, BOM, TAG
+/// characters), Zl and Zp (line/paragraph separators), plus the whole TAG
+/// block U+E0000..=U+E007F (some of it is unassigned, hence not Cf).
+pub(crate) fn is_stripped(c: char) -> bool {
+    matches!(
+        unicode_general_category::get_general_category(c),
+        unicode_general_category::GeneralCategory::Control
+            | unicode_general_category::GeneralCategory::Format
+            | unicode_general_category::GeneralCategory::LineSeparator
+            | unicode_general_category::GeneralCategory::ParagraphSeparator
+    ) || ('\u{E0000}'..='\u{E007F}').contains(&c)
+}
+
+/// One line of display text from a sender-chosen name: every character
+/// `is_stripped` removes is dropped (no controls, no bidi or zero-width
+/// characters, no line separators), at most `MAX_NAME_CHARS` characters are
+/// kept, and a name that ends up blank is no name.
+pub(crate) fn clean_display_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !is_stripped(*c))
+        .take(MAX_NAME_CHARS)
+        .collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,11 +91,11 @@ pub enum SkipCode {
 #[derive(Debug, Default)]
 pub struct ParsedAttachments {
     pub refs: Vec<AttachmentRef>,
-    /// Human-readable reasons for every attachment that was not used. These
-    /// embed the sender's attachment name and the host's note text: for logs
-    /// and diagnostics only, NEVER for a model prompt (use `skipped_codes`).
-    pub skipped: Vec<String>,
-    /// One entry per `skipped` entry, same order.
+    /// Why each attachment that was not used was skipped, in order. Codes
+    /// only: there is deliberately no human-readable reason here, because one
+    /// would carry the sender's name and the host's free text, and a
+    /// formattable string is one step away from a model prompt. Consumers map
+    /// a code to a fixed sentence.
     pub skipped_codes: Vec<SkipCode>,
 }
 
@@ -97,16 +126,8 @@ pub fn parse_flow_attachments(
     let meta_list = meta.as_array();
     let notes_list = notes.as_array();
     for (index, item) in list.iter().enumerate() {
-        let label = item
-            .get("name")
-            .and_then(Value::as_str)
-            .map(|n| n.chars().take(MAX_LABEL_CHARS).collect::<String>())
-            .unwrap_or_else(|| format!("attachment #{}", index + 1));
         let url = item.get("url").and_then(Value::as_str).unwrap_or("");
         if url.starts_with(ARTIFACT_SCHEME) && !is_artifact_ref(url) {
-            // Never echo the offending value: it may be arbitrarily long.
-            out.skipped
-                .push(format!("{label}: not a valid artifact reference"));
             out.skipped_codes.push(SkipCode::InvalidReference);
             continue;
         }
@@ -120,24 +141,13 @@ pub fn parse_flow_attachments(
                 None if message.is_some() => SkipCode::Host(None),
                 None => SkipCode::NotStored,
             });
-            out.skipped.push(match (code, message) {
-                (Some(code), Some(message)) => format!("{label}: {code} ({message})"),
-                (Some(code), None) => format!("{label}: {code}"),
-                _ => format!("{label}: not available to the agent (not stored as an artifact)"),
-            });
             continue;
         }
         if out.refs.iter().any(|r| r.id == url) {
-            out.skipped.push(format!(
-                "{label}: duplicate of an attachment already in this message"
-            ));
             out.skipped_codes.push(SkipCode::Duplicate);
             continue;
         }
         if out.refs.len() >= MAX_ATTACHMENTS {
-            out.skipped.push(format!(
-                "{label}: more than {MAX_ATTACHMENTS} attachments in one message"
-            ));
             out.skipped_codes.push(SkipCode::OverLimit);
             continue;
         }
@@ -164,7 +174,10 @@ pub fn parse_flow_attachments(
         out.refs.push(AttachmentRef {
             id: url.to_string(),
             mime_type,
-            name: item.get("name").and_then(Value::as_str).map(str::to_string),
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(clean_display_name),
             size_bytes: item.get("size_bytes").and_then(Value::as_u64),
             kind,
             text_ref,
@@ -173,6 +186,7 @@ pub fn parse_flow_attachments(
     out
 }
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -197,7 +211,7 @@ mod tests {
             {"sha256":"22","kind":"document","text_ref":aid('c')}
         ]);
         let parsed = parse_flow_attachments(&atts, &meta, &json!(null));
-        assert!(parsed.skipped.is_empty());
+        assert!(parsed.skipped_codes.is_empty());
         assert_eq!(parsed.refs.len(), 2);
         assert_eq!(parsed.refs[0].kind, AttachmentKind::Image);
         assert_eq!(parsed.refs[1].text_ref.as_deref(), Some(aid('c').as_str()));
@@ -213,7 +227,7 @@ mod tests {
         let meta = json!([{"kind":"image"},{"kind":"image"},{"kind":"image"}]);
         let parsed = parse_flow_attachments(&atts, &meta, &json!(null));
         assert_eq!(parsed.refs.len(), 1);
-        assert_eq!(parsed.skipped.len(), 2);
+        assert_eq!(parsed.skipped_codes.len(), 2);
     }
 
     #[test]
@@ -221,15 +235,15 @@ mod tests {
         let list: Vec<Value> = "012345".chars().map(|c| img(&aid(c), "x.png")).collect();
         let parsed = parse_flow_attachments(&Value::Array(list), &json!(null), &json!(null));
         assert_eq!(parsed.refs.len(), MAX_ATTACHMENTS);
-        assert_eq!(parsed.skipped.len(), 1);
+        assert_eq!(parsed.skipped_codes.len(), 1);
     }
 
     #[test]
     fn missing_or_non_array_input_is_empty_not_an_error() {
         let parsed = parse_flow_attachments(&json!(null), &json!(null), &json!(null));
-        assert!(parsed.refs.is_empty() && parsed.skipped.is_empty());
+        assert!(parsed.refs.is_empty() && parsed.skipped_codes.is_empty());
         let parsed = parse_flow_attachments(&json!("nope"), &json!({}), &json!(7));
-        assert!(parsed.refs.is_empty() && parsed.skipped.is_empty());
+        assert!(parsed.refs.is_empty() && parsed.skipped_codes.is_empty());
     }
 
     #[test]
@@ -237,7 +251,7 @@ mod tests {
         let parsed = parse_flow_attachments(&json!(""), &json!(""), &json!(""));
         assert!(parsed.refs.is_empty());
         assert!(
-            parsed.skipped.is_empty(),
+            parsed.skipped_codes.is_empty(),
             "no attachments is not a failure to report"
         );
     }
@@ -258,16 +272,20 @@ mod tests {
         let notes = json!([{"code":"too_large","message":"file is over 10 MB"}, null]);
         let parsed = parse_flow_attachments(&atts, &json!([{}, {"kind":"image"}]), &notes);
         assert_eq!(parsed.refs.len(), 1);
-        assert_eq!(parsed.skipped.len(), 1);
-        assert!(parsed.skipped[0].contains("report.pdf"));
-        assert!(parsed.skipped[0].contains("too_large"));
+        assert_eq!(
+            parsed.skipped_codes,
+            vec![SkipCode::Host(Some("too_large".into()))]
+        );
     }
 
     #[test]
     fn a_note_with_a_code_but_no_message_reports_the_code_alone() {
         let atts = json!([{"mime_type":"image/png","url":null,"name":"a.png"}]);
         let parsed = parse_flow_attachments(&atts, &json!(null), &json!([{"code":"fetch_failed"}]));
-        assert_eq!(parsed.skipped, vec!["a.png: fetch_failed".to_string()]);
+        assert_eq!(
+            parsed.skipped_codes,
+            vec![SkipCode::Host(Some("fetch_failed".into()))]
+        );
     }
 
     #[test]
@@ -276,10 +294,10 @@ mod tests {
         let long =
             json!([{"code":"fetch_failed","message":"x"}, {"code":"too_large","message":"y"}]);
         let parsed = parse_flow_attachments(&atts, &json!(null), &long);
-        assert_eq!(parsed.skipped.len(), 1);
+        assert_eq!(parsed.skipped_codes.len(), 1);
         let parsed = parse_flow_attachments(&atts, &json!(null), &json!([]));
         assert_eq!(
-            parsed.skipped.len(),
+            parsed.skipped_codes.len(),
             1,
             "no note: generic reason, still reported"
         );
@@ -301,17 +319,17 @@ mod tests {
             let parsed =
                 parse_flow_attachments(&json!([img(&url, "x.png")]), &json!(null), &json!(null));
             assert!(parsed.refs.is_empty(), "accepted {url}");
-            assert_eq!(parsed.skipped.len(), 1, "not reported: {url}");
+            assert_eq!(parsed.skipped_codes.len(), 1, "not reported: {url}");
         }
     }
 
     #[test]
-    fn a_very_long_invalid_id_is_not_echoed_in_the_report() {
+    fn a_very_long_invalid_id_is_reported_by_code_only() {
         let url = format!("artifact://{}", "z".repeat(5000));
         let parsed =
             parse_flow_attachments(&json!([img(&url, "x.png")]), &json!(null), &json!(null));
-        assert!(parsed.skipped[0].len() < 200, "{}", parsed.skipped[0].len());
-        assert!(!parsed.skipped[0].contains("zzzz"));
+        assert_eq!(parsed.skipped_codes, vec![SkipCode::InvalidReference]);
+        assert!(!format!("{parsed:?}").contains("zzzz"));
     }
 
     #[test]
@@ -326,7 +344,7 @@ mod tests {
             let parsed = parse_flow_attachments(&atts, &meta, &json!(null));
             assert_eq!(parsed.refs.len(), 1);
             assert_eq!(parsed.refs[0].text_ref, None);
-            assert!(parsed.skipped.is_empty());
+            assert!(parsed.skipped_codes.is_empty());
         }
     }
 
@@ -340,8 +358,7 @@ mod tests {
         let parsed = parse_flow_attachments(&atts, &json!(null), &json!(null));
         assert_eq!(parsed.refs.len(), 2);
         assert_eq!(parsed.refs[0].name.as_deref(), Some("one.png"));
-        assert_eq!(parsed.skipped.len(), 1);
-        assert!(parsed.skipped[0].contains("duplicate"));
+        assert_eq!(parsed.skipped_codes, vec![SkipCode::Duplicate]);
     }
 
     #[test]
@@ -353,13 +370,13 @@ mod tests {
         let parsed = parse_flow_attachments(&Value::Array(list), &json!(null), &json!(null));
         assert_eq!(parsed.refs.len(), MAX_ATTACHMENTS);
         let dups = parsed
-            .skipped
+            .skipped_codes
             .iter()
-            .filter(|s| s.contains("duplicate"))
+            .filter(|c| **c == SkipCode::Duplicate)
             .count();
         assert_eq!(dups, 5);
         assert_eq!(
-            parsed.skipped.len(),
+            parsed.skipped_codes.len(),
             6,
             "the sixth distinct one is over the cap"
         );
@@ -375,11 +392,11 @@ mod tests {
         let atts = json!([7, null, "x", img(&aid('a'), "ok.png")]);
         let parsed = parse_flow_attachments(&atts, &json!(null), &json!(null));
         assert_eq!(parsed.refs.len(), 1);
-        assert_eq!(parsed.skipped.len(), 3);
+        assert_eq!(parsed.skipped_codes.len(), 3);
     }
 
     #[test]
-    fn skip_codes_run_parallel_to_skip_reasons() {
+    fn skip_codes_are_reported_in_order() {
         let atts = json!([
             {"mime_type":"image/png","url":null,"name":"x"},
             {"mime_type":"image/png","url":null,"name":"y"},
@@ -389,7 +406,6 @@ mod tests {
         ]);
         let notes = json!([{"code":"too_large","message":"m"}]);
         let parsed = parse_flow_attachments(&atts, &json!(null), &notes);
-        assert_eq!(parsed.skipped.len(), parsed.skipped_codes.len());
         assert_eq!(
             parsed.skipped_codes,
             vec![
@@ -399,5 +415,31 @@ mod tests {
                 SkipCode::Duplicate
             ]
         );
+    }
+
+    #[test]
+    fn names_are_cleaned_and_capped_at_parse() {
+        let hostile = format!(
+            "a\u{202E}b\n\u{200B}c\u{2028}d\u{E0041}e{}",
+            "x".repeat(500)
+        );
+        let atts = json!([img(&aid('a'), &hostile)]);
+        let parsed = parse_flow_attachments(&atts, &json!(null), &json!(null));
+        let name = parsed.refs[0].name.clone().unwrap();
+        assert!(name.starts_with("abcde"), "{name}");
+        assert!(
+            name.chars().count() <= MAX_NAME_CHARS,
+            "{}",
+            name.chars().count()
+        );
+        assert!(!name.chars().any(is_stripped), "{name:?}");
+        // A name made only of stripped characters is no name.
+        let atts = json!([img(&aid('b'), "\u{200B}\n\u{202E}  ")]);
+        let parsed = parse_flow_attachments(&atts, &json!(null), &json!(null));
+        assert_eq!(parsed.refs[0].name, None);
+        // Real text survives.
+        let atts = json!([img(&aid('c'), "Grüße 世界.png")]);
+        let parsed = parse_flow_attachments(&atts, &json!(null), &json!(null));
+        assert_eq!(parsed.refs[0].name.as_deref(), Some("Grüße 世界.png"));
     }
 }
