@@ -915,11 +915,24 @@ mod aw {
             // Contract mirror of agent_node.rs: a missing/empty `user_text`
             // resolves to an empty string and the run proceeds (it never returns
             // Err for this case).
-            let user_text = flow_input
+            let mut user_text = flow_input
                 .get("user_text")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // A graph turn cannot open files: say so with the fixed notice
+            // (a count only, no name) instead of dropping them silently.
+            let attachment_count = flow_input
+                .get("attachments")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if attachment_count > 0 {
+                user_text.push_str(
+                    &greentic_aw_runtime::attachments_materialize::unreadable_note(
+                        attachment_count,
+                    ),
+                );
+            }
 
             let tenant = TenantContext::new(tenant_id, env_id);
 
@@ -2103,6 +2116,51 @@ mod aw {
                 "trail should be a non-empty array: {:?}",
                 out["trail"]
             );
+        }
+
+        /// A graph turn cannot open files: attachments on the flow node are
+        /// announced to the graph's agents with the fixed notice, never
+        /// dropped silently, and no name reaches them.
+        #[tokio::test]
+        async fn attachments_on_a_graph_turn_are_announced_with_the_fixed_notice() {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen_by_agent = seen.clone();
+            let agent: AgentTurnFn = Arc::new(move |req: AgentTurnRequest| {
+                seen_by_agent.lock().unwrap().extend(
+                    req.state
+                        .messages
+                        .iter()
+                        .map(|m| m.content.clone())
+                        .collect::<Vec<_>>(),
+                );
+                Box::pin(async move {
+                    Ok(AgentTurnResult {
+                        reply: "done".into(),
+                        resolved: true,
+                    })
+                })
+            });
+            let handler = handler_with(provider_with("triage", triage_cfg(3)), agent, tool_fn_ok());
+            handler
+                .execute(
+                    "t",
+                    "e",
+                    "triage",
+                    "sess-1",
+                    &json!({
+                        "user_text": "look",
+                        "attachments": [
+                            {"mime_type": "image/png", "url": format!("artifact://{}", "a".repeat(64)), "name": "secret.png"},
+                            {"mime_type": "application/pdf", "url": null, "name": "b.pdf"}
+                        ]
+                    }),
+                )
+                .await
+                .expect("execute should succeed");
+            let seen = seen.lock().unwrap().join("\n");
+            let note = greentic_aw_runtime::attachments_materialize::unreadable_note(2);
+            assert!(seen.contains(&format!("look{note}")), "{seen}");
+            assert!(!seen.contains("secret.png"), "{seen}");
         }
 
         #[tokio::test]

@@ -439,3 +439,54 @@ async fn an_expired_pending_tool_is_cancelled_not_resumed() {
         "got {cancelled}"
     );
 }
+
+/// Files sent with the answer to a parked flow cannot go to the flow or the
+/// model: the agent is told with the fixed "not available" notice, never
+/// silently.
+#[tokio::test]
+async fn attachments_sent_with_a_resume_are_announced_not_dropped() {
+    use greentic_aw_runtime::{AttachmentKind, AttachmentRef};
+    let llm = Arc::new(RecordingLlm::new(vec![
+        tool_calls(vec![call("c1", "form")]),
+        final_reply("booked"),
+    ]));
+    let flows = Arc::new(ScriptedFlows::new(
+        vec![waiting("A")],
+        vec![FlowInvokeOutcome::Completed(json!({ "room": "101" }))],
+    ));
+    let h = harness(llm.clone(), flows);
+    h.step("book me a room", None).await;
+
+    let out =
+        h.rt.step(
+            h.tc.clone(),
+            SESSION,
+            "a",
+            AgentInput {
+                text: String::new(),
+                conversational: false,
+                resume_payload: Some(json!({ "metadata": { "action": "submit" } })),
+                attachments: vec![AttachmentRef {
+                    id: format!("artifact://{}", "a".repeat(64)),
+                    mime_type: "image/png".into(),
+                    name: Some("secret.png".into()),
+                    size_bytes: None,
+                    kind: AttachmentKind::Image,
+                    text_ref: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.reply, "booked");
+    let seen = llm.histories.lock().unwrap()[1].clone();
+    let note = greentic_aw_runtime::attachments_materialize::unreadable_note(1);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ChatMessage::System { content } if content == note.trim()
+        )),
+        "{seen:?}"
+    );
+    assert!(!format!("{seen:?}").contains("secret.png"));
+}

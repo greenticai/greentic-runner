@@ -253,6 +253,13 @@ async fn run_step_scoped(
     // Skipped when resuming a parked flow tool: the user's answer goes to the
     // flow, not the LLM, and returns as a tool result like any other tool's.
     let attachments = message.attachments;
+    // The answer to a parked flow goes to the flow, which takes no files: the
+    // count is kept so the agent is told after the resume, never silently.
+    let resume_attachment_count = if resuming.is_some() {
+        attachments.len()
+    } else {
+        0
+    };
     let user_message = if resuming.is_some() {
         crate::flow_suspend::last_user_text(&state)
     } else {
@@ -521,6 +528,15 @@ async fn run_step_scoped(
         .await;
         if suspension.is_some() {
             terminated_by = TerminationReason::AwaitingToolInput;
+        }
+        // After the resumed tool's result, so the tool-call sequence stays
+        // intact. Fixed text, a count only: no name or id reaches the model.
+        if resume_attachment_count > 0 {
+            state.messages.push(ChatMessage::System {
+                content: crate::attachments_materialize::unreadable_note(resume_attachment_count)
+                    .trim()
+                    .to_string(),
+            });
         }
     }
     // One memo per TURN, shared by every iteration's request (and by a
