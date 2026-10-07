@@ -785,6 +785,7 @@ async fn a_parked_then_resumed_turn_appends_once_on_the_final_reply() {
                 text: String::new(),
                 conversational: false,
                 resume_payload: Some(json!({ "metadata": { "action": "submit" } })),
+                ..Default::default()
             },
         )
         .await

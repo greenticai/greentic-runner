@@ -374,6 +374,7 @@ mod aw {
                 text: user_text,
                 conversational,
                 resume_payload: resume_payload.cloned(),
+                attachments: Vec::new(),
             };
 
             // Off by default: with neither an audit sink nor a registered

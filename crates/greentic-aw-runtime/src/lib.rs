@@ -14,6 +14,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod a2a_source;
+pub mod attachments;
 pub mod billing;
 pub mod component_source;
 pub mod config;
@@ -73,6 +74,7 @@ pub mod mock;
 pub mod serve;
 
 pub use a2a_source::{A2aRoute, A2aToolCatalog, A2aToolEntry, A2aToolSource};
+pub use attachments::{AttachmentKind, AttachmentRef};
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
@@ -623,6 +625,9 @@ pub struct AgentInput {
     /// [`TerminationReason::AwaitingToolInput`]: crate::error::TerminationReason::AwaitingToolInput
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_payload: Option<serde_json::Value>,
+    /// Attachments of THIS message (references only; see [`attachments`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
 }
 
 /// Token + iteration accounting for one [`AgentRuntime::step`]. Surfaced on

@@ -396,6 +396,7 @@ mod tests {
                     text: "go".into(),
                     conversational: false,
                     resume_payload: None,
+                    ..Default::default()
                 },
             )
             .await

@@ -309,6 +309,7 @@ async fn pii_guardrail_masks_inbound_email() {
                 text: "email me at x@y.com please".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -358,6 +359,7 @@ async fn pii_guardrail_denies_blocklist_match() {
                 text: "this message contains forbidden content".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await;
@@ -439,6 +441,7 @@ async fn pii_guardrail_enforce_denial_notifies_real_observer() {
                 text: "this message contains forbidden content".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
             observer.clone(),
         )
@@ -489,6 +492,7 @@ async fn pii_guardrail_monitor_denial_notifies_real_observer_without_blocking() 
                 text: "this message contains forbidden content".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
             observer.clone(),
         )
@@ -674,6 +678,7 @@ async fn the_trace_records_the_guarded_reply() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         ),
     )
@@ -766,6 +771,7 @@ async fn the_user_ledger_records_the_guarded_reply() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await

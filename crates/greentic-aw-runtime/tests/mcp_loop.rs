@@ -251,6 +251,7 @@ async fn mcp_tool_offered_called_and_result_in_trail() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -317,6 +318,7 @@ async fn mcp_unreachable_server_degrades_no_tool_offered() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await

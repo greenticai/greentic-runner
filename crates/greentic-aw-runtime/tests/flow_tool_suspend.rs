@@ -249,6 +249,7 @@ impl Harness {
                     text: text.into(),
                     conversational: false,
                     resume_payload,
+                    ..Default::default()
                 },
             )
             .await

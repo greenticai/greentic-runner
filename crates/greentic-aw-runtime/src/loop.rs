@@ -1605,6 +1605,7 @@ mod tests {
                     text: "hi".into(),
                     conversational: true,
                     resume_payload: None,
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -1644,6 +1645,7 @@ mod tests {
                     text: "hi".into(),
                     conversational: false,
                     resume_payload: None,
+                    attachments: Vec::new(),
                 },
             )
             .await
