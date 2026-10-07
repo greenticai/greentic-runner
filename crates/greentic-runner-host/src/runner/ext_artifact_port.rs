@@ -95,6 +95,30 @@ impl HttpArtifactPort {
     }
 }
 
+/// Largest put reply read: the reply is a small JSON object.
+const MAX_REPLY_BYTES: usize = 16 * 1024;
+
+/// Read the body while it arrives and stop past the cap (`None`).
+async fn read_capped(response: reqwest::Response) -> Option<Vec<u8>> {
+    use futures::StreamExt;
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_REPLY_BYTES as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if body.len() + chunk.len() > MAX_REPLY_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
+
 #[derive(serde::Deserialize)]
 struct PutBody {
     id: String,
@@ -167,6 +191,21 @@ impl ArtifactPort for HttpArtifactPort {
             // 401/403 (token or purpose), 413, 429, 503, a redirect and
             // anything else: not stored. The body is never read or returned.
             other => {
+                // Distinct fixed codes for the host log; the extension sees
+                // the same `unavailable` whatever the cause.
+                let reason = match other {
+                    401 => "unauthorized",
+                    403 => "purpose_not_granted",
+                    413 => "too_large",
+                    429 => "rate_limited",
+                    _ => "refused",
+                };
+                tracing::debug!(
+                    extension = %extension_id,
+                    status = other,
+                    reason,
+                    "artifact put refused"
+                );
                 tracing::warn!(
                     extension = %extension_id,
                     status = other,
@@ -178,9 +217,15 @@ impl ArtifactPort for HttpArtifactPort {
                 )));
             }
         }
-        let parsed =
-            tokio::task::block_in_place(|| self.handle.block_on(response.json::<PutBody>()))
-                .map_err(|_| unavailable("artifact door answered an unreadable body"))?;
+        // The reply is untrusted: read at most MAX_REPLY_BYTES of it, and
+        // accept only a well-formed artifact id.
+        let raw = tokio::task::block_in_place(|| self.handle.block_on(read_capped(response)))
+            .ok_or_else(|| unavailable("artifact door answered an unreadable body"))?;
+        let parsed: PutBody = serde_json::from_slice(&raw)
+            .map_err(|_| unavailable("artifact door answered an unreadable body"))?;
+        if !greentic_aw_runtime::is_artifact_ref(&parsed.id) {
+            return Err(unavailable("artifact door answered an invalid id"));
+        }
         Ok(parsed.id)
     }
 }

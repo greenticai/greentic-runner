@@ -812,3 +812,35 @@ async fn an_empty_extracted_text_is_reported_as_no_readable_text() {
     assert!(m.text.contains("no readable text"), "{}", m.text);
     assert!(!m.text.contains("size limit"));
 }
+
+#[test]
+fn debug_output_never_carries_attachment_content() {
+    let bytes = crate::artifact_reader::ArtifactBytes {
+        mime_type: "text/plain".into(),
+        name: Some("secret-name.txt".into()),
+        bytes: b"TOP-SECRET-BYTES".to_vec(),
+    };
+    let image = MaterializedImage {
+        data_base64: "U0VDUkVUSU1BR0U=".into(),
+        media_type: "image/png".into(),
+    };
+    let m = Materialized {
+        images: vec![image.clone()],
+        text: "SECRET DOCUMENT TEXT".into(),
+    };
+    for shown in [format!("{bytes:?}"), format!("{image:?}"), format!("{m:?}")] {
+        for secret in [
+            "TOP-SECRET",
+            "84, 79, 80",
+            "U0VDUkVUSU1BR0U",
+            "SECRET DOCUMENT",
+            "secret-name",
+        ] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
+    assert!(
+        format!("{bytes:?}").contains("16"),
+        "the size is still shown"
+    );
+}

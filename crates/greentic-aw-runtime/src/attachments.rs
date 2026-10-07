@@ -18,7 +18,7 @@ const ARTIFACT_ID_LEN: usize = 64;
 
 /// `artifact://` followed by exactly 64 characters of `[0-9a-f]`; nothing else.
 /// The ONE definition of a valid artifact reference.
-pub(crate) fn is_artifact_ref(s: &str) -> bool {
+pub fn is_artifact_ref(s: &str) -> bool {
     s.strip_prefix(ARTIFACT_SCHEME).is_some_and(|id| {
         id.len() == ARTIFACT_ID_LEN && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     })
@@ -441,5 +441,13 @@ mod tests {
         let atts = json!([img(&aid('c'), "Grüße 世界.png")]);
         let parsed = parse_flow_attachments(&atts, &json!(null), &json!(null));
         assert_eq!(parsed.refs[0].name.as_deref(), Some("Grüße 世界.png"));
+    }
+
+    /// The ONE definition of an artifact reference is public, so the
+    /// extension artifact port can shape-check the ids the door returns.
+    #[test]
+    fn the_artifact_ref_check_is_public() {
+        assert!(crate::is_artifact_ref(&aid('a')));
+        assert!(!crate::is_artifact_ref("artifact://abc"));
     }
 }

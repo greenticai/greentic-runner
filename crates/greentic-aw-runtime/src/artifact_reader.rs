@@ -25,10 +25,6 @@ pub const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = MAX_ARTIFACT_BYTES.div_ceil(3) * 4 + 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
-/// Longest artifact name kept; a name is display text and may be hostile.
-const MAX_NAME_CHARS: usize = 120;
-const ARTIFACT_SCHEME: &str = "artifact://";
-const ARTIFACT_ID_LEN: usize = 64;
 
 /// The v1 media types (master plan: image/jpeg, png, gif, webp; text/plain,
 /// markdown, csv; application/json, pdf). SVG is deliberately absent.
@@ -44,11 +40,21 @@ const ALLOWED_MIME: &[&str] = &[
     "application/pdf",
 ];
 
-#[derive(Debug)]
 pub struct ArtifactBytes {
     pub mime_type: String,
     pub name: Option<String>,
     pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for ArtifactBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the bytes or the sender's name: sizes and the media type only.
+        f.debug_struct("ArtifactBytes")
+            .field("mime_type", &self.mime_type)
+            .field("has_name", &self.name.is_some())
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// A failed read. Never carries the door's response body, the token or a URL.
@@ -179,31 +185,11 @@ pub fn door_url(endpoint: &str, op: &str) -> Option<reqwest::Url> {
     }
 }
 
-/// `artifact://` followed by exactly 64 lowercase hex characters.
-fn is_artifact_ref(s: &str) -> bool {
-    s.strip_prefix(ARTIFACT_SCHEME).is_some_and(|id| {
-        id.len() == ARTIFACT_ID_LEN && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
-}
-
-/// Unicode format (Cf) characters and line/paragraph separators (Zl, Zp):
-/// invisible, and able to reorder or hide text around them.
-fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
-        | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
-        | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
-        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
-}
-
+/// A door-supplied name as one line of display text (the same rule as a
+/// sender-supplied one, `attachments::clean_display_name`), and never `.` or
+/// `..`.
 fn clean_name(name: Option<String>) -> Option<String> {
-    let cleaned: String = name?
-        .chars()
-        .filter(|c| !c.is_control() && !is_invisible(*c))
-        .take(MAX_NAME_CHARS)
-        .collect();
-    let cleaned = cleaned.trim();
-    (!cleaned.is_empty() && cleaned != "." && cleaned != "..").then(|| cleaned.to_string())
+    crate::attachments::clean_display_name(&name?).filter(|n| n != "." && n != "..")
 }
 
 /// Trim, ASCII-lowercase and drop any `;` parameters, then require a v1 type.
@@ -254,7 +240,7 @@ impl ArtifactReader for HttpArtifactReader {
     ) -> Pin<Box<dyn Future<Output = Result<ArtifactBytes, ArtifactError>> + Send + 'a>> {
         Box::pin(async move {
             // Validate before the id goes anywhere near a request.
-            if !is_artifact_ref(id) {
+            if !crate::attachments::is_artifact_ref(id) {
                 return Err(ArtifactError::NotFound);
             }
             let url = self.get_url()?;
@@ -511,7 +497,10 @@ mod tests {
             .unwrap()
             .name
             .unwrap();
-        assert!(name.chars().count() <= MAX_NAME_CHARS && !name.chars().any(char::is_control));
+        assert!(
+            name.chars().count() <= crate::attachments::MAX_NAME_CHARS
+                && !name.chars().any(char::is_control)
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::host::ExtArtifactPort;
 
+const VALID_ID: &str =
+    "artifact://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 fn ctx(tenant: &str) -> HostCallContext {
     HostCallContext {
         tenant: Some(tenant.into()),
@@ -51,7 +54,7 @@ async fn put_posts_the_contract_body_and_returns_the_id() {
         .and(path("/artifacts/put"))
         .and(header("authorization", "Bearer gtm_secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "artifact://abc", "sha256": "aa", "size_bytes": 3,
+            "id": VALID_ID, "sha256": "aa", "size_bytes": 3,
             "kind": "image", "mime_type": "image/png"
         })))
         .expect(1)
@@ -59,7 +62,7 @@ async fn put_posts_the_contract_body_and_returns_the_id() {
         .await;
     assert_eq!(
         put(port_for(&server, "gtm_secret"), "acme").await.unwrap(),
-        "artifact://abc"
+        VALID_ID
     );
     let received = server.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -383,4 +386,27 @@ fn the_env_port_fallback_is_off_unless_the_host_opts_in() {
             .with_artifact_env_fallback(true)
             .artifact_env_fallback_for_tests()
     );
+}
+
+/// The door's reply is untrusted: an id that is not `artifact://<64 hex>` is
+/// refused, and an oversized reply is not read into memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_or_oversized_reply_is_refused() {
+    for body in [
+        serde_json::json!({ "id": "https://evil.example/x" }).to_string(),
+        serde_json::json!({ "id": "artifact://abc" }).to_string(),
+        serde_json::json!({ "id": VALID_ID, "pad": "x".repeat(64 * 1024) }).to_string(),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+        let err = put(port_for(&server, "t"), "acme").await.unwrap_err();
+        assert!(
+            matches!(err, ArtifactPortError::Unavailable(_)),
+            "{err:?} for {}",
+            &body[..40.min(body.len())]
+        );
+    }
 }

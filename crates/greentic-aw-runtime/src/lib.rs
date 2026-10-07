@@ -79,7 +79,7 @@ pub use a2a_source::{A2aRoute, A2aToolCatalog, A2aToolEntry, A2aToolSource};
 pub use artifact_reader::{
     ArtifactBytes, ArtifactClientError, ArtifactError, ArtifactReader, HttpArtifactReader, door_url,
 };
-pub use attachments::{AttachmentKind, AttachmentRef};
+pub use attachments::{AttachmentKind, AttachmentRef, is_artifact_ref};
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,

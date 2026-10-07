@@ -49,18 +49,38 @@ const FALLBACK_NAME: &str = "file";
 const OPEN: char = '\u{27E6}'; // ⟦
 const CLOSE: char = '\u{27E7}'; // ⟧
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MaterializedImage {
     pub data_base64: String,
     pub media_type: String,
 }
 
-#[derive(Clone, Debug, Default)]
+impl std::fmt::Debug for MaterializedImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the image data.
+        f.debug_struct("MaterializedImage")
+            .field("media_type", &self.media_type)
+            .field("base64_len", &self.data_base64.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct Materialized {
     pub images: Vec<MaterializedImage>,
     /// Appended to the user message: document blocks and fixed notes about
     /// attachments the model could not receive.
     pub text: String,
+}
+
+impl std::fmt::Debug for Materialized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the document text or the image data.
+        f.debug_struct("Materialized")
+            .field("images", &self.images)
+            .field("text_len", &self.text.len())
+            .finish()
+    }
 }
 
 /// Which message, under which vision flag, a memo entry was built for.
