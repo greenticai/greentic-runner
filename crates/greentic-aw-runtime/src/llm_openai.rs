@@ -847,6 +847,7 @@ mod tests {
                 credential_ref: None,
             },
             turn_attachments: Default::default(),
+            attachment_text_guard: None,
         };
         let value = serde_json::to_value(build_messages(&req)).unwrap();
         // [0] = system prompt, [1] = the assistant turn.
@@ -887,6 +888,7 @@ mod tests {
                 credential_ref: None,
             },
             turn_attachments: Default::default(),
+            attachment_text_guard: None,
         };
         let value = serde_json::to_value(build_messages(&req)).unwrap();
         let content = value[1]["content"].as_str().unwrap();

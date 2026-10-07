@@ -212,6 +212,7 @@ mod tests {
                 credential_ref: None,
             },
             turn_attachments: Default::default(),
+            attachment_text_guard: None,
         }
     }
 

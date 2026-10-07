@@ -20,6 +20,7 @@ use greentic_llm::{
 };
 
 use crate::artifact_reader::ArtifactReader;
+use crate::attachment_guard::AttachmentTextGuard;
 use crate::attachments_materialize::{TurnAttachments, TurnKey, materialize};
 use crate::error::LlmError;
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
@@ -142,8 +143,9 @@ impl LlmBackend for GreenticLlmBackend {
             let vision = provider.capabilities().vision;
             let mut request = request;
             let memo = request.turn_attachments.clone();
+            let guard = request.attachment_text_guard.clone();
             let images = self
-                .apply_attachments(&mut request.history, vision, &memo)
+                .apply_attachments(&mut request.history, vision, &memo, guard.as_deref())
                 .await;
             let image_count = images.len();
             let chat_request = build_chat_request(&request, images);
@@ -192,6 +194,7 @@ impl GreenticLlmBackend {
         history: &mut [ChatMessage],
         vision: bool,
         memo: &TurnAttachments,
+        guard: Option<&dyn AttachmentTextGuard>,
     ) -> Vec<GChatImage> {
         let last_user = history
             .iter()
@@ -218,7 +221,8 @@ impl GreenticLlmBackend {
                     .get_or_materialize(key, || {
                         let nonce = (self.nonce_source)();
                         async move {
-                            materialize(self.artifacts.as_deref(), refs, vision, &nonce).await
+                            materialize(self.artifacts.as_deref(), refs, vision, &nonce, guard)
+                                .await
                         }
                     })
                     .await;
@@ -380,6 +384,7 @@ mod tests {
                 credential_ref: None,
             },
             turn_attachments: Default::default(),
+            attachment_text_guard: None,
         }
     }
 

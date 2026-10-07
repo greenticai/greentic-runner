@@ -592,7 +592,8 @@ fn build_full_runtime_with_llm(
             credential_ref: None,
         },
         limits: AgentLimits {
-            max_iter: 2,
+            // Room for the attachment tests' three tool iterations plus the reply.
+            max_iter: 5,
             timeout: Duration::from_secs(30),
             ..AgentLimits::default()
         },
@@ -790,3 +791,7 @@ async fn the_user_ledger_records_the_guarded_reply() {
         "the ledger gets what the user saw"
     );
 }
+
+#[cfg(feature = "greentic-llm-backend")]
+#[path = "guardrail_e2e/attachments.rs"]
+mod attachments;

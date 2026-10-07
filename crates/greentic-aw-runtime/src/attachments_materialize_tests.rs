@@ -119,7 +119,7 @@ async fn mat(
     refs: &[AttachmentRef],
     vision: bool,
 ) -> Materialized {
-    materialize(reader, refs, vision, NONCE).await
+    materialize(reader, refs, vision, NONCE, None).await
 }
 
 fn begin_line(n: usize) -> String {

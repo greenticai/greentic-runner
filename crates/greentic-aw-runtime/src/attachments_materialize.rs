@@ -23,6 +23,7 @@ use futures::{StreamExt, stream};
 use tokio::sync::OnceCell;
 
 use crate::artifact_reader::{ArtifactBytes, ArtifactError, ArtifactReader};
+use crate::attachment_guard::{AttachmentTextGuard, AttachmentTextVerdict};
 use crate::attachments::{AttachmentKind, AttachmentRef, MAX_ATTACHMENTS, is_stripped};
 
 /// Most characters of one document's text put in front of the model.
@@ -240,6 +241,7 @@ pub async fn materialize(
     refs: &[AttachmentRef],
     vision: bool,
     nonce: &str,
+    guard: Option<&dyn AttachmentTextGuard>,
 ) -> Materialized {
     let mut out = Materialized::default();
     if refs.is_empty() {
@@ -317,7 +319,7 @@ pub async fn materialize(
                     &fetched,
                     &mut doc_chars_left,
                     budget_left,
-                    nonce,
+                    DocContext { nonce, guard },
                 );
                 kept.store(used_so_far + added, Ordering::SeqCst);
             }
@@ -413,6 +415,14 @@ fn is_text_mime(mime: &str) -> bool {
     )
 }
 
+/// What every document block of one message shares: the per-turn marker
+/// nonce, and the inbound guard its text must pass (if any).
+#[derive(Clone, Copy)]
+struct DocContext<'a> {
+    nonce: &'a str,
+    guard: Option<&'a dyn AttachmentTextGuard>,
+}
+
 /// Appends the document block (or a note) and returns the bytes it KEPT.
 fn push_document(
     out: &mut Materialized,
@@ -421,8 +431,9 @@ fn push_document(
     got: &ArtifactBytes,
     chars_left: &mut usize,
     bytes_left: usize,
-    nonce: &str,
+    ctx: DocContext<'_>,
 ) -> usize {
+    let DocContext { nonce, guard } = ctx;
     if !is_text_mime(&got.mime_type) {
         tracing::warn!(
             attachment = n,
@@ -443,16 +454,34 @@ fn push_document(
     // Lazy: only as much of a large text as is kept is sanitised.
     let raw = String::from_utf8_lossy(&got.bytes);
     let cap = DOC_CHAR_CAP.min(*chars_left);
-    let mut body = String::new();
-    let mut taken = 0usize;
-    let mut truncated = false;
-    for c in sanitized_chars(&raw) {
-        if taken == cap || body.len() + c.len_utf8() > bytes_left {
-            truncated = true;
-            break;
+    let (mut body, mut taken, mut truncated) = kept_text(&raw, cap, bytes_left);
+    if taken > 0
+        && let Some(guard) = guard
+    {
+        // The guard checks exactly the text the model would read (sanitised
+        // and capped), so no sanitiser trick can separate the two.
+        match guard.check(&body) {
+            AttachmentTextVerdict::Withhold => {
+                tracing::warn!(
+                    attachment = n,
+                    code = "withheld_by_guardrail",
+                    "document text not shown"
+                );
+                out.text
+                    .push_str(&note(n, r.kind, "was withheld by a content policy."));
+                return 0;
+            }
+            AttachmentTextVerdict::Allow(text) if text != body => {
+                // A redaction goes through the same sanitising and caps, so a
+                // guardrail's output can never write a marker either.
+                let (redacted, redacted_taken, redacted_truncated) =
+                    kept_text(&text, cap, bytes_left);
+                body = redacted;
+                taken = redacted_taken;
+                truncated |= redacted_truncated;
+            }
+            AttachmentTextVerdict::Allow(_) => {}
         }
-        body.push(c);
-        taken += 1;
     }
     if taken == 0 {
         // Nothing fitted the byte budget, or the text was empty to begin with.
@@ -482,6 +511,22 @@ fn push_document(
         ));
     }
     body.len()
+}
+
+/// The sanitised text kept from `raw`: at most `cap` characters and
+/// `bytes_left` UTF-8 bytes. Returns the text, its character count, and
+/// whether anything was cut.
+fn kept_text(raw: &str, cap: usize, bytes_left: usize) -> (String, usize, bool) {
+    let mut body = String::new();
+    let mut taken = 0usize;
+    for c in sanitized_chars(raw) {
+        if taken == cap || body.len() + c.len_utf8() > bytes_left {
+            return (body, taken, true);
+        }
+        body.push(c);
+        taken += 1;
+    }
+    (body, taken, false)
 }
 
 /// One line of display text: nothing stripped by `is_stripped` (so no
@@ -564,3 +609,7 @@ fn log_fetch_error(n: usize, e: &ArtifactError) {
 #[cfg(test)]
 #[path = "attachments_materialize_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "attachments_materialize_guard_tests.rs"]
+mod guard_tests;

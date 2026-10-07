@@ -107,19 +107,39 @@ anything the extension sees. A door refusal reaches the extension as the same
 reason (`unauthorized`, `purpose_not_granted`, `too_large`, `rate_limited`,
 `refused`).
 
-## Known v1 limitation: inbound guardrails do not see document text
+## Inbound guardrails see document text (not images)
 
-The inbound guardrail chain runs on the user's message TEXT only, in the agent
-loop (`crates/greentic-aw-runtime/src/loop.rs`, the "Inbound guardrail hook"
-that calls `crate::guardrail::run_chain` on `message.text`). Attachment
-document text is fetched later, inside the LLM backend
-(`crates/greentic-aw-runtime/src/llm_greentic.rs` `apply_attachments` →
-`crates/greentic-aw-runtime/src/attachments_materialize.rs` `push_document`),
-which holds neither the chain nor the guardrail evaluator. So a document's text
-reaches the model without passing the inbound guardrails. It is delimited and
-labelled as user data (nonce-marked block), which is a mitigation, not a
-guardrail. Closing this means handing the chain (or a guard callback) to the
-backend through `LlmRequest`, the follow-up.
+The inbound guardrail chain that checks the user's message text in the agent
+loop (`crates/greentic-aw-runtime/src/loop.rs`) also checks every attachment
+document's text. The loop hands the backend a guard built from the SAME chain,
+context and evaluator (`LlmRequest.attachment_text_guard`,
+`crates/greentic-aw-runtime/src/attachment_guard.rs`), and
+`attachments_materialize.rs` `push_document` calls it before the text is put
+in the prompt:
+
+- The guard checks the text AFTER sanitising and capping, i.e. exactly what the
+  model would read, so no sanitiser trick can separate what is checked from
+  what is shown.
+- Accept: the text is shown unchanged. A redaction (`Update`) is what the model
+  reads, re-sanitised and re-capped, so a guardrail's output cannot write a
+  block marker either. A Monitor-mode deny is recorded and the text is shown.
+- An Enforce-mode deny WITHHOLDS the document: the model gets the fixed
+  sentence "... was withheld by a content policy." (no name, no reason, no
+  text) and the turn goes on. A withheld document spends none of the
+  per-message text budget.
+- An evaluator ERROR withholds the document whatever the guardrail is. This
+  differs from the message text, where an agent-level guardrail fails open: a
+  file nobody could check is not shown.
+- Denials (blocked or monitored) reach the step observer like the message
+  text's, as `inbound`.
+- It runs once per document per turn (inside the per-turn memo), not once per
+  tool iteration or retry. No guardrail configured means no guard, and the
+  prompt is byte-identical to before.
+- Only the multi-provider backend (`GreenticLlmBackend`) reads document text,
+  so it is the only backend that calls the guard.
+
+**Image content is not guardrail-inspected in v1**: an image is not text, and
+it reaches a vision model as sent.
 
 ## Paths NOT served in v1
 
