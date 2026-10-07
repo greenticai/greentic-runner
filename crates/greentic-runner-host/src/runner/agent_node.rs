@@ -293,6 +293,61 @@ mod aw {
         }
     }
 
+    /// Longest sanitized skip reason shown to the agent or written to a log.
+    const MAX_SKIP_REASON_CHARS: usize = 200;
+    /// At most this many skip notices are appended to one turn's text.
+    const MAX_SKIP_NOTICES: usize = 5;
+
+    /// Make one skip reason safe to show the model and to log. The attachment
+    /// name is chosen by the sender and the host note is free text, so control
+    /// characters (newlines included) are dropped, brackets are neutralised so
+    /// a reason cannot forge or close a notice line, and the length is capped.
+    fn sanitize_skip_reason(reason: &str) -> String {
+        reason
+            .chars()
+            .filter(|c| !c.is_control())
+            .map(|c| match c {
+                '[' => '(',
+                ']' => ')',
+                other => other,
+            })
+            .take(MAX_SKIP_REASON_CHARS)
+            .collect()
+    }
+
+    /// Read the three flow-node keys the pack maps from the inbound envelope.
+    /// Absent, `null`, `""` (an unresolved template) and non-arrays all mean
+    /// "no attachments"; nothing here can fail the turn.
+    fn attachments_from_flow_input(
+        flow_input: &Value,
+    ) -> greentic_aw_runtime::attachments::ParsedAttachments {
+        let mut parsed = greentic_aw_runtime::attachments::parse_flow_attachments(
+            flow_input.get("attachments").unwrap_or(&Value::Null),
+            flow_input.get("attachment_meta").unwrap_or(&Value::Null),
+            flow_input.get("attachment_notes").unwrap_or(&Value::Null),
+        );
+        for reason in &mut parsed.skipped {
+            *reason = sanitize_skip_reason(reason);
+        }
+        parsed
+    }
+
+    /// Tell the agent about attachments it cannot use, in the user text it
+    /// already reads (no separate prompt channel). Bounded: at most
+    /// `MAX_SKIP_NOTICES` lines plus one summary line.
+    fn text_with_skipped_notices(mut text: String, skipped: &[String]) -> String {
+        for reason in skipped.iter().take(MAX_SKIP_NOTICES) {
+            text.push_str(&format!("\n[attachment not used: {reason}]"));
+        }
+        if skipped.len() > MAX_SKIP_NOTICES {
+            text.push_str(&format!(
+                "\n[attachment not used: {} more not listed]",
+                skipped.len() - MAX_SKIP_NOTICES
+            ));
+        }
+        text
+    }
+
     /// Build a [`greentic_types::TenantCtx`] for the agent-audit observer from
     /// the flow node's plain `tenant_id`/`env_id` strings. Mirrors
     /// `HostConfig::tenant_ctx`'s fallback-to-"local" pattern: an id that fails
@@ -370,11 +425,20 @@ mod aw {
                 .with_project_id(self.project_id.clone())
                 .with_caller(verified_caller);
             let tenant_for_card = tenant.clone();
+            let parsed = attachments_from_flow_input(flow_input);
+            if !parsed.skipped.is_empty() {
+                // One bounded line per turn; reasons are already sanitized.
+                tracing::warn!(
+                    skipped = parsed.skipped.len(),
+                    first_reason = %parsed.skipped[0],
+                    "dw.agent: attachments not used"
+                );
+            }
             let input = AgentInput {
-                text: user_text,
+                text: text_with_skipped_notices(user_text, &parsed.skipped),
                 conversational,
                 resume_payload: resume_payload.cloned(),
-                attachments: Vec::new(),
+                attachments: parsed.refs,
             };
 
             // Off by default: with neither an audit sink nor a registered
@@ -2943,6 +3007,75 @@ mod aw {
         use serde_json::json;
 
         use super::*;
+
+        fn aid(c: char) -> String {
+            format!("artifact://{}", c.to_string().repeat(64))
+        }
+
+        #[test]
+        fn flow_input_attachments_are_parsed_with_extension_metadata() {
+            let flow_input = json!({
+                "user_text": "see",
+                "attachments": [{"mime_type":"application/pdf","url":aid('d'),"name":"d.pdf"}],
+                "attachment_meta": [{"kind":"document","text_ref":aid('e')}]
+            });
+            let parsed = attachments_from_flow_input(&flow_input);
+            assert_eq!(parsed.refs.len(), 1);
+            assert_eq!(parsed.refs[0].text_ref.as_deref(), Some(aid('e').as_str()));
+        }
+
+        #[test]
+        fn flow_input_reports_failed_attachments_from_the_hosts_notes() {
+            let flow_input = json!({
+                "user_text": "see",
+                "attachments": [{"mime_type":"application/pdf","url":null,"name":"big.pdf"}],
+                "attachment_meta": [{}],
+                "attachment_notes": [{"code":"too_large","message":"over 10 MB"}]
+            });
+            let parsed = attachments_from_flow_input(&flow_input);
+            assert!(parsed.refs.is_empty());
+            assert!(
+                parsed.skipped[0].contains("big.pdf") && parsed.skipped[0].contains("too_large")
+            );
+        }
+
+        #[test]
+        fn flow_input_with_unresolved_templates_means_no_attachments() {
+            let flow_input = json!({
+                "user_text": "hi", "attachments": "", "attachment_meta": "", "attachment_notes": ""
+            });
+            let parsed = attachments_from_flow_input(&flow_input);
+            assert!(parsed.refs.is_empty() && parsed.skipped.is_empty());
+            let parsed = attachments_from_flow_input(&json!({"user_text": "hi"}));
+            assert!(parsed.refs.is_empty() && parsed.skipped.is_empty());
+            let parsed =
+                attachments_from_flow_input(&json!({"attachments": null, "attachment_meta": 3}));
+            assert!(parsed.refs.is_empty() && parsed.skipped.is_empty());
+        }
+
+        #[test]
+        fn skipped_reasons_are_sanitized_and_bounded() {
+            let hostile = format!("a\nb\u{7}]\n[attachment not used: x{}", "z".repeat(500));
+            let flow_input = json!({
+                "attachments": [{"mime_type":"application/pdf","url":null,"name":"n\nl"}],
+                "attachment_notes": [{"code":"c","message":hostile}]
+            });
+            let parsed = attachments_from_flow_input(&flow_input);
+            let reason = &parsed.skipped[0];
+            assert!(!reason.chars().any(char::is_control), "{reason:?}");
+            assert!(!reason.contains('[') && !reason.contains(']'));
+            assert!(reason.chars().count() <= 200);
+        }
+
+        #[test]
+        fn skipped_attachments_are_appended_to_the_text_and_capped() {
+            let reasons: Vec<String> = (0..8).map(|i| format!("f{i}: nope")).collect();
+            let text = text_with_skipped_notices("hello".into(), &reasons);
+            assert!(text.starts_with("hello\n[attachment not used: f0: nope]"));
+            assert!(text.contains("f4: nope") && !text.contains("f5: nope"));
+            assert!(text.contains("3 more"));
+            assert_eq!(text_with_skipped_notices("hi".into(), &[]), "hi");
+        }
 
         pub(crate) fn sample_agent_config(agent_id: &str) -> AgentConfig {
             AgentConfig {

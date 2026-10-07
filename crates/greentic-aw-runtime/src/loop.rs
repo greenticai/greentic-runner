@@ -252,6 +252,7 @@ async fn run_step_scoped(
     // --- Inbound guardrail hook ---
     // Skipped when resuming a parked flow tool: the user's answer goes to the
     // flow, not the LLM, and returns as a tool result like any other tool's.
+    let attachments = message.attachments;
     let user_message = if resuming.is_some() {
         crate::flow_suspend::last_user_text(&state)
     } else {
@@ -289,7 +290,7 @@ async fn run_step_scoped(
         let user_message = user_text.clone();
         state.messages.push(ChatMessage::User {
             content: user_text,
-            attachments: Vec::new(),
+            attachments,
         });
         user_message
     };
