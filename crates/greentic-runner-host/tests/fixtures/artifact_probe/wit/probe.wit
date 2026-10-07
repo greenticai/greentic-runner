@@ -1,0 +1,8 @@
+package test:artifact-probe;
+
+/// A design extension whose only tool stores 3 bytes through
+/// `host.artifact.put` and answers the id, or `err:<artifact-error case>`.
+world probe {
+  import greentic:extension-host/artifact@0.1.0;
+  export greentic:extension-design/tools@0.2.0;
+}

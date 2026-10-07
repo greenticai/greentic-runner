@@ -1385,6 +1385,7 @@ mod aw {
         secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend>,
         host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        artifact_port: Option<crate::host::ExtArtifactPort>,
         packs: &[Arc<crate::pack::PackRuntime>],
     ) -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
         use greentic_ext_runtime::{
@@ -1502,6 +1503,21 @@ mod aw {
                 return None;
             }
         };
+
+        // Files an extension creates (`greentic.media`) are stored through the
+        // artifact door. Installed exactly as handed (the host decided it, env
+        // fallback included; nothing below the host reads the env) and BEFORE
+        // any extension is registered: an instance is built against the
+        // runtime as it is at load time.
+        match artifact_port {
+            Some(port) => {
+                tracing::info!("extension runtime artifact port wired");
+                runtime = runtime.with_artifact_port(port);
+            }
+            None => tracing::info!(
+                "extension runtime artifact port not configured (host.artifact.put answers unsupported)"
+            ),
+        }
 
         // Initial load of on-disk design extensions (agentic-worker tools live
         // in `<root>/design/<ext>/`).
@@ -1983,6 +1999,7 @@ mod aw {
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
         artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        ext_artifact_port: Option<crate::host::ExtArtifactPort>,
     ) -> Option<Arc<AgentRuntime>> {
         use std::time::Duration;
 
@@ -2035,7 +2052,13 @@ mod aw {
                 // zero-env branch's `if`) means an inversion of the shared
                 // logic is caught on this branch as well.
                 debug_assert!(!should_attempt_agent_llm_port(true, ext_llm_port.is_some()));
-                let ext_runtime = build_ext_runtime(secrets_backend, ext_llm_port, None, &packs)?;
+                let ext_runtime = build_ext_runtime(
+                    secrets_backend,
+                    ext_llm_port,
+                    None,
+                    ext_artifact_port,
+                    &packs,
+                )?;
 
                 use greentic_aw_runtime::llm_credential::SecretsBackedCredentialResolver;
                 let resolver = Arc::new(SecretsBackedCredentialResolver::new(
@@ -2120,8 +2143,13 @@ mod aw {
                         None
                     };
 
-                let ext_runtime =
-                    build_ext_runtime(secrets_backend, ext_llm_port, agent_llm_port, &packs)?;
+                let ext_runtime = build_ext_runtime(
+                    secrets_backend,
+                    ext_llm_port,
+                    agent_llm_port,
+                    ext_artifact_port,
+                    &packs,
+                )?;
                 (ext_runtime, llm)
             }
         };
@@ -2340,6 +2368,7 @@ mod aw {
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
         artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        ext_artifact_port: Option<crate::host::ExtArtifactPort>,
     ) -> Option<AgentNodeWiring> {
         // The deployed unit (`bundle_id`) doubles as the MCP credential scope:
         // the same identity billing attributes this runtime's spend to.
@@ -2356,6 +2385,7 @@ mod aw {
             billing_meter,
             user_ledger,
             artifact_reader,
+            ext_artifact_port,
         )
         .await?;
         let handler: Arc<dyn AgentNodeHandler> = Arc::new(RuntimeAgentNodeHandler::new(
@@ -2476,8 +2506,9 @@ mod aw {
             stream_observers,
             project_id,
             resolve_billing_meter(None),
-            // The un-metered wrappers carry no host seam: no user ledger and
-            // no artifact reader (only a host decides one).
+            // The un-metered wrappers carry no host seam: no user ledger, no
+            // artifact reader, no artifact port (only a host decides those).
+            None,
             None,
             None,
         )
@@ -2530,6 +2561,7 @@ mod aw {
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
         artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        ext_artifact_port: Option<crate::host::ExtArtifactPort>,
     ) -> Option<AgentNodeWiring> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
@@ -2559,6 +2591,7 @@ mod aw {
             billing_meter,
             user_ledger,
             artifact_reader,
+            ext_artifact_port,
         )
         .await
     }
@@ -2629,8 +2662,9 @@ mod aw {
             stream_observers,
             project_id,
             resolve_billing_meter(None),
-            // The un-metered wrappers carry no host seam: no user ledger and
-            // no artifact reader (only a host decides one).
+            // The un-metered wrappers carry no host seam: no user ledger, no
+            // artifact reader, no artifact port (only a host decides those).
+            None,
             None,
             None,
         )
@@ -2653,6 +2687,7 @@ mod aw {
         billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
         artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        ext_artifact_port: Option<crate::host::ExtArtifactPort>,
     ) -> Option<AgentNodeWiring> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
@@ -2695,6 +2730,7 @@ mod aw {
             billing_meter,
             user_ledger,
             artifact_reader,
+            ext_artifact_port,
         )
         .await
     }
@@ -2754,7 +2790,7 @@ mod aw {
              not wired to tier 2 (the worker's own backend); an extension's host.llm.complete \
              here still falls through to tier 3 (env-keyed) or tier 4 (unconfigured)"
         );
-        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, &[])?;
+        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, None, &[])?;
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
@@ -3616,6 +3652,7 @@ mod aw {
                 resolve_billing_meter(None),
                 None,
                 None,
+                None,
             )
             .await
             .expect("handler should build from mock stores")
@@ -3723,6 +3760,7 @@ mod aw {
                 None,
                 Some("support-bot".to_string()),
                 chosen,
+                None,
                 None,
                 None,
             )
@@ -4837,6 +4875,7 @@ mod aw {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             }
@@ -5196,6 +5235,7 @@ mod aw {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("runtime should build")
@@ -5251,6 +5291,7 @@ mod aw {
                     Arc::new(MockTokenMeter::new(0)),
                     Arc::new(NoopToolLedger),
                     Some("worker-a".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -5323,6 +5364,7 @@ mod aw {
                     Some("worker-a".to_string()),
                     None,
                     user_ledger,
+                    None,
                     None,
                 )
                 .await

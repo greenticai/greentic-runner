@@ -588,7 +588,7 @@ mod tests {
         );
         let watcher = squash(include_str!("../watcher.rs"));
         assert!(
-            watcher.contains("#[cfg(feature = \"agentic-worker\")] artifact_reader.clone(), #[cfg(feature = \"agentic-worker\")] Some(stream_observers.clone()),"),
+            watcher.contains("TenantRuntime::from_packs_with_artifact_reader(") && watcher.contains("#[cfg(feature = \"agentic-worker\")] artifact_reader.clone(), #[cfg(feature = \"agentic-worker\")] ext_artifact_port.clone(), #[cfg(feature = \"agentic-worker\")] Some(stream_observers.clone()),"),
             "a pack reload must keep the host's reader"
         );
     }

@@ -403,6 +403,8 @@ mod aw {
             std::sync::Arc::new(super::super::agent_node::EnvSecretsBackend),
             None,
             None,
+            // Process-level path: no embedding host, so no artifact port.
+            None,
             &packs,
         )?;
         let llm = super::super::agent_node::build_llm_backend(&ext_runtime);

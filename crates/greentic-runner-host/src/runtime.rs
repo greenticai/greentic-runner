@@ -367,6 +367,8 @@ pub struct RevisionHostOptions {
     user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
     #[cfg(feature = "agentic-worker")]
     artifact_reader: Option<crate::host::ArtifactReaderPort>,
+    #[cfg(feature = "agentic-worker")]
+    ext_artifact_port: Option<crate::host::ExtArtifactPort>,
 }
 
 impl std::fmt::Debug for RevisionHostOptions {
@@ -380,6 +382,8 @@ impl std::fmt::Debug for RevisionHostOptions {
         out.field("user_ledger", &self.user_ledger.is_some());
         #[cfg(feature = "agentic-worker")]
         out.field("artifact_reader", &self.artifact_reader.is_some());
+        #[cfg(feature = "agentic-worker")]
+        out.field("ext_artifact_port", &self.ext_artifact_port.is_some());
         out.finish()
     }
 }
@@ -486,6 +490,22 @@ impl RevisionHostOptions {
         self.artifact_reader = Some(reader);
         self
     }
+
+    /// Store the files this unit's extensions create (`host.artifact.put`,
+    /// contract C3 `put`) through `port`. greentic-start builds it per unit,
+    /// over that unit's own door and token, like
+    /// [`Self::with_artifact_reader`].
+    ///
+    /// Per REVISION for the same reason: one process serves every unit, each
+    /// with its own token. Without one the unit has NO port: the
+    /// `GREENTIC_ARTIFACT_*` env variables are never read on this path, and an
+    /// extension's `put` answers `unsupported`.
+    #[cfg(feature = "agentic-worker")]
+    #[must_use]
+    pub fn with_ext_artifact_port(mut self, port: crate::host::ExtArtifactPort) -> Self {
+        self.ext_artifact_port = Some(port);
+        self
+    }
 }
 
 /// Block on a future whether or not we're already inside a tokio runtime.
@@ -535,7 +555,9 @@ impl TenantRuntime {
             ext_llm_port,
             #[cfg(feature = "agentic-worker")]
             mcp_source,
-            // No host: no attachment reader.
+            // No host: no attachment reader and no artifact port.
+            #[cfg(feature = "agentic-worker")]
+            None,
             #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
@@ -563,6 +585,7 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
         #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -599,6 +622,8 @@ impl TenantRuntime {
             mcp_source,
             #[cfg(feature = "agentic-worker")]
             artifact_reader,
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port,
             #[cfg(feature = "agentic-worker")]
             stream_observers,
         )
@@ -663,6 +688,8 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             None,
             None,
+            None,
+            #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
             None,
@@ -744,6 +771,8 @@ impl TenantRuntime {
             options.user_ledger,
             #[cfg(feature = "agentic-worker")]
             options.artifact_reader,
+            #[cfg(feature = "agentic-worker")]
+            options.ext_artifact_port,
         )
         .await
     }
@@ -775,6 +804,7 @@ impl TenantRuntime {
             greentic_aw_runtime::user_ledger::UserLedgerTarget,
         >,
         #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -874,6 +904,8 @@ impl TenantRuntime {
             // The unit's own attachment reader (the revision's host options).
             #[cfg(feature = "agentic-worker")]
             artifact_reader,
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port,
             #[cfg(feature = "agentic-worker")]
             None,
             rollout,
@@ -996,7 +1028,9 @@ impl TenantRuntime {
             ext_llm_port,
             #[cfg(feature = "agentic-worker")]
             mcp_source,
-            // No host: no attachment reader.
+            // No host: no attachment reader and no artifact port.
+            #[cfg(feature = "agentic-worker")]
+            None,
             #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
@@ -1019,6 +1053,7 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
         #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -1038,6 +1073,8 @@ impl TenantRuntime {
             mcp_source,
             #[cfg(feature = "agentic-worker")]
             artifact_reader,
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port,
             #[cfg(feature = "agentic-worker")]
             stream_observers,
             RolloutIds::default(),
@@ -1071,6 +1108,7 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
         #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
+        #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -1324,6 +1362,7 @@ impl TenantRuntime {
                     billing_meter.clone(),
                     user_ledger.clone(),
                     artifact_reader.clone(),
+                    ext_artifact_port.clone(),
                 )
                 .await
             } else {
@@ -1341,6 +1380,7 @@ impl TenantRuntime {
                         billing_meter.clone(),
                         user_ledger.clone(),
                         artifact_reader.clone(),
+                        ext_artifact_port.clone(),
                     )
                     .await
                 }
@@ -1358,6 +1398,7 @@ impl TenantRuntime {
                         billing_meter.clone(),
                         user_ledger.clone(),
                         artifact_reader.clone(),
+                        ext_artifact_port.clone(),
                     )
                     .await
                 }
