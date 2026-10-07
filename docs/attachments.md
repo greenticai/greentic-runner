@@ -174,8 +174,11 @@ marked.
   with that call. If the flow parks again the count waits on the pending call
   and is announced when the call is answered (completed or cancelled).
 - **Agent-graph turns** (`dw.agent_graph`, `graph_node.rs`): the graph runs on
-  text; attachments on the node are announced to its agents with the fixed
-  "not available" notice appended to the user text.
+  text; attachments on the node are parsed exactly like the `dw.agent` path and
+  announced to its agents in the user text: a file the host could not store
+  (or a bad, duplicate or over-limit reference) gets its fixed skip notice, and
+  only the files the runner would read are counted in the "not available"
+  notice.
 - **NATS serve path** (`greentic-aw-runtime/src/serve.rs`): `extract_user_text`
   builds the turn from `user_text` / `text` only. Silent: this path never sees
   the attachment keys.

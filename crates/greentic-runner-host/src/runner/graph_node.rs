@@ -915,21 +915,26 @@ mod aw {
             // Contract mirror of agent_node.rs: a missing/empty `user_text`
             // resolves to an empty string and the run proceeds (it never returns
             // Err for this case).
-            let mut user_text = flow_input
+            let user_text = flow_input
                 .get("user_text")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            // A graph turn cannot open files: say so with the fixed notice
-            // (a count only, no name) instead of dropping them silently.
-            let attachment_count = flow_input
-                .get("attachments")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            if attachment_count > 0 {
+            // A graph turn cannot open files: say so with the fixed notices
+            // (counts and codes only, no name) instead of dropping them
+            // silently. Parsed exactly like the `dw.agent` path: a file the
+            // host could not store (or a bad / duplicate / over-limit
+            // reference) gets its own skip notice, and only the files the
+            // runner would actually read are counted as "not available".
+            let parsed = crate::runner::agent_node::attachments_from_flow_input(flow_input);
+            let mut user_text = crate::runner::agent_node::text_with_skipped_notices(
+                user_text,
+                &parsed.skipped_codes,
+            );
+            if !parsed.refs.is_empty() {
                 user_text.push_str(
                     &greentic_aw_runtime::attachments_materialize::unreadable_note(
-                        attachment_count,
+                        parsed.refs.len(),
                     ),
                 );
             }
@@ -2158,9 +2163,18 @@ mod aw {
                 .await
                 .expect("execute should succeed");
             let seen = seen.lock().unwrap().join("\n");
-            let note = greentic_aw_runtime::attachments_materialize::unreadable_note(2);
-            assert!(seen.contains(&format!("look{note}")), "{seen}");
+            // Counted like the `dw.agent` path: only the file the runner would
+            // read is "not available"; the one the host could not store gets
+            // its own fixed notice, and is not counted twice.
+            let note = greentic_aw_runtime::attachments_materialize::unreadable_note(1);
+            assert!(
+                seen.contains(&format!(
+                    "look\n[attachment not used: a file was not stored for the agent]{note}"
+                )),
+                "{seen}"
+            );
             assert!(!seen.contains("secret.png"), "{seen}");
+            assert!(!seen.contains("b.pdf"), "{seen}");
         }
 
         #[tokio::test]

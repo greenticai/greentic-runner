@@ -337,9 +337,9 @@ mod aw {
     /// replaces `state.entry` with the new activity), so this is a pure
     /// function of the new message and cannot replay an earlier one.
     ///
-    /// `dw.agent_graph` does not read attachments: it announces them with the
-    /// fixed "not available" notice (`graph_node.rs`).
-    fn attachments_from_flow_input(
+    /// `dw.agent_graph` does not read attachments: it parses them with this
+    /// same function and announces them with the same notices (`graph_node.rs`).
+    pub(crate) fn attachments_from_flow_input(
         flow_input: &Value,
     ) -> greentic_aw_runtime::attachments::ParsedAttachments {
         greentic_aw_runtime::attachments::parse_flow_attachments(
@@ -353,7 +353,7 @@ mod aw {
     /// already reads (no separate prompt channel). Every line comes from the
     /// fixed table in [`skip_sentence`]; at most `MAX_SKIP_NOTICES` lines plus
     /// one summary line.
-    fn text_with_skipped_notices(mut text: String, skipped: &[SkipCode]) -> String {
+    pub(crate) fn text_with_skipped_notices(mut text: String, skipped: &[SkipCode]) -> String {
         for code in skipped.iter().take(MAX_SKIP_NOTICES) {
             text.push_str(&format!("\n[attachment not used: {}]", skip_sentence(code)));
         }
@@ -5927,8 +5927,9 @@ pub use aw::{build_agent_node_handler_ephemeral, build_agent_node_wiring_ephemer
 
 #[cfg(feature = "agentic-worker")]
 pub(crate) use aw::{
-    EnvSecretsBackend, build_agent_node_wiring_metered, build_ext_runtime, build_llm_backend,
-    component_source_from_packs, mcp_secrets_manager, mcp_source_from_env,
+    EnvSecretsBackend, attachments_from_flow_input, build_agent_node_wiring_metered,
+    build_ext_runtime, build_llm_backend, component_source_from_packs, mcp_secrets_manager,
+    mcp_source_from_env, text_with_skipped_notices,
 };
 
 #[cfg(feature = "desktop-agent-ephemeral")]
