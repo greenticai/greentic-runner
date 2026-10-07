@@ -227,7 +227,11 @@ async fn a_wired_runtime_hands_out_a_turn_for_its_own_tenant() {
     let ledger = Arc::new(StubLedger::default());
     let rt = runtime(agent("helper", vec![]), llm, ledger, LedgerMode::ReadWrite);
     let binding = rt.user_ledger().expect("installed");
-    assert!(binding.turn_for(&verified("sub-1"), "helper").is_some());
+    assert!(
+        binding
+            .turn_for(&verified("sub-1"), "helper", &input("hi"))
+            .is_some()
+    );
     assert!(
         bare_runtime(
             agent("helper", vec![]),
