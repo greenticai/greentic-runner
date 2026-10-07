@@ -626,6 +626,10 @@ pub struct AgentInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_payload: Option<serde_json::Value>,
     /// Attachments of THIS message (references only; see [`attachments`]).
+    ///
+    /// Adding this field made `AgentInput { .. }` literals without a base fail
+    /// to compile; downstream constructors use `..Default::default()` rather
+    /// than the struct being `#[non_exhaustive]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentRef>,
 }
