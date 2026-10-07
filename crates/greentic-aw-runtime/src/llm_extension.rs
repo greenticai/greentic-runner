@@ -191,8 +191,10 @@ mod tests {
     fn req() -> LlmRequest {
         LlmRequest {
             system_prompt: "be helpful".into(),
+            // attachments unsupported on this backend
             history: vec![ChatMessage::User {
                 content: "hi".into(),
+                attachments: Vec::new(),
             }],
             tools: vec![LlmToolSchema {
                 extension_id: "http".into(),

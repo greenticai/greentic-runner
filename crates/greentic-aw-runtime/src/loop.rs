@@ -287,9 +287,10 @@ async fn run_step_scoped(
         };
         // Keep user_message for long-term memory recall query below.
         let user_message = user_text.clone();
-        state
-            .messages
-            .push(ChatMessage::User { content: user_text });
+        state.messages.push(ChatMessage::User {
+            content: user_text,
+            attachments: Vec::new(),
+        });
         user_message
     };
 

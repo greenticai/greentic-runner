@@ -1169,7 +1169,10 @@ mod aw {
                 "system" => ChatMessage::System { content },
                 // Any non-assistant/non-system role (notably "user") maps to a
                 // user turn — the safe default for a chat completion.
-                _ => ChatMessage::User { content },
+                _ => ChatMessage::User {
+                    content,
+                    attachments: Vec::new(),
+                },
             })
             .collect();
 

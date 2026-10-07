@@ -588,7 +588,8 @@ fn build_messages(req: &LlmRequest) -> Vec<OaMessage> {
             ChatMessage::System { content } => out.push(OaMessage::System {
                 content: content.clone(),
             }),
-            ChatMessage::User { content } => out.push(OaMessage::User {
+            // attachments unsupported on this backend
+            ChatMessage::User { content, .. } => out.push(OaMessage::User {
                 content: content.clone(),
             }),
             ChatMessage::Assistant {

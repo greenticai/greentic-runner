@@ -262,7 +262,7 @@ pub(crate) fn last_user_text(state: &ConversationState) -> String {
         .iter()
         .rev()
         .find_map(|m| match m {
-            ChatMessage::User { content } => Some(content.clone()),
+            ChatMessage::User { content, .. } => Some(content.clone()),
             _ => None,
         })
         .unwrap_or_default()
@@ -411,6 +411,7 @@ mod tests {
             tool("c1", json!({ "status": AWAITING_PLACEHOLDER })),
             ChatMessage::User {
                 content: "q".into(),
+                attachments: Vec::new(),
             },
         ]);
         patch_tool_result(&mut s, "c1", json!({ "ok": true }));
@@ -458,6 +459,7 @@ mod tests {
             tool("c1", old.clone()),
             ChatMessage::User {
                 content: "next".into(),
+                attachments: Vec::new(),
             },
             asst(&["c1"]),
             tool("c1", json!({ "status": AWAITING_PLACEHOLDER })),
@@ -475,6 +477,7 @@ mod tests {
             tool("c1", json!({ "old": true })),
             ChatMessage::User {
                 content: "next".into(),
+                attachments: Vec::new(),
             },
             asst(&["c1"]),
         ]);

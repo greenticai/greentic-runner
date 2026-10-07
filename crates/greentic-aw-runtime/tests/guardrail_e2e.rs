@@ -82,7 +82,7 @@ impl LlmBackend for EchoLlmBackend {
             .history
             .iter()
             .filter_map(|m| {
-                if let greentic_aw_runtime::state::ChatMessage::User { content } = m {
+                if let greentic_aw_runtime::state::ChatMessage::User { content, .. } = m {
                     Some(content.clone())
                 } else {
                     None

@@ -209,6 +209,10 @@ pub enum ChatMessage {
     },
     User {
         content: String,
+        /// References only (never bytes): the LLM backend resolves them for
+        /// the current turn. Absent in state stored before attachments existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::attachments::AttachmentRef>,
     },
     Assistant {
         content: String,
@@ -405,6 +409,7 @@ mod tests {
         });
         conversation_state.messages.push(ChatMessage::User {
             content: "u1".into(),
+            attachments: Vec::new(),
         });
         conversation_state.messages.push(ChatMessage::Assistant {
             content: "a1".into(),
@@ -412,6 +417,7 @@ mod tests {
         });
         conversation_state.messages.push(ChatMessage::User {
             content: "u2".into(),
+            attachments: Vec::new(),
         });
         conversation_state.messages.push(ChatMessage::Assistant {
             content: "a2".into(),
@@ -426,7 +432,7 @@ mod tests {
             conversation_state.messages[0],
             ChatMessage::System { .. }
         ));
-        if let ChatMessage::User { content } = &conversation_state.messages[1] {
+        if let ChatMessage::User { content, .. } = &conversation_state.messages[1] {
             assert_eq!(content, "u2");
         } else {
             panic!("expected User u2 at position 1");
@@ -444,6 +450,7 @@ mod tests {
     fn user(text: &str) -> ChatMessage {
         ChatMessage::User {
             content: text.into(),
+            attachments: Vec::new(),
         }
     }
 
@@ -564,5 +571,59 @@ mod tests {
             s.messages
         );
         assert!(pairing_is_valid(&s.messages), "{:?}", s.messages);
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn user_message_without_attachments_serializes_exactly_as_before() {
+        let msg = ChatMessage::User {
+            content: "hi".into(),
+            attachments: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            serde_json::json!({"role":"user","content":"hi"})
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn user_message_stored_before_attachments_existed_still_loads() {
+        let old = serde_json::json!({"role":"user","content":"hello"});
+        let msg: ChatMessage = serde_json::from_value(old).unwrap();
+        match msg {
+            ChatMessage::User {
+                content,
+                attachments,
+            } => {
+                assert_eq!(content, "hello");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn user_message_attachments_round_trip_as_references_only() {
+        use crate::attachments::{AttachmentKind, AttachmentRef};
+        let id = format!("artifact://{}", "a".repeat(64));
+        let msg = ChatMessage::User {
+            content: "see".into(),
+            attachments: vec![AttachmentRef {
+                id: id.clone(),
+                mime_type: "image/png".into(),
+                name: Some("a.png".into()),
+                size_bytes: Some(3),
+                kind: AttachmentKind::Image,
+                text_ref: None,
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(&id));
+        assert!(!json.contains("base64"));
+        let back: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, ChatMessage::User { ref attachments, .. } if attachments.len() == 1 && attachments[0].id == id)
+        );
     }
 }

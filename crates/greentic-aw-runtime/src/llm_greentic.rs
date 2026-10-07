@@ -147,7 +147,7 @@ fn text_message(role: MessageRole, content: String) -> GChatMessage {
 fn map_message(msg: &ChatMessage) -> GChatMessage {
     match msg {
         ChatMessage::System { content } => text_message(MessageRole::System, content.clone()),
-        ChatMessage::User { content } => text_message(MessageRole::User, content.clone()),
+        ChatMessage::User { content, .. } => text_message(MessageRole::User, content.clone()),
         ChatMessage::Assistant {
             content,
             tool_calls,
@@ -231,6 +231,7 @@ mod tests {
         let request = req(
             vec![ChatMessage::User {
                 content: "hi".into(),
+                attachments: Vec::new(),
             }],
             vec![LlmToolSchema {
                 extension_id: "greentic.tavily".into(),
@@ -297,6 +298,7 @@ mod tests {
         let request = req(
             vec![ChatMessage::User {
                 content: "What is the latest stable Rust version? Use tavily_search.".into(),
+                attachments: Vec::new(),
             }],
             vec![LlmToolSchema {
                 extension_id: "greentic.tavily".into(),

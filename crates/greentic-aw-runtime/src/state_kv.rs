@@ -172,6 +172,7 @@ mod tests {
         let mut state = ConversationState::empty(&t, "sess");
         state.messages.push(ChatMessage::User {
             content: "hi".into(),
+            attachments: Vec::new(),
         });
         s.save(&t, "sess", &state).await.unwrap();
         let loaded = s.load(&t, "sess").await.unwrap();

@@ -1080,6 +1080,7 @@ mod aw {
             match m.role {
                 GraphRole::User => seeded.messages.push(ChatMessage::User {
                     content: m.content.clone(),
+                    attachments: Vec::new(),
                 }),
                 GraphRole::Assistant => seeded.messages.push(ChatMessage::Assistant {
                     content: m.content.clone(),
@@ -1087,6 +1088,7 @@ mod aw {
                 }),
                 GraphRole::Tool => seeded.messages.push(ChatMessage::User {
                     content: format!("Tool result: {}", m.content),
+                    attachments: Vec::new(),
                 }),
             }
         }

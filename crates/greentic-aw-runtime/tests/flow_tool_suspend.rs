@@ -403,7 +403,7 @@ async fn a_message_without_a_resume_payload_cancels_the_pending_tool() {
     let cancelled = tool_result(&seen, "c1").expect("cancelled result");
     assert_eq!(cancelled["status"], "cancelled");
     assert!(
-        matches!(seen.last(), Some(ChatMessage::User { content }) if content == "never mind"),
+        matches!(seen.last(), Some(ChatMessage::User { content, .. }) if content == "never mind"),
         "the user's text follows the cancelled tool result"
     );
     assert!(h.state().await.pending_tool.is_none());

@@ -324,6 +324,7 @@ mod build_tests {
         let mut state = ConversationState::empty(&tenant, session_id);
         state.messages.push(ChatMessage::User {
             content: "hello from handler one".to_string(),
+            attachments: Vec::new(),
         });
 
         backends1
@@ -344,7 +345,7 @@ mod build_tests {
             "message saved via first backend must be visible via second (shared store)"
         );
         match &loaded.messages[0] {
-            ChatMessage::User { content } => {
+            ChatMessage::User { content, .. } => {
                 assert_eq!(content, "hello from handler one");
             }
             other => panic!("unexpected message variant: {other:?}"),
