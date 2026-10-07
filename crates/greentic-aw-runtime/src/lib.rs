@@ -77,7 +77,7 @@ pub mod serve;
 
 pub use a2a_source::{A2aRoute, A2aToolCatalog, A2aToolEntry, A2aToolSource};
 pub use artifact_reader::{
-    ArtifactBytes, ArtifactClientError, ArtifactError, ArtifactReader, HttpArtifactReader,
+    ArtifactBytes, ArtifactClientError, ArtifactError, ArtifactReader, HttpArtifactReader, door_url,
 };
 pub use attachments::{AttachmentKind, AttachmentRef};
 pub use component_source::{

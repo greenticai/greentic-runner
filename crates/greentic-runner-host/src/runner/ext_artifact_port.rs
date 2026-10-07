@@ -125,7 +125,11 @@ impl ArtifactPort for HttpArtifactPort {
         ) {
             return Err(unavailable("artifact put needs a multi-thread runtime"));
         }
-        let url = format!("{}/put", self.endpoint.trim_end_matches('/'));
+        // The same endpoint rule as the reader: https, or loopback http only,
+        // never userinfo. A refused endpoint never receives the token.
+        let Some(url) = greentic_aw_runtime::door_url(&self.endpoint, "put") else {
+            return Err(unavailable("artifact endpoint is not usable"));
+        };
         let body = serde_json::json!({
             "name": request.name,
             "mime_type": request.mime_type,

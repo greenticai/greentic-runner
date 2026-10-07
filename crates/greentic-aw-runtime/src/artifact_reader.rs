@@ -149,20 +149,33 @@ impl HttpArtifactReader {
     }
 
     fn get_url(&self) -> Result<reqwest::Url, ArtifactError> {
-        let bad = || ArtifactError::Unavailable("artifact endpoint is not usable".into());
-        let url = reqwest::Url::parse(&format!("{}/get", self.endpoint.trim_end_matches('/')))
-            .map_err(|_| bad())?;
-        let loopback = url.host_str().is_some_and(|h| {
-            h == "localhost"
-                || h.trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
-        match url.scheme() {
-            "https" => Ok(url),
-            "http" if loopback => Ok(url),
-            _ => Err(bad()),
-        }
+        door_url(&self.endpoint, "get")
+            .ok_or_else(|| ArtifactError::Unavailable("artifact endpoint is not usable".into()))
+    }
+}
+
+/// The URL of one operation on the artifacts door, or `None` when the endpoint
+/// must not receive the bearer token. ONE rule for every door client (the
+/// reader here, runner-host's extension artifact port): `https`, or `http`
+/// to a loopback host only; never userinfo in the URL (a token there would be
+/// sent as Basic auth and logged by proxies); anything else (`file:`, `ftp:`,
+/// no scheme, cleartext `http` to another host) is refused, so the token is
+/// never sent in clear text.
+pub fn door_url(endpoint: &str, op: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(&format!("{}/{op}", endpoint.trim_end_matches('/'))).ok()?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let loopback = url.host_str().is_some_and(|h| {
+        h == "localhost"
+            || h.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    match url.scheme() {
+        "https" => Some(url),
+        "http" if loopback => Some(url),
+        _ => None,
     }
 }
 
@@ -295,7 +308,7 @@ impl ArtifactReader for HttpArtifactReader {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use wiremock::matchers::{body_json, header, method, path};
@@ -640,5 +653,59 @@ mod tests {
         let long = format!("{} tail", "x".repeat(119));
         let got = clean_name(Some(long)).unwrap();
         assert_eq!(got, "x".repeat(119));
+    }
+
+    #[test]
+    fn the_door_url_rule_admits_https_and_loopback_http_only() {
+        for ok in [
+            "https://admin.example/api/v1/ingest/artifacts",
+            "https://admin.example/artifacts/",
+            "http://127.0.0.1:8080/artifacts",
+            "http://localhost:8080/artifacts",
+            "http://[::1]:8080/artifacts",
+        ] {
+            let url = door_url(ok, "get").unwrap_or_else(|| panic!("refused {ok}"));
+            assert!(url.path().ends_with("/artifacts/get"), "{url}");
+        }
+        for bad in [
+            "http://admin.example/artifacts",
+            "http://10.0.0.1/artifacts",
+            "file:///etc/artifacts",
+            "ftp://admin.example/artifacts",
+            "admin.example/artifacts",
+            "",
+            "https://user:pw@admin.example/artifacts",
+            "https://user@admin.example/artifacts",
+            "http://user:pw@127.0.0.1:8080/artifacts",
+        ] {
+            assert!(door_url(bad, "get").is_none(), "admitted {bad:?}");
+        }
+    }
+
+    /// A hostile endpoint never receives a request, so the bearer is never
+    /// sent in clear text or with userinfo.
+    #[tokio::test]
+    async fn a_hostile_endpoint_gets_no_request_and_a_fixed_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("image/png", &[1])))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let port = server.address().port();
+        for endpoint in [
+            format!("http://user:pw@127.0.0.1:{port}/artifacts"),
+            "http://admin.example/artifacts".to_string(),
+            "file:///tmp/artifacts".to_string(),
+            "admin.example/artifacts".to_string(),
+        ] {
+            let reader = HttpArtifactReader::new(endpoint.clone(), "gtm_secret".into()).unwrap();
+            match reader.get(&aid('a')).await {
+                Err(ArtifactError::Unavailable(msg)) => {
+                    assert_eq!(msg, "artifact endpoint is not usable", "{endpoint}")
+                }
+                other => panic!("{endpoint}: {other:?}"),
+            }
+        }
     }
 }

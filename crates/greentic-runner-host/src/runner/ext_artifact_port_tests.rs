@@ -305,3 +305,35 @@ fn the_port_is_threaded_from_both_host_paths_and_never_from_the_env_below_them()
         "pack reload"
     );
 }
+
+/// The port shares the reader's endpoint rule: https, or loopback http only,
+/// and never userinfo. A hostile endpoint gets no request at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hostile_endpoint_gets_no_request_and_a_fixed_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let port_no = server.address().port();
+    for endpoint in [
+        format!("http://user:pw@127.0.0.1:{port_no}/artifacts"),
+        "http://admin.example/artifacts".to_string(),
+        "file:///tmp/artifacts".to_string(),
+        "admin.example/artifacts".to_string(),
+    ] {
+        let port = HttpArtifactPort::new(
+            endpoint.clone(),
+            "gtm_secret".into(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        match put(port, "acme").await {
+            Err(ArtifactPortError::Unavailable(msg)) => {
+                assert_eq!(msg, "artifact endpoint is not usable", "{endpoint}")
+            }
+            other => panic!("{endpoint}: {other:?}"),
+        }
+    }
+}
