@@ -14,6 +14,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod a2a_source;
+pub mod artifact_door;
 pub mod artifact_reader;
 pub mod attachment_guard;
 pub mod attachments;
@@ -77,6 +78,7 @@ pub mod mock;
 pub mod serve;
 
 pub use a2a_source::{A2aRoute, A2aToolCatalog, A2aToolEntry, A2aToolSource};
+pub use artifact_door::{DOOR_ATTEMPTS, DOOR_CONCURRENCY, DoorReply, DoorRetry, DoorSendError};
 pub use artifact_reader::{
     ArtifactBytes, ArtifactClientError, ArtifactError, ArtifactReader, HttpArtifactReader, door_url,
 };
@@ -126,6 +128,10 @@ pub use playbook_source::{
     PlaybookSource, PlaybookToolCatalog, PlaybookToolEntry, PlaybookToolSource, PlaybookTurnFn,
     PlaybookTurnRequest, PlaybookTurnResult,
 };
+/// The `reqwest` the door helpers ([`DoorRetry`]) speak. A door client in
+/// another crate builds its `reqwest::Client` from this one, so the two never
+/// disagree on the version.
+pub use reqwest as door_reqwest;
 pub use run_trace::{RunContext, RunTrace, StepId, ToolOutcome};
 pub use share_policy::{BindingModes, ShareMode, SharePolicy};
 pub use sorla_source::{

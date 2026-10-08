@@ -464,3 +464,113 @@ async fn the_client_ignores_the_proxy_environment() {
     );
     assert!(got.is_ok(), "{got:?}");
 }
+
+fn put_ok() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "id": VALID_ID, "sha256": "aa", "size_bytes": 3,
+        "kind": "image", "mime_type": "image/png"
+    }))
+}
+
+/// Mounts `first` for the first `n` calls, then a successful put.
+async fn door_failing_then_ok(server: &MockServer, first: ResponseTemplate, n: u64) {
+    Mock::given(method("POST"))
+        .respond_with(first)
+        .up_to_n_times(n)
+        .with_priority(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(put_ok())
+        .with_priority(2)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_or_failing_door_is_retried_and_the_put_succeeds() {
+    for status in [408u16, 429, 502, 503, 504] {
+        let server = MockServer::start().await;
+        door_failing_then_ok(&server, ResponseTemplate::new(status), 1).await;
+        let got = put(port_for(&server, "t"), "acme").await;
+        assert_eq!(got.ok().as_deref(), Some(VALID_ID), "{status}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_door_answers_are_not_retried() {
+    for status in [400u16, 401, 403, 404, 413, 415, 422] {
+        let server = MockServer::start().await;
+        door_failing_then_ok(&server, ResponseTemplate::new(status), 1).await;
+        assert!(
+            put(port_for(&server, "t"), "acme").await.is_err(),
+            "{status}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_retries_stop_after_three_attempts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let err = put(port_for(&server, "t"), "acme").await.unwrap_err();
+    assert!(matches!(err, ArtifactPortError::Unavailable(_)), "{err:?}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_honours_retry_after() {
+    let server = MockServer::start().await;
+    door_failing_then_ok(
+        &server,
+        ResponseTemplate::new(429).insert_header("retry-after", "1"),
+        1,
+    )
+    .await;
+    let started = std::time::Instant::now();
+    assert!(put(port_for(&server, "t"), "acme").await.is_ok());
+    assert!(
+        started.elapsed() >= Duration::from_millis(950),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_most_two_puts_are_in_flight_per_port() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(put_ok().set_delay(Duration::from_millis(400)))
+        .mount(&server)
+        .await;
+    let port = Arc::new(port_for(&server, "t"));
+    let started = std::time::Instant::now();
+    let calls: Vec<_> = (0..4)
+        .map(|_| {
+            let port = Arc::clone(&port);
+            tokio::task::spawn_blocking(move || port.put("greentic.media", &ctx("acme"), request()))
+        })
+        .collect();
+    for call in calls {
+        assert!(call.await.unwrap().is_ok());
+    }
+    // Four 400 ms answers two at a time take two rounds; unbounded, one.
+    assert!(
+        started.elapsed() >= Duration::from_millis(780),
+        "{:?}",
+        started.elapsed()
+    );
+}

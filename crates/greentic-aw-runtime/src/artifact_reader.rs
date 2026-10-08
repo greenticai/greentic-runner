@@ -96,12 +96,14 @@ pub enum ArtifactClientError {
 /// Reads one artifact from the admin door.
 ///
 /// Memory: one read can hold roughly 14 MB of raw response body, a 14 MB base64
-/// string and the 10 MB decoded bytes at the same time. The CALLER (the Task 6
-/// wiring) must bound the number of concurrent reads.
+/// string and the 10 MB decoded bytes at the same time. At most two reads per
+/// reader are in flight, and a busy or failing door is retried
+/// (`crate::artifact_door`); each attempt has its own timeouts.
 pub struct HttpArtifactReader {
     client: reqwest::Client,
     endpoint: String,
     token: String,
+    door: crate::artifact_door::DoorRetry,
 }
 
 impl std::fmt::Debug for HttpArtifactReader {
@@ -153,6 +155,7 @@ impl HttpArtifactReader {
             client,
             endpoint,
             token,
+            door: crate::artifact_door::DoorRetry::new(),
         })
     }
 
@@ -226,7 +229,8 @@ async fn read_capped(response: reqwest::Response) -> Result<Vec<u8>, ArtifactErr
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ArtifactError::Unavailable(e.without_url().to_string()))?;
+        let chunk = chunk
+            .map_err(|_| ArtifactError::Unavailable("door answer could not be read".into()))?;
         if body.len() + chunk.len() > MAX_BODY_BYTES {
             return Err(ArtifactError::TooLarge);
         }
@@ -246,22 +250,27 @@ impl ArtifactReader for HttpArtifactReader {
                 return Err(ArtifactError::NotFound);
             }
             let url = self.get_url()?;
-            let response = self
-                .client
-                .post(url)
-                .bearer_auth(&self.token)
-                .json(&serde_json::json!({ "id": id }))
-                .send()
+            let body = serde_json::json!({ "id": id });
+            // The reply holds this reader's door slot until the body is read.
+            let reply = self
+                .door
+                .send(|| {
+                    self.client
+                        .post(url.clone())
+                        .bearer_auth(&self.token)
+                        .json(&body)
+                })
                 .await
-                // `without_url`: a reqwest error can embed the request URL.
-                .map_err(|e| ArtifactError::Unavailable(e.without_url().to_string()))?;
+                .map_err(|e| ArtifactError::Unavailable(e.to_string()))?;
+            let response = reply.response;
             match response.status().as_u16() {
                 200 => {}
                 401 => return Err(ArtifactError::Unauthorized),
                 403 => return Err(ArtifactError::PurposeNotGranted),
                 404 => return Err(ArtifactError::NotFound),
                 413 => return Err(ArtifactError::TooLarge),
-                // 415, 422, 429, 503, redirects and anything else: not served.
+                // 415, 422, a 429/503 still refused after every retry,
+                // redirects and anything else: not served.
                 other => return Err(ArtifactError::Unavailable(format!("door answered {other}"))),
             }
             let raw = read_capped(response).await?;
@@ -632,6 +641,123 @@ mod tests {
             HttpArtifactReader::new("https://admin.example/x".into(), "gtm_topsecret".into())
                 .unwrap();
         assert!(!format!("{reader:?}").contains("topsecret"));
+    }
+
+    /// Mounts `first` for the first `n` calls, then a 200 with one byte.
+    async fn door_failing_then_ok(server: &MockServer, first: ResponseTemplate, n: u64) {
+        Mock::given(method("POST"))
+            .respond_with(first)
+            .up_to_n_times(n)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("image/png", &[7])))
+            .with_priority(2)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_busy_or_failing_door_is_retried_and_the_read_succeeds() {
+        for status in [408u16, 429, 502, 503, 504] {
+            let server = MockServer::start().await;
+            door_failing_then_ok(&server, ResponseTemplate::new(status), 1).await;
+            let got = reader_for(&server).await.get(&aid('a')).await;
+            assert_eq!(got.map(|b| b.bytes).ok(), Some(vec![7]), "{status}");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                2,
+                "{status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn final_answers_are_not_retried() {
+        for status in [400u16, 401, 403, 404, 413, 415, 422] {
+            let server = MockServer::start().await;
+            door_failing_then_ok(&server, ResponseTemplate::new(status), 1).await;
+            assert!(
+                reader_for(&server).await.get(&aid('a')).await.is_err(),
+                "{status}"
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "{status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_stop_after_three_attempts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let err = reader_for(&server).await.get(&aid('a')).await.unwrap_err();
+        assert!(matches!(err, ArtifactError::Unavailable(_)), "{err:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_honoured_and_capped() {
+        // `Retry-After: 1` waits a second, longer than the 250 ms backoff.
+        let server = MockServer::start().await;
+        door_failing_then_ok(
+            &server,
+            ResponseTemplate::new(429).insert_header("retry-after", "1"),
+            1,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        assert!(reader_for(&server).await.get(&aid('a')).await.is_ok());
+        assert!(
+            started.elapsed() >= Duration::from_millis(950),
+            "{:?}",
+            started.elapsed()
+        );
+        // `Retry-After: 60` is capped at three seconds.
+        let server = MockServer::start().await;
+        door_failing_then_ok(
+            &server,
+            ResponseTemplate::new(503).insert_header("retry-after", "60"),
+            1,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        assert!(reader_for(&server).await.get(&aid('a')).await.is_ok());
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(2900) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_two_reads_are_in_flight_per_reader() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_json(ok_body("image/png", &[1])),
+            )
+            .mount(&server)
+            .await;
+        let reader = reader_for(&server).await;
+        let ids: Vec<String> = ['a', 'b', 'c', 'd'].into_iter().map(aid).collect();
+        let started = std::time::Instant::now();
+        let results = futures::future::join_all(ids.iter().map(|id| reader.get(id))).await;
+        assert!(results.iter().all(Result::is_ok));
+        // Four 400 ms answers two at a time take two rounds; unbounded, one.
+        assert!(
+            started.elapsed() >= Duration::from_millis(780),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     async fn one_mime(mime: &str) -> Result<ArtifactBytes, ArtifactError> {

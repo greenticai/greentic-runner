@@ -31,7 +31,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use greentic_aw_runtime::ArtifactClientError;
+// The door helper speaks greentic-aw-runtime's `reqwest`, so the port's
+// client is built from that one too.
+use greentic_aw_runtime::door_reqwest as reqwest;
+use greentic_aw_runtime::{ArtifactClientError, DoorRetry};
 use greentic_ext_runtime::host_ports::{
     ArtifactPort, ArtifactPortError, ArtifactPutRequest, HostCallContext,
 };
@@ -48,6 +51,9 @@ pub struct HttpArtifactPort {
     endpoint: String,
     token: String,
     handle: tokio::runtime::Handle,
+    /// At most two puts in flight per port, and a busy or failing door retried
+    /// (`greentic_aw_runtime::artifact_door`, the reader's own rules).
+    door: DoorRetry,
 }
 
 impl std::fmt::Debug for HttpArtifactPort {
@@ -93,6 +99,7 @@ impl HttpArtifactPort {
             endpoint,
             token,
             handle,
+            door: DoorRetry::new(),
         })
     }
 }
@@ -124,6 +131,13 @@ async fn read_capped(response: reqwest::Response) -> Option<Vec<u8>> {
 #[derive(serde::Deserialize)]
 struct PutBody {
     id: String,
+}
+
+/// What one put brought back: a refusal status, or a 200's capped body
+/// (`None` when unreadable or over the cap).
+enum PutOutcome {
+    Refused(u16),
+    Body(Option<Vec<u8>>),
 }
 
 /// Unavailable with a fixed, credential-free reason.
@@ -177,22 +191,36 @@ impl ArtifactPort for HttpArtifactPort {
             // applies only the per-tenant byte quota.
             "conversation_id": null,
         });
-        let send = self
-            .client
-            .post(url)
-            .bearer_auth(&self.token)
-            .json(&body)
-            .send();
+        // One blocking section for the request AND the reply, so this port's
+        // door slot is held until the reply is read (the transfer lasts that
+        // long on the door). A busy door (408/429/502/503/504) or a transport
+        // failure is retried before anything is reported.
+        let exchange = async {
+            let reply = self
+                .door
+                .send(|| {
+                    self.client
+                        .post(url.clone())
+                        .bearer_auth(&self.token)
+                        .json(&body)
+                })
+                .await?;
+            Ok::<_, greentic_aw_runtime::DoorSendError>(match reply.response.status().as_u16() {
+                200 => PutOutcome::Body(read_capped(reply.response).await),
+                other => PutOutcome::Refused(other),
+            })
+        };
         // Errors carry fixed reasons only: a reqwest error can embed the URL.
-        let response = tokio::task::block_in_place(|| self.handle.block_on(send))
+        let outcome = tokio::task::block_in_place(|| self.handle.block_on(exchange))
             .map_err(|_| unavailable("artifact door unreachable"))?;
-        match response.status().as_u16() {
-            200 => {}
-            415 => return Err(ArtifactPortError::InvalidMediaType),
-            422 => return Err(ArtifactPortError::QuotaExceeded),
-            // 401/403 (token or purpose), 413, 429, 503, a redirect and
-            // anything else: not stored. The body is never read or returned.
-            other => {
+        let raw = match outcome {
+            PutOutcome::Body(raw) => raw,
+            PutOutcome::Refused(415) => return Err(ArtifactPortError::InvalidMediaType),
+            PutOutcome::Refused(422) => return Err(ArtifactPortError::QuotaExceeded),
+            // 401/403 (token or purpose), 413, a 429/503 still refused after
+            // every retry, a redirect and anything else: not stored. The body
+            // is never read or returned.
+            PutOutcome::Refused(other) => {
                 // Distinct fixed codes for the host log; the extension sees
                 // the same `unavailable` whatever the cause.
                 let reason = match other {
@@ -218,11 +246,10 @@ impl ArtifactPort for HttpArtifactPort {
                     "door answered {other}"
                 )));
             }
-        }
-        // The reply is untrusted: read at most MAX_REPLY_BYTES of it, and
-        // accept only a well-formed artifact id.
-        let raw = tokio::task::block_in_place(|| self.handle.block_on(read_capped(response)))
-            .ok_or_else(|| unavailable("artifact door answered an unreadable body"))?;
+        };
+        // The reply is untrusted: at most MAX_REPLY_BYTES of it were read, and
+        // only a well-formed artifact id is accepted.
+        let raw = raw.ok_or_else(|| unavailable("artifact door answered an unreadable body"))?;
         let parsed: PutBody = serde_json::from_slice(&raw)
             .map_err(|_| unavailable("artifact door answered an unreadable body"))?;
         if !greentic_aw_runtime::is_artifact_ref(&parsed.id) {
