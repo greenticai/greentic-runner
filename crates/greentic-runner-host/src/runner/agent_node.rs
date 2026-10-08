@@ -5417,11 +5417,16 @@ mod aw {
                 sub: Some("alice".into()),
                 ..Default::default()
             };
+            let said = greentic_aw_runtime::AgentInput {
+                text: "hi".into(),
+                ..Default::default()
+            };
             assert!(
                 binding
                     .turn_for(
                         &TenantContext::new("t1", "e").with_caller(Some(alice.clone())),
-                        "greeter"
+                        "greeter",
+                        &said
                     )
                     .is_some(),
                 "the binding must serve a verified turn of the runtime's own tenant"
@@ -5430,7 +5435,8 @@ mod aw {
                 binding
                     .turn_for(
                         &TenantContext::new("other", "e").with_caller(Some(alice)),
-                        "greeter"
+                        "greeter",
+                        &said
                     )
                     .is_none()
             );

@@ -249,6 +249,31 @@ async fn run_step_scoped(
         env_id: tenant.env_id.clone(),
     };
 
+    // --- User ledger (shared context, Phase C): what this signed-in user did
+    // in any unit of the environment. Off unless the host installed a ledger,
+    // the pack names this agent, the caller is provider-verified and this is
+    // a TOP-LEVEL step (`turn_for` refuses inside a tool call frame, i.e. a
+    // nested agent of a `flow:` tool). `turn_for` must run here, on the
+    // step's own task: the nested check reads a task-local that a
+    // `tokio::spawn` would lose. The read runs alongside the catalog
+    // resolution (same task, no spawn) so the lock-held wait it can add is at
+    // most `READ_TIMEOUT` minus that time; a slow, failing or suspended
+    // ledger injects nothing and never fails the turn.
+    //
+    // Not subject to the #828 share modes in this version: the ledger is
+    // keyed by the verified caller, not by the run, and nested agents never
+    // see it. The view goes into this step's system prompt only and is never
+    // appended to the run trace.
+    //
+    // Decided here, before the inbound guardrail consumes `message.text`:
+    // `turn_for` judges the RAW input, and a turn the visitor did not take
+    // (blank text, no submit payload — a channel's auto-start turn) gets a
+    // handle that reads but never appends (`user_ledger::visitor_spoke`).
+    let ledger_turn = runtime
+        .user_ledger
+        .as_ref()
+        .and_then(|binding| binding.turn_for(&tenant, agent_id, &message));
+
     // --- Inbound guardrail hook ---
     // Skipped when resuming a parked flow tool: the user's answer goes to the
     // flow, not the LLM, and returns as a tool result like any other tool's.
@@ -438,26 +463,6 @@ async fn run_step_scoped(
     } else {
         system_prompt
     };
-
-    // --- User ledger (shared context, Phase C): what this signed-in user did
-    // in any unit of the environment. Off unless the host installed a ledger,
-    // the pack names this agent, the caller is provider-verified and this is
-    // a TOP-LEVEL step (`turn_for` refuses inside a tool call frame, i.e. a
-    // nested agent of a `flow:` tool). `turn_for` must run here, on the
-    // step's own task: the nested check reads a task-local that a
-    // `tokio::spawn` would lose. The read runs alongside the catalog
-    // resolution (same task, no spawn) so the lock-held wait it can add is at
-    // most `READ_TIMEOUT` minus that time; a slow, failing or suspended
-    // ledger injects nothing and never fails the turn.
-    //
-    // Not subject to the #828 share modes in this version: the ledger is
-    // keyed by the verified caller, not by the run, and nested agents never
-    // see it. The view goes into this step's system prompt only and is never
-    // appended to the run trace.
-    let ledger_turn = runtime
-        .user_ledger
-        .as_ref()
-        .and_then(|binding| binding.turn_for(&tenant, agent_id));
 
     // Resolve the per-tenant tool catalogs (MCP, component, flow, playbook,
     // SoRLa, A2A)
