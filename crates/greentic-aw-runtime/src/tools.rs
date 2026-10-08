@@ -821,6 +821,7 @@ mod caller_stamp_tests {
             groups: vec!["engineering".into()],
             team: Some("platform".into()),
             role: Some("member".into()),
+            iss: None,
         }
     }
 
