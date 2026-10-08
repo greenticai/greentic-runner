@@ -90,6 +90,13 @@ pub struct VerifiedCaller {
     /// The caller's role, when the credential asserts one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// The IdP issuer that verified the credential, VERBATIM (like `sub`, it
+    /// is compared exactly, never normalised). Optional: a provider that
+    /// predates the field stamps none, which is the ordinary case. The user
+    /// ledger keys on `(iss, sub)` when it is present, so the same `sub` from
+    /// two issuers is two users.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
 }
 
 impl TenantContext {

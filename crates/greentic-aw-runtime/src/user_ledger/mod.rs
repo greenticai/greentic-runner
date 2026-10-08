@@ -6,8 +6,9 @@
 //! Rules, each pinned by a test:
 //!
 //! - **Verified callers only.** The subject is the `sub` of a caller block a
-//!   messaging provider stamped with `user_verified: true`. An anonymous or
-//!   self-declared id is never a key ([`verified_subject`]).
+//!   messaging provider stamped with `user_verified: true`, together with the
+//!   block's `iss` when the provider stamped one ([`LedgerSubject`]). An
+//!   anonymous or self-declared id is never a key ([`verified_subject`]).
 //! - **Off unless configured.** A runtime carries a [`UserLedgerBinding`] only
 //!   when the host installed a door target AND a pack sidecar names the agent;
 //!   `GREENTIC_AW_USER_LEDGER=0|false|off|no` turns it off at run time.
@@ -57,6 +58,8 @@ pub const MAX_VIEW_CHARS: usize = 1500;
 pub const REPLY_KIND: &str = "reply";
 /// The door's subject cap.
 pub const MAX_SUBJECT_BYTES: usize = 256;
+/// The door's issuer cap.
+pub const MAX_ISSUER_BYTES: usize = 512;
 /// Appends in flight per runtime; past this an append is dropped.
 pub const MAX_IN_FLIGHT_APPENDS: usize = 16;
 /// The most an append may hold its in-flight permit.
@@ -146,16 +149,68 @@ pub enum LedgerError {
 
 pub type LedgerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LedgerError>> + Send + 'a>>;
 
+/// Who a ledger is keyed by: the verified `sub` and, when the provider stamped
+/// one, the IdP issuer that verified it. Both VERBATIM. `issuer: None` is the
+/// legacy key (a provider that predates `iss`); the door body omits the field
+/// then. Built by [`verified_subject`] in production; [`LedgerSubject::new`]
+/// exists for stubs and does not validate.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct LedgerSubject {
+    sub: String,
+    issuer: Option<String>,
+}
+
+impl LedgerSubject {
+    /// An UNVALIDATED subject, for tests and stub ledgers. Production code
+    /// gets one from [`verified_subject`].
+    pub fn new(sub: impl Into<String>, issuer: Option<String>) -> Self {
+        Self {
+            sub: sub.into(),
+            issuer,
+        }
+    }
+
+    pub fn sub(&self) -> &str {
+        &self.sub
+    }
+
+    pub fn issuer(&self) -> Option<&str> {
+        self.issuer.as_deref()
+    }
+}
+
+/// Lengths only: both values identify an end user.
+impl std::fmt::Debug for LedgerSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerSubject")
+            .field("sub_len", &self.sub.len())
+            .field("issuer_len", &self.issuer.as_ref().map(String::len))
+            .finish()
+    }
+}
+
 /// The store behind the ledger. `http::HttpUserLedger` (Task 2) in production; a
 /// stub in tests.
 pub trait UserLedger: Send + Sync {
-    fn read<'a>(&'a self, subject: &'a str, limit: u32) -> LedgerFuture<'a, Vec<LedgerEvent>>;
+    fn read<'a>(
+        &'a self,
+        subject: &'a LedgerSubject,
+        limit: u32,
+    ) -> LedgerFuture<'a, Vec<LedgerEvent>>;
     fn append<'a>(
         &'a self,
-        subject: &'a str,
+        subject: &'a LedgerSubject,
         kind: &'a str,
         summary: &'a str,
     ) -> LedgerFuture<'a, ()>;
+}
+
+/// Non-empty, within `max` bytes, no surrounding whitespace, no control char.
+fn well_formed(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 /// The subject a ledger may be keyed by, or `None`. Gates on the
@@ -164,17 +219,26 @@ pub trait UserLedger: Send + Sync {
 /// VERBATIM: OIDC compares `sub` exactly, so folding canonically-equivalent
 /// spellings (NFC/NFD) could merge two distinct identities into one ledger.
 /// Two spellings of one user's `sub` are two ledgers (the safe failure).
-pub fn verified_subject(tenant: &TenantContext) -> Option<String> {
+///
+/// `iss`, when the provider stamped one, joins the key verbatim. An `iss`
+/// that is PRESENT but malformed yields no subject at all: falling back to the
+/// issuer-less key would merge this user with every other issuer's user of
+/// the same `sub`, the very collision the issuer exists to prevent.
+pub fn verified_subject(tenant: &TenantContext) -> Option<LedgerSubject> {
     let caller = tenant.caller.as_ref()?;
     if !caller.user_verified {
         return None;
     }
     let sub = caller.sub.clone()?;
-    let well_formed = !sub.is_empty()
-        && sub.len() <= MAX_SUBJECT_BYTES
-        && sub.trim() == sub
-        && !sub.chars().any(char::is_control);
-    well_formed.then_some(sub)
+    if !well_formed(&sub, MAX_SUBJECT_BYTES) {
+        return None;
+    }
+    let issuer = match caller.iss.as_deref() {
+        None => None,
+        Some(iss) if well_formed(iss, MAX_ISSUER_BYTES) => Some(iss.to_string()),
+        Some(_) => return None,
+    };
+    Some(LedgerSubject { sub, issuer })
 }
 
 /// `GREENTIC_AW_USER_LEDGER`: `0`/`false`/`off`/`no` (trimmed, any case) is
@@ -426,7 +490,7 @@ impl UserLedgerBinding {
 /// The ledger for one verified caller's turn.
 pub struct LedgerTurn {
     binding: Arc<UserLedgerBinding>,
-    subject: String,
+    subject: LedgerSubject,
     mode: LedgerMode,
     /// [`visitor_spoke`] for this turn's input; `false` blocks the append.
     visitor_spoke: bool,
@@ -523,7 +587,7 @@ mod tests {
     fn only_a_verified_well_formed_sub_is_a_subject() {
         assert_eq!(
             verified_subject(&caller(true, Some("u-1"))),
-            Some("u-1".into())
+            Some(LedgerSubject::new("u-1", None))
         );
         assert_eq!(verified_subject(&caller(false, Some("u-1"))), None);
         assert_eq!(verified_subject(&caller(true, None)), None);
@@ -544,8 +608,8 @@ mod tests {
         // "e" + combining acute (NFD) vs the precomposed "é" (NFC).
         let decomposed = verified_subject(&caller(true, Some("cafe\u{301}")));
         let precomposed = verified_subject(&caller(true, Some("caf\u{e9}")));
-        assert_eq!(decomposed, Some("cafe\u{301}".to_string()));
-        assert_eq!(precomposed, Some("caf\u{e9}".to_string()));
+        assert_eq!(decomposed, Some(LedgerSubject::new("cafe\u{301}", None)));
+        assert_eq!(precomposed, Some(LedgerSubject::new("caf\u{e9}", None)));
         assert_ne!(decomposed, precomposed);
     }
 
@@ -648,10 +712,19 @@ mod tests {
     struct NoLedger;
 
     impl UserLedger for NoLedger {
-        fn read<'a>(&'a self, _s: &'a str, _l: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
+        fn read<'a>(
+            &'a self,
+            _s: &'a LedgerSubject,
+            _l: u32,
+        ) -> LedgerFuture<'a, Vec<LedgerEvent>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn append<'a>(&'a self, _s: &'a str, _k: &'a str, _m: &'a str) -> LedgerFuture<'a, ()> {
+        fn append<'a>(
+            &'a self,
+            _s: &'a LedgerSubject,
+            _k: &'a str,
+            _m: &'a str,
+        ) -> LedgerFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -806,10 +879,19 @@ mod tests {
     struct SlowLedger(std::sync::atomic::AtomicUsize);
 
     impl UserLedger for SlowLedger {
-        fn read<'a>(&'a self, _s: &'a str, _l: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
+        fn read<'a>(
+            &'a self,
+            _s: &'a LedgerSubject,
+            _l: u32,
+        ) -> LedgerFuture<'a, Vec<LedgerEvent>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn append<'a>(&'a self, _s: &'a str, _k: &'a str, _m: &'a str) -> LedgerFuture<'a, ()> {
+        fn append<'a>(
+            &'a self,
+            _s: &'a LedgerSubject,
+            _k: &'a str,
+            _m: &'a str,
+        ) -> LedgerFuture<'a, ()> {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -903,10 +985,19 @@ mod tests {
     struct HangingLedger;
 
     impl UserLedger for HangingLedger {
-        fn read<'a>(&'a self, _s: &'a str, _l: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
+        fn read<'a>(
+            &'a self,
+            _s: &'a LedgerSubject,
+            _l: u32,
+        ) -> LedgerFuture<'a, Vec<LedgerEvent>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn append<'a>(&'a self, _s: &'a str, _k: &'a str, _m: &'a str) -> LedgerFuture<'a, ()> {
+        fn append<'a>(
+            &'a self,
+            _s: &'a LedgerSubject,
+            _k: &'a str,
+            _m: &'a str,
+        ) -> LedgerFuture<'a, ()> {
             Box::pin(std::future::pending())
         }
     }
@@ -1018,6 +1109,209 @@ mod tests {
             1,
             "exactly one ledger record"
         );
+    }
+
+    fn caller_iss(verified: bool, sub: &str, iss: Option<&str>) -> TenantContext {
+        TenantContext::new("acme", "prod").with_caller(Some(VerifiedCaller {
+            user_verified: verified,
+            sub: Some(sub.to_string()),
+            iss: iss.map(str::to_string),
+            ..VerifiedCaller::default()
+        }))
+    }
+
+    #[test]
+    fn an_absent_issuer_is_the_legacy_key_and_a_present_one_is_kept_verbatim() {
+        let legacy = verified_subject(&caller_iss(true, "u-1", None)).unwrap();
+        assert_eq!(legacy.sub(), "u-1");
+        assert_eq!(legacy.issuer(), None);
+        // Verbatim: no trailing-slash folding, no case folding.
+        for iss in [
+            "https://idp.a.example",
+            "https://idp.a.example/",
+            "HTTPS://IdP.A.example",
+            "urn:x",
+        ] {
+            let s = verified_subject(&caller_iss(true, "u-1", Some(iss))).unwrap();
+            assert_eq!(s.issuer(), Some(iss), "{iss}");
+            assert_eq!(s.sub(), "u-1");
+        }
+        let at_cap = "i".repeat(MAX_ISSUER_BYTES);
+        assert!(verified_subject(&caller_iss(true, "u-1", Some(&at_cap))).is_some());
+    }
+
+    /// An asserted but unusable issuer refuses the WHOLE subject: falling back
+    /// to the issuer-less key would merge identities across issuers.
+    #[test]
+    fn a_malformed_issuer_refuses_the_subject_rather_than_falling_back() {
+        let over = "i".repeat(MAX_ISSUER_BYTES + 1);
+        let wide = "\u{e9}".repeat(MAX_ISSUER_BYTES / 2 + 1);
+        assert!(wide.chars().count() < MAX_ISSUER_BYTES && wide.len() > MAX_ISSUER_BYTES);
+        for bad in [
+            "",
+            " https://idp",
+            "https://idp ",
+            "https://\nidp",
+            "https://idp\u{7}",
+            "\t",
+            over.as_str(),
+            wide.as_str(),
+        ] {
+            assert_eq!(
+                verified_subject(&caller_iss(true, "u-1", Some(bad))),
+                None,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_caller_with_an_issuer_is_still_not_a_subject() {
+        assert_eq!(
+            verified_subject(&caller_iss(false, "u-1", Some("https://idp"))),
+            None
+        );
+    }
+
+    #[test]
+    fn the_same_sub_from_two_issuers_is_two_subjects() {
+        let a = verified_subject(&caller_iss(true, "u-1", Some("https://idp.a"))).unwrap();
+        let b = verified_subject(&caller_iss(true, "u-1", Some("https://idp.b"))).unwrap();
+        let legacy = verified_subject(&caller_iss(true, "u-1", None)).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, legacy);
+        assert_ne!(b, legacy);
+    }
+
+    #[test]
+    fn debug_of_a_subject_prints_lengths_only() {
+        let s = LedgerSubject::new("alice-secret", Some("https://idp.hidden".into()));
+        let d = format!("{s:?}");
+        assert!(!d.contains("alice") && !d.contains("hidden"), "{d}");
+        assert!(d.contains("sub_len") && d.contains("issuer_len"), "{d}");
+    }
+
+    /// Records the subject of every read and append.
+    #[derive(Default)]
+    struct SubjectLedger {
+        reads: std::sync::Mutex<Vec<LedgerSubject>>,
+        appends: std::sync::Mutex<Vec<LedgerSubject>>,
+    }
+
+    impl UserLedger for SubjectLedger {
+        fn read<'a>(&'a self, s: &'a LedgerSubject, _l: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
+            self.reads.lock().unwrap().push(s.clone());
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn append<'a>(
+            &'a self,
+            s: &'a LedgerSubject,
+            _k: &'a str,
+            _m: &'a str,
+        ) -> LedgerFuture<'a, ()> {
+            self.appends.lock().unwrap().push(s.clone());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn subject_binding(ledger: Arc<SubjectLedger>) -> Arc<UserLedgerBinding> {
+        Arc::new(UserLedgerBinding::new(
+            "acme",
+            ledger,
+            HashMap::from([("helper".to_string(), LedgerMode::ReadWrite)]),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_turn_reads_and_appends_under_the_issuer_qualified_subject() {
+        let ledger = Arc::new(SubjectLedger::default());
+        let binding = subject_binding(ledger.clone());
+        let turn = binding
+            .turn_for(
+                &caller_iss(true, "u-1", Some("https://idp.a")),
+                "helper",
+                &said(),
+            )
+            .unwrap();
+        let _ = turn.read_view().await;
+        turn.record_reply("done");
+        assert!(appends_settled(Duration::from_secs(10)).await);
+        let want = LedgerSubject::new("u-1", Some("https://idp.a".into()));
+        assert_eq!(*ledger.reads.lock().unwrap(), vec![want.clone()]);
+        assert_eq!(*ledger.appends.lock().unwrap(), vec![want]);
+    }
+
+    #[test]
+    fn a_malformed_issuer_gets_no_ledger_turn() {
+        let binding = subject_binding(Arc::new(SubjectLedger::default()));
+        assert!(
+            binding
+                .turn_for(&caller_iss(true, "u-1", Some(" bad")), "helper", &said())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_kill_switch_and_an_anonymous_caller_still_refuse_with_an_issuer() {
+        let binding = subject_binding(Arc::new(SubjectLedger::default()));
+        let who = caller_iss(true, "u-1", Some("https://idp.a"));
+        assert!(
+            binding
+                .turn_for_enabled(&who, "helper", &said(), false)
+                .is_none()
+        );
+        let anon = caller_iss(false, "u-1", Some("https://idp.a"));
+        assert!(
+            binding
+                .turn_for_enabled(&anon, "helper", &said(), true)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nested_agent_is_refused_with_an_issuer() {
+        use crate::tool_call_frame::{ToolCallFrame, within};
+        let binding = subject_binding(Arc::new(SubjectLedger::default()));
+        let who = caller_iss(true, "u-1", Some("https://idp.a"));
+        assert!(binding.turn_for(&who, "helper", &said()).is_some());
+        let nested = within(ToolCallFrame::new(Some("s1"), "c1"), async {
+            binding.turn_for(&who, "helper", &said()).is_some()
+        })
+        .await;
+        assert!(!nested);
+    }
+
+    #[tokio::test]
+    async fn a_silent_turn_with_an_issuer_reads_but_never_appends() {
+        let ledger = Arc::new(SubjectLedger::default());
+        let binding = subject_binding(ledger.clone());
+        let turn = binding
+            .turn_for(
+                &caller_iss(true, "u-1", Some("https://idp.a")),
+                "helper",
+                &AgentInput::default(),
+            )
+            .unwrap();
+        let _ = turn.read_view().await;
+        turn.record_reply("Hello!");
+        assert!(appends_settled(Duration::from_secs(10)).await);
+        assert_eq!(ledger.reads.lock().unwrap().len(), 1);
+        assert!(ledger.appends.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_caller_block_with_iss_decodes_into_verified_caller() {
+        let c: VerifiedCaller = serde_json::from_value(serde_json::json!({
+            "user_verified": true, "sub": "u-1", "iss": "https://idp.a"
+        }))
+        .unwrap();
+        assert_eq!(c.iss.as_deref(), Some("https://idp.a"));
+        let legacy: VerifiedCaller =
+            serde_json::from_value(serde_json::json!({ "user_verified": true, "sub": "u-1" }))
+                .unwrap();
+        assert_eq!(legacy.iss, None);
+        // Absent stays absent on the way out (tools see the same shape as before).
+        assert!(serde_json::to_value(&legacy).unwrap().get("iss").is_none());
     }
 
     #[test]
