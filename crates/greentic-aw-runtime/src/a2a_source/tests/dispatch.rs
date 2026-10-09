@@ -869,7 +869,10 @@ async fn a_caller_that_asks_for_a_card_sends_the_opt_in_and_gets_the_card() {
             &acme(),
             &mut A2aContinuations::default(),
             at(0),
-            A2aCallOptions { want_card: true },
+            A2aCallOptions {
+                want_card: true,
+                answer: None,
+            },
         )
         .await;
 
@@ -915,4 +918,80 @@ async fn a_caller_that_does_not_ask_sends_no_configuration_and_sees_no_card_key(
         body["params"].get("configuration").is_none(),
         "no opt-in unless asked: {body}"
     );
+}
+
+#[tokio::test]
+async fn an_answer_travels_as_a_data_part_beside_the_text() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, text_reply("thanks")).await;
+
+    let catalog = source_for(vec![("signup", server.uri())]).catalog().await;
+    let answer = json!({"email": "a@b.co", "action": "submit"});
+    catalog
+        .dispatch_in_conversation_with(
+            "signup",
+            &json!(""),
+            &acme(),
+            &mut A2aContinuations::default(),
+            at(0),
+            A2aCallOptions {
+                want_card: true,
+                answer: Some(answer.clone()),
+            },
+        )
+        .await;
+
+    let requests = server.received_requests().await.expect("request log");
+    let rpc = requests
+        .iter()
+        .find(|r| r.method.as_str() == "POST")
+        .expect("a POST reached the agent");
+    let body: serde_json::Value = rpc.body_json().expect("a json body");
+    let parts = body["params"]["message"]["parts"]
+        .as_array()
+        .expect("parts");
+    assert_eq!(
+        parts.len(),
+        1,
+        "an empty text is not sent beside an answer: {parts:?}"
+    );
+    assert_eq!(parts[0]["data"], answer);
+}
+
+#[tokio::test]
+async fn text_and_an_answer_both_travel_and_an_empty_answer_is_ignored() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, text_reply("ok")).await;
+    let catalog = source_for(vec![("signup", server.uri())]).catalog().await;
+
+    for (answer, expected_parts) in [(json!({"a": 1}), 2), (json!({}), 1), (json!("x"), 1)] {
+        server.reset().await;
+        mount_card(&server).await;
+        mount_reply(&server, text_reply("ok")).await;
+        catalog
+            .dispatch_in_conversation_with(
+                "signup",
+                &json!("hello"),
+                &acme(),
+                &mut A2aContinuations::default(),
+                at(0),
+                A2aCallOptions {
+                    want_card: false,
+                    answer: Some(answer),
+                },
+            )
+            .await;
+        let requests = server.received_requests().await.expect("request log");
+        let rpc = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("a POST");
+        let body: serde_json::Value = rpc.body_json().expect("json");
+        assert_eq!(
+            body["params"]["message"]["parts"].as_array().unwrap().len(),
+            expected_parts
+        );
+    }
 }

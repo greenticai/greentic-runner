@@ -177,7 +177,11 @@ impl A2aToolSource {
     /// [`A2aToolCatalog::dispatch_in_conversation`], which is what the agent
     /// loop uses.
     pub async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
-        match self.transport.send(agent_id, text, None, false).await? {
+        match self
+            .transport
+            .send(agent_id, text, None, false, None)
+            .await?
+        {
             A2aReply {
                 outcome: A2aOutcome::Answered { text, .. },
                 ..
@@ -293,6 +297,7 @@ impl Transport {
         text: &str,
         prior: Option<&A2aContinuation>,
         want_card: bool,
+        answer: Option<&Value>,
     ) -> Result<A2aReply, String> {
         let route = self
             .agents
@@ -347,7 +352,7 @@ impl Transport {
             context_id: prior.map(|c| c.context_id.clone()),
             task_id: prior.and_then(|c| c.task_id.clone()),
             role: Role::User,
-            parts: vec![Part::text(text)],
+            parts: message_parts(text, answer),
             metadata: None,
         };
         // An Adaptive Card is sent only to a caller that names it here (interop
@@ -416,6 +421,24 @@ impl Transport {
             )),
         }
     }
+}
+
+/// The parts of the message we send: the text (when there is any) and, when
+/// answering a card, the answer object as a `data` part.
+///
+/// A message must carry at least one part, so an empty text with no answer
+/// still sends the (empty) text part rather than none. An answer that is not a
+/// non-empty object is ignored: only `{field id: value}` is an answer.
+fn message_parts(text: &str, answer: Option<&Value>) -> Vec<Part> {
+    let answer = answer.filter(|a| a.as_object().is_some_and(|m| !m.is_empty()));
+    let mut parts = Vec::new();
+    if !text.trim().is_empty() || answer.is_none() {
+        parts.push(Part::text(text));
+    }
+    if let Some(answer) = answer {
+        parts.push(Part::data(answer.clone()));
+    }
+    parts
 }
 
 /// The Adaptive Card among `parts`, when the agent sent one.
