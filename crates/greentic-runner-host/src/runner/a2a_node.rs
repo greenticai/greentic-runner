@@ -97,12 +97,20 @@ const NAVIGATION_KEYS: &[&str] = &["routeToCardId", "toCardId", "nextCardId"];
 /// The answer a node forwards to its agent, from the payload's `answer` field
 /// (typically `{{ in.input.metadata }}`, the fields a card submit carried).
 ///
-/// `None` unless it is a non-empty object once the navigation keys are removed
-/// and an empty/blank value is dropped; a submit that carried nothing but a
-/// navigation key answers nothing.
+/// Forwarded ONLY for a card submit this node's own card produced: the
+/// metadata must carry `nextCardId`, which [`retarget_card_submits`] writes
+/// into every submit action. An ordinary text turn's metadata (locale, a
+/// routed turn's `routeToCardId` and prefill, provider extras) is not an answer
+/// and must never reach the remote as one.
+///
+/// `None` unless it is a non-empty object once the navigation keys and empty
+/// values are removed.
 #[cfg_attr(not(feature = "agentic-worker"), allow(dead_code))]
 pub(crate) fn answer_from_payload(payload: &Value) -> Option<Value> {
     let mut map = payload.get("answer")?.as_object()?.clone();
+    if !map.contains_key("nextCardId") {
+        return None;
+    }
     for key in NAVIGATION_KEYS {
         map.remove(*key);
     }
