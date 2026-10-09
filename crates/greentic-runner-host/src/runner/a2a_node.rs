@@ -94,6 +94,13 @@ pub(crate) fn wants_card(payload: &Value) -> bool {
 /// sent (the remote would otherwise see the router's own node ids).
 const NAVIGATION_KEYS: &[&str] = &["routeToCardId", "toCardId", "nextCardId"];
 
+/// The key [`retarget_card_submits`] adds to every submit action's data, so a
+/// flow can route on `response.a2aCardSubmit == "true"` when a button press
+/// resumes a parked card instead of navigating (a routed card needs both: the
+/// press may arrive either way). Not part of the answer; removed before it is
+/// forwarded.
+pub const CARD_SUBMIT_MARKER: &str = "a2aCardSubmit";
+
 /// The answer a node forwards to its agent, from the payload's `answer` field
 /// (typically `{{ in.input.metadata }}`, the fields a card submit carried).
 ///
@@ -114,6 +121,7 @@ pub(crate) fn answer_from_payload(payload: &Value) -> Option<Value> {
     for key in NAVIGATION_KEYS {
         map.remove(*key);
     }
+    map.remove(CARD_SUBMIT_MARKER);
     map.retain(|_, value| !matches!(value, Value::Null) && value.as_str() != Some(""));
     (!map.is_empty()).then_some(Value::Object(map))
 }
@@ -149,6 +157,7 @@ pub(crate) fn retarget_card_submits(card: &mut Value, node_id: &str) -> bool {
                         data.remove(*key);
                     }
                     data.insert("nextCardId".to_string(), Value::String(node_id.to_string()));
+                    data.insert(CARD_SUBMIT_MARKER.to_string(), Value::Bool(true));
                     changed = true;
                 }
             }
@@ -531,7 +540,8 @@ mod wants_card_tests {
         use super::answer_from_payload;
         let payload = json!({"answer": {
             "email": "a@b.co", "notes": "", "gone": null,
-            "nextCardId": "ask_x", "routeToCardId": "y", "action": "submit"
+            "nextCardId": "ask_x", "routeToCardId": "y", "action": "submit",
+            "a2aCardSubmit": true
         }});
         assert_eq!(
             answer_from_payload(&payload),
@@ -561,11 +571,11 @@ mod wants_card_tests {
         assert!(retarget_card_submits(&mut card, "ask_signup"));
         assert_eq!(
             card["actions"][0]["data"],
-            json!({"action": "go", "nextCardId": "ask_signup"})
+            json!({"action": "go", "nextCardId": "ask_signup", "a2aCardSubmit": true})
         );
         assert_eq!(
             card["actions"][1]["data"],
-            json!({"nextCardId": "ask_signup"})
+            json!({"nextCardId": "ask_signup", "a2aCardSubmit": true})
         );
         assert!(card["actions"][2].get("data").is_none());
         let mut plain = json!({"type": "AdaptiveCard", "body": []});
