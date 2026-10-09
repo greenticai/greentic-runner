@@ -160,6 +160,31 @@ impl A2aToolCatalog {
         continuations: &mut A2aContinuations,
         now: DateTime<Utc>,
     ) -> Value {
+        self.dispatch_in_conversation_with(
+            agent_id,
+            args,
+            tenant,
+            continuations,
+            now,
+            A2aCallOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Self::dispatch_in_conversation`] with per-call options.
+    ///
+    /// `options.want_card` asks the agent for its Adaptive Card (interop
+    /// contract D10); the rendered value then carries it under `card`. Without
+    /// it nothing changes: no `configuration` is sent and no `card` key exists.
+    pub async fn dispatch_in_conversation_with(
+        &self,
+        agent_id: &str,
+        args: &Value,
+        tenant: &TenantContext,
+        continuations: &mut A2aContinuations,
+        now: DateTime<Utc>,
+        options: A2aCallOptions,
+    ) -> Value {
         let caller = self
             .caller
             .as_ref()
@@ -174,7 +199,12 @@ impl A2aToolCatalog {
 
         let prior = continuations.resume(tenant, agent_id, now);
         match caller
-            .send(agent_id, &args_to_text(args), prior.as_ref())
+            .send(
+                agent_id,
+                &args_to_text(args),
+                prior.as_ref(),
+                options.want_card,
+            )
             .await
         {
             Ok(reply) => {
@@ -208,6 +238,13 @@ impl A2aToolCatalog {
             }
         }
     }
+}
+
+/// Per-call options for [`A2aToolCatalog::dispatch_in_conversation_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct A2aCallOptions {
+    /// Ask the agent for its Adaptive Card as well as its text.
+    pub want_card: bool,
 }
 
 /// The text an A2A agent receives for a tool call's `args`.

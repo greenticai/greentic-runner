@@ -367,7 +367,7 @@ async fn a_failed_call_is_an_error_value_the_model_can_read() {
 
 use chrono::{DateTime, Utc};
 
-use crate::a2a_source::{A2aContinuations, A2aToolCatalog};
+use crate::a2a_source::{A2aCallOptions, A2aContinuations, A2aToolCatalog};
 use crate::tenant::TenantContext;
 
 fn acme() -> TenantContext {
@@ -832,4 +832,87 @@ async fn a_structured_only_task_is_answered_rather_than_reported_as_empty() {
         .expect("a structured result is an answer");
 
     assert_eq!(reply, "{\"ok\":true}");
+}
+
+/// A task parked on input-required whose status message carries the agent's
+/// Adaptive Card beside the text fallback, as greentic-start sends it to a
+/// caller that asked for one.
+fn card_task(card: &serde_json::Value) -> serde_json::Value {
+    json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {
+        "id": "t-1",
+        "contextId": "ctx-1",
+        "status": {
+            "state": "TASK_STATE_INPUT_REQUIRED",
+            "message": {
+                "messageId": "m-s", "role": "ROLE_AGENT",
+                "parts": [
+                    {"data": card, "mediaType": "application/vnd.microsoft.card.adaptive+json"},
+                    {"text": "Tell us about you"}
+                ]
+            }
+        }
+    }}})
+}
+
+#[tokio::test]
+async fn a_caller_that_asks_for_a_card_sends_the_opt_in_and_gets_the_card() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    let card = json!({"type": "AdaptiveCard", "body": [{"type": "Input.Text", "id": "email"}]});
+    mount_reply(&server, card_task(&card)).await;
+
+    let catalog = source_for(vec![("signup", server.uri())]).catalog().await;
+    let value = catalog
+        .dispatch_in_conversation_with(
+            "signup",
+            &json!({"message": "I want to become a partner"}),
+            &acme(),
+            &mut A2aContinuations::default(),
+            at(0),
+            A2aCallOptions { want_card: true },
+        )
+        .await;
+
+    assert_eq!(value["status"], "input_required", "got: {value}");
+    assert_eq!(value["card"], card);
+    assert_eq!(value["question"], "Tell us about you");
+
+    let requests = server.received_requests().await.expect("request log");
+    let rpc = requests
+        .iter()
+        .find(|r| r.method.as_str() == "POST")
+        .expect("a POST reached the agent");
+    let body: serde_json::Value = rpc.body_json().expect("a json body");
+    let modes = body["params"]["configuration"]["acceptedOutputModes"]
+        .as_array()
+        .expect("the opt-in is sent");
+    assert!(
+        modes
+            .iter()
+            .any(|m| m == "application/vnd.microsoft.card.adaptive+json")
+    );
+}
+
+#[tokio::test]
+async fn a_caller_that_does_not_ask_sends_no_configuration_and_sees_no_card_key() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    mount_reply(&server, text_reply("an omelette")).await;
+
+    let catalog = source_for(vec![("recipe", server.uri())]).catalog().await;
+    let value = catalog
+        .dispatch("recipe", &json!({"message": "eggs?"}))
+        .await;
+
+    assert!(value.get("card").is_none());
+    let requests = server.received_requests().await.expect("request log");
+    let rpc = requests
+        .iter()
+        .find(|r| r.method.as_str() == "POST")
+        .expect("a POST reached the agent");
+    let body: serde_json::Value = rpc.body_json().expect("a json body");
+    assert!(
+        body["params"].get("configuration").is_none(),
+        "no opt-in unless asked: {body}"
+    );
 }

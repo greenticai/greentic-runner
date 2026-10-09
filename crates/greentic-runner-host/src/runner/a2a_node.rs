@@ -72,6 +72,21 @@ pub(crate) fn agent_from_payload(payload: &Value) -> Option<String> {
     super::mcp_node::str_field(payload, "agent")
 }
 
+/// Whether the node asks the agent for its Adaptive Card as well as its text.
+///
+/// `card: true` in the payload (LOCKED ENCODING v1, optional). The string
+/// `"true"` is accepted too, because a templated config value arrives as text.
+/// Anything else, or the key's absence, is off: a flow that never opted in
+/// sends the request it always did and its value gains no `card` key.
+#[cfg_attr(not(feature = "agentic-worker"), allow(dead_code))]
+pub(crate) fn wants_card(payload: &Value) -> bool {
+    match payload.get("card") {
+        Some(Value::Bool(on)) => *on,
+        Some(Value::String(text)) => text.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
 /// Parse an `a2a:<agent_id>` component ref, or a bare `<agent_id>` carried as
 /// the node `operation`. Returns `None` for an empty id.
 pub(crate) fn agent_from_ref(reference: &str) -> Option<String> {
@@ -86,7 +101,8 @@ pub mod aw {
     use chrono::Utc;
     use greentic_aw_runtime::TenantContext;
     use greentic_aw_runtime::a2a_source::{
-        A2aContinuations, A2aToolSource, CONTINUATION_IDLE_TTL_SECS, call_error_value,
+        A2aCallOptions, A2aContinuations, A2aToolSource, CONTINUATION_IDLE_TTL_SECS,
+        call_error_value,
     };
     use greentic_types::{StateKey, TenantCtx};
     use serde_json::Value;
@@ -264,6 +280,8 @@ pub mod aw {
         /// The pack whose sidecar `source` was built from, named in the
         /// "not configured" refusal so an operator knows which pack to rebuild.
         pub pack_id: &'a str,
+        /// Ask the agent for its Adaptive Card too (interop contract D10).
+        pub want_card: bool,
     }
 
     /// Ask `agent_id` one question and return the value the node binds.
@@ -297,12 +315,15 @@ pub mod aw {
         let before = continuations.clone();
 
         let result = catalog
-            .dispatch_in_conversation(
+            .dispatch_in_conversation_with(
                 agent_id,
                 message,
                 &tenant_ctx,
                 &mut continuations,
                 Utc::now(),
+                A2aCallOptions {
+                    want_card: call.want_card,
+                },
             )
             .await;
 
@@ -398,5 +419,22 @@ pub mod aw {
             // A no-op rather than a panic; there is no store to observe.
             save_continuations(None, None, "support", None, &empty);
         }
+    }
+}
+
+#[cfg(test)]
+mod wants_card_tests {
+    use super::wants_card;
+    use serde_json::json;
+
+    #[test]
+    fn only_an_explicit_card_true_opts_in() {
+        assert!(wants_card(&json!({"card": true})));
+        assert!(wants_card(&json!({"card": "true"})));
+        assert!(wants_card(&json!({"card": " TRUE "})));
+        assert!(!wants_card(&json!({"card": false})));
+        assert!(!wants_card(&json!({"card": "yes"})));
+        assert!(!wants_card(&json!({"agent": "a"})));
+        assert!(!wants_card(&json!(null)));
     }
 }

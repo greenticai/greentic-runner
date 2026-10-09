@@ -6,11 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use greentic_a2a::fetch::{CardCache, require_secure_interface};
-use greentic_a2a::message::{Message, Part, Role, Task, TaskProgress, TaskState};
+use greentic_a2a::message::{
+    ADAPTIVE_CARD_MEDIA_TYPE, Message, Part, Role, Task, TaskProgress, TaskState,
+};
 use greentic_a2a::rpc::{
-    JsonRpcRequest, JsonRpcResponse, METHOD_SEND_MESSAGE, SendMessageParams, SendMessageResult,
+    JsonRpcRequest, JsonRpcResponse, METHOD_SEND_MESSAGE, SendMessageConfiguration,
+    SendMessageParams, SendMessageResult,
 };
 use greentic_secrets_lib::SecretsManager;
+use serde_json::Value;
 
 use super::auth::{CredentialScope, ensure_same_host};
 use super::continuation::A2aContinuation;
@@ -173,9 +177,9 @@ impl A2aToolSource {
     /// [`A2aToolCatalog::dispatch_in_conversation`], which is what the agent
     /// loop uses.
     pub async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
-        match self.transport.send(agent_id, text, None).await? {
+        match self.transport.send(agent_id, text, None, false).await? {
             A2aReply {
-                outcome: A2aOutcome::Answered { text },
+                outcome: A2aOutcome::Answered { text, .. },
                 ..
             } => Ok(text),
             other => Err(flatten_non_answer(agent_id, &other.outcome)),
@@ -288,6 +292,7 @@ impl Transport {
         agent_id: &str,
         text: &str,
         prior: Option<&A2aContinuation>,
+        want_card: bool,
     ) -> Result<A2aReply, String> {
         let route = self
             .agents
@@ -345,9 +350,19 @@ impl Transport {
             parts: vec![Part::text(text)],
             metadata: None,
         };
+        // An Adaptive Card is sent only to a caller that names it here (interop
+        // contract D10), so asking is what makes a worker's form reach us at
+        // all. Plain text stays acceptable: the prose fallback always rides.
+        let configuration = want_card.then(|| SendMessageConfiguration {
+            accepted_output_modes: vec![
+                ADAPTIVE_CARD_MEDIA_TYPE.to_string(),
+                "text/plain".to_string(),
+            ],
+        });
         let params = SendMessageParams {
             message,
             tenant: interface.tenant.clone(),
+            configuration,
             metadata: None,
         };
         let request = JsonRpcRequest::new(1, METHOD_SEND_MESSAGE, params);
@@ -386,6 +401,7 @@ impl Transport {
             Some(SendMessageResult::Message(reply)) => Ok(A2aReply {
                 outcome: A2aOutcome::Answered {
                     text: reply_text(agent_id, &reply.parts, "replied with no text part")?,
+                    card: card_of(&reply.parts),
                 },
                 context_id: reply.context_id,
                 // A bare `Message` reply is not a task, so there is nothing
@@ -400,6 +416,14 @@ impl Transport {
             )),
         }
     }
+}
+
+/// The Adaptive Card among `parts`, when the agent sent one.
+///
+/// Present only for a caller that asked (contract D10), so a plain call never
+/// sees one. The first card wins: a reply carries one.
+fn card_of(parts: &[Part]) -> Option<Value> {
+    parts.iter().find_map(|part| part.adaptive_card().cloned())
 }
 
 /// The text of `parts`, one part per line.
@@ -486,6 +510,7 @@ const STRUCTURED_OUTPUT_MEDIA_TYPE: &str = "application/json";
 /// either way, so a follow-up question still lands in the same remote
 /// conversation.
 fn task_reply(agent_id: &str, task: Task) -> A2aReply {
+    let card = task.status.message.as_ref().and_then(|m| card_of(&m.parts));
     let detail = task
         .status
         .message
@@ -501,7 +526,7 @@ fn task_reply(agent_id: &str, task: Task) -> A2aReply {
                 .flat_map(|artifact| artifact.parts.iter().cloned())
                 .collect();
             match artifact_answer(agent_id, &parts) {
-                Ok(text) => A2aOutcome::Answered { text },
+                Ok(text) => A2aOutcome::Answered { text, card },
                 // A completed task with nothing to read is not an answer.
                 // Reported as an end state rather than as an empty reply, so
                 // the model does not relay silence as the agent's response.
@@ -511,9 +536,10 @@ fn task_reply(agent_id: &str, task: Task) -> A2aReply {
                 },
             }
         }
-        TaskProgress::Open if state == TaskState::InputRequired => {
-            A2aOutcome::InputRequired { question: detail }
-        }
+        TaskProgress::Open if state == TaskState::InputRequired => A2aOutcome::InputRequired {
+            question: detail,
+            card,
+        },
         TaskProgress::Open => A2aOutcome::Working { state, detail },
         TaskProgress::Ended => A2aOutcome::Ended { state, detail },
     };
