@@ -87,6 +87,77 @@ pub(crate) fn wants_card(payload: &Value) -> bool {
     }
 }
 
+/// Metadata keys a card submit carries to name the NEXT card to navigate to.
+///
+/// They address nodes of the flow that rendered the card, so they are
+/// meaningless to the remote agent and are removed from an answer before it is
+/// sent (the remote would otherwise see the router's own node ids).
+const NAVIGATION_KEYS: &[&str] = &["routeToCardId", "toCardId", "nextCardId"];
+
+/// The answer a node forwards to its agent, from the payload's `answer` field
+/// (typically `{{ in.input.metadata }}`, the fields a card submit carried).
+///
+/// `None` unless it is a non-empty object once the navigation keys are removed
+/// and an empty/blank value is dropped; a submit that carried nothing but a
+/// navigation key answers nothing.
+#[cfg_attr(not(feature = "agentic-worker"), allow(dead_code))]
+pub(crate) fn answer_from_payload(payload: &Value) -> Option<Value> {
+    let mut map = payload.get("answer")?.as_object()?.clone();
+    for key in NAVIGATION_KEYS {
+        map.remove(*key);
+    }
+    map.retain(|_, value| !matches!(value, Value::Null) && value.as_str() != Some(""));
+    (!map.is_empty()).then_some(Value::Object(map))
+}
+
+/// The node id the node's returned card should submit back to
+/// (`card_submit_to` in the payload), when set.
+#[cfg_attr(not(feature = "agentic-worker"), allow(dead_code))]
+pub(crate) fn card_submit_target(payload: &Value) -> Option<String> {
+    super::mcp_node::str_field(payload, "card_submit_to")
+}
+
+/// Point every `Action.Submit` of `card` at `node_id`.
+///
+/// The card is the REMOTE agent's, so its submit actions name the remote's own
+/// nodes. Rendered by another flow they would navigate nowhere; this makes the
+/// submit return to the node that asked, which then forwards the answer. Any
+/// other navigation key is removed so the precedence cannot pick a stale one.
+/// Returns whether any action was rewritten.
+#[cfg_attr(not(feature = "agentic-worker"), allow(dead_code))]
+pub(crate) fn retarget_card_submits(card: &mut Value, node_id: &str) -> bool {
+    let mut changed = false;
+    match card {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("Action.Submit") {
+                let data = map
+                    .entry("data")
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if !data.is_object() {
+                    *data = Value::Object(Default::default());
+                }
+                if let Some(data) = data.as_object_mut() {
+                    for key in NAVIGATION_KEYS {
+                        data.remove(*key);
+                    }
+                    data.insert("nextCardId".to_string(), Value::String(node_id.to_string()));
+                    changed = true;
+                }
+            }
+            for value in map.values_mut() {
+                changed |= retarget_card_submits(value, node_id);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                changed |= retarget_card_submits(item, node_id);
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
 /// Parse an `a2a:<agent_id>` component ref, or a bare `<agent_id>` carried as
 /// the node `operation`. Returns `None` for an empty id.
 pub(crate) fn agent_from_ref(reference: &str) -> Option<String> {
@@ -282,6 +353,10 @@ pub mod aw {
         pub pack_id: &'a str,
         /// Ask the agent for its Adaptive Card too (interop contract D10).
         pub want_card: bool,
+        /// The card-submit answer to forward as a `data` part.
+        pub answer: Option<Value>,
+        /// The node the returned card's submit actions navigate back to.
+        pub card_submit_to: Option<&'a str>,
     }
 
     /// Ask `agent_id` one question and return the value the node binds.
@@ -323,9 +398,14 @@ pub mod aw {
                 Utc::now(),
                 A2aCallOptions {
                     want_card: call.want_card,
+                    answer: call.answer.clone(),
                 },
             )
             .await;
+        let mut result = result;
+        if let (Some(node_id), Some(card)) = (call.card_submit_to, result.get_mut("card")) {
+            super::retarget_card_submits(card, node_id);
+        }
 
         // Only on a change: an agent that neither opened nor closed anything
         // would otherwise make every turn of every flow a store write.
@@ -436,5 +516,51 @@ mod wants_card_tests {
         assert!(!wants_card(&json!({"card": "yes"})));
         assert!(!wants_card(&json!({"agent": "a"})));
         assert!(!wants_card(&json!(null)));
+    }
+
+    #[test]
+    fn an_answer_drops_the_routers_navigation_keys_and_empty_values() {
+        use super::answer_from_payload;
+        let payload = json!({"answer": {
+            "email": "a@b.co", "notes": "", "gone": null,
+            "nextCardId": "ask_x", "routeToCardId": "y", "action": "submit"
+        }});
+        assert_eq!(
+            answer_from_payload(&payload),
+            Some(json!({"email": "a@b.co", "action": "submit"}))
+        );
+        assert_eq!(
+            answer_from_payload(&json!({"answer": {"nextCardId": "x"}})),
+            None
+        );
+        assert_eq!(answer_from_payload(&json!({"answer": "text"})), None);
+        assert_eq!(answer_from_payload(&json!({})), None);
+    }
+
+    #[test]
+    fn every_submit_action_in_a_remote_card_is_pointed_back_at_the_asking_node() {
+        use super::retarget_card_submits;
+        let mut card = json!({
+            "type": "AdaptiveCard",
+            "body": [{"type": "Input.Text", "id": "email"}],
+            "actions": [
+                {"type": "Action.Submit", "title": "Go",
+                 "data": {"action": "go", "nextCardId": "remote_node", "toCardId": "z"}},
+                {"type": "Action.Submit", "title": "Bare"},
+                {"type": "Action.OpenUrl", "url": "https://x"}
+            ]
+        });
+        assert!(retarget_card_submits(&mut card, "ask_signup"));
+        assert_eq!(
+            card["actions"][0]["data"],
+            json!({"action": "go", "nextCardId": "ask_signup"})
+        );
+        assert_eq!(
+            card["actions"][1]["data"],
+            json!({"nextCardId": "ask_signup"})
+        );
+        assert!(card["actions"][2].get("data").is_none());
+        let mut plain = json!({"type": "AdaptiveCard", "body": []});
+        assert!(!retarget_card_submits(&mut plain, "n"));
     }
 }

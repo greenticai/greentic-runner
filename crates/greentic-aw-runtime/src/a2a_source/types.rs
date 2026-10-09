@@ -204,6 +204,7 @@ impl A2aToolCatalog {
                 &args_to_text(args),
                 prior.as_ref(),
                 options.want_card,
+                options.answer.as_ref(),
             )
             .await
         {
@@ -241,10 +242,15 @@ impl A2aToolCatalog {
 }
 
 /// Per-call options for [`A2aToolCatalog::dispatch_in_conversation_with`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct A2aCallOptions {
     /// Ask the agent for its Adaptive Card as well as its text.
     pub want_card: bool,
+    /// An answer to a question the agent asked with a card: the `{field id:
+    /// value}` object a card submit carries, sent as a `data` part beside the
+    /// message text. This is how a form the agent parked on is submitted
+    /// (interop contract section 9.4); text alone cannot carry it.
+    pub answer: Option<Value>,
 }
 
 /// The text an A2A agent receives for a tool call's `args`.
