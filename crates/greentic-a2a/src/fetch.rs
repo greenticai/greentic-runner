@@ -47,6 +47,24 @@ pub fn card_url(base: &str) -> Result<String, A2aError> {
     Ok(card.to_string())
 }
 
+/// The card URL under the base's OWN path, or `None` when the base is a bare origin.
+///
+/// Agents hosted behind a shared origin (several workers in one Cloud Run
+/// service, each under `/<unit>`) publish their card at
+/// `<origin>/<unit>/.well-known/agent-card.json`; the origin root serves
+/// nothing. Query and fragment are dropped, the path is kept.
+fn card_url_under_path(base: &str) -> Result<Option<String>, A2aError> {
+    let mut parsed = require_secure(base)?;
+    let path = parsed.path().trim_end_matches('/').to_string();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.set_path(&format!("{path}{WELL_KNOWN_PATH}"));
+    Ok(Some(parsed.to_string()))
+}
+
 /// Parse `url` and refuse it unless it is `https`, or plaintext on loopback.
 ///
 /// The rule [`card_url`] applies to a base, exposed so a caller can apply the
@@ -160,8 +178,21 @@ impl CardCache {
     /// This is the entry point, and it is what enforces the https rule: it
     /// builds the URL through [`card_url`] before ever handing it to the
     /// internal fetch below.
+    ///
+    /// A base with a path is tried under that path first, then at the origin
+    /// root. Only a `404` from the path-scoped URL falls through to the root:
+    /// any other failure is the agent's real answer and is reported as is.
     pub async fn get(&self, base: &str) -> Result<Arc<AgentCard>, A2aError> {
-        self.get_from_url(&card_url(base)?).await
+        let root = card_url(base)?;
+        match card_url_under_path(base)? {
+            None => self.get_from_url(&root).await,
+            Some(scoped) => match self.get_from_url(&scoped).await {
+                Err(A2aError::Transport(msg)) if msg.contains("404") => {
+                    self.get_from_url(&root).await
+                }
+                other => other,
+            },
+        }
     }
 
     /// The internal fetch, by an already-built URL.
@@ -330,6 +361,16 @@ mod tests {
     }
 
     #[test]
+    fn a_base_with_a_path_has_a_path_scoped_card_url() {
+        assert_eq!(
+            card_url_under_path("https://a.run.app/partner-signup/?x=1#f").unwrap(),
+            Some("https://a.run.app/partner-signup/.well-known/agent-card.json".to_string())
+        );
+        assert_eq!(card_url_under_path("https://a.run.app/").unwrap(), None);
+        assert!(card_url_under_path("http://a.example.com/x").is_err());
+    }
+
+    #[test]
     fn a_base_with_a_path_still_resolves_to_the_well_known_location() {
         // String concatenation would have produced
         // ".../foo/bar/.well-known/agent-card.json"; the well-known location
@@ -385,6 +426,39 @@ mod tests {
         { "id": "suggest", "name": "Suggest a recipe", "description": "Suggests a dish.", "tags": ["cooking"] }
       ]
     }"#;
+
+    /// Like `spawn_card_server`, but the card exists ONLY under `/unit/` and
+    /// every other path answers 404, as a shared multi-worker origin does.
+    fn spawn_path_scoped_card_server() -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind loopback");
+        let port = server.server_addr().to_ip().expect("an ip addr").port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                if request.url() == "/unit/.well-known/agent-card.json" {
+                    let _ = request.respond(tiny_http::Response::from_string(CARD_JSON));
+                } else {
+                    let _ = request
+                        .respond(tiny_http::Response::from_string("no").with_status_code(404));
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn a_worker_behind_a_shared_origin_is_found_under_its_own_path() {
+        let base = format!("{}/unit", spawn_path_scoped_card_server());
+        let cache = CardCache::new(Duration::from_secs(300)).expect("client builds");
+        assert!(cache.get(&base).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_path_base_whose_card_is_at_the_origin_root_still_works() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let base = format!("{}/elsewhere", spawn_card_server(hits));
+        let cache = CardCache::new(Duration::from_secs(300)).expect("client builds");
+        assert!(cache.get(&base).await.is_ok());
+    }
 
     /// Serve `CARD_JSON` on an ephemeral loopback port, counting requests, and
     /// return the base URL. The thread ends with the test process.
