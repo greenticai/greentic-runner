@@ -47,4 +47,4 @@ mod tests;
 pub use continuation::{A2aContinuation, A2aContinuations, CONTINUATION_IDLE_TTL_SECS};
 pub use outcome::call_error_value;
 pub use source::A2aToolSource;
-pub use types::{A2aRoute, A2aToolCatalog, A2aToolEntry};
+pub use types::{A2aCallOptions, A2aRoute, A2aToolCatalog, A2aToolEntry};

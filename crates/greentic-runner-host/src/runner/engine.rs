@@ -2458,6 +2458,7 @@ impl FlowEngine {
                 tenant: ctx.tenant,
                 env: &self.default_env,
                 pack_id: &pack_id,
+                want_card: crate::runner::a2a_node::wants_card(&payload),
             },
             agent_id,
             message,
