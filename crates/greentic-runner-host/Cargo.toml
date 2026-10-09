@@ -110,7 +110,7 @@ dev-allow-unsigned = ["agentic-worker", "greentic-aw-runtime?/dev-allow-unsigned
 # greentic-biz/greentic-chronicle-ext).
 
 [dependencies]
-async-nats = "0.46"
+async-nats = "0.47"
 async-trait.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true
