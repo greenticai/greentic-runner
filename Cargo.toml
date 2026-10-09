@@ -24,7 +24,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.2.0-dev.0"
+version = "1.2.0"
 
 # THE LANE. Every greentic dependency is a RANGE over the single `1.2.0-dev`
 # crates.io lane (`>=1.2.0-dev, <1.3.0-0`), because `dev-publish.yml` stamps
@@ -43,18 +43,18 @@ async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
 futures = "0.3"
-greentic-flow = ">=1.2.0-dev.37223336412, <1.3.0-0"
-greentic-session = ">=1.2.0-dev, <1.3.0-0"
-greentic-state = ">=1.2.0-dev.37220328375, <1.3.0-0"
-greentic-config = ">=1.2.0-dev, <1.3.0-0"
-greentic-config-types = ">=1.2.0-dev, <1.3.0-0"
-greentic-secrets-lib = ">=1.2.0-dev, <1.3.0-0"
+greentic-flow = ">=1.2.0-0, <1.3.0-0"
+greentic-session = ">=1.2.0-0, <1.3.0-0"
+greentic-state = ">=1.2.0-0, <1.3.0-0"
+greentic-config = ">=1.2.0-0, <1.3.0-0"
+greentic-config-types = ">=1.2.0-0, <1.3.0-0"
+greentic-secrets-lib = ">=1.2.0-0, <1.3.0-0"
 greentic-trust = "0.2"
 # Additive (from main): runner-host uses `greentic_deploy_spec::ids::{RevisionId,BundleId}`.
 # The range is what unifies it with greentic-start/greentic-deployer, which
 # cross deploy-spec types with runner-host: every repo in the chain resolves the
 # same dev-lane publish instead of forking a copy of its own.
-greentic-deploy-spec = ">=1.2.0-dev, <1.3.0-0"
+greentic-deploy-spec = ">=1.2.0-0, <1.3.0-0"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
@@ -85,7 +85,7 @@ serial_test = "3"
 toml = "1"
 # `TelemetryCtx::kv()` must include `gt.pack_id` for the C5.4 export path; every
 # 1.2 dev publish carries it (the floor it used to name was on the 1.1 line).
-greentic-telemetry = ">=1.2.0-dev, <1.3.0-0"
+greentic-telemetry = ">=1.2.0-0, <1.3.0-0"
 walkdir = "2"
 wasmtime-wasi-http = "45"
 wasmtime-wasi-tls = "45"
@@ -125,7 +125,7 @@ features = [
 # `tenant_ctx()` in `engine::runtime::IngressEnvelope` does not compile. Both
 # are on the whole 1.2 dev lane.
 [workspace.dependencies.greentic-types]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 default-features = false
 features = [
     "std",
@@ -136,54 +136,54 @@ features = [
 
 [workspace.dependencies.greentic_pack]
 package = "greentic-pack-lib"
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.greentic-distributor-client]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 features = [
     "dist-client",
 ]
 
 [workspace.dependencies.greentic-interfaces]
-version = ">=1.2.0-dev.37221142016, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 default-features = false
 features = [
     "bindings-rust",
 ]
 
 [workspace.dependencies.greentic-interfaces-guest]
-version = ">=1.2.0-dev.37221142016, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 default-features = false
 
 [workspace.dependencies.greentic-interfaces-host]
-version = ">=1.2.0-dev.37221142016, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.greentic-interfaces-wasmtime]
-version = ">=1.2.0-dev.37221142016, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.greentic-x-runtime]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.greentic-x-types]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.greentic-oauth-sdk]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.greentic-oauth-host]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.greentic-runner-host]
 path = "crates/greentic-runner-host"
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.greentic-runner-desktop]
 path = "crates/greentic-runner-desktop"
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.runner-core]
 path = "crates/runner-core"
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 
 [workspace.dependencies.reqwest]
 version = "0.13"
