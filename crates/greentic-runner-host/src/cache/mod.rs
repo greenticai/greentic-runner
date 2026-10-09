@@ -39,6 +39,7 @@ struct CacheMetrics {
     disk_hits: AtomicU64,
     disk_reads: AtomicU64,
     compiles: AtomicU64,
+    deserialize_failures: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -47,6 +48,7 @@ pub struct CacheMetricsSnapshot {
     pub disk_hits: u64,
     pub disk_reads: u64,
     pub compiles: u64,
+    pub deserialize_failures: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,6 +84,7 @@ impl CacheManager {
             disk_hits: self.metrics.disk_hits.load(Ordering::Relaxed),
             disk_reads: self.metrics.disk_reads.load(Ordering::Relaxed),
             compiles: self.metrics.compiles.load(Ordering::Relaxed),
+            deserialize_failures: self.metrics.deserialize_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -99,7 +102,6 @@ impl CacheManager {
         })
     }
 
-    #[allow(unsafe_code)]
     pub async fn get_component(
         &self,
         engine: &Engine,
@@ -114,26 +116,10 @@ impl CacheManager {
         }
         if self.config.disk_enabled {
             self.metrics.disk_reads.fetch_add(1, Ordering::Relaxed);
-            if let Some(serialized) = self.disk.try_read(key)? {
-                // Safety: serialized components are only loaded within the same engine profile.
-                match unsafe { Component::deserialize(engine, &serialized) } {
-                    Ok(component) => {
-                        self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
-                        let component = Arc::new(component);
-                        if self.config.memory_enabled {
-                            self.memory.insert(
-                                key.clone(),
-                                Arc::clone(&component),
-                                serialized.len(),
-                                false,
-                            );
-                        }
-                        return Ok(component);
-                    }
-                    Err(_) => {
-                        let _ = self.disk.delete(key);
-                    }
-                }
+            if let Some(serialized) = self.disk.try_read(key)?
+                && let Some(c) = self.try_deserialize_disk_hit(engine, key, &serialized)
+            {
+                return Ok(c);
             }
         }
 
@@ -146,26 +132,10 @@ impl CacheManager {
         }
         if self.config.disk_enabled {
             self.metrics.disk_reads.fetch_add(1, Ordering::Relaxed);
-            if let Some(serialized) = self.disk.try_read(key)? {
-                // Safety: serialized components are only loaded within the same engine profile.
-                match unsafe { Component::deserialize(engine, &serialized) } {
-                    Ok(component) => {
-                        self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
-                        let component = Arc::new(component);
-                        if self.config.memory_enabled {
-                            self.memory.insert(
-                                key.clone(),
-                                Arc::clone(&component),
-                                serialized.len(),
-                                false,
-                            );
-                        }
-                        return Ok(component);
-                    }
-                    Err(_) => {
-                        let _ = self.disk.delete(key);
-                    }
-                }
+            if let Some(serialized) = self.disk.try_read(key)?
+                && let Some(c) = self.try_deserialize_disk_hit(engine, key, &serialized)
+            {
+                return Ok(c);
             }
         }
 
@@ -188,6 +158,52 @@ impl CacheManager {
                 .insert(key.clone(), Arc::clone(&component), bytes.len(), false);
         }
         Ok(component)
+    }
+
+    /// Try to deserialize a disk-cached artifact. Returns `Some` on success
+    /// (bumping `disk_hits` and inserting into the memory cache), or `None` on
+    /// failure. On failure the corrupt/stale entry is deleted — the caller
+    /// always has a `wasm_bytes` closure so a recompile will repopulate it via
+    /// `write_atomic`, making the cache self-healing.
+    #[allow(unsafe_code)]
+    fn try_deserialize_disk_hit(
+        &self,
+        engine: &Engine,
+        key: &ArtifactKey,
+        serialized: &[u8],
+    ) -> Option<Arc<Component>> {
+        // Safety: serialized components are only loaded within the same engine profile.
+        match unsafe { Component::deserialize(engine, serialized) } {
+            Ok(component) => {
+                self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
+                let component = Arc::new(component);
+                if self.config.memory_enabled {
+                    self.memory.insert(
+                        key.clone(),
+                        Arc::clone(&component),
+                        serialized.len(),
+                        false,
+                    );
+                }
+                Some(component)
+            }
+            Err(error) => {
+                self.metrics
+                    .deserialize_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    wasm_digest = %key.wasm_digest,
+                    engine_profile_id = %self.profile.engine_profile_id,
+                    error = %error,
+                    "cached component failed to deserialize; deleting stale entry"
+                );
+                // Delete the stale entry — get_component always receives a wasm_bytes
+                // closure, so a recompile is possible and write_atomic will repopulate
+                // the disk slot, making the cache self-healing.
+                let _ = self.disk.delete(key);
+                None
+            }
+        }
     }
 
     pub async fn warmup(

@@ -37,6 +37,24 @@ pub enum NodeKind {
         /// maps to `"openai"` for backward compatibility.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        /// When set, run the referenced published agent's FULL config
+        /// (memory/knowledge/guardrails) resolved from the pack's merged
+        /// agents, instead of the inline system_prompt/model/tools.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_ref: Option<String>,
+        /// When set, keep this node's OWN `system_prompt` and `model` but
+        /// inherit the referenced agent's tools, memory, knowledge and
+        /// guardrails.
+        ///
+        /// This is the specialist case, and it is why `agent_ref` alone is not
+        /// enough: `agent_ref` adopts the referenced config wholesale, prompt
+        /// included, which would make every specialist in a generated graph an
+        /// identical copy of its parent worker. `inherit_from` keeps what makes
+        /// a specialist a specialist and inherits only the capability surface.
+        ///
+        /// Ignored when `agent_ref` is set — that already takes everything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherit_from: Option<String>,
     },
     /// A deterministic tool call node.
     #[serde(rename_all = "camelCase")]
@@ -62,6 +80,17 @@ pub enum NodeKind {
         /// maps to `"openai"` for backward compatibility.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        /// When set, inherit the referenced agent's **guardrails** from the
+        /// pack's merged agents.
+        ///
+        /// Deliberately narrower than [`NodeKind::Agent`]'s `agent_ref`, which
+        /// adopts the referenced agent's full config: a supervisor routes, it
+        /// does not work, so it stays tool-free and gains no memory or
+        /// knowledge. Guardrails are the exception because a supervisor reads
+        /// the operator's raw input — it is the first place sensitive data
+        /// arrives, so inbound content-safety hooks must run there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_ref: Option<String>,
     },
     /// Fan-out node — spawns one branch per outgoing edge.
     ///
@@ -1220,12 +1249,71 @@ mod tests {
                 model: "gpt-4o-mini".to_string(),
                 tools: vec![],
                 provider: None,
+                agent_ref: None,
+                inherit_from: None,
             },
         };
         let value = serde_json::to_value(&node).expect("serialization must succeed");
         assert!(
             value.get("provider").is_none(),
             "provider: None must be omitted from JSON, got: {value}"
+        );
+    }
+
+    #[test]
+    fn agent_node_carries_optional_agent_ref() {
+        let j = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "a",
+            "nodes": [
+                {"id":"a","kind":"agent","systemPrompt":"","model":"gpt-4","agentRef":"support"},
+                {"id":"r","kind":"respond"}
+            ],
+            "edges": [{"from":"a","to":"r"}]
+        });
+        let cfg = GraphConfig::from_json(&j.to_string()).unwrap();
+        let a = cfg.graph.nodes.iter().find(|n| n.id == "a").unwrap();
+        match &a.kind {
+            NodeKind::Agent { agent_ref, .. } => assert_eq!(agent_ref.as_deref(), Some("support")),
+            other => panic!("expected Agent, got {other:?}"),
+        }
+        // a present agent_ref re-serializes to the camelCase `agentRef` key
+        let back = serde_json::to_value(&a.kind).unwrap();
+        assert_eq!(back["agentRef"], serde_json::json!("support"));
+    }
+
+    /// SP1 Task 4: an `agent_ref` node is subject to the same "exactly 1
+    /// outgoing edge" rule as any other Agent node (Rule 4) — no separate
+    /// `agent_ref`-specific validation is needed. Confirms the existing rule
+    /// covers it both ways (valid with 1 edge, rejected with 0).
+    #[test]
+    fn agent_ref_node_validates_with_one_edge() {
+        let ok = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "a",
+            "nodes": [
+                {"id":"a","kind":"agent","systemPrompt":"","model":"gpt-4","agentRef":"support"},
+                {"id":"r","kind":"respond"}
+            ],
+            "edges": [{"from":"a","to":"r"}]
+        });
+        assert!(GraphConfig::from_json(&ok.to_string()).is_ok());
+
+        let bad = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "a",
+            "nodes": [
+                {"id":"a","kind":"agent","systemPrompt":"","model":"gpt-4","agentRef":"support"},
+                {"id":"r","kind":"respond"}
+            ],
+            "edges": []
+        });
+        let err = GraphConfig::from_json(&bad.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exactly 1 outgoing edge"),
+            "unexpected error: {err}"
         );
     }
 }

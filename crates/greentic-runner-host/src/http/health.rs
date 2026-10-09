@@ -105,13 +105,18 @@ mod tests {
     use std::sync::Arc;
 
     fn state() -> ServerState {
+        let host = crate::host::RunnerHost::for_test();
         ServerState {
             active: Arc::new(ActivePacks::new()),
             routing: TenantRouting::new(RoutingConfig::default()),
             health: Arc::new(HealthState::new()),
             reload: None,
             admin: AdminAuth::default(),
-            host: crate::host::RunnerHost::for_test(),
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: host.stream_observers(),
+            #[cfg(feature = "agentic-worker")]
+            ext_runtime: None,
+            host,
             sql: crate::sql::SqlGateway::new(std::collections::HashMap::new(), String::new()),
         }
     }

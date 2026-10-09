@@ -216,6 +216,29 @@ impl StateStore for FaultyStateStore {
         result
     }
 
+    fn set_json_if_absent(
+        &self,
+        tenant: &TenantCtx,
+        prefix: &str,
+        key: &StateKey,
+        value: &Value,
+        ttl_secs: Option<u32>,
+    ) -> GResult<bool> {
+        // Like `set_json`, a dropped write is acknowledged without touching the
+        // inner store (reported as "created").
+        if self.state.config.drop_state_write {
+            return Ok(true);
+        }
+        let created = self
+            .inner
+            .set_json_if_absent(tenant, prefix, key, value, ttl_secs)?;
+        if created && self.state.config.stale_state_read {
+            let cache_key = self.key(tenant, prefix, key);
+            self.cache.lock().insert(cache_key, value.clone());
+        }
+        Ok(created)
+    }
+
     fn del(&self, tenant: &TenantCtx, prefix: &str, key: &StateKey) -> GResult<bool> {
         if self.state.config.drop_state_write {
             return Ok(true);
@@ -292,6 +315,81 @@ mod tests {
         let rate = parse_rate(Some("2/5".to_string())).expect("rate");
         assert_eq!(rate.numerator, 2);
         assert_eq!(rate.denominator, 5);
+    }
+
+    fn faulty(drop_state_write: bool, stale_state_read: bool) -> FaultyStateStore {
+        let state = Arc::new(FaultState {
+            config: FaultConfig {
+                drop_state_write,
+                delay_state_read_ms: 0,
+                stale_state_read,
+                asset_transient: None,
+                asset_delay_ms: 0,
+                seed: 0,
+            },
+            counters: FaultCounters::default(),
+        });
+        FaultyStateStore::new(
+            Arc::new(greentic_state::inmemory::InMemoryStateStore::new()),
+            state,
+        )
+    }
+
+    fn ctx() -> TenantCtx {
+        use std::str::FromStr;
+        TenantCtx::new(
+            greentic_types::EnvId::from_str("local").expect("env"),
+            greentic_types::TenantId::from_str("demo").expect("tenant"),
+        )
+    }
+
+    #[test]
+    fn if_absent_forwards_to_the_inner_atomic_store() {
+        let store = faulty(false, false);
+        let key = StateKey::new("k");
+        let first = serde_json::json!("one");
+        let second = serde_json::json!("two");
+        assert!(
+            store
+                .set_json_if_absent(&ctx(), "p", &key, &first, None)
+                .expect("first")
+        );
+        assert!(
+            !store
+                .set_json_if_absent(&ctx(), "p", &key, &second, None)
+                .expect("second")
+        );
+        let stored = store.get_json(&ctx(), "p", &key, None).expect("get");
+        assert_eq!(stored, Some(first));
+    }
+
+    #[test]
+    fn if_absent_honours_drop_state_write_without_writing() {
+        let store = faulty(true, false);
+        let key = StateKey::new("k");
+        let created = store
+            .set_json_if_absent(&ctx(), "p", &key, &serde_json::json!(1), None)
+            .expect("acknowledged");
+        assert!(created, "a dropped write is acknowledged like set_json");
+        assert_eq!(store.get_json(&ctx(), "p", &key, None).expect("get"), None);
+    }
+
+    #[test]
+    fn if_absent_updates_the_stale_read_cache_only_when_created() {
+        let store = faulty(false, true);
+        let key = StateKey::new("k");
+        assert!(
+            store
+                .set_json_if_absent(&ctx(), "p", &key, &serde_json::json!("a"), None)
+                .expect("first")
+        );
+        assert!(
+            !store
+                .set_json_if_absent(&ctx(), "p", &key, &serde_json::json!("b"), None)
+                .expect("second")
+        );
+        let cached = store.get_json(&ctx(), "p", &key, None).expect("get");
+        assert_eq!(cached, Some(serde_json::json!("a")));
     }
 
     #[test]

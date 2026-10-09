@@ -23,6 +23,7 @@ jobs:
   dev-prepare:
     uses: greenticai/.github/.github/workflows/dev-prepare.yml@main
     with:
+      debuginfo: "line-tables-only"
       exclude-crates: "echo-secret component-v0-6-dummy"
       wasm-target: true
       require-pre-release: true
@@ -33,13 +34,14 @@ jobs:
     with:
       package: greentic-runner
       version: ${{ needs.dev-prepare.outputs.binary-version }}
+      features: "desktop-agent-ephemeral,greentic-llm-backend"
 
   dev-publish:
     needs: [dev-prepare, dev-binaries-greentic-runner]
     uses: greenticai/.github/.github/workflows/dev-publish.yml@main
     with:
       version: ${{ needs.dev-prepare.outputs.version }}
-      crates: "runner-core greentic-runner-host greentic-runner-desktop greentic-runner"
+      crates: "runner-core greentic-a2a aw-event-bridge greentic-aw-runtime greentic-runner-host greentic-runner-desktop greentic-runner"
       binary-version: ${{ needs.dev-prepare.outputs.binary-version }}
       binary-crates: "greentic-runner"
       dual-role-binary-crates: "greentic-runner"

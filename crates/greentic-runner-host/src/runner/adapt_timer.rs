@@ -74,6 +74,8 @@ pub fn spawn_timers(runtime: Arc<TenantRuntime>) -> Result<Vec<JoinHandle<()>>> 
                     channel: Some(schedule_id.clone()),
                     conversation: Some(schedule_id.clone()),
                     user: None,
+                    // A timer fires the flow from its entrypoint; it carries no card nav.
+                    entry_node: None,
                     activity_id: Some(format!("{}@{}", schedule_id, next)),
                     timestamp: Some(next.to_rfc3339()),
                     payload,

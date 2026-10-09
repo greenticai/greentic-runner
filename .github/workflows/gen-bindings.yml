@@ -3,12 +3,14 @@ permissions:
   contents: read
 
 # NOTE: no `pull_request:` trigger. This job runs `cargo test --package
-# greentic-runner`, which resolves the whole workspace; cargo then clones the
-# cross-org private repo `greentic-biz/greentic-chronicle-ext` (optional
-# `knowledge-chronicle` deps) during resolution. PR CI lacks cross-org
+# greentic-runner`, which resolves the whole workspace; cargo then cloned the
+# cross-org private repo `greentic-biz/greentic-chronicle-ext` (the optional
+# `knowledge-chronicle` deps) during resolution, and PR CI lacks cross-org
 # credentials, so it always failed at dependency-fetch — pure red noise on every
-# PR. Restore the `pull_request:` trigger once a cross-org deploy-key/PAT is
-# provisioned (see ci.yml for the same rationale).
+# PR. That reason is GONE: the Chronicle backends moved out behind
+# `runner::runtime_ext` and no private git dependency is left. Restoring the
+# `pull_request:` trigger is a separate change (it has not been run on a PR
+# since, so nobody knows what else it reports).
 on:
   push:
     branches: [main]

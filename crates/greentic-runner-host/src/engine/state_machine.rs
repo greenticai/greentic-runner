@@ -109,7 +109,7 @@ impl StateMachine {
         flow_id: &str,
         session_hint: Option<String>,
         input: Value,
-    ) -> GResult<Value> {
+    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
         let mut telemetry_ctx = tenant
             .clone()
             .with_provider(PROVIDER_ID.to_string())
@@ -159,6 +159,12 @@ impl StateMachine {
             session.waiting = None;
         }
 
+        // Per-node outputs for this turn, keyed by the real flow node id (e.g.
+        // `insights_agent`), merged from each adapter step's FlowEngine map.
+        // Observability only — never feeds back into `outcome` or session state;
+        // callers that don't need it (`step` via `handle`) drop the map.
+        let mut node_outputs = serde_json::Map::new();
+
         let outcome = loop {
             if session.cursor.position >= flow.steps.len() {
                 let outcome = session
@@ -178,10 +184,15 @@ impl StateMachine {
 
             match step {
                 FlowStep::Adapter(call) => {
-                    let outcome = self
+                    // Merge the FlowEngine's per-node output map (keyed by the
+                    // real node id, e.g. `insights_agent`) so mid-flow node
+                    // outputs — which the outer step outcome does not expose —
+                    // survive to the caller. Observability only.
+                    let (outcome, flow_nodes) = self
                         .execute_adapter_step(&flow, &mut session, call, tenant)
                         .await?;
                     session.last_outcome = Some(outcome.clone());
+                    node_outputs.extend(flow_nodes);
                     continue;
                 }
                 FlowStep::AwaitInput { reason } => {
@@ -233,7 +244,7 @@ impl StateMachine {
             });
         }
 
-        Ok(outcome)
+        Ok((outcome, node_outputs))
     }
 
     fn ensure_policy_budget(&self, flow: &FlowDefinition) -> GResult<()> {
@@ -253,7 +264,7 @@ impl StateMachine {
         session: &mut SessionSnapshot,
         call: AdapterCall,
         tenant: &TenantCtx,
-    ) -> GResult<Value> {
+    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
         let adapter =
             self.adapters
                 .get(&call.adapter)
@@ -304,7 +315,11 @@ impl StateMachine {
                 "status": "done",
                 "response": entry.response.clone(),
             }));
-            return Ok(session.last_outcome.clone().unwrap());
+            // Dedup hit: no adapter ran, so no per-node flow map this turn.
+            return Ok((
+                session.last_outcome.clone().unwrap(),
+                serde_json::Map::new(),
+            ));
         }
 
         self.host
@@ -322,10 +337,12 @@ impl StateMachine {
         let adapter_clone = adapter.clone();
         let mut call_clone = call.clone();
         call_clone.payload = resolved_payload.clone();
-        let response = retry_with_jitter(&self.policy.retry, || {
+        // `call_traced` also yields the flow's per-node output map (keyed by the
+        // real node id, e.g. `insights_agent`) when the adapter drives a flow.
+        let (response, flow_nodes) = retry_with_jitter(&self.policy.retry, || {
             let adapter = adapter_clone.clone();
             let call = call_clone.clone();
-            async move { adapter.call(&call).await }
+            async move { adapter.call_traced(&call).await }
         })
         .await?;
 
@@ -358,7 +375,7 @@ impl StateMachine {
             )
             .await?;
 
-        Ok(session.last_outcome.clone().unwrap())
+        Ok((session.last_outcome.clone().unwrap(), flow_nodes))
     }
 
     fn update_state_input(session: &mut SessionSnapshot, input: Value) {
@@ -451,7 +468,10 @@ mod tests {
         let tenant_ctx = TenantCtx::new(env, tenant_id);
         let session_hint = Some("demo:telegram:chat:user".to_string());
 
-        let first = sm
+        // A MockChatAdapter is not FlowEngine-backed, so it contributes no
+        // per-node map — node_outputs capture is asserted at the FlowEngine
+        // level in `runner::engine` tests. Here we only exercise step outcomes.
+        let (first, _first_nodes) = sm
             .step(
                 &tenant_ctx,
                 "test-pack",
@@ -477,7 +497,7 @@ mod tests {
         assert!(snapshot.waiting.is_some());
         assert_eq!(snapshot.cursor.position, 1);
 
-        let second = sm
+        let (second, _second_nodes) = sm
             .step(
                 &tenant_ctx,
                 "test-pack",

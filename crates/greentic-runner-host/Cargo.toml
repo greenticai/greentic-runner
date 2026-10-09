@@ -11,8 +11,20 @@ keywords = ["greentic", "runner", "wasmtime", "mcp", "flows"]
 categories = ["asynchronous", "api-bindings", "command-line-utilities"]
 
 [features]
-default = ["verify", "agentic-worker"]
+default = ["verify", "agentic-worker", "state-disk", "session-redis"]
 verify = []
+# Redis-backed parked-flow sessions (`storage::SessionBackend::Redis`).
+#
+# ON by default since the durable-storage work, and the cost of that is nil:
+# `greentic-state` already enables `redis` in ITS defaults, so the `redis`
+# crate is in this graph whether or not this feature is on. Leaving it off
+# would have meant the only way to get a durable session store into a
+# deployed worker was a downstream Cargo edit in greentic-start.
+#
+# With the feature off, `storage::SessionBackend::Redis` still EXISTS — the
+# config type does not change shape with features, because greentic-start
+# compiles against it — and asking for it is a loud build-time refusal rather
+# than a quiet fall back to in-memory sessions.
 session-redis = ["greentic-session/redis"]
 fault-injection = []
 component-v0-6-introspection = []
@@ -25,33 +37,80 @@ greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 # (greentic-aw-runtime + greentic-ext-runtime). Disable this feature to
 # produce a lean, publishable build that lacks DwAgent node support.
 agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
+# On-disk AW state backend (redb) — forwarded to greentic-aw-runtime. Purely a
+# passthrough so the runner-host-side `#[cfg(feature = "state-disk")]` gate
+# resolves; greentic-aw-runtime's own `state-disk` default is already active
+# transitively since it's pulled without `default-features = false`.
+state-disk = ["greentic-aw-runtime?/state-disk"]
 # Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…),
 # routing the worker LLM call through greentic-llm. Opt-in (pulls rig-core).
-greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-backend"]
+greentic-llm-backend = [
+    "agentic-worker",
+    # `agent_node` asks `greentic_llm::ProviderKind::requires_api_key()` whether
+    # an empty key is legitimate for the configured provider (#743).
+    "dep:greentic-llm",
+    "greentic-aw-runtime?/greentic-llm-backend",
+]
+# In-process deep-worker runtime for `operala.call` flow nodes
+# (`greentic-dw-operala-invoker` running `DeepLoopCoordinator` with a
+# `greentic_llm::RigBackend`). Server-safe: it pulls NO mock types, so a
+# production binary (greentic-start, the runner binary) may enable it. When on,
+# `runtime.rs` wires the handler unless GREENTIC_OPERALA_DISPATCH=nats, and only
+# when an LLM key resolves; otherwise `operala.call` keeps the NATS
+# `RemoteDispatchHandler` path. `greentic-llm`'s default `rig` feature is what
+# provides `RigBackend`, so `greentic-llm-backend` is not required.
+operala-in-process = [
+    "agentic-worker",
+    "dep:greentic-dw-operala-invoker",
+    "dep:greentic-dw-operala-bridge",
+    "dep:greentic-llm",
+]
 # Adds the ephemeral (in-memory) agent builder for desktop/local runs.
 # Enables the test-mock types from greentic-aw-runtime; must NOT be enabled
-# in the server binary — the server always uses the Redis path.
-desktop-agent-ephemeral = ["agentic-worker", "greentic-aw-runtime?/test-mock", "greentic-aw-runtime?/dev-allow-unsigned"]
-
-[lints.rust]
-# `long-term-chronicle` and `knowledge-chronicle` gate real in-tree modules
-# (runner/long_term_memory.rs, runner/knowledge_mount.rs, runner/knowledge_corpus.rs)
-# but are declared as features only on the `research` lane. Their optional deps
-# (chronicle-core, chronicle-driver-{surreal,neo4j,falkor}) are git deps on the
-# CROSS-ORG PRIVATE repo greentic-biz/greentic-chronicle-ext, and this lane's CI
-# holds `greenticai`-org credentials only. Declaring them here would make cargo
-# clone that repo during resolution — which happens regardless of whether the
-# feature is switched on — and every `--all-features` build (Nightly Coverage,
-# ci/local_check.sh) would die at dependency-fetch. So tell check-cfg the values
-# are expected rather than declaring them, and keep the gated code compiling on
-# `research` where the deps resolve. Re-declare as real features once a cross-org
-# deploy key / PAT is provisioned. Mirrors the same allowlist on `develop`.
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("knowledge-chronicle", "long-term-chronicle"))',
-] }
+# in the server binary. The server does not need it for Redis-free runs:
+# `aw_backends::build_aw_backends` picks the shared in-memory store (or redb
+# under GREENTIC_AW_STATE_BACKEND=disk) when GREENTIC_AW_REDIS_URL is unset.
+# A server that wants in-process `operala.call` enables `operala-in-process`
+# instead.
+desktop-agent-ephemeral = [
+    "agentic-worker",
+    # dw.agent MUST use the multi-provider in-process backend (GreenticLlmBackend
+    # → DeepSeek/Anthropic/…). Without this the ephemeral sidecar falls back to
+    # the OpenAI-only `OpenAiLlmBackend`, which ignores the agent's configured
+    # provider and calls OpenAI with the (usually empty) OpenAI key — a hard 401
+    # for any non-OpenAI worker (e.g. a DeepSeek dw.agent in the offline
+    # Test-chat sidecar).
+    "greentic-llm-backend",
+    "greentic-aw-runtime?/test-mock",
+    # NOTE: deliberately does NOT pull `greentic-aw-runtime?/dev-allow-unsigned`.
+    # It used to, which meant asking for "in-memory agent state" silently also
+    # disabled extension signature verification — two unrelated things, one of
+    # them a security control. Anything that needs the bypass must now name it:
+    # `--features dev-allow-unsigned`. See that feature's comment below.
+    # The offline Test-chat sidecar runs `operala.call` with no NATS.
+    "operala-in-process",
+]
+# Lets `GREENTIC_EXT_ALLOW_UNSIGNED=1` skip extension signature verification.
+#
+# LOCAL DEV ONLY. A runner built with this loads unsigned — and therefore
+# attacker-supplyable — extensions. That includes guardrails, so a "mandatory"
+# guardrail policy on such a runner guarantees nothing: the operator is told the
+# turn is checked, and it may not be. Never enable it in a build that serves
+# production traffic.
+#
+# Split out of `desktop-agent-ephemeral` deliberately: the bypass must be named
+# by whoever wants it, not inherited from a feature about in-memory state.
+dev-allow-unsigned = ["agentic-worker", "greentic-aw-runtime?/dev-allow-unsigned"]
+# Long-term memory and knowledge (document RAG) backends are not features of
+# this crate. They live in a private repository, and a published crate cannot
+# name a git dependency even as an optional one, so a binary that wants them
+# registers them at startup through `runner::runtime_ext` (the
+# `long-term-chronicle` / `knowledge-chronicle` features that used to compile
+# them in were removed for that reason; see greentic-runner-full in
+# greentic-biz/greentic-chronicle-ext).
 
 [dependencies]
-async-nats = "0.49"
+async-nats = "0.47"
 async-trait.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true
@@ -59,15 +118,23 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
-greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.1.0-0, <1.2.0-0", features = ["serve"], optional = true }
-# Pulled only to enable its `pack-manifest-agents` feature (see the
-# long-term-chronicle feature). The crate is otherwise a transitive dep of the
-# openai-compatible providers above.
-# Knowledge (document-RAG / W4) tier. The chronicle provider + its core trait/DTOs
-# come from greentic-dw-providers; the SurrealDB driver + GraphDriver trait come
-# from greentic-chronicle-ext and are built at this edge (bindgen / RocksDB live
-# here). All optional, gated by the `knowledge-chronicle` feature.
-greentic-ext-runtime = { version = "=1.2.24", optional = true }
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.2.0-0, <1.3.0-0", features = ["serve"], optional = true }
+# In-process deep-worker runtime for `operala.call` flow nodes (feature
+# `operala-in-process`; `desktop-agent-ephemeral` implies it). Pinned to the
+# SAME greentic-dw rev greentic-aw-runtime pins greentic-dw-manifest to, so the
+# graph keeps a single greentic-dw source — move all three together.
+greentic-dw-operala-invoker = { version = ">=1.2.0-0, <1.3.0-0", optional = true }
+greentic-dw-operala-bridge = { version = ">=1.2.0-0, <1.3.0-0", optional = true }
+# Needed directly (not just transitively via greentic-aw-runtime) to build the
+# `Arc<dyn greentic_llm::LlmProvider>` that `DeepWorkerInvoker::new` takes.
+# The range must stay byte-identical to greentic-aw-runtime's (which see for
+# why it is the plain lane range and not greentic-llm's newer 1.2.7-dev
+# base): the two unify into ONE `greentic_llm`, or the `Arc<dyn LlmProvider>`
+# handed across that boundary stops type-checking. Nothing unifies them
+# implicitly any more -- the root `[patch.crates-io]` that used to is gone,
+# because a patch never travels into a published crate.
+greentic-llm = { version = ">=1.2.0-0, <1.3.0-0", optional = true }
+greentic-ext-runtime = { version = ">=1.2.0-0, <1.3.0-0", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
@@ -91,8 +158,10 @@ opentelemetry = "0.31"
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-rustls.workspace = true
 runner-core.workspace = true
+# Run-outcome sink (`run_outcome::http`): bearer kept out of Debug, ULID
+# event/run ids. Same versions greentic-aw-runtime already resolves.
+secrecy = "0.10"
 serde = { workspace = true }
 serde_cbor.workspace = true
 serde_json.workspace = true
@@ -103,6 +172,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 time.workspace = true
 tracing.workspace = true
+ulid = "1"
 url.workspace = true
 wasmparser.workspace = true
 zip.workspace = true
@@ -132,7 +202,13 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
 wasmtime-wasi-tls = { workspace = true }
+# Needed to install a process-level rustls CryptoProvider for wasi-tls.
+# rustls 0.23 (pulled by wasmtime-wasi-tls 45) refuses to auto-select a
+# provider when both `aws-lc-rs` (via reqwest/hyper-rustls) and `ring`
+# (via wasmtime-wasi-tls) are linked, so the runner must pick one explicitly.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 greentic-telemetry = { workspace = true }
+hyper = "1"
 
 [dev-dependencies]
 criterion.workspace = true
@@ -141,16 +217,25 @@ tempfile.workspace = true
 once_cell.workspace = true
 semver.workspace = true
 proptest.workspace = true
-# C5.4 export regression: a real OTLP exporter to prove gt.* attribution reaches
-# exported spans. Versions match greentic-telemetry's OTel stack.
-opentelemetry = "0.31"
+# C5.4 export regression (main lineage): a real OTLP exporter to prove gt.*
+# attribution reaches exported spans. Versions match greentic-telemetry's OTel
+# stack. Consumed by the `#[cfg(all(test, feature = "telemetry"))]` export_tests.
 opentelemetry_sdk = "0.31"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 tower.workspace = true
 http-body-util = "0.1"
 wiremock = "0.6"
-greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.1.0-0, <1.2.0-0", features = ["test-mock"] }
+# Signs the pack-carried extension fixture in `runner::pack_extensions` tests so
+# the real load gate (signature + ledger + TOFU anchor) is exercised end to end.
+ed25519-dalek.workspace = true
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.2.0-0, <1.3.0-0", features = ["test-mock"] }
+# Not `.workspace = true`: despite the root Cargo.toml comment near line 244,
+# this crate is not in `[workspace.dependencies]` — it's a `[patch.crates-io]`
+# entry (root Cargo.toml:248-249) redirecting the crates.io requirement to the
+# git tag. Pinned the same way greentic-aw-runtime itself depends on it
+# (its Cargo.toml:55), so the patch applies and both resolve to one version.
+greentic-extension-sdk-contract = ">=1.2.24-dev, <1.2.25"
 
 [[bench]]
 name = "perf"

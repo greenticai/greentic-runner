@@ -199,6 +199,14 @@ impl Activity {
         self
     }
 
+    /// Replace the payload body, keeping the activity's kind and routing. The
+    /// agent chat ingress uses it to carry a card submit (the answer to a
+    /// parked `flow:` tool) as a message activity.
+    pub fn with_payload(mut self, payload: Value) -> Self {
+        self.payload = payload;
+        self
+    }
+
     /// Attach a session identifier used for retries/idempotency.
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());

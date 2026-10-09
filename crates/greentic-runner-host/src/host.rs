@@ -20,8 +20,8 @@ use crate::runner::engine::FlowEngine;
 use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::secrets::{DynSecretsManager, default_manager};
 use crate::storage::{
-    DynSessionStore, DynStateStore, new_session_store, new_state_store, session_host_from,
-    state_host_from,
+    DynSessionStore, DynStateStore, StorageConfig, session_host_from, state_host_from,
+    stores_from_config,
 };
 use crate::wasi::RunnerWasiPolicy;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
@@ -36,12 +36,32 @@ pub struct TelemetryCfg {
     pub export: greentic_telemetry::export::ExportConfig,
 }
 
+/// An LLM port an embedding host can inject so in-process tool extensions that
+/// call `host.llm.complete()` (e.g. adaptive-cards `generate_card`) resolve the
+/// LLM via the host's own per-tenant, admin-backed path instead of the env-only
+/// fallback. Only meaningful with the agentic-worker runtime, so the type — and
+/// everything that threads it — is gated behind that feature.
+#[cfg(feature = "agentic-worker")]
+pub type ExtLlmPort = Arc<dyn greentic_ext_runtime::host_ports::LlmPort>;
+
+/// An MCP tool source an embedding host can inject so `mcp` flow nodes resolve
+/// their catalog through the host's own per-tenant admin path instead of the
+/// process-global `GREENTIC_AW_*` environment. See
+/// [`HostBuilder::with_mcp_source`].
+#[cfg(feature = "agentic-worker")]
+pub type McpSource = Arc<greentic_aw_runtime::McpToolSource>;
+
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
     telemetry: Option<TelemetryCfg>,
     wasi_policy: RunnerWasiPolicy,
     secrets: Option<DynSecretsManager>,
+    storage: StorageConfig,
+    #[cfg(feature = "agentic-worker")]
+    ext_llm_port: Option<ExtLlmPort>,
+    #[cfg(feature = "agentic-worker")]
+    mcp_source: Option<McpSource>,
 }
 
 impl HostBuilder {
@@ -51,6 +71,11 @@ impl HostBuilder {
             telemetry: None,
             wasi_policy: RunnerWasiPolicy::default(),
             secrets: None,
+            storage: StorageConfig::default(),
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
         }
     }
 
@@ -74,6 +99,63 @@ impl HostBuilder {
         self
     }
 
+    /// Choose where this host keeps its sessions and flow state.
+    ///
+    /// Unset means [`StorageConfig::default`] — both stores in memory, which is
+    /// what every caller got before this method existed. A parked flow then
+    /// dies with the process: correct for a desktop run, wrong for a deployed
+    /// worker, where a revision rollout or a cold start silently restarts the
+    /// conversation.
+    ///
+    /// A configured-but-unreachable backend makes [`HostBuilder::build`] fail.
+    /// It never degrades to memory — a host that quietly forgets every parked
+    /// conversation looks healthy from every angle except the user's.
+    ///
+    /// ```no_run
+    /// # use greentic_runner_host::{HostBuilder, HostConfig};
+    /// # use greentic_runner_host::storage::StorageConfig;
+    /// # fn main() -> anyhow::Result<()> {
+    /// # let config: HostConfig = unimplemented!();
+    /// let storage = StorageConfig::redis("redis://redis:6379", "greentic:session:prod")?;
+    /// let host = HostBuilder::new().with_config(config).with_storage(storage).build()?;
+    /// # let _ = host;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_storage(mut self, storage: StorageConfig) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    /// Inject a host-provided LLM port for the in-process extension runtime.
+    ///
+    /// When `Some`, tool extensions that call `host.llm.complete()` resolve the
+    /// LLM through this port (the embedding host's per-tenant, admin-backed
+    /// path) instead of the env-only fallback. When `None`, the extension
+    /// runtime falls back to the env-keyed `EnvLlmPort` (standalone runners) —
+    /// so leaving this unset preserves the prior behaviour exactly.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_ext_llm_port(mut self, port: Option<ExtLlmPort>) -> Self {
+        self.ext_llm_port = port;
+        self
+    }
+
+    /// Inject a host-built MCP tool source for this host's flow engines.
+    ///
+    /// When `Some`, `mcp` flow nodes resolve their catalog through it. When
+    /// `None`, each engine keeps deriving one from the process-global
+    /// `GREENTIC_AW_*` environment — the standalone runner path, unchanged.
+    ///
+    /// A host that serves many tenants from one process must inject: the
+    /// environment names a single tenant, so it cannot express a per-tenant
+    /// catalog. Build one source per tenant, identified with
+    /// `greentic_aw_runtime::McpCallerIdentity`.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_mcp_source(mut self, source: Option<McpSource>) -> Self {
+        self.mcp_source = source;
+        self
+    }
+
     pub fn build(self) -> Result<RunnerHost> {
         if self.configs.is_empty() {
             bail!("at least one tenant configuration is required");
@@ -84,10 +166,44 @@ impl HostBuilder {
             .into_iter()
             .map(|(tenant, cfg)| (tenant, Arc::new(cfg)))
             .collect();
-        let session_store = new_session_store();
-        let session_host = session_host_from(Arc::clone(&session_store));
-        let state_store = new_state_store();
+        let (session_store, state_store) = stores_from_config(&self.storage)?;
+        // `SessionStoreHost` is deliberately NOT pointed at a durable store.
+        //
+        // It is write-only by construction: `put` goes through
+        // `SessionStore::create_session`, which does not add the row to the
+        // per-user wait index — and `get` reads exactly that index, via
+        // `find_by_user`. Both backends behave this way, so `get` never returns
+        // what `put` wrote, `state_machine::step`'s `is_new` is always true, and
+        // every turn writes a fresh row under a random UUID.
+        //
+        // In memory that is a bounded-by-process-lifetime map nobody reads. On
+        // Redis it would be one permanent key PER TURN — `create_session` takes
+        // no TTL argument, so there is no expiry to attach and the
+        // `DefaultWaitTtl` decorator cannot reach it — growing without bound
+        // while buying nothing, because nothing can read it back.
+        //
+        // The parked-flow snapshot, which is what durability is for, does NOT
+        // travel this path: `FlowResumeStore` uses `register_wait` /
+        // `find_wait_by_scope` and gets `session_store` below. Closing the
+        // write-only behaviour itself is an upstream change in greentic-session.
+        let session_host = if self.storage.session.is_durable() {
+            session_host_from(crate::storage::new_session_store())
+        } else {
+            // Unchanged for every caller that names no storage: one store,
+            // shared, exactly as before.
+            session_host_from(Arc::clone(&session_store))
+        };
         let state_host = state_host_from(Arc::clone(&state_store));
+        if self.storage.is_durable() {
+            // Names, never the configured values: a Redis URL may carry
+            // `redis://user:password@host`, and a startup log line is the last
+            // place a credential should land.
+            tracing::info!(
+                session = self.storage.session.describe(),
+                state = self.storage.state.describe(),
+                "runner host using durable storage; parked flows survive a restart"
+            );
+        }
         let secrets = match self.secrets {
             Some(manager) => manager,
             None => default_manager().context("failed to initialise default secrets backend")?,
@@ -102,6 +218,12 @@ impl HostBuilder {
             state_host,
             wasi_policy,
             secrets_manager: secrets,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: self.ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: self.mcp_source,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: self.telemetry,
         })
     }
@@ -111,6 +233,23 @@ impl Default for HostBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Result of [`RunnerHost::handle_activity_traced`]: the same outbound replies
+/// as [`RunnerHost::handle_activity`], plus this turn's per-step node outputs
+/// (keyed by each step's `operation`; for a `dw.agent` step that is the
+/// agent_id). Observability only.
+pub struct TurnTrace {
+    pub replies: Vec<Activity>,
+    pub node_outputs: HashMap<String, Value>,
+}
+
+/// Outcome of [`RunnerHost::build_prepared`]: either a fast2flow short-circuit
+/// (a pre-built response returned without entering the state machine) or a
+/// canonical ingress envelope the caller runs through `handle`/`handle_traced`.
+enum Prepared {
+    ShortCircuit(Vec<Activity>),
+    Run(Box<IngressEnvelope>),
 }
 
 /// Runtime host that manages tenant-bound packs and flow execution.
@@ -124,6 +263,19 @@ pub struct RunnerHost {
     state_host: Arc<dyn StateHost>,
     wasi_policy: Arc<RunnerWasiPolicy>,
     secrets_manager: DynSecretsManager,
+    #[cfg(feature = "agentic-worker")]
+    ext_llm_port: Option<ExtLlmPort>,
+    /// MCP tool source injected by an embedding host, or `None` to let each
+    /// flow engine derive one from `GREENTIC_AW_*` env (standalone runners).
+    #[cfg(feature = "agentic-worker")]
+    mcp_source: Option<McpSource>,
+    /// Session-id → active streaming observer, shared by every `dw.agent`
+    /// node handler this host builds (writer: the `POST /agent/chat/stream`
+    /// SSE handler via `ServerState`; reader: `RuntimeAgentNodeHandler::execute`).
+    /// Always present (an empty registry, not `None`) — no external
+    /// dependency gates it, unlike `ext_llm_port`.
+    #[cfg(feature = "agentic-worker")]
+    stream_observers: crate::http::agent_stream::StreamObserverRegistry,
     telemetry: Option<TelemetryCfg>,
 }
 
@@ -160,11 +312,61 @@ impl RunnerHost {
     }
 
     pub async fn handle_activity(&self, tenant: &str, activity: Activity) -> Result<Vec<Activity>> {
+        let (runtime, prepared) = self.prepare_turn(tenant, activity).await?;
+        match prepared {
+            Prepared::ShortCircuit(replies) => Ok(replies),
+            Prepared::Run(envelope) => {
+                let result = runtime.state_machine().handle(*envelope).await?;
+                Ok(normalize_replies(result, tenant))
+            }
+        }
+    }
+
+    /// Like [`Self::handle_activity`], but also returns this turn's per-step
+    /// node-output map (keyed by each step's `operation`; for a `dw.agent` step
+    /// that is the agent_id). Observability only — `replies` are byte-identical
+    /// to [`Self::handle_activity`] for the same input.
+    pub async fn handle_activity_traced(
+        &self,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<TurnTrace> {
+        let (runtime, prepared) = self.prepare_turn(tenant, activity).await?;
+        match prepared {
+            Prepared::ShortCircuit(replies) => Ok(TurnTrace {
+                replies,
+                node_outputs: HashMap::new(),
+            }),
+            Prepared::Run(envelope) => {
+                let (result, node_outputs) =
+                    runtime.state_machine().handle_traced(*envelope).await?;
+                let replies = normalize_replies(result, tenant);
+                let node_outputs = match node_outputs {
+                    Value::Object(map) => map.into_iter().collect(),
+                    _ => HashMap::new(),
+                };
+                Ok(TurnTrace {
+                    replies,
+                    node_outputs,
+                })
+            }
+        }
+    }
+
+    /// Shared setup for [`Self::handle_activity`] / [`Self::handle_activity_traced`]:
+    /// resolve the tenant runtime and build the canonical ingress envelope. The
+    /// single seam guarantees the traced and untraced paths cannot diverge.
+    async fn prepare_turn(
+        &self,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<(Arc<TenantRuntime>, Prepared)> {
         let runtime = self
             .active
             .load_pack(tenant)
             .with_context(|| format!("tenant {tenant} not loaded"))?;
-        self.dispatch_activity(&runtime, tenant, activity).await
+        let prepared = self.build_prepared(&runtime, tenant, activity).await?;
+        Ok((runtime, prepared))
     }
 
     /// Execute an activity against a specific deployment/bundle/revision runtime.
@@ -526,12 +728,17 @@ impl RunnerHost {
     /// ingress envelope, run the state machine, and normalize replies. Both the
     /// legacy and revision entry points funnel through here so flow resolution
     /// and reply shaping never drift between them.
-    async fn dispatch_activity(
+    /// Build the ingress envelope for a turn (fast2flow routing + welcome-flow
+    /// override), or short-circuit with a pre-built response (fast2flow
+    /// Respond/Deny). The caller runs the state machine on the `Run` arm,
+    /// so the traced (`handle_traced`) and untraced (`handle`) paths share this
+    /// single envelope-building seam and cannot diverge.
+    async fn build_prepared(
         &self,
         runtime: &TenantRuntime,
         tenant: &str,
         activity: Activity,
-    ) -> Result<Vec<Activity>> {
+    ) -> Result<Prepared> {
         let activity = apply_fast2flow_routing(runtime, tenant, activity)?;
 
         // Fast2Flow Respond/Deny returns a pre-built response activity
@@ -540,7 +747,7 @@ impl RunnerHost {
         // enter the state machine, otherwise a Deny still executes the
         // tenant entry flow with the denial payload.
         if activity.action() == Some("response") && activity.flow_id().is_none() {
-            return Ok(vec![activity]);
+            return Ok(Prepared::ShortCircuit(vec![activity]));
         }
 
         let (pack_id, flow_id) = resolve_flow_id(runtime, &activity)?;
@@ -564,9 +771,35 @@ impl RunnerHost {
                         .flow_by_key(&pack_id, &flow_id)
                         .map(|desc| desc.flow_type.clone())
                 });
-        let payload = activity.into_payload();
+        let mut payload = activity.into_payload();
+
+        // A card button says where to go next in `nextCardId` and friends.
+        // Usually that names another CARD, which the adaptive-card component
+        // renders. When it names a FLOW NODE the pack's graph continues there
+        // instead — and the target has to be lifted out of the payload, because
+        // the component prefers an inbound `nextCardId` over its node's own
+        // asset and would fail to resolve a node id as a card
+        // (`AC_ASSET_NOT_FOUND`, surfacing as a generic service error).
+        //
+        // greentic-start does this for the messaging path it owns; this is the
+        // same rule for the in-process path, which previously had none — card
+        // navigation worked and flow-node navigation did not.
+        let entry_node = {
+            let node_ids = runtime.engine().flow_node_ids(&pack_id, &flow_id).await;
+            let target = crate::runner::card_nav::entry_node_from_card_nav(
+                payload.get("metadata").unwrap_or(&serde_json::Value::Null),
+                &node_ids,
+            );
+            if target.is_some()
+                && let Some(metadata) = payload.get_mut("metadata")
+            {
+                crate::runner::card_nav::strip_card_nav_keys(metadata);
+            }
+            target
+        };
 
         let mut envelope = IngressEnvelope {
+            entry_node,
             tenant: tenant.to_string(),
             env: std::env::var("GREENTIC_ENV").ok(),
             pack_id: Some(pack_id.clone()),
@@ -598,10 +831,28 @@ impl RunnerHost {
             &mut envelope,
             welcome_flow_hint.as_ref(),
             hint_flow_type,
-        )?;
+        )
+        .await?;
 
-        let result = runtime.state_machine().handle(envelope).await?;
-        Ok(normalize_replies(result, tenant))
+        Ok(Prepared::Run(Box::new(envelope)))
+    }
+
+    /// Execute an activity against a specific deployment/bundle/revision runtime.
+    /// Builds the envelope via [`Self::build_prepared`] then runs the state
+    /// machine (or returns the fast2flow short-circuit replies directly).
+    async fn dispatch_activity(
+        &self,
+        runtime: &TenantRuntime,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<Vec<Activity>> {
+        match self.build_prepared(runtime, tenant, activity).await? {
+            Prepared::ShortCircuit(replies) => Ok(replies),
+            Prepared::Run(envelope) => {
+                let result = runtime.state_machine().handle(*envelope).await?;
+                Ok(normalize_replies(result, tenant))
+            }
+        }
     }
 
     pub async fn tenant(&self, tenant: &str) -> Option<TenantHandle> {
@@ -642,6 +893,31 @@ impl RunnerHost {
         Arc::clone(&self.secrets_manager)
     }
 
+    /// The host-injected extension LLM port, if any. `None` for standalone
+    /// runners, in which case the extension runtime uses its env-keyed fallback.
+    #[cfg(feature = "agentic-worker")]
+    pub fn ext_llm_port(&self) -> Option<ExtLlmPort> {
+        self.ext_llm_port.clone()
+    }
+
+    /// The host-injected MCP tool source, if any. `None` for standalone
+    /// runners, in which case each flow engine derives one from
+    /// `GREENTIC_AW_*` env.
+    #[cfg(feature = "agentic-worker")]
+    pub fn mcp_source(&self) -> Option<McpSource> {
+        self.mcp_source.clone()
+    }
+
+    /// The shared session-keyed streaming-observer registry (R2). Cloning
+    /// this `Arc` and handing it to both `TenantRuntime` construction (so
+    /// `RuntimeAgentNodeHandler::execute` can read it) and `ServerState` (so
+    /// the `POST /agent/chat/stream` SSE handler can write to it) is what
+    /// keeps the two sides talking about the same registry.
+    #[cfg(feature = "agentic-worker")]
+    pub fn stream_observers(&self) -> crate::http::agent_stream::StreamObserverRegistry {
+        self.stream_observers.clone()
+    }
+
     pub fn tenant_configs(&self) -> HashMap<String, Arc<HostConfig>> {
         self.configs.clone()
     }
@@ -652,6 +928,8 @@ impl RunnerHost {
     /// `POST /agent/chat` handler tests exercise.
     #[cfg(test)]
     pub(crate) fn for_test() -> Arc<Self> {
+        use crate::storage::{new_session_store, new_state_store};
+
         use crate::config::{
             FlowRetryConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
             WebhookPolicy,
@@ -695,6 +973,12 @@ impl RunnerHost {
             state_host,
             wasi_policy: Arc::new(RunnerWasiPolicy::default()),
             secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: None,
         })
     }
@@ -728,6 +1012,12 @@ impl RunnerHost {
             self.state_store(),
             self.state_host(),
             self.secrets_manager(),
+            #[cfg(feature = "agentic-worker")]
+            self.ext_llm_port(),
+            #[cfg(feature = "agentic-worker")]
+            self.mcp_source(),
+            #[cfg(feature = "agentic-worker")]
+            Some(self.stream_observers()),
         )
         .await?;
         let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
@@ -781,7 +1071,10 @@ impl TenantHandle {
 /// `session_store` + `hint_flow_type` are passed as primitives so the logic
 /// is unit-testable without a `TenantRuntime`; the caller does the engine
 /// lookup that produces `hint_flow_type`.
-fn apply_welcome_flow_override(
+///
+/// `async` because both probes are session-store round-trips, and that store
+/// may be Redis — see [`FlowResumeStore`].
+async fn apply_welcome_flow_override(
     session_store: &DynSessionStore,
     envelope: &mut IngressEnvelope,
     hint: Option<&WelcomeFlowHint>,
@@ -794,13 +1087,14 @@ fn apply_welcome_flow_override(
         return Ok(());
     }
 
-    if !try_mark_welcome_first_contact(session_store, envelope)? {
+    if !try_mark_welcome_first_contact(session_store, envelope).await? {
         return Ok(());
     }
 
     let resume = FlowResumeStore::new(Arc::clone(session_store));
     let snapshot = resume
         .fetch(envelope)
+        .await
         .map_err(|err| anyhow!("welcome-flow first-contact probe failed: {err}"))?;
     if snapshot.is_some() {
         return Ok(());
@@ -824,7 +1118,7 @@ fn apply_welcome_flow_override(
 /// welcome once — bounded harm, mitigated by the wait-snapshot safety net
 /// in [`apply_welcome_flow_override`]. A real atomic primitive
 /// (`register_wait_if_absent`) is Phase D.
-fn try_mark_welcome_first_contact(
+async fn try_mark_welcome_first_contact(
     store: &DynSessionStore,
     envelope: &IngressEnvelope,
 ) -> Result<bool> {
@@ -834,20 +1128,29 @@ fn try_mark_welcome_first_contact(
     let (ctx, user) = FlowResumeStore::contact_identity(envelope)
         .map_err(|e| anyhow!("welcome marker identity probe failed: {e}"))?;
 
-    if store
-        .find_wait_by_scope(&ctx, &user, &scope)
-        .map_err(|e| anyhow!("welcome marker probe failed: {e}"))?
-        .is_some()
-    {
-        return Ok(false);
-    }
+    // One offload, not two: check and mark are already documented as a
+    // non-atomic pair, and splitting them across two blocking hops would widen
+    // the race window for nothing.
+    let store = Arc::clone(store);
+    let marked = tokio::task::spawn_blocking(move || -> Result<bool> {
+        if store
+            .find_wait_by_scope(&ctx, &user, &scope)
+            .map_err(|e| anyhow!("welcome marker probe failed: {e}"))?
+            .is_some()
+        {
+            return Ok(false);
+        }
 
-    let data = marker_session_data(&ctx, &user);
-    let session_key = marker_session_key(&ctx, &user, &scope);
-    store
-        .register_wait(&ctx, &user, &scope, &session_key, data, None)
-        .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
-    Ok(true)
+        let data = marker_session_data(&ctx, &user);
+        let session_key = marker_session_key(&ctx, &user, &scope);
+        store
+            .register_wait(&ctx, &user, &scope, &session_key, data, None)
+            .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
+        Ok(true)
+    })
+    .await
+    .map_err(|err| anyhow!("welcome marker probe panicked or was cancelled: {err}"))??;
+    Ok(marked)
 }
 
 /// Stable, identity-scoped session key for the welcome marker.
@@ -1141,6 +1444,7 @@ mod welcome_flow_tests {
             channel: Some("chan".into()),
             conversation: Some(format!("conv-{user}")),
             user: Some(user.to_string()),
+            entry_node: None,
             activity_id: None,
             timestamp: None,
             payload: json!({}),
@@ -1162,7 +1466,7 @@ mod welcome_flow_tests {
         }
     }
 
-    fn seed_resume(store: &DynSessionStore, envelope: &IngressEnvelope) {
+    async fn seed_resume(store: &DynSessionStore, envelope: &IngressEnvelope) {
         // Plant a snapshot in the exact bucket `fetch` would query so the
         // next call resolves to a resume — proves the override skips when a
         // session already exists.
@@ -1180,40 +1484,44 @@ mod welcome_flow_tests {
                 flow_id: envelope.flow_id.clone(),
                 next_flow: None,
                 next_node: "node-2".into(),
+                awaiting_submit: false,
                 state,
             },
         };
-        resume.save(envelope, &wait).expect("seed save");
+        resume.save(envelope, &wait).await.expect("seed save");
     }
 
-    #[test]
-    fn override_is_no_op_when_hint_absent() {
+    #[tokio::test]
+    async fn override_is_no_op_when_hint_absent() {
         // Pre-M1.5 producers don't attach a hint — flow resolution must
         // stay exactly the same.
         let store = new_session_store();
         let mut envelope = sample_envelope(Some("teams-legal"));
         let before = envelope.clone();
-        apply_welcome_flow_override(&store, &mut envelope, None, None).expect("ok");
+        apply_welcome_flow_override(&store, &mut envelope, None, None)
+            .await
+            .expect("ok");
         assert_eq!(envelope.pack_id, before.pack_id);
         assert_eq!(envelope.flow_id, before.flow_id);
         assert_eq!(envelope.flow_type, before.flow_type);
     }
 
-    #[test]
-    fn override_is_no_op_when_endpoint_id_absent() {
+    #[tokio::test]
+    async fn override_is_no_op_when_endpoint_id_absent() {
         // Non-messaging traffic carries no endpoint id and must never hit
         // the welcome-flow path even if the hint is somehow set.
         let store = new_session_store();
         let mut envelope = sample_envelope(None);
         let before = envelope.clone();
         apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("ok");
         assert_eq!(envelope.pack_id, before.pack_id);
         assert_eq!(envelope.flow_id, before.flow_id);
     }
 
-    #[test]
-    fn override_swaps_pack_flow_and_threads_flow_type_through() {
+    #[tokio::test]
+    async fn override_swaps_pack_flow_and_threads_flow_type_through() {
         // Both axes covered: when the caller pre-resolved the welcome
         // flow's type, it lands on the envelope; when the resolver
         // returned None (unknown flow in engine), it lands as None and
@@ -1227,6 +1535,7 @@ mod welcome_flow_tests {
                 Some(&hint()),
                 hint_flow_type.clone(),
             )
+            .await
             .expect("ok");
             assert_eq!(envelope.pack_id.as_deref(), Some("pack.welcome"));
             assert_eq!(envelope.flow_id, "flow.welcome");
@@ -1234,25 +1543,26 @@ mod welcome_flow_tests {
         }
     }
 
-    #[test]
-    fn override_is_no_op_on_repeat_turn_with_existing_session() {
+    #[tokio::test]
+    async fn override_is_no_op_on_repeat_turn_with_existing_session() {
         // Resume path: an already-active session in the same bucket means
         // this isn't first contact. The user must continue on the resumed
         // flow, NOT be redirected to the welcome flow.
         let store = new_session_store();
         let envelope_template = sample_envelope(Some("teams-legal"));
-        seed_resume(&store, &envelope_template);
+        seed_resume(&store, &envelope_template).await;
 
         let mut envelope = envelope_template.clone();
         apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("ok");
         assert_eq!(envelope.pack_id, envelope_template.pack_id);
         assert_eq!(envelope.flow_id, envelope_template.flow_id);
         assert_eq!(envelope.flow_type, envelope_template.flow_type);
     }
 
-    #[test]
-    fn override_is_no_op_post_completion_when_marker_present() {
+    #[tokio::test]
+    async fn override_is_no_op_post_completion_when_marker_present() {
         // POST-COMPLETION REGRESSION GUARD (Codex #201): the welcome-seen
         // marker is durable and survives flow completion. After welcome
         // fires once + the flow finishes (wait cleared), the next turn
@@ -1261,6 +1571,7 @@ mod welcome_flow_tests {
         let store = new_session_store();
         let mut first = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut first, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("first turn ok");
         assert_eq!(
             first.pack_id.as_deref(),
@@ -1273,13 +1584,17 @@ mod welcome_flow_tests {
         // marker must NOT be in the wait scope, so this clear has no
         // effect on the marker.
         let resume = FlowResumeStore::new(Arc::clone(&store));
-        resume.clear(&first).expect("clear post-completion wait");
+        resume
+            .clear(&first)
+            .await
+            .expect("clear post-completion wait");
 
         // Second turn arrives — producer still attaches the hint (it
         // does not know flow-completion happened). The marker keeps the
         // override off.
         let mut second = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut second, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("second turn ok");
         assert_eq!(
             second.pack_id.as_deref(),
@@ -1289,19 +1604,21 @@ mod welcome_flow_tests {
         assert_eq!(second.flow_id, "flow.default");
     }
 
-    #[test]
-    fn override_is_no_op_on_second_turn_after_marker_set() {
+    #[tokio::test]
+    async fn override_is_no_op_on_second_turn_after_marker_set() {
         // No-wait variant of the post-completion test: a welcome flow
         // without `session.wait` leaves no snapshot AT ALL. Marker is the
         // only thing standing between turn 2 and a welcome re-fire.
         let store = new_session_store();
         let mut first = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut first, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("first turn ok");
         assert_eq!(first.pack_id.as_deref(), Some("pack.welcome"));
 
         let mut second = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut second, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("second turn ok");
         assert_eq!(
             second.pack_id.as_deref(),
@@ -1310,8 +1627,8 @@ mod welcome_flow_tests {
         );
     }
 
-    #[test]
-    fn override_partitions_marker_per_endpoint() {
+    #[tokio::test]
+    async fn override_partitions_marker_per_endpoint() {
         // The marker is keyed by `(tenant, env, eid, user)` — a user
         // marked seen on `teams-legal` is still first contact on
         // `teams-accounting`. Welcome must fire independently on each
@@ -1319,6 +1636,7 @@ mod welcome_flow_tests {
         let store = new_session_store();
         let mut legal = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut legal, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("legal first turn ok");
         assert_eq!(legal.pack_id.as_deref(), Some("pack.welcome"));
 
@@ -1329,6 +1647,7 @@ mod welcome_flow_tests {
             Some(&hint()),
             Some("welcome".into()),
         )
+        .await
         .expect("accounting first turn ok");
         assert_eq!(
             accounting.pack_id.as_deref(),
@@ -1337,8 +1656,8 @@ mod welcome_flow_tests {
         );
     }
 
-    #[test]
-    fn override_partitions_marker_per_user_on_same_endpoint() {
+    #[tokio::test]
+    async fn override_partitions_marker_per_user_on_same_endpoint() {
         // Codex adversarial review of #382 (high): a session-key derived
         // only from the eid collapses every user on that endpoint onto one
         // store row — in-memory rejects User B's first turn with a hard
@@ -1353,12 +1672,14 @@ mod welcome_flow_tests {
         // User A's first turn
         let mut a1 = sample_envelope_for_user(Some("teams-legal"), "user-a");
         apply_welcome_flow_override(&store, &mut a1, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("user-a first ok");
         assert_eq!(a1.pack_id.as_deref(), Some("pack.welcome"));
 
         // User B's first turn — must independently fire welcome, NOT error.
         let mut b1 = sample_envelope_for_user(Some("teams-legal"), "user-b");
         apply_welcome_flow_override(&store, &mut b1, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("user-b first must not collide with user-a marker");
         assert_eq!(
             b1.pack_id.as_deref(),
@@ -1369,6 +1690,7 @@ mod welcome_flow_tests {
         // User A's second turn — marker still intact, no re-fire.
         let mut a2 = sample_envelope_for_user(Some("teams-legal"), "user-a");
         apply_welcome_flow_override(&store, &mut a2, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("user-a second ok");
         assert_eq!(
             a2.pack_id.as_deref(),
@@ -1379,12 +1701,13 @@ mod welcome_flow_tests {
         // User B's second turn — same.
         let mut b2 = sample_envelope_for_user(Some("teams-legal"), "user-b");
         apply_welcome_flow_override(&store, &mut b2, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("user-b second ok");
         assert_eq!(b2.pack_id.as_deref(), Some("pack.default"));
     }
 
-    #[test]
-    fn marker_is_not_written_when_hint_absent() {
+    #[tokio::test]
+    async fn marker_is_not_written_when_hint_absent() {
         // Marker writes are gated on the hint+eid preconditions — a
         // pre-M1.5 turn (no hint) MUST NOT leak a marker, otherwise a
         // producer that later enables welcome would treat that user as
@@ -1395,10 +1718,13 @@ mod welcome_flow_tests {
         // This test only guards the no-hint gate.
         let store = new_session_store();
         let mut envelope = sample_envelope(Some("teams-legal"));
-        apply_welcome_flow_override(&store, &mut envelope, None, None).expect("ok");
+        apply_welcome_flow_override(&store, &mut envelope, None, None)
+            .await
+            .expect("ok");
 
         let mut next = sample_envelope(Some("teams-legal"));
         apply_welcome_flow_override(&store, &mut next, Some(&hint()), Some("welcome".into()))
+            .await
             .expect("ok");
         assert_eq!(
             next.pack_id.as_deref(),
@@ -1411,11 +1737,18 @@ mod welcome_flow_tests {
 #[cfg(test)]
 mod identify_endpoints_tests {
     use super::*;
+    use crate::storage::{new_session_store, new_state_store};
 
     fn dummy_runner_host() -> RunnerHost {
         let session_store = new_session_store();
         let state_store = new_state_store();
         RunnerHost {
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: Arc::new(dashmap::DashMap::new()),
             configs: HashMap::new(),
             active: Arc::new(ActivePacks::new()),
             health: Arc::new(HealthState::new()),

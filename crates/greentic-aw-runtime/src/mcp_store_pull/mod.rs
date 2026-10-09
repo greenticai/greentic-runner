@@ -34,10 +34,14 @@
 //! keys, exponent-form numbers).
 
 use base64::Engine as _;
+use chrono::Utc;
 use ed25519_dalek::{Signature, VerifyingKey};
+use greentic_trust::DidWeb;
 use sha2::{Digest, Sha256};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::mcp_local::cache_dir;
 
@@ -49,6 +53,10 @@ pub(crate) const TRUSTED_SIGNERS_ENV: &str = "GREENTIC_MCP_TRUSTED_SIGNERS";
 pub(crate) const STORE_URL_ENV: &str = "GREENTIC_STORE_URL";
 /// Optional `gts_` service token sent as a bearer credential.
 pub(crate) const STORE_TOKEN_ENV: &str = "GREENTIC_STORE_TOKEN";
+/// did:web DID whose published root anchors publisher-certificate verification.
+/// When set, the store-pull path verifies the embedded `signature.certificate`
+/// (cert -> root -> binding -> signature) instead of the flat allowlist.
+pub(crate) const TRUST_DID_ENV: &str = "GREENTIC_RUNNER_TRUST_DID";
 
 /// The ZIP entry names this loader looks for inside the `.gtxpack`.
 const DESCRIBE_ENTRY: &str = "describe.json";
@@ -150,8 +158,9 @@ pub async fn ensure_cached(
     // 3. Unzip into the describe document + the bare wasm bytes.
     let (describe, wasm) = unzip_describe_and_wasm(&archive_bytes)?;
 
-    // 4. Authenticity: Ed25519 over the describe-minus-signature.
-    verify_describe_signature(&describe, &trusted_signers())?;
+    // 4. Authenticity: embedded publisher cert -> did:web root when a trusted
+    //    DID is configured; otherwise the flat allowlist.
+    verify_authenticity(&describe).await?;
 
     // 5. Atomically install. The write ORDER is load-bearing for crash- and
     //    concurrency-safety:
@@ -295,6 +304,82 @@ pub fn trusted_signers() -> Vec<VerifyingKey> {
     raw.split(',')
         .filter_map(|entry| parse_trusted_signer(entry.trim()))
         .collect()
+}
+
+/// The configured trusted DID, or `None` when unset or empty. An empty value
+/// is treated as unset so a blank deployment override does not half-enable the
+/// cert path. The returned DID is trimmed so a file-sourced trailing newline
+/// (e.g. from a mounted secret) never reaches [`DidWeb::parse`].
+pub(crate) fn trust_did() -> Option<String> {
+    match std::env::var(TRUST_DID_ENV) {
+        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Fold a `greentic_trust::TrustError` into the store-pull authenticity error,
+/// preserving the specific reason (cert-missing, foreign-root, expired,
+/// key-mismatch, bad-signature, unreachable DID) in the message.
+pub(crate) fn map_trust_error(err: greentic_trust::TrustError) -> StorePullError {
+    StorePullError::Signature(format!("did:web trust verification failed: {err}"))
+}
+
+/// TTL and capacity for the shared did:web resolver cache.
+const RESOLVER_TTL: Duration = Duration::from_secs(300);
+const RESOLVER_CAPACITY: u64 = 16;
+
+/// Process-shared https-only resolver, so its TTL cache is reused across pulls
+/// rather than rebuilt per artifact. Built lazily the first time a DID is set.
+fn shared_resolver() -> Result<&'static greentic_trust::HttpResolver, StorePullError> {
+    static RESOLVER: OnceLock<greentic_trust::HttpResolver> = OnceLock::new();
+    if let Some(resolver) = RESOLVER.get() {
+        return Ok(resolver);
+    }
+    let built = greentic_trust::HttpResolver::new(RESOLVER_TTL, RESOLVER_CAPACITY)
+        .map_err(|e| StorePullError::Config(format!("failed to build trust resolver: {e}")))?;
+    // If another thread initialised first, `set` returns the value back; either
+    // way `get` is populated afterwards.
+    let _ = RESOLVER.set(built);
+    RESOLVER
+        .get()
+        .ok_or_else(|| StorePullError::Config("trust resolver unavailable after init".into()))
+}
+
+/// Verify a describe against a configured trusted DID: the embedded
+/// `signature.certificate` must chain to the DID's published root, vouch for
+/// the signing key, and cover a valid describe signature. The whole check is
+/// `greentic_trust::verify_describe` (S1); the runner only wires it.
+pub(crate) async fn verify_certified(
+    describe: &serde_json::Value,
+    did: &str,
+    resolver: &greentic_trust::HttpResolver,
+) -> Result<(), StorePullError> {
+    let did = DidWeb::parse(did)
+        .map_err(|e| StorePullError::Config(format!("invalid {TRUST_DID_ENV}: {e}")))?;
+    greentic_trust::verify_describe(describe, &did, resolver, Utc::now())
+        .await
+        .map(|_key| ())
+        .map_err(map_trust_error)
+}
+
+/// Authenticity gate: with a trusted DID configured, verify the embedded
+/// publisher certificate; without one, fall back to the flat allowlist exactly
+/// as before.
+async fn verify_authenticity(describe: &serde_json::Value) -> Result<(), StorePullError> {
+    match trust_did() {
+        Some(did) => verify_certified(describe, &did, shared_resolver()?).await,
+        None => verify_describe_signature(describe, &trusted_signers()),
+    }
+}
+
+/// Test-only seam onto [`verify_authenticity`], exposed so integration tests
+/// (which live in a sibling `tests` module) can drive the real DID/allowlist
+/// routing without making the gate itself `pub`.
+#[cfg(test)]
+pub(crate) async fn verify_authenticity_for_test(
+    describe: &serde_json::Value,
+) -> Result<(), StorePullError> {
+    verify_authenticity(describe).await
 }
 
 /// Parse a single `ed25519:<base64>` (or bare `<base64>`) allowlist entry into

@@ -3,8 +3,9 @@ use std::pin::Pin;
 
 use greentic_ext_runtime::capability::CapabilityRegistry;
 use greentic_extension_sdk_contract::{CapabilityId, CapabilityRef as ExtCapabilityRef};
+use serde::Serialize;
 
-use crate::config::GuardrailRef;
+use crate::config::{GuardrailMode, GuardrailRef};
 use crate::tenant::TenantContext;
 
 /// Failure obtaining the mandatory guardrail policy. Treated as fail-closed by
@@ -67,6 +68,7 @@ pub struct ResolvedGuardrail {
     pub extension_id: String,
     pub cap_id: String,
     pub mandatory: bool,
+    pub mode: GuardrailMode,
     pub config: serde_json::Value,
 }
 
@@ -230,6 +232,7 @@ fn resolve_one(
             extension_id: binding.extension_id.clone(),
             cap_id: guardrail_ref.cap_id.clone(),
             mandatory: is_mandatory,
+            mode: guardrail_ref.mode,
             config: guardrail_ref.config.clone(),
         }),
         None => {
@@ -290,13 +293,39 @@ pub struct GuardrailRunCtx {
     pub env_id: String,
 }
 
+/// What the runner did about an explicit `deny` verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardrailAction {
+    /// Enforce mode: the turn was blocked.
+    Blocked,
+    /// Monitor mode: recorded only; the content passed through.
+    Monitored,
+}
+
+/// A single guardrail denial, recorded whether or not it blocked. This is the
+/// payload the host turns into a best-effort violation event; `run_chain`
+/// itself neither knows the tenant nor owns a sink.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuardrailObservation {
+    pub cap_id: String,
+    pub extension_id: String,
+    pub direction: GuardrailDirection,
+    pub code: String,
+    pub action: GuardrailAction,
+}
+
 /// Outcome of running a guardrail chain over content.
 #[derive(Clone, Debug)]
 pub enum ChainOutcome {
-    Pass(String),
+    Pass {
+        content: String,
+        observations: Vec<GuardrailObservation>,
+    },
     Denied {
         info: GuardrailDenyInfo,
         direction: GuardrailDirection,
+        observation: GuardrailObservation,
     },
 }
 
@@ -307,7 +336,7 @@ pub enum ChainOutcome {
 /// - Each guardrail in the chain is evaluated in order against the current content.
 /// - If a guardrail returns `Update(new_content)`, the new content is threaded forward to the next guardrail.
 /// - If a guardrail returns `Accept`, execution continues with the content unchanged.
-/// - If a guardrail returns `Deny(info)`, execution stops and `ChainOutcome::Denied` is returned immediately (short-circuit).
+/// - If a guardrail returns `Deny(info)` in Enforce mode, execution stops and `ChainOutcome::Denied` is returned immediately (short-circuit). In Monitor mode, the denial is recorded as a `GuardrailObservation` instead, and execution continues with the content UNCHANGED.
 /// - If a guardrail's evaluator returns an error:
 ///   - For **mandatory** guardrails: fails closed — returns `ChainOutcome::Denied` with code "internal".
 ///   - For **agent-level** guardrails: fails open — logs a warning and continues with content unchanged.
@@ -322,8 +351,11 @@ pub enum ChainOutcome {
 ///
 /// # Returns
 ///
-/// - `ChainOutcome::Pass(final_content)` if all guardrails accept the content (possibly modified)
-/// - `ChainOutcome::Denied { info, direction }` if any guardrail denies or a mandatory guardrail fails
+/// - `ChainOutcome::Pass { content, observations }` if all guardrails accept the
+///   content (possibly modified); `observations` carries any Monitor-mode denials
+///   recorded along the way.
+/// - `ChainOutcome::Denied { info, direction, observation }` if an Enforce-mode
+///   guardrail denies, or a mandatory guardrail's evaluator errors.
 pub fn run_chain(
     chain: &[ResolvedGuardrail],
     direction: GuardrailDirection,
@@ -332,6 +364,7 @@ pub fn run_chain(
     evaluator: &dyn GuardrailEvaluator,
 ) -> ChainOutcome {
     let mut content = content;
+    let mut observations = Vec::new();
     for g in chain {
         let context = if g.config.is_null() {
             None
@@ -350,26 +383,67 @@ pub fn run_chain(
         match evaluator.evaluate(&g.extension_id, &input) {
             Ok(GuardrailVerdict::Accept) => {}
             Ok(GuardrailVerdict::Update(new_content)) => content = new_content,
-            Ok(GuardrailVerdict::Deny(info)) => {
-                return ChainOutcome::Denied { info, direction };
-            }
+            Ok(GuardrailVerdict::Deny(info)) => match g.mode {
+                GuardrailMode::Enforce => {
+                    let observation = GuardrailObservation {
+                        cap_id: g.cap_id.clone(),
+                        extension_id: g.extension_id.clone(),
+                        direction,
+                        code: info.code.clone(),
+                        action: GuardrailAction::Blocked,
+                    };
+                    return ChainOutcome::Denied {
+                        info,
+                        direction,
+                        observation,
+                    };
+                }
+                GuardrailMode::Monitor => {
+                    // Monitor: record and keep going with the content UNCHANGED.
+                    tracing::info!(
+                        extension_id = %g.extension_id,
+                        cap_id = %g.cap_id,
+                        code = %info.code,
+                        "guardrail denied in monitor mode; not blocking"
+                    );
+                    observations.push(GuardrailObservation {
+                        cap_id: g.cap_id.clone(),
+                        extension_id: g.extension_id.clone(),
+                        direction,
+                        code: info.code,
+                        action: GuardrailAction::Monitored,
+                    });
+                }
+            },
             Err(e) => {
                 if g.mandatory {
                     tracing::error!(extension_id = %g.extension_id, error = %e.0, "mandatory guardrail failed; failing closed");
-                    return ChainOutcome::Denied {
-                        info: GuardrailDenyInfo {
-                            code: "internal".into(),
-                            message: "A required guardrail is unavailable.".into(),
-                            details: None,
-                        },
+                    let info = GuardrailDenyInfo {
+                        code: "internal".into(),
+                        message: "A required guardrail is unavailable.".into(),
+                        details: None,
+                    };
+                    let observation = GuardrailObservation {
+                        cap_id: g.cap_id.clone(),
+                        extension_id: g.extension_id.clone(),
                         direction,
+                        code: info.code.clone(),
+                        action: GuardrailAction::Blocked,
+                    };
+                    return ChainOutcome::Denied {
+                        info,
+                        direction,
+                        observation,
                     };
                 }
                 tracing::warn!(extension_id = %g.extension_id, error = %e.0, "optional guardrail failed; failing open");
             }
         }
     }
-    ChainOutcome::Pass(content)
+    ChainOutcome::Pass {
+        content,
+        observations,
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +470,7 @@ mod tests {
             cap_id: "greentic:guardrail/pii".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let policy = StaticGuardrailPolicy(refs.clone());
         assert_eq!(policy.mandatory_guardrails(&t).await.unwrap(), refs);
@@ -429,11 +504,13 @@ mod tests {
             cap_id: "greentic:guardrail/toxicity".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let agent = vec![GuardrailRef {
             cap_id: "greentic:guardrail/pii".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
 
         let chain = assemble_chain(&registry, &mandatory, &agent).expect("all refs are registered");
@@ -453,6 +530,7 @@ mod tests {
             cap_id: "greentic:guardrail/missing".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         // Agent-level unresolved refs are skipped (fail-open); result must be Ok with empty chain.
         let chain =
@@ -470,6 +548,7 @@ mod tests {
             cap_id: "greentic:guardrail/missing-mandatory".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let result = assemble_chain(&registry, &mandatory, &[]);
         assert!(
@@ -497,11 +576,13 @@ mod tests {
             cap_id: "greentic:guardrail/pii".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let agent = vec![GuardrailRef {
             cap_id: "greentic:guardrail/not-registered".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let chain = assemble_chain(&registry, &mandatory, &agent)
             .expect("unresolved agent-level ref must not fail the chain");
@@ -545,6 +626,7 @@ mod tests {
             extension_id: ext.into(),
             cap_id: "greentic.cap.guardrail.v1".into(),
             mandatory,
+            mode: GuardrailMode::Enforce,
             config: serde_json::Value::Null,
         }
     }
@@ -564,7 +646,7 @@ mod tests {
             &eval,
         );
         match out {
-            ChainOutcome::Pass(c) => assert_eq!(c, "masked"),
+            ChainOutcome::Pass { content, .. } => assert_eq!(content, "masked"),
             _ => panic!("expected pass"),
         }
     }
@@ -595,9 +677,14 @@ mod tests {
             &eval,
         );
         match out {
-            ChainOutcome::Denied { info, direction } => {
+            ChainOutcome::Denied {
+                info,
+                direction,
+                observation,
+            } => {
                 assert_eq!(info.code, "permission_denied");
                 assert_eq!(direction, GuardrailDirection::Outbound);
+                assert_eq!(observation.action, GuardrailAction::Blocked);
             }
             _ => panic!("expected denied"),
         }
@@ -617,9 +704,14 @@ mod tests {
             &eval,
         );
         match out {
-            ChainOutcome::Denied { info, direction } => {
+            ChainOutcome::Denied {
+                info,
+                direction,
+                observation,
+            } => {
                 assert_eq!(info.code, "internal");
                 assert_eq!(direction, GuardrailDirection::Inbound);
+                assert_eq!(observation.action, GuardrailAction::Blocked);
             }
             _ => panic!("expected denied"),
         }
@@ -639,8 +731,154 @@ mod tests {
             &eval,
         );
         match out {
-            ChainOutcome::Pass(c) => assert_eq!(c, "raw"),
+            ChainOutcome::Pass { content, .. } => assert_eq!(content, "raw"),
             _ => panic!("expected pass (fail-open)"),
+        }
+    }
+
+    fn resolved(ext: &str, cap_id: &str, mode: GuardrailMode) -> ResolvedGuardrail {
+        ResolvedGuardrail {
+            extension_id: ext.into(),
+            cap_id: cap_id.into(),
+            mandatory: false,
+            mode,
+            config: serde_json::Value::Null,
+        }
+    }
+
+    fn deny_info(code: &str) -> GuardrailDenyInfo {
+        GuardrailDenyInfo {
+            code: code.into(),
+            message: format!("blocked {code}"),
+            details: None,
+        }
+    }
+
+    #[test]
+    fn monitor_mode_does_not_block_and_records_an_observation() {
+        // A denying guardrail in Monitor mode must pass the ORIGINAL content
+        // through untouched and surface exactly one Monitored observation.
+        let chain = vec![resolved(
+            "ext-pii",
+            "greentic:guardrail/pii",
+            GuardrailMode::Monitor,
+        )];
+        let mut script = std::collections::HashMap::new();
+        script.insert(
+            "ext-pii".into(),
+            Ok(GuardrailVerdict::Deny(deny_info("pii"))),
+        );
+        let eval = ScriptedEvaluator { script };
+        match run_chain(
+            &chain,
+            GuardrailDirection::Inbound,
+            "hello".into(),
+            &ctx(),
+            &eval,
+        ) {
+            ChainOutcome::Pass {
+                content,
+                observations,
+            } => {
+                assert_eq!(content, "hello");
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].action, GuardrailAction::Monitored);
+                assert_eq!(observations[0].cap_id, "greentic:guardrail/pii");
+                assert_eq!(observations[0].code, "pii");
+            }
+            other => panic!("monitor mode must not block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_mode_still_blocks_and_reports_a_blocked_observation() {
+        let chain = vec![resolved(
+            "ext-pii",
+            "greentic:guardrail/pii",
+            GuardrailMode::Enforce,
+        )];
+        let mut script = std::collections::HashMap::new();
+        script.insert(
+            "ext-pii".into(),
+            Ok(GuardrailVerdict::Deny(deny_info("pii"))),
+        );
+        let eval = ScriptedEvaluator { script };
+        match run_chain(
+            &chain,
+            GuardrailDirection::Inbound,
+            "hello".into(),
+            &ctx(),
+            &eval,
+        ) {
+            ChainOutcome::Denied {
+                info, observation, ..
+            } => {
+                assert_eq!(info.code, "pii");
+                assert_eq!(observation.action, GuardrailAction::Blocked);
+            }
+            other => panic!("enforce mode must block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn monitor_mode_does_not_stop_the_chain() {
+        // A Monitor deny must not short-circuit: a later guardrail still runs
+        // and can still Update the content.
+        let chain = vec![
+            resolved("ext-a", "greentic:guardrail/pii", GuardrailMode::Monitor),
+            resolved("ext-b", "greentic:guardrail/topic", GuardrailMode::Enforce),
+        ];
+        let mut script = std::collections::HashMap::new();
+        script.insert("ext-a".into(), Ok(GuardrailVerdict::Deny(deny_info("pii"))));
+        script.insert(
+            "ext-b".into(),
+            Ok(GuardrailVerdict::Update("rewritten".into())),
+        );
+        let eval = ScriptedEvaluator { script };
+        match run_chain(
+            &chain,
+            GuardrailDirection::Inbound,
+            "hello".into(),
+            &ctx(),
+            &eval,
+        ) {
+            ChainOutcome::Pass {
+                content,
+                observations,
+            } => {
+                assert_eq!(
+                    content, "rewritten",
+                    "the chain must continue past a monitored deny"
+                );
+                assert_eq!(observations.len(), 1);
+            }
+            other => panic!("expected pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mandatory_evaluator_error_still_fails_closed_regardless_of_monitor_mode() {
+        // `mandatory` is orthogonal to `mode`: an evaluator ERROR on a mandatory
+        // guardrail must still fail closed even when the mode is Monitor.
+        let chain = vec![ResolvedGuardrail {
+            extension_id: "ext-pii".into(),
+            cap_id: "greentic:guardrail/pii".into(),
+            mandatory: true,
+            mode: GuardrailMode::Monitor,
+            config: serde_json::Value::Null,
+        }];
+        let mut script = std::collections::HashMap::new();
+        script.insert("ext-pii".into(), Err(()));
+        let eval = ScriptedEvaluator { script };
+        match run_chain(
+            &chain,
+            GuardrailDirection::Inbound,
+            "hello".into(),
+            &ctx(),
+            &eval,
+        ) {
+            ChainOutcome::Denied { info, .. } => assert_eq!(info.code, "internal"),
+            other => panic!("mandatory error must fail closed, got {other:?}"),
         }
     }
 }

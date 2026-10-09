@@ -34,8 +34,9 @@ use greentic_interfaces_wasmtime::host_helpers::v1::{
     runtime_config::{ConfigError, RuntimeConfigHost},
     secrets_store::{SecretsError, SecretsErrorV1_1, SecretsStoreHost, SecretsStoreHostV1_1},
     state_store::{
-        OpAck as StateOpAck, StateKey as HostStateKey, StateStoreError as StateError,
-        StateStoreHost, TenantCtx as StateTenantCtx,
+        OpAck as StateOpAck, OpAckV1_1 as StateOpAckV1_1, StateKey as HostStateKey,
+        StateStoreError as StateError, StateStoreErrorV1_1 as StateErrorV1_1, StateStoreHost,
+        StateStoreHostV1_1, TenantCtx as StateTenantCtx, TenantCtxV1_1 as StateTenantCtxV1_1,
     },
     telemetry_logger::{
         OpAck as TelemetryAck, SpanContext as TelemetrySpanContext,
@@ -83,11 +84,11 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::p2::LinkOptions;
+use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker};
 use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
-use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
+use crate::runner::engine::{FlowContext, FlowEngine, FlowExecution, FlowSnapshot, FlowStatus};
 use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow, is_native_op_key};
 use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, MockLayer};
 #[cfg(feature = "fault-injection")]
@@ -96,7 +97,8 @@ use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
 use crate::config::HostConfig;
 use crate::fault;
 use crate::secrets::{
-    DynSecretsManager, canonicalize_secret_key, read_secret_blocking, write_secret_blocking,
+    DynSecretsManager, canonicalize_secret_key, read_pack_secret_blocking,
+    write_pack_secret_blocking,
 };
 use crate::storage::state::STATE_PREFIX;
 use crate::storage::{DynSessionStore, DynStateStore};
@@ -153,6 +155,38 @@ pub struct PackRuntime {
     ///
     /// [`RuntimeRefResolver`]: crate::runtime_refs::RuntimeRefResolver
     runtime_refs: Option<RuntimeRefsInjection>,
+    /// Lazily-parsed `assets/mcp-routes.json` sidecar — see
+    /// [`PackRuntime::mcp_routes`]. Read on first use rather than at load so a
+    /// pack with no MCP nodes never touches the archive for it.
+    mcp_routes: std::sync::OnceLock<Option<crate::runner::mcp_pack_routes::PackMcpRoutes>>,
+    /// Lazily-parsed `assets/a2a-routes.json` sidecar — see
+    /// [`PackRuntime::a2a_routes`]. Twin of `mcp_routes`, read on first use.
+    a2a_routes: std::sync::OnceLock<Option<crate::runner::a2a_pack_routes::PackA2aRoutes>>,
+    /// Lazily-parsed `assets/run-context.json` sidecar — see
+    /// [`PackRuntime::run_context`]. Twin of `a2a_routes`, read on first use.
+    run_context: std::sync::OnceLock<Option<crate::runner::run_context_routes::PackRunContext>>,
+    /// Lazily-parsed `assets/user-ledger.json` sidecar — see
+    /// [`PackRuntime::user_ledger`].
+    user_ledger: std::sync::OnceLock<Option<crate::runner::user_ledger_routes::PackUserLedger>>,
+    /// Handlers a `flow:` tool's per-call engine borrows from the host that
+    /// wired the top-level engine — see [`crate::runner::nested_flow`].
+    /// Write-once; empty means "nested engines get no handler" (the
+    /// pre-existing behaviour).
+    nested_flow_handlers: std::sync::OnceLock<crate::runner::nested_flow::NestedFlowHandlers>,
+    /// Lazily-parsed `assets/sorla-routes.json` sidecar — see
+    /// [`PackRuntime::sorla_routes`]. Twin of `mcp_routes`, read on first use.
+    sorla_routes: std::sync::OnceLock<Option<crate::runner::sorla_pack_routes::PackSorlaRoutes>>,
+    /// The deployed unit this pack instance belongs to — the revision's
+    /// `bundle_id`, set by [`TenantRuntime::load_revision`] through
+    /// [`set_unit_id`](Self::set_unit_id).
+    ///
+    /// It scopes every extension credential this pack's components read, so two
+    /// units of the SAME pack in one environment can hold different values.
+    /// `None` on the legacy tenant-only path and in `for_component_test`, which
+    /// then resolve the bare pack scope exactly as before.
+    ///
+    /// [`TenantRuntime::load_revision`]: crate::runtime::TenantRuntime::load_revision
+    unit_id: Option<String>,
 }
 
 struct PackComponent {
@@ -327,6 +361,36 @@ pub struct FlowDescriptor {
     pub entry: bool,
 }
 
+/// What an interactive agent-tool flow run produced
+/// ([`PackRuntime::run_flow_for_tool_interactive`] /
+/// [`PackRuntime::resume_flow_for_tool`]).
+#[derive(Clone, Debug)]
+pub enum ToolFlowOutcome {
+    /// The flow ran to its end; the value is its output.
+    Completed(Value),
+    /// The flow parked awaiting the user. `snapshot` is the serialized
+    /// [`FlowSnapshot`] to resume from; `presentation` is the flow's output at
+    /// the park point (the finalized card, or every message emitted so far).
+    Waiting {
+        snapshot: Value,
+        presentation: Value,
+    },
+}
+
+fn tool_flow_outcome(flow_id: &str, execution: FlowExecution) -> Result<ToolFlowOutcome, String> {
+    match execution.status {
+        FlowStatus::Completed => Ok(ToolFlowOutcome::Completed(execution.output)),
+        FlowStatus::Waiting(wait) => {
+            let snapshot = serde_json::to_value(&wait.snapshot)
+                .map_err(|e| format!("flow '{flow_id}': cannot serialize its park point: {e}"))?;
+            Ok(ToolFlowOutcome::Waiting {
+                snapshot,
+                presentation: execution.output,
+            })
+        }
+    }
+}
+
 pub struct HostState {
     #[allow(dead_code)]
     pack_id: String,
@@ -352,6 +416,11 @@ pub struct HostState {
     /// bindings plus the env-shared resolver. The host import resolves the
     /// URI on every call so the value tracks `runtime.json` hot-reloads.
     runtime_refs: Option<RuntimeRefsInjection>,
+    /// The deployed unit whose copy of this pack's secrets the component reads
+    /// and writes — see [`PackRuntime::unit_id`] and
+    /// [`with_unit`](Self::with_unit). `None` means "no unit known", which
+    /// resolves the bare pack scope exactly as before.
+    unit_id: Option<String>,
 }
 
 impl HostState {
@@ -387,14 +456,66 @@ impl HostState {
             provider_core_component,
             runtime_config_non_secret,
             runtime_refs,
+            unit_id: None,
         })
     }
 
+    /// Bind this host state to a deployed unit, so its pack-secret reads try
+    /// that unit's own address before the shared one and its writes land there
+    /// only.
+    ///
+    /// A separate builder rather than a 14th argument to [`new`](Self::new):
+    /// `new` is public and already carries thirteen, and `None` — "no unit
+    /// known" — is a legitimate state (the legacy tenant-only runtime, the
+    /// process-level serve path), not an oversight. Every caller in
+    /// [`PackRuntime`] threads its own `unit_id` through here.
+    #[must_use]
+    pub fn with_unit(mut self, unit_id: Option<String>) -> Self {
+        self.unit_id = unit_id;
+        self
+    }
+
+    /// Read one of this pack's secrets at the unit scope, falling back to the
+    /// shared pack scope. THE single read path for every `SecretsStoreHost` /
+    /// `RuntimeConfigHost` entry point on this type — four call sites used to
+    /// spell the same address inline, which is how one of them would be missed.
+    fn read_pack_secret(&self, ctx: &TypesTenantCtx, canonical_key: &str) -> Result<Vec<u8>> {
+        read_pack_secret_blocking(
+            &self.secrets,
+            ctx,
+            &self.pack_id,
+            self.unit_id.as_deref(),
+            canonical_key,
+        )
+    }
+
+    /// Write one of this pack's secrets. Lands at the unit address ONLY when a
+    /// unit is known — never a write-through to the shared address, which every
+    /// other unit of this pack reads.
+    fn write_pack_secret(
+        &self,
+        ctx: &TypesTenantCtx,
+        canonical_key: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        write_pack_secret_blocking(
+            &self.secrets,
+            ctx,
+            &self.pack_id,
+            self.unit_id.as_deref(),
+            canonical_key,
+            value,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn instantiate_component_result(
         linker: &mut Linker<ComponentState>,
         store: &mut Store<ComponentState>,
         component: &Component,
         ctx: &ComponentExecCtx,
+        caller: Option<&crate::caller_identity::ComponentCaller>,
+        provider_id: Option<&str>,
         component_ref: &str,
         operation: &str,
         input_json: &str,
@@ -402,7 +523,13 @@ impl HostState {
         let pre_instance = linker.instantiate_pre(component)?;
         match component_api::v0_6::ComponentPre::new(pre_instance) {
             Ok(pre) => {
-                let envelope = component_api::envelope_v0_6(ctx, component_ref, input_json)?;
+                let envelope = component_api::envelope_v0_6_for(
+                    ctx,
+                    caller,
+                    provider_id,
+                    component_ref,
+                    input_json,
+                )?;
                 let operation_owned = operation.to_string();
                 let result = block_on(async {
                     let bindings = pre.instantiate_async(&mut *store).await?;
@@ -421,7 +548,8 @@ impl HostState {
                         let result = block_on(async {
                             let bindings = pre.instantiate_async(&mut *store).await?;
                             let node = bindings.greentic_component_node();
-                            let ctx_v05 = component_api::exec_ctx_v0_5(ctx);
+                            let ctx_v05 =
+                                component_api::exec_ctx_v0_5_for(ctx, caller, provider_id);
                             let operation_owned = operation.to_string();
                             let input_owned = input_json.to_string();
                             node.call_invoke(&mut *store, &ctx_v05, &operation_owned, &input_owned)
@@ -438,7 +566,8 @@ impl HostState {
                                 let result = block_on(async {
                                     let bindings = pre.instantiate_async(&mut *store).await?;
                                     let node = bindings.greentic_component_node();
-                                    let ctx_v04 = component_api::exec_ctx_v0_4(ctx);
+                                    let ctx_v04 =
+                                        component_api::exec_ctx_v0_4_for(ctx, caller, provider_id);
                                     let operation_owned = operation.to_string();
                                     let input_owned = input_json.to_string();
                                     node.call_invoke(
@@ -568,7 +697,8 @@ impl HostState {
         }
         let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_secret_key(key);
-        let bytes = read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key)
+        let bytes = self
+            .read_pack_secret(&ctx, &canonical_key)
             .context("failed to read secret from manager")?;
         let value = String::from_utf8(bytes).context("secret value is not valid UTF-8")?;
         Ok(value)
@@ -800,7 +930,7 @@ impl SecretsStoreHost for HostState {
         }
         let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_secret_key(&key);
-        match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
+        match self.read_pack_secret(&ctx, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
                 warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
@@ -826,7 +956,7 @@ impl SecretsStoreHostV1_1 for HostState {
         }
         let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_secret_key(&key);
-        match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
+        match self.read_pack_secret(&ctx, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
                 warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
@@ -854,9 +984,7 @@ impl SecretsStoreHostV1_1 for HostState {
         }
         let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_secret_key(&key);
-        if let Err(err) =
-            write_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key, &value)
-        {
+        if let Err(err) = self.write_pack_secret(&ctx, &canonical_key, &value) {
             warn!(secret = %key, canonical = %canonical_key, error = %err, "secret write failed");
             panic!("secret write failed for key {key}");
         }
@@ -1160,6 +1288,164 @@ impl StateStoreHost for HostState {
     }
 }
 
+/// `StateStore::set_json_if_absent` reports a backend that has no atomic
+/// implementation as `InvalidInput` with this message; surface it as a stable
+/// `unsupported` code instead of a generic failure.
+const UNSUPPORTED_IF_ABSENT_MARKER: &str = "set_json_if_absent is not supported";
+
+fn state_error_from_if_absent(err: greentic_types::GreenticError) -> StateError {
+    let code = if err.code == greentic_types::ErrorCode::InvalidInput
+        && err.message.contains(UNSUPPORTED_IF_ABSENT_MARKER)
+    {
+        "unsupported"
+    } else if err.code == greentic_types::ErrorCode::Unavailable {
+        "unavailable"
+    } else {
+        "internal"
+    };
+    StateError {
+        code: code.into(),
+        message: err.to_string(),
+    }
+}
+
+impl HostState {
+    /// Shared body of `write-if-absent`: same tenant derivation, fault hook,
+    /// prefix and bytes-to-JSON conversion as `StateStoreHost::write`.
+    fn state_write_if_absent(
+        &mut self,
+        key: HostStateKey,
+        bytes: Vec<u8>,
+        ctx: Option<StateTenantCtx>,
+    ) -> Result<bool, StateError> {
+        let store = match self.state_store.as_ref() {
+            Some(store) => store.clone(),
+            None => {
+                return Err(StateError {
+                    code: "unavailable".into(),
+                    message: "state store not configured".into(),
+                });
+            }
+        };
+        let tenant_ctx = match self.tenant_ctx_from_v1(ctx) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                return Err(StateError {
+                    code: "invalid-ctx".into(),
+                    message: err.to_string(),
+                });
+            }
+        };
+        #[cfg(feature = "fault-injection")]
+        {
+            let exec_ctx = self.exec_ctx.as_ref();
+            let flow_id = exec_ctx
+                .map(|ctx| ctx.flow_id.as_str())
+                .unwrap_or("unknown");
+            let node_id = exec_ctx.and_then(|ctx| ctx.node_id.as_deref());
+            let attempt = exec_ctx.map(|ctx| ctx.tenant.attempt).unwrap_or(1);
+            let fault_ctx = FaultContext {
+                pack_id: self.pack_id.as_str(),
+                flow_id,
+                node_id,
+                attempt,
+            };
+            if let Err(err) = maybe_fail(FaultPoint::StateWrite, fault_ctx) {
+                return Err(StateError {
+                    code: "internal".into(),
+                    message: err.to_string(),
+                });
+            }
+        }
+        let key = StoreStateKey::from(key);
+        let value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()));
+        store
+            .set_json_if_absent(&tenant_ctx, STATE_PREFIX, &key, &value, None)
+            .map_err(state_error_from_if_absent)
+    }
+}
+
+fn state_ctx_v1_from_v1_1(ctx: StateTenantCtxV1_1) -> StateTenantCtx {
+    StateTenantCtx {
+        env: ctx.env,
+        tenant: ctx.tenant,
+        tenant_id: ctx.tenant_id,
+        team: ctx.team,
+        team_id: ctx.team_id,
+        user: ctx.user,
+        user_id: ctx.user_id,
+        trace_id: ctx.trace_id,
+        i18n_id: ctx.i18n_id,
+        correlation_id: ctx.correlation_id,
+        attributes: ctx.attributes,
+        session_id: ctx.session_id,
+        flow_id: ctx.flow_id,
+        node_id: ctx.node_id,
+        provider_id: ctx.provider_id,
+        deadline_ms: ctx.deadline_ms,
+        attempt: ctx.attempt,
+        idempotency_key: ctx.idempotency_key,
+        impersonation: ctx.impersonation.map(|imp| {
+            greentic_interfaces_wasmtime::state_store_store_v1_0::greentic::interfaces_types::types::Impersonation {
+                actor_id: imp.actor_id,
+                reason: imp.reason,
+            }
+        }),
+    }
+}
+
+fn state_error_v1_1(err: StateError) -> StateErrorV1_1 {
+    StateErrorV1_1 {
+        code: err.code,
+        message: err.message,
+    }
+}
+
+/// `greentic:state/state-store@1.1.0`: the same read/write/delete as 1.0.0
+/// (delegated, so tenant derivation, fault hooks and byte conversion cannot
+/// drift) plus the atomic `write-if-absent`.
+impl StateStoreHostV1_1 for HostState {
+    fn read(
+        &mut self,
+        key: HostStateKey,
+        ctx: Option<StateTenantCtxV1_1>,
+    ) -> Result<Vec<u8>, StateErrorV1_1> {
+        StateStoreHost::read(self, key, ctx.map(state_ctx_v1_from_v1_1)).map_err(state_error_v1_1)
+    }
+
+    fn write(
+        &mut self,
+        key: HostStateKey,
+        bytes: Vec<u8>,
+        ctx: Option<StateTenantCtxV1_1>,
+    ) -> Result<StateOpAckV1_1, StateErrorV1_1> {
+        StateStoreHost::write(self, key, bytes, ctx.map(state_ctx_v1_from_v1_1))
+            .map(|_| StateOpAckV1_1::Ok)
+            .map_err(state_error_v1_1)
+    }
+
+    fn delete(
+        &mut self,
+        key: HostStateKey,
+        ctx: Option<StateTenantCtxV1_1>,
+    ) -> Result<StateOpAckV1_1, StateErrorV1_1> {
+        StateStoreHost::delete(self, key, ctx.map(state_ctx_v1_from_v1_1))
+            .map(|_| StateOpAckV1_1::Ok)
+            .map_err(state_error_v1_1)
+    }
+
+    fn write_if_absent(
+        &mut self,
+        key: HostStateKey,
+        bytes: Vec<u8>,
+        ctx: Option<StateTenantCtxV1_1>,
+    ) -> Result<bool, StateErrorV1_1> {
+        self.state_write_if_absent(key, bytes, ctx.map(state_ctx_v1_from_v1_1))
+            .map_err(state_error_v1_1)
+    }
+}
+
 impl TelemetryLoggerHost for HostState {
     fn log(
         &mut self,
@@ -1443,6 +1729,7 @@ pub struct ComponentState {
     wasi_ctx: WasiCtx,
     wasi_tls_ctx: WasiTlsCtx,
     wasi_http_ctx: WasiHttpCtx,
+    http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks,
     resource_table: ResourceTable,
 }
 
@@ -1476,6 +1763,7 @@ impl ComponentState {
             wasi_ctx,
             wasi_tls_ctx: WasiTlsCtxBuilder::new().build(),
             wasi_http_ctx: WasiHttpCtx::new(),
+            http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks::from_env(),
             resource_table: ResourceTable::new(),
         })
     }
@@ -1628,7 +1916,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    wasmtime_wasi_tls::p2::add_to_linker(linker, &opts)?;
+    add_wasi_tls_to_linker(linker, &opts)?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -1642,7 +1930,12 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             runner_host_http: Some(|state: &mut ComponentState| state.host_mut()),
             runner_host_kv: Some(|state: &mut ComponentState| state.host_mut()),
             telemetry_logger: Some(|state: &mut ComponentState| state.host_mut()),
-            state_store: allow_state_store.then_some(|state: &mut ComponentState| state.host_mut()),
+            // The v1.1 helper registers BOTH `state-store@1.1.0` and `@1.0.0` from
+            // one host impl, so the legacy field stays `None` (it is ignored when
+            // v1.1 is set and would otherwise read as a double registration).
+            state_store_v1_1: allow_state_store
+                .then_some(|state: &mut ComponentState| state.host_mut()),
+            state_store: None,
             secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             secrets_store: None,
             runtime_config: Some(|state: &mut ComponentState| state.host_mut()),
@@ -1800,7 +2093,7 @@ impl WasiHttpView for ComponentState {
         WasiHttpCtxView {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
-            hooks: Default::default(),
+            hooks: &mut self.http_timeout_hooks,
         }
     }
 }
@@ -2166,7 +2459,49 @@ impl PackRuntime {
             cache,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
+            a2a_routes: std::sync::OnceLock::new(),
+            run_context: std::sync::OnceLock::new(),
+            user_ledger: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
+            sorla_routes: std::sync::OnceLock::new(),
+            unit_id: None,
         })
+    }
+
+    /// Lend this pack's flow-tool engines the host's node handlers. Called
+    /// once per pack by the host after it wired its top-level engine; a
+    /// second call keeps the first registration and warns.
+    pub fn set_nested_flow_handlers(
+        &self,
+        handlers: crate::runner::nested_flow::NestedFlowHandlers,
+    ) {
+        if self.nested_flow_handlers.set(handlers).is_err() {
+            tracing::warn!(
+                pack_id = self.metadata.pack_id.as_str(),
+                "nested flow-tool handlers already registered for this pack; keeping the first"
+            );
+        }
+    }
+
+    /// Bind this pack instance to the deployed unit it belongs to (the
+    /// revision's `bundle_id`), so every extension credential its components
+    /// read resolves that unit's own value before the value shared by every
+    /// unit of the same pack.
+    ///
+    /// Called by `TenantRuntime::load_revision` through `load_pack_runtime`,
+    /// before the `Arc<PackRuntime>` is created — the same seam
+    /// [`set_runtime_config_non_secret`](Self::set_runtime_config_non_secret)
+    /// uses. `None` is the legacy tenant-only path, which keeps the bare pack
+    /// scope.
+    pub fn set_unit_id(&mut self, unit_id: Option<String>) {
+        self.unit_id = unit_id;
+    }
+
+    /// The deployed unit this pack instance is bound to, if any. See
+    /// [`set_unit_id`](Self::set_unit_id).
+    pub fn unit_id(&self) -> Option<&str> {
+        self.unit_id.as_deref()
     }
 
     /// Inject the `pack-config.v1.non_secret` map for this pack. Called by
@@ -2219,12 +2554,42 @@ impl PackRuntime {
         Ok(Vec::new())
     }
 
-    #[allow(dead_code)]
-    pub async fn run_flow(
-        &self,
-        flow_id: &str,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    /// Synchronous accessor for the cached flow descriptors. Reads the same
+    /// in-memory fields as `list_flows` but without `.await`, so it is safe to
+    /// call from a synchronous context (e.g. `FlowInvoker::list_flows`).
+    /// This avoids a `block_on`-in-async-context panic on the runner thread.
+    ///
+    /// Its only caller is `runner::flow_invoker::PackRuntimeFlowInvoker`,
+    /// which is entirely `#![cfg(feature = "agentic-worker")]`; gate this the
+    /// same way so it isn't flagged dead when that feature is off.
+    #[cfg(feature = "agentic-worker")]
+    pub(crate) fn flow_descriptors(&self) -> Vec<FlowDescriptor> {
+        if let Some(cache) = &self.flows {
+            return cache.descriptors.clone();
+        }
+        if let Some(manifest) = &self.manifest {
+            return manifest
+                .flows
+                .iter()
+                .map(|flow| FlowDescriptor {
+                    id: flow.id.as_str().to_string(),
+                    flow_type: flow_kind_to_str(flow.kind).to_string(),
+                    pack_id: manifest.pack_id.as_str().to_string(),
+                    profile: manifest.pack_id.as_str().to_string(),
+                    version: manifest.version.to_string(),
+                    description: None,
+                    entry: tags_indicate_entry(flow.tags.iter().map(String::as_str)),
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Load a fresh engine over this pack, the way every direct flow run here
+    /// does. Shared by [`Self::execute_flow_inner`] and
+    /// [`Self::resume_flow_for_tool`], so a resumed tool flow runs on exactly
+    /// the pack and engine configuration its first leg did.
+    async fn load_flow_engine(&self) -> Result<(Arc<PackRuntime>, FlowEngine)> {
         let pack = Arc::new(
             PackRuntime::load(
                 &self.path,
@@ -2241,14 +2606,24 @@ impl PackRuntime {
             )
             .await?,
         );
+        let mut engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
+        // Read from `self` (the pack the host built its agent runtime over),
+        // not from the freshly loaded `pack`, whose slot is empty.
+        if let Some(handlers) = self.nested_flow_handlers.get() {
+            handlers.install_on(&mut engine);
+        }
+        Ok((pack, engine))
+    }
 
-        let engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
-        let retry_config = self.config.retry_config().into();
-        let mocks = pack.mocks.as_deref();
-        let tenant = self.config.tenant.as_str();
-
-        let ctx = FlowContext {
-            tenant,
+    /// The [`FlowContext`] a direct (non-ingress) flow run executes under.
+    fn direct_flow_ctx<'a>(
+        &'a self,
+        pack: &'a PackRuntime,
+        flow_id: &'a str,
+        caller: Option<&'a Value>,
+    ) -> FlowContext<'a> {
+        FlowContext {
+            tenant: self.config.tenant.as_str(),
             pack_id: pack.metadata().pack_id.as_str(),
             flow_id,
             node_id: None,
@@ -2257,13 +2632,46 @@ impl PackRuntime {
             session_id: None,
             provider_id: None,
             reply_scope: None,
-            retry_config,
+            retry_config: self.config.retry_config().into(),
             attempt: 1,
             observer: None,
-            mocks,
-        };
+            mocks: pack.mocks.as_deref(),
+            caller,
+        }
+    }
 
-        let execution = engine.execute(ctx, input).await?;
+    /// Shared load + engine + execute body for `run_flow` and
+    /// `run_flow_for_tool`. Returns the raw `FlowExecution` so each caller can
+    /// match on `FlowStatus` according to its own contract.
+    async fn execute_flow_inner(
+        &self,
+        flow_id: &str,
+        mut input: serde_json::Value,
+    ) -> Result<FlowExecution> {
+        let frame = crate::runner::nested_flow::enter(flow_id).map_err(anyhow::Error::msg)?;
+        let (pack, engine) = self.load_flow_engine().await?;
+        // The input is the model's tool arguments: the caller it names is
+        // replaced by the OUTER step's host-stamped one BEFORE `caller_block`
+        // reads it (see `nested_flow::pin_caller`).
+        crate::runner::nested_flow::pin_caller(&mut input);
+        // Same single establishment point as the ingress path, for callers
+        // that drive a flow directly — see `crate::caller_identity`.
+        // Cloned rather than borrowed: `input` is moved into the run below,
+        // and the context must outlive that move.
+        let caller_block = crate::caller_identity::caller_block(&input).cloned();
+        let ctx = self.direct_flow_ctx(&pack, flow_id, caller_block.as_ref());
+        // `ctx.session_id` stays `None` on purpose; a `dw.agent` in this flow
+        // reads its session from the frame (`nested_flow::agent_session_for`).
+        crate::runner::nested_flow::scope(frame, engine.execute(ctx, input)).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn run_flow(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let execution = self.execute_flow_inner(flow_id, input).await?;
         match execution.status {
             FlowStatus::Completed => Ok(execution.output),
             FlowStatus::Waiting(wait) => Ok(serde_json::json!({
@@ -2275,6 +2683,87 @@ impl PackRuntime {
         }
     }
 
+    /// Non-interactive flow execution for use as an agent tool. Identical to
+    /// `run_flow` in its load + execute path, but `FlowStatus::Waiting` is an
+    /// error because agent tools must be non-interactive (they cannot pause and
+    /// resume mid-LLM-turn).
+    ///
+    /// Returns `Ok(output)` on `Completed`, `Err(message)` on any failure.
+    pub async fn run_flow_for_tool(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let execution = self
+            .execute_flow_inner(flow_id, input)
+            .await
+            .map_err(|e| e.to_string())?;
+        match execution.status {
+            FlowStatus::Completed => Ok(execution.output),
+            FlowStatus::Waiting(wait) => Err(format!(
+                "flow '{flow_id}' tried to pause ({:?}); agent tools must be non-interactive",
+                wait.reason
+            )),
+        }
+    }
+
+    /// Interactive flow execution for an agentic worker's `flow:` tool.
+    ///
+    /// Unlike [`Self::run_flow_for_tool`], a flow that parks (a card awaiting
+    /// its routed submit) is not an error: it answers
+    /// [`ToolFlowOutcome::Waiting`] with the serialized [`FlowSnapshot`] to
+    /// hand back to [`Self::resume_flow_for_tool`] and the flow's output at
+    /// the park point — the finalized card — to present meanwhile.
+    ///
+    /// Only the in-process `dw.agent` loop calls this. Graph tool nodes and
+    /// deep workers keep `run_flow_for_tool`, because neither can suspend.
+    pub async fn run_flow_for_tool_interactive(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<ToolFlowOutcome, String> {
+        let execution = self
+            .execute_flow_inner(flow_id, input)
+            .await
+            .map_err(|e| e.to_string())?;
+        tool_flow_outcome(flow_id, execution)
+    }
+
+    /// Resume a flow parked by [`Self::run_flow_for_tool_interactive`] with
+    /// `input` — the user's submit, shaped exactly as the inbound activity a
+    /// standalone card flow would have been resumed with.
+    ///
+    /// `snapshot` must be a [`FlowSnapshot`] of `flow_id`; any other flow's
+    /// snapshot is refused rather than resumed under the wrong name.
+    pub async fn resume_flow_for_tool(
+        &self,
+        flow_id: &str,
+        snapshot: serde_json::Value,
+        mut input: serde_json::Value,
+    ) -> Result<ToolFlowOutcome, String> {
+        let snapshot: FlowSnapshot = serde_json::from_value(snapshot)
+            .map_err(|e| format!("flow '{flow_id}': unreadable resume snapshot: {e}"))?;
+        if snapshot.flow_id != flow_id {
+            return Err(format!(
+                "flow '{flow_id}': resume snapshot belongs to flow '{}'",
+                snapshot.flow_id
+            ));
+        }
+        let frame = crate::runner::nested_flow::enter(flow_id)?;
+        let (pack, engine) = self.load_flow_engine().await.map_err(|e| e.to_string())?;
+        // Same rule as the call: the resume input is model-reachable text, so
+        // its caller is the outer step's, substituted before it is read.
+        crate::runner::nested_flow::pin_caller(&mut input);
+        let caller_block = crate::caller_identity::caller_block(&input).cloned();
+        let snapshot_flow = snapshot.flow_id.clone();
+        let ctx = self.direct_flow_ctx(&pack, &snapshot_flow, caller_block.as_ref());
+        let execution =
+            crate::runner::nested_flow::scope(frame, engine.resume(ctx, snapshot, input))
+                .await
+                .map_err(|e| e.to_string())?;
+        tool_flow_outcome(flow_id, execution)
+    }
+
     pub async fn invoke_component(
         &self,
         component_ref: &str,
@@ -2283,6 +2772,60 @@ impl PackRuntime {
         config_json: Option<String>,
         input_json: String,
     ) -> Result<Value> {
+        self.invoke_component_as(component_ref, ctx, None, operation, config_json, input_json)
+            .await
+    }
+
+    /// [`Self::invoke_component`] on behalf of a provider-verified caller.
+    ///
+    /// `caller` is presented to the component as its `user`/`team` (and, where
+    /// the world has one, the `caller.*` attribute map). It is an argument
+    /// rather than a field of `ExecCtx` because downstream crates build that
+    /// struct with literal initializers; and it never touches `ctx.tenant`,
+    /// which stays the host's scope for the component's secrets and state.
+    pub async fn invoke_component_as(
+        &self,
+        component_ref: &str,
+        ctx: ComponentExecCtx,
+        caller: Option<crate::caller_identity::ComponentCaller>,
+        operation: &str,
+        config_json: Option<String>,
+        input_json: String,
+    ) -> Result<Value> {
+        self.invoke_component_for(
+            component_ref,
+            ctx,
+            caller,
+            None,
+            operation,
+            config_json,
+            input_json,
+        )
+        .await
+    }
+
+    /// [`Self::invoke_component_as`] for an invocation delivered by
+    /// `provider_id` (the flow engine's `FlowContext::provider_id`).
+    ///
+    /// The provider is presented to a 0.5 component in its `provider_id` slot,
+    /// and — when it is also the host scope's `user`, as the flow engine sets
+    /// it — is NOT presented as the component's user: a caller with no
+    /// verified subject reaches the component with no user (see
+    /// `component_api::presented_user` and `GREENTIC_PRESENT_PROVIDER_AS_USER`).
+    /// `ctx.tenant` is still passed to the host untouched, so the component's
+    /// state and secrets scope does not move.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_component_for(
+        &self,
+        component_ref: &str,
+        ctx: ComponentExecCtx,
+        caller: Option<crate::caller_identity::ComponentCaller>,
+        provider_id: Option<&str>,
+        operation: &str,
+        config_json: Option<String>,
+        input_json: String,
+    ) -> Result<Value> {
+        let provider_id = provider_id.map(str::to_string);
         let component_ref = resolve_component_key(component_ref, operation, |key| {
             self.components.contains_key(key)
         });
@@ -2300,6 +2843,9 @@ impl PackRuntime {
         let oauth_config = self.oauth_config.clone();
         let wasi_policy = Arc::clone(&self.wasi_policy);
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
         let allow_state_store = self.allows_state_store(component_ref);
         let component = pack_component.component.clone();
         let component_ref_owned = component_ref.to_string();
@@ -2330,7 +2876,8 @@ impl PackRuntime {
                 false,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
 
@@ -2339,12 +2886,77 @@ impl PackRuntime {
                 &mut store,
                 &component,
                 &ctx_owned,
+                caller.as_ref(),
+                provider_id.as_deref(),
                 &component_ref_owned,
                 &operation_owned,
                 &input_owned,
             )?;
             HostState::convert_invoke_result(invoke_result)
         })
+    }
+
+    /// Fold a provider instance's configured answers into its invocation
+    /// payload, the same way [`Self::merge_component_config_into_input_json`]
+    /// does for a component.
+    ///
+    /// `ProviderBinding` has carried `config_json` since providers gained
+    /// instances, and `runner::operator` passes it whenever it reaches a
+    /// provider through `invoke_component`. This path — the one
+    /// `HostRuntime`'s webhook dispatch uses — took the payload and handed it
+    /// over untouched, so a provider invoked here saw `request.config` as an
+    /// empty object no matter what the operator had answered. Nothing failed:
+    /// every setup answer simply was not there, which a provider reports (if
+    /// at all) as its own feature being switched off.
+    ///
+    /// Two rules, and the second is why this is not just a call to the
+    /// component version:
+    ///
+    /// - **No config, no change.** A provider instance with no configured
+    ///   answers gets the byte-identical payload it gets today, so nothing
+    ///   about an unconfigured provider moves.
+    /// - **The payload must already be JSON.** A provider's input arrives as
+    ///   bytes from a webhook body, not as a flow node's value, so it may not
+    ///   be JSON at all. The component merge wraps a non-JSON input as a JSON
+    ///   string, which for a provider would replace a binary body with an
+    ///   envelope the component cannot read — trading a missing config for a
+    ///   corrupted request. Here a payload that does not parse is passed
+    ///   through untouched and the drop is logged with the provider named,
+    ///   because silence is what this whole function exists to end.
+    fn merge_provider_config_into_input(
+        config_json: Option<&str>,
+        input_json: Vec<u8>,
+        provider_type: &str,
+    ) -> Vec<u8> {
+        let Some(config_json) = config_json else {
+            return input_json;
+        };
+        let Ok(input_str) = std::str::from_utf8(&input_json) else {
+            tracing::warn!(
+                provider_type,
+                "provider payload is not UTF-8; invoking without its configured answers"
+            );
+            return input_json;
+        };
+        if serde_json::from_str::<Value>(input_str).is_err() {
+            tracing::warn!(
+                provider_type,
+                "provider payload is not JSON; invoking without its configured answers"
+            );
+            return input_json;
+        }
+        match Self::merge_component_config_into_input_json(Some(config_json), input_str) {
+            Ok(merged) => merged.into_bytes(),
+            Err(error) => {
+                tracing::warn!(
+                    provider_type,
+                    %error,
+                    "could not merge the provider's configured answers into its payload; \
+                     invoking without them"
+                );
+                input_json
+            }
+        }
     }
 
     fn merge_component_config_into_input_json(
@@ -2414,8 +3026,15 @@ impl PackRuntime {
         let oauth_config = self.oauth_config.clone();
         let wasi_policy = Arc::clone(&self.wasi_policy);
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
         let allow_state_store = self.allows_state_store(&component_ref_owned);
-        let input_owned = input_json;
+        let input_owned = Self::merge_provider_config_into_input(
+            binding.config_json.as_deref(),
+            input_json,
+            &binding.provider_type,
+        );
         let op_owned = op.to_string();
         let ctx_owned = ctx;
         let world = binding.world.clone();
@@ -2440,7 +3059,8 @@ impl PackRuntime {
                 true,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
 
@@ -2564,6 +3184,9 @@ impl PackRuntime {
         let secrets = Arc::clone(&self.secrets);
         let oauth_config = self.oauth_config.clone();
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
 
         // Locked-down WASI policy: no preopens, no env, no stdio.
         // The linker registers all imports (Wasmtime requires it for
@@ -2589,7 +3212,8 @@ impl PackRuntime {
                 true,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
 
@@ -2645,6 +3269,9 @@ impl PackRuntime {
         let secrets = Arc::clone(&self.secrets);
         let oauth_config = self.oauth_config.clone();
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
 
         // Locked-down WASI policy — same rationale as
         // `invoke_identify_instance`. See [`register_identity_probe`] docs.
@@ -2668,7 +3295,8 @@ impl PackRuntime {
                 true,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
 
@@ -2935,6 +3563,16 @@ impl PackRuntime {
         &self.metadata
     }
 
+    /// The manifest's human `name`, when the pack declares one (blank counts
+    /// as absent). A legacy manifest carries no name.
+    pub fn manifest_name(&self) -> Option<&str> {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
     /// Read an asset file from the pack's assets directory.
     ///
     /// Accepts paths like `assets/cards/card-a.json` or `cards/card-a.json`
@@ -2998,6 +3636,262 @@ impl PackRuntime {
     /// [`load_schema_json`]: PackRuntime::load_schema_json
     pub fn read_agent_graph_sidecar(&self) -> Option<Vec<u8>> {
         self.read_pack_file("agent-graph.json")
+    }
+
+    /// Archive-relative entry names of the design-extension `.gtxpack` archives
+    /// this pack carries, sorted and deduplicated.
+    ///
+    /// Reads the materialized pack directory and the `.gtpack` archive, the
+    /// same two sources — in the same order — as [`PackRuntime::read_pack_file`],
+    /// so an entry this returns is one that call can then read.
+    ///
+    /// The `.gtxpack` suffix, not membership of `extensions/`, is what makes an
+    /// entry an extension: that directory already carries the wizard's
+    /// `extensions/*.json` manifest sidecars, which predate this feature and are
+    /// not extensions. The rule lives in
+    /// [`crate::runner::pack_extensions::is_extension_archive_entry`], beside
+    /// the contract it comes from.
+    ///
+    /// An empty result is the normal reading of a pack built before the feature,
+    /// and of any pack whose worker binds no extension tools.
+    #[cfg(feature = "agentic-worker")]
+    pub fn extension_archive_entries(&self) -> Vec<String> {
+        use crate::runner::pack_extensions::{EXTENSIONS_PREFIX, is_extension_archive_entry};
+
+        let mut names = std::collections::BTreeSet::new();
+
+        if self.path.is_dir() {
+            let dir = self.path.join(EXTENSIONS_PREFIX.trim_end_matches('/'));
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if !entry
+                            .file_type()
+                            .map(|kind| kind.is_file())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                            continue;
+                        };
+                        let candidate = format!("{EXTENSIONS_PREFIX}{file_name}");
+                        if is_extension_archive_entry(&candidate) {
+                            names.insert(candidate);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "failed to list the pack's extensions directory"
+                ),
+            }
+        }
+
+        if let Some(archive_path) = self
+            .archive_path
+            .as_ref()
+            .or_else(|| path_is_gtpack(&self.path).then_some(&self.path))
+        {
+            match File::open(archive_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|file| ZipArchive::new(file).map_err(anyhow::Error::from))
+            {
+                Ok(archive) => names.extend(
+                    archive
+                        .file_names()
+                        .filter(|name| is_extension_archive_entry(name))
+                        .map(str::to_string),
+                ),
+                Err(error) => tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to read the pack archive while listing extensions"
+                ),
+            }
+        }
+
+        names.into_iter().collect()
+    }
+
+    /// Every playbook document the pack carries, as bare ids.
+    ///
+    /// The contract is one file per playbook at `assets/playbooks/<id>.yaml`
+    /// with no index beside it, because every field a listing needs is inside
+    /// each document — so enumerating the directory is the only way to find
+    /// them, and [`PackRuntime::read_asset`] can then read one by id.
+    ///
+    /// Searched in the same places assets are, and for the same reason
+    /// [`extension_archive_entries`](Self::extension_archive_entries) searches
+    /// two: the extracted tempdir an archive-backed pack holds, the
+    /// materialized directory, and the archive itself. A `BTreeSet` makes the
+    /// result stable and deduplicates a pack that has both.
+    ///
+    /// An empty result is the normal reading of a pack that carries no
+    /// playbooks — which is every pack built before the feature.
+    #[cfg(feature = "agentic-worker")]
+    pub fn playbook_ids(&self) -> Vec<String> {
+        const PREFIX: &str = "assets/playbooks/";
+        const SUFFIX: &str = ".yaml";
+
+        fn id_of(name: &str) -> Option<String> {
+            let rest = name.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+            // One level only: a nested path is not an id this reader can
+            // address through `read_asset`, so it is not a playbook.
+            (!rest.is_empty() && !rest.contains('/')).then(|| rest.to_string())
+        }
+
+        let mut ids = std::collections::BTreeSet::new();
+
+        let mut scan_dir = |root: &std::path::Path| {
+            let dir = root.join(PREFIX.trim_end_matches('/'));
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if !entry
+                            .file_type()
+                            .map(|kind| kind.is_file())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                            continue;
+                        };
+                        if let Some(id) = id_of(&format!("{PREFIX}{file_name}")) {
+                            ids.insert(id);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "failed to list the pack's playbooks directory"
+                ),
+            }
+        };
+
+        if let Some(tempdir) = &self.assets_tempdir {
+            scan_dir(tempdir.path());
+        }
+        if self.path.is_dir() {
+            scan_dir(&self.path);
+        }
+
+        if let Some(archive_path) = self
+            .archive_path
+            .as_ref()
+            .or_else(|| path_is_gtpack(&self.path).then_some(&self.path))
+        {
+            match File::open(archive_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|file| ZipArchive::new(file).map_err(anyhow::Error::from))
+            {
+                Ok(archive) => ids.extend(archive.file_names().filter_map(id_of)),
+                Err(error) => tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to read the pack archive while listing playbooks"
+                ),
+            }
+        }
+
+        ids.into_iter().collect()
+    }
+
+    /// MCP route material from the optional `assets/mcp-routes.json` sidecar.
+    ///
+    /// `None` when the pack carries none — which is how a pack built before
+    /// the feature reads, and means "fall back to the tenant's admin catalog"
+    /// rather than "this pack has no MCP servers".
+    ///
+    /// Parsed at most once per `PackRuntime` and memoized: a hot reload
+    /// allocates a fresh `PackRuntime`, so there is nothing to invalidate.
+    pub fn mcp_routes(&self) -> Option<&crate::runner::mcp_pack_routes::PackMcpRoutes> {
+        self.mcp_routes
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::mcp_pack_routes::MCP_ROUTES_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::mcp_pack_routes::PackMcpRoutes::from_sidecar_bytes(&bytes)
+                    })
+            })
+            .as_ref()
+    }
+
+    /// A2A agent route material from the optional `assets/a2a-routes.json`
+    /// sidecar (cross-repo contract 2026-09-21 §4).
+    ///
+    /// `None` when the pack carries none. That is how a pack built before
+    /// the feature reads, and it means "no A2A agents". Parsed at most once
+    /// per `PackRuntime`; a hot reload allocates a fresh one.
+    pub fn a2a_routes(&self) -> Option<&crate::runner::a2a_pack_routes::PackA2aRoutes> {
+        self.a2a_routes
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::a2a_pack_routes::A2A_ROUTES_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::a2a_pack_routes::PackA2aRoutes::from_sidecar_bytes(&bytes)
+                    })
+            })
+            .as_ref()
+    }
+
+    /// Per-binding sharing modes from the optional `assets/run-context.json`
+    /// sidecar (shared context, Phase A2). `None` when the pack carries none,
+    /// which means every binding of every agent is `none`.
+    ///
+    /// Parsed at most once per `PackRuntime` (lazily), but
+    /// `share_policy_from_packs` (agent_node.rs) calls it for EVERY pack at
+    /// each agent-runtime build, so the sidecar is in practice read when a
+    /// runtime is built, not only when an agent first shares.
+    pub fn run_context(&self) -> Option<&crate::runner::run_context_routes::PackRunContext> {
+        self.run_context
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::run_context_routes::RUN_CONTEXT_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::run_context_routes::PackRunContext::from_sidecar_bytes(
+                            &bytes,
+                        )
+                    })
+            })
+            .as_ref()
+    }
+
+    /// Agents that use the user ledger, from the optional
+    /// `assets/user-ledger.json` sidecar. `None` when the pack carries none
+    /// (or it was malformed/oversized): then no agent uses the ledger.
+    pub fn user_ledger(&self) -> Option<&crate::runner::user_ledger_routes::PackUserLedger> {
+        self.user_ledger
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::user_ledger_routes::USER_LEDGER_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::user_ledger_routes::PackUserLedger::from_sidecar_bytes(
+                            &bytes,
+                        )
+                    })
+            })
+            .as_ref()
+    }
+
+    /// SoR requirements from the optional `assets/sorla-routes.json` sidecar.
+    ///
+    /// `None` when the pack carries none — a pack built before the feature,
+    /// or one with no `sorla.call` nodes and no worker tools bound to a SoR.
+    /// Parsed at most once per `PackRuntime`; a hot reload allocates a fresh
+    /// one.
+    pub fn sorla_routes(&self) -> Option<&crate::runner::sorla_pack_routes::PackSorlaRoutes> {
+        self.sorla_routes
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::sorla_pack_routes::SORLA_ROUTES_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::sorla_pack_routes::PackSorlaRoutes::from_sidecar_bytes(
+                            &bytes,
+                        )
+                    })
+            })
+            .as_ref()
     }
 
     /// Raw agent-config blobs from the optional `dw-agents.json` sidecar.
@@ -3114,6 +4008,9 @@ impl PackRuntime {
         let oauth_config = self.oauth_config.clone();
         let wasi_policy = Arc::clone(&self.wasi_policy);
         let pack_id = self.metadata().pack_id.clone();
+        // Hoisted with `pack_id`: the WASI closure below is `move` and must not
+        // borrow `self`.
+        let unit_id = self.unit_id.clone();
         let allow_state_store = self.allows_state_store(component_ref);
         let component = pack_component.component.clone();
         let component_ref_owned = component_ref.to_string();
@@ -3139,7 +4036,8 @@ impl PackRuntime {
                 false,
                 runtime_config_non_secret,
                 runtime_refs,
-            )?;
+            )?
+            .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
             let pre_instance = linker.instantiate_pre(&component)?;
@@ -3247,10 +4145,14 @@ impl PackRuntime {
                     }
                 }
                 let ctx = self.config.tenant_ctx();
-                read_secret_blocking(
+                // Unit scope first: a requirement this unit has its own value
+                // for is SATISFIED, and reading only the shared address would
+                // report it missing and block the deploy gate.
+                read_pack_secret_blocking(
                     &self.secrets,
                     &ctx,
                     &self.metadata.pack_id,
+                    self.unit_id.as_deref(),
                     canonicalize_secret_key(req.key.as_str()).as_str(),
                 )
                 .is_err()
@@ -3342,6 +4244,13 @@ impl PackRuntime {
             cache,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
+            a2a_routes: std::sync::OnceLock::new(),
+            run_context: std::sync::OnceLock::new(),
+            user_ledger: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
+            sorla_routes: std::sync::OnceLock::new(),
+            unit_id: None,
         })
     }
 }
@@ -3861,6 +4770,10 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 err_map: None,
                 routing,
                 telemetry,
+                // Pack-manifest component nodes are not conversational chat
+                // segments; the SP3 flag flows via the flow-doc parse path
+                // (greentic_flow -> types::Node.conversational).
+                conversational: false,
             },
         );
     }
@@ -5296,11 +6209,54 @@ async fn load_components_from_archive(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use greentic_flow::model::{FlowDoc, NodeDoc};
     use indexmap::IndexMap;
     use serde_json::json;
+
+    /// The whole point: a configured provider used to be invoked with its
+    /// answers dropped, so `request.config` arrived empty.
+    #[test]
+    fn a_configured_provider_receives_its_answers() {
+        let merged = PackRuntime::merge_provider_config_into_input(
+            Some(r#"{"auto_start_on_open":false}"#),
+            br#"{"hello":"world"}"#.to_vec(),
+            "webchat-gui",
+        );
+        let value: Value = serde_json::from_slice(&merged).expect("merged payload is JSON");
+        assert_eq!(value["config"]["auto_start_on_open"], json!(false));
+        assert_eq!(value["input"]["hello"], json!("world"));
+    }
+
+    /// An unconfigured provider must get the bytes it gets today, unchanged —
+    /// so nothing about a provider nobody has answered for moves.
+    #[test]
+    fn an_unconfigured_provider_payload_is_untouched() {
+        let original = br#"{"hello":"world"}"#.to_vec();
+        let merged =
+            PackRuntime::merge_provider_config_into_input(None, original.clone(), "webchat-gui");
+        assert_eq!(merged, original);
+    }
+
+    /// A provider's input is a webhook body, not a flow value, so it may not be
+    /// JSON. The component merge would wrap it as a JSON string; doing that
+    /// here would swap a missing config for a corrupted request body.
+    #[test]
+    fn a_non_json_provider_payload_is_passed_through_rather_than_wrapped() {
+        let original = vec![0x89u8, 0x50, 0x4e, 0x47];
+        let merged = PackRuntime::merge_provider_config_into_input(
+            Some(r#"{"k":1}"#),
+            original.clone(),
+            "some-provider",
+        );
+        assert_eq!(merged, original, "binary payloads must survive verbatim");
+
+        let text = b"not json at all".to_vec();
+        let merged =
+            PackRuntime::merge_provider_config_into_input(Some(r#"{"k":1}"#), text.clone(), "p");
+        assert_eq!(merged, text);
+    }
 
     #[test]
     fn tags_indicate_entry_treats_internal_as_non_entry() {
@@ -5332,7 +6288,15 @@ mod tests {
     /// resolves files from that directory via `self.path.is_dir()`.
     /// Mirrors the `for_component_test` constructor but sets `path` to the
     /// caller-supplied directory instead of `PathBuf::new()`.
-    fn pack_runtime_for_dir(dir: &std::path::Path) -> PackRuntime {
+    ///
+    /// `pub(crate)` so sibling modules whose subject is what a pack CARRIES —
+    /// `runner::pack_extensions` — can drive the real reader rather than a
+    /// stand-in that could disagree with it.
+    ///
+    /// Passing a path to a `.gtpack` file rather than a directory exercises the
+    /// archive branch of the same readers: `self.path.is_dir()` is false, and
+    /// `path_is_gtpack(&self.path)` then supplies the archive.
+    pub(crate) fn pack_runtime_for_dir(dir: &std::path::Path) -> PackRuntime {
         let engine = Engine::default();
         let engine_profile =
             EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
@@ -5389,6 +6353,13 @@ mod tests {
             oauth_config: None,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
+            a2a_routes: std::sync::OnceLock::new(),
+            run_context: std::sync::OnceLock::new(),
+            user_ledger: std::sync::OnceLock::new(),
+            nested_flow_handlers: std::sync::OnceLock::new(),
+            sorla_routes: std::sync::OnceLock::new(),
+            unit_id: None,
             cache,
         }
     }
@@ -5409,6 +6380,75 @@ mod tests {
         let blobs = pack.dw_agents_sidecar_blobs();
         assert!(blobs.contains_key("greeter"));
         assert_eq!(blobs["greeter"]["agent_id"], "greeter");
+    }
+
+    /// The contract's rule 2, exercised against a real pack directory: the
+    /// `.gtxpack` suffix decides, not membership of `extensions/`.
+    ///
+    /// The `.json` sidecar here is not hypothetical — the pack wizard writes
+    /// `extensions/*.json` manifest sidecars and they are walked into the
+    /// archive verbatim, so treating that directory as homogeneous would hand
+    /// the extension loader a file that has never been an extension.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_lists_only_gtxpack_files_from_a_pack_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(extensions.join("nested")).unwrap();
+        std::fs::write(extensions.join("acme.tool.gtxpack"), b"archive").unwrap();
+        std::fs::write(extensions.join("wizard-answers.json"), b"{}").unwrap();
+        std::fs::write(extensions.join("nested/deep.gtxpack"), b"archive").unwrap();
+        std::fs::write(dir.path().join("manifest.cbor"), b"").unwrap();
+
+        let pack = pack_runtime_for_dir(dir.path());
+        assert_eq!(
+            pack.extension_archive_entries(),
+            vec!["extensions/acme.tool.gtxpack".to_string()]
+        );
+        assert_eq!(
+            pack.read_pack_file("extensions/acme.tool.gtxpack")
+                .as_deref(),
+            Some(b"archive".as_slice()),
+            "every listed entry must be readable by the same reader"
+        );
+    }
+
+    /// The same rule over a real `.gtpack` ZIP, which is the shape a deployed
+    /// runner actually sees — a container never has the pack materialised.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_lists_only_gtxpack_files_from_a_gtpack_archive() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("worker.gtpack");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            ("extensions/acme.tool.gtxpack", b"archive".as_slice()),
+            ("extensions/wizard-answers.json", b"{}".as_slice()),
+            ("extensions/design/kinded.gtxpack", b"archive".as_slice()),
+            ("assets/mcp-routes.json", b"{}".as_slice()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let pack = pack_runtime_for_dir(&archive_path);
+        assert_eq!(
+            pack.extension_archive_entries(),
+            vec!["extensions/acme.tool.gtxpack".to_string()]
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_is_empty_for_a_pack_built_before_the_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.extension_archive_entries().is_empty());
     }
 
     #[test]
@@ -5622,6 +6662,96 @@ mod tests {
             id_a(),
             "first Identified wins; later id does not replace"
         );
+    }
+
+    #[test]
+    fn a2a_routes_are_read_from_a_pack_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/a2a-routes.json"),
+            br#"[{"agent_id":"recipe","base_url":"https://agent.example.com","requires_auth":true}]"#,
+        )
+        .unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        let routes = pack.a2a_routes().expect("sidecar present");
+        assert!(routes.get("recipe").unwrap().requires_auth);
+        assert!(
+            std::ptr::eq(routes, pack.a2a_routes().unwrap()),
+            "memoised: the second read returns the same parse"
+        );
+    }
+
+    #[test]
+    fn a2a_routes_are_read_from_a_gtpack_archive() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("worker.gtpack");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("assets/a2a-routes.json", options)
+            .unwrap();
+        writer
+            .write_all(br#"[{"agent_id":"recipe","base_url":"https://agent.example.com"}]"#)
+            .unwrap();
+        writer.finish().unwrap();
+
+        let pack = pack_runtime_for_dir(&archive_path);
+        assert!(pack.a2a_routes().and_then(|r| r.get("recipe")).is_some());
+    }
+
+    #[test]
+    fn a_pack_without_the_a2a_sidecar_has_no_a2a_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.a2a_routes().is_none());
+    }
+
+    #[test]
+    fn the_user_ledger_sidecar_is_read_from_the_pack_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/user-ledger.json"),
+            br#"{"helper":"read_write"}"#,
+        )
+        .unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        let declared = pack.user_ledger().expect("sidecar");
+        assert_eq!(declared.agents().count(), 1);
+        let empty = tempfile::tempdir().unwrap();
+        assert!(pack_runtime_for_dir(empty.path()).user_ledger().is_none());
+    }
+
+    #[test]
+    fn the_user_ledger_sidecar_is_read_from_a_gtpack_archive() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("worker.gtpack");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("assets/user-ledger.json", options)
+            .unwrap();
+        writer.write_all(br#"{"helper":"read"}"#).unwrap();
+        writer.finish().unwrap();
+        let pack = pack_runtime_for_dir(&archive_path);
+        assert_eq!(pack.user_ledger().map(|l| l.agents().count()), Some(1));
+    }
+
+    #[test]
+    fn a_malformed_user_ledger_sidecar_fails_closed_without_taking_the_pack_down() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/user-ledger.json"), b"{not json").unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.user_ledger().is_none());
+        assert!(pack.a2a_routes().is_none(), "other sidecars unaffected");
     }
 }
 

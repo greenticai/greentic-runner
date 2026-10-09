@@ -11,6 +11,21 @@ pub trait AgentNodeHandler: Send + Sync {
     /// Execute one agentic step. `flow_input` is the upstream node's
     /// JSON payload (expects at least `{"user_text": "..."}`); returns
     /// the node output JSON (`{"reply", "trail", "terminated_by"}`).
+    ///
+    /// `conversational` is the flow node's `conversational` flag (SP3): when
+    /// true the agent is offered the host `end_conversation` tool so it can end
+    /// the segment the engine park-loop maintains, regardless of the agent's
+    /// own config default.
+    ///
+    /// `caller` is the block the messaging provider verified for this run,
+    /// carried on `FlowContext` rather than inside `flow_input` — see
+    /// [`crate::caller_identity`] for why identity must not arrive through a
+    /// flow's own node mapping. `None` means the turn is anonymous, which is
+    /// what every provider predating the contract produces.
+    // `caller` is deliberately its own argument rather than a field folded
+    // into `flow_input` (authorable) — so this lane, which also carries
+    // `conversational`, crosses clippy's seven-argument line.
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
         tenant_id: &str,
@@ -18,7 +33,46 @@ pub trait AgentNodeHandler: Send + Sync {
         agent_id: &str,
         session_id: &str,
         flow_input: &Value,
+        conversational: bool,
+        caller: Option<&Value>,
     ) -> Result<Value>;
+
+    /// [`Self::execute`] plus the user's answer to a `flow:` tool that parked
+    /// the previous turn on a card (`terminated_by == "awaiting_tool_input"`).
+    ///
+    /// `resume_payload` is the raw inbound activity (the flow's `entry`) when
+    /// the engine is re-entering this node from such a park and the activity
+    /// is a card submit; `None` otherwise. It is its own argument — like
+    /// `caller`, and for the same reason — rather than a key inside the
+    /// authorable `flow_input`.
+    ///
+    /// The default ignores it and runs [`Self::execute`], which keeps every
+    /// existing implementor source-compatible; such a handler never produces
+    /// `awaiting_tool_input`, so it is never handed a payload it would need.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_with_resume(
+        &self,
+        tenant_id: &str,
+        env_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        flow_input: &Value,
+        conversational: bool,
+        caller: Option<&Value>,
+        resume_payload: Option<&Value>,
+    ) -> Result<Value> {
+        let _ = resume_payload;
+        self.execute(
+            tenant_id,
+            env_id,
+            agent_id,
+            session_id,
+            flow_input,
+            conversational,
+            caller,
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +97,9 @@ mod aw {
     use serde_json::{Value, json};
 
     use crate::trace::agent_audit::AgentAuditObserver;
+    use crate::trace::audit_event::{build_agent_run_metering_event, metering_subject};
     use crate::trace::audit_sink::AuditSink;
+    use crate::trace::generate_audit_event_id;
 
     use super::AgentNodeHandler;
 
@@ -114,6 +170,16 @@ mod aw {
     /// flow output, so internal failure modes do not leak to end users.
     const SANITISED_ERROR_REPLY: &str = "Something went wrong. Please try again.";
 
+    /// A turn failed (an LLM error, a lock timeout) while the agent still holds
+    /// a parked `flow:` tool: turn the sanitised error output into a park that
+    /// re-offers the card. The engine then keeps its await armed, so the user's
+    /// next card submit resumes the tool instead of being read as typed text.
+    fn reoffer_parked_card(out: &mut Value, card: Value) {
+        out["terminated_by"] = json!("awaiting_tool_input");
+        out["pending_presentation"] = card;
+        out["side_turn"] = json!(true);
+    }
+
     /// Build the structured JSON output emitted by a `DwAgent` node when a
     /// guardrail blocks the step.
     ///
@@ -177,6 +243,12 @@ mod aw {
         /// on the plain [`AgentRuntime::step`] path, byte-identical to the
         /// behaviour before this observer existed.
         audit_sink: Option<AuditSink>,
+        /// Session-keyed streaming-observer registry (R2). `None` — the
+        /// default when no registry was wired in — keeps `execute` from
+        /// looking up a stream observer at all. When `Some`, `execute` looks
+        /// up `session_id` in the registry on every call; a miss (no active
+        /// SSE stream for that session) behaves exactly like `None`.
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         /// Identity of the deployed unit these agents were loaded from — the
         /// revision's `bundle_id`, stamped onto every step's
         /// [`TenantContext`] so billing can attribute spend to a project.
@@ -196,17 +268,26 @@ mod aw {
         /// `audit.<tenant>.agent.<event>`. When `None`, `execute` uses
         /// [`AgentRuntime::step`] directly (no observer, no behaviour change).
         ///
+        /// `stream_observers` (R2) is the session-keyed registry a
+        /// `POST /agent/chat/stream` handler inserts into before dispatching a
+        /// turn; `execute` looks up `session_id` in it and, when present, fans
+        /// the step's token/tool callbacks out to that observer alongside the
+        /// audit observer (via [`crate::http::agent_stream::CompositeObserver`]
+        /// when both are present).
+        ///
         /// `project_id` is the deployed unit's `bundle_id` (`None` on the
         /// legacy tenant-only path); it becomes the `project_id` billing
         /// dimension of every step this handler runs.
         pub fn new(
             runtime: Arc<AgentRuntime>,
             audit_sink: Option<AuditSink>,
+            stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
             project_id: Option<String>,
         ) -> Self {
             Self {
                 runtime,
                 audit_sink,
+                stream_observers,
                 project_id,
             }
         }
@@ -235,40 +316,168 @@ mod aw {
             agent_id: &str,
             session_id: &str,
             flow_input: &Value,
+            conversational: bool,
+            caller: Option<&Value>,
+        ) -> Result<Value> {
+            self.execute_with_resume(
+                tenant_id,
+                env_id,
+                agent_id,
+                session_id,
+                flow_input,
+                conversational,
+                caller,
+                None,
+            )
+            .await
+        }
+
+        async fn execute_with_resume(
+            &self,
+            tenant_id: &str,
+            env_id: &str,
+            agent_id: &str,
+            session_id: &str,
+            flow_input: &Value,
+            conversational: bool,
+            caller: Option<&Value>,
+            resume_payload: Option<&Value>,
         ) -> Result<Value> {
             let user_text = flow_input
                 .get("user_text")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let tenant =
-                TenantContext::new(tenant_id, env_id).with_project_id(self.project_id.clone());
-            let input = AgentInput { text: user_text };
-
-            // Off by default: with no audit sink configured, this is exactly
-            // the pre-existing `self.runtime.step(...)` call — no observer is
-            // constructed and behaviour is byte-identical to before EPIC-B B-3.
-            let step_result = match &self.audit_sink {
-                Some(sink) => {
-                    let observer: Arc<dyn StepObserver> = Arc::new(AgentAuditObserver::new(
-                        sink.clone(),
-                        tenant_ctx_for_audit(tenant_id, env_id),
-                        agent_id.to_string(),
-                        session_id.to_string(),
-                    ));
-                    self.runtime
-                        .step_with_observer(tenant, session_id, agent_id, input, observer)
-                        .await
+            // A block the provider stamped but this runtime cannot decode is
+            // NOT silently treated as verified: the decode failure warns and
+            // the turn proceeds anonymously, which is the restrictive
+            // direction and the same state a provider that stamped nothing
+            // produces.
+            let verified_caller = caller.and_then(|block| {
+                match serde_json::from_value::<greentic_aw_runtime::VerifiedCaller>(block.clone()) {
+                    Ok(caller) => Some(caller),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "provider stamped a caller block this runtime cannot decode; \
+                             running the turn anonymously"
+                        );
+                        None
+                    }
                 }
-                None => self.runtime.step(tenant, session_id, agent_id, input).await,
+            });
+            let tenant = TenantContext::new(tenant_id, env_id)
+                .with_project_id(self.project_id.clone())
+                .with_caller(verified_caller);
+            let tenant_for_card = tenant.clone();
+            let input = AgentInput {
+                text: user_text,
+                conversational,
+                resume_payload: resume_payload.cloned(),
+            };
+
+            // Off by default: with neither an audit sink nor a registered
+            // stream observer, this is exactly the pre-existing
+            // `self.runtime.step(...)` call — no observer is constructed and
+            // behaviour is byte-identical to before EPIC-B B-3 / R2.
+            let mut observers: Vec<Arc<dyn StepObserver>> = Vec::new();
+            if let Some(sink) = &self.audit_sink {
+                observers.push(Arc::new(AgentAuditObserver::new(
+                    sink.clone(),
+                    tenant_ctx_for_audit(tenant_id, env_id),
+                    agent_id.to_string(),
+                    session_id.to_string(),
+                )));
+            }
+            if let Some(reg) = &self.stream_observers
+                && let Some(entry) = reg.get(session_id)
+            {
+                observers.push(entry.value().clone());
+            }
+            // Shared context (Phase A2): this is the ONE place the run's first
+            // context opens — fresh trace, read-write, bound to this step's
+            // tenant. It does not set the caller policy; `run_step` does that
+            // for every agent turn, including ones that never come through this
+            // handler (graph turns, playbook turns, designer hosts).
+            let open_run_context =
+                crate::runner::run_context_policy::should_open_scope(&self.runtime, agent_id);
+            let step = async move {
+                match observers.len() {
+                    0 => self.runtime.step(tenant, session_id, agent_id, input).await,
+                    1 => {
+                        self.runtime
+                            .step_with_observer(
+                                tenant,
+                                session_id,
+                                agent_id,
+                                input,
+                                observers.remove(0),
+                            )
+                            .await
+                    }
+                    _ => {
+                        let composite: Arc<dyn StepObserver> =
+                            Arc::new(crate::http::agent_stream::CompositeObserver::new(observers));
+                        self.runtime
+                            .step_with_observer(tenant, session_id, agent_id, input, composite)
+                            .await
+                    }
+                }
+            };
+            let step_result = if open_run_context {
+                greentic_aw_runtime::RunContext::scope(
+                    greentic_aw_runtime::RunContext::new(
+                        tenant_id,
+                        Arc::new(greentic_aw_runtime::RunTrace::new()),
+                    ),
+                    step,
+                )
+                .await
+            } else {
+                step.await
             };
 
             match step_result {
-                Ok(output) => Ok(json!({
-                    "reply": output.reply,
-                    "trail": output.trail,
-                    "terminated_by": output.terminated_by,
-                })),
+                Ok(output) => {
+                    // Best-effort per-run metering event (EPIC-D D-1), emitted
+                    // alongside (never instead of) the per-step agent-audit
+                    // events above. Off by default: with no audit sink
+                    // configured, no metering event is built or sent — this
+                    // mirrors the audit-sink "off" branch's byte-identical
+                    // behaviour above.
+                    if let Some(sink) = &self.audit_sink {
+                        let tenant_ctx = tenant_ctx_for_audit(tenant_id, env_id);
+                        sink.emit(
+                            metering_subject(tenant_id),
+                            &build_agent_run_metering_event(
+                                &tenant_ctx,
+                                agent_id,
+                                output.trail.len(),
+                                chrono::Utc::now(),
+                                generate_audit_event_id(),
+                            ),
+                        );
+                    }
+
+                    let mut node_output = json!({
+                        "reply": output.reply,
+                        "trail": output.trail,
+                        "terminated_by": output.terminated_by,
+                        "usage": output.usage,
+                    });
+                    // Present only while a `flow:` tool is parked on the user
+                    // (`terminated_by == "awaiting_tool_input"`): the card the
+                    // engine renders as this turn's output in place of `reply`.
+                    if let Some(presentation) = output.pending_presentation {
+                        node_output["pending_presentation"] = presentation;
+                    }
+                    // A typed message answered while the tool stays parked:
+                    // `reply` is the answer and the card follows it.
+                    if output.side_turn {
+                        node_output["side_turn"] = json!(true);
+                    }
+                    Ok(node_output)
+                }
                 Err(AgentError::GuardrailDenied {
                     direction,
                     code,
@@ -296,11 +505,28 @@ mod aw {
                     // Never leak the internal AgentError to the flow output. Log
                     // the detail for operators; return a sanitised reply only.
                     tracing::warn!(error = %error, agent_id, session_id, "DwAgent step failed");
-                    Ok(json!({
+                    let mut out = json!({
                         "reply": SANITISED_ERROR_REPLY,
                         "trail": Vec::<AgentStep>::new(),
                         "terminated_by": "error",
-                    }))
+                    });
+                    // Opt-in diagnostic: surface the internal error detail (never
+                    // part of the user-facing reply) when `GREENTIC_AGENT_ERROR_DETAIL`
+                    // is truthy, so an operator debugging the offline Test-chat
+                    // sidecar sees the real cause instead of only "Something went
+                    // wrong". The runner's telemetry `main` exports tracing to OTLP,
+                    // not stderr, so the `warn!` above is otherwise invisible.
+                    if std::env::var("GREENTIC_AGENT_ERROR_DETAIL")
+                        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                        .unwrap_or(false)
+                    {
+                        out["error_detail"] = json!(format!("{error} || {error:?}"));
+                    }
+                    if let Some(card) = self.runtime.parked_card(&tenant_for_card, session_id).await
+                    {
+                        reoffer_parked_card(&mut out, card);
+                    }
+                    Ok(out)
                 }
             }
         }
@@ -401,8 +627,16 @@ mod aw {
     /// tenant-registered MCP servers must stay disabled. Returns `None` on
     /// opt-out or when either credential is missing/empty.
     ///
+    /// `secrets`, when `Some`, is threaded into [`McpToolSource::with_secrets`]
+    /// so `local-wasm` tools dispatched from this source's catalogs can read
+    /// their tenant credentials. Callers with no per-tenant secrets context
+    /// (the process-level serve path) pass `None`, matching prior behavior.
+    ///
     /// [`McpToolSource`]: greentic_aw_runtime::McpToolSource
-    fn mcp_source_from_env() -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
+    /// [`McpToolSource::with_secrets`]: greentic_aw_runtime::McpToolSource::with_secrets
+    pub(crate) fn mcp_source_from_env(
+        secrets: Option<crate::secrets::DynSecretsManager>,
+    ) -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
         if std::env::var("GREENTIC_AW_MCP").ok().as_deref() == Some("0") {
             tracing::info!("GREENTIC_AW_MCP=0; MCP tool source disabled");
             return None;
@@ -414,9 +648,145 @@ mod aw {
             .ok()
             .filter(|s| !s.is_empty())?;
         tracing::info!(endpoint = %endpoint, "MCP tool source constructed");
-        Some(Arc::new(greentic_aw_runtime::McpToolSource::new(
-            endpoint, token,
-        )))
+        let source = match secrets {
+            Some(manager) => {
+                greentic_aw_runtime::McpToolSource::with_secrets(endpoint, token, manager)
+            }
+            None => greentic_aw_runtime::McpToolSource::new(endpoint, token),
+        };
+        Some(Arc::new(source))
+    }
+
+    /// Build the MCP tool source from the route material the operator's loaded
+    /// packs carry in `assets/mcp-routes.json`, for a deployed runner that has
+    /// no admin credentials.
+    ///
+    /// Mirrors [`component_source_from_packs`] and [`flow_source_from_packs`]:
+    /// discover from the packs rather than a remote admin. It is the FALLBACK
+    /// behind [`mcp_source_from_env`], never a replacement — see the precedence
+    /// note at the two construction sites.
+    ///
+    /// Honours the same `GREENTIC_AW_MCP=0` opt-out as [`mcp_source_from_env`]:
+    /// an operator who disabled outbound MCP must not have it re-enabled by a
+    /// pack. Returns `None` when disabled, when no pack is loaded, or when no
+    /// loaded pack declares any route — so `mcp:` tool refs then resolve from
+    /// their `ToolRef` contract for the LLM tool list and report an honest
+    /// "unknown mcp tool" if actually called.
+    ///
+    /// Route ids are deduplicated across packs, first pack wins. Server ids are
+    /// tenant-scoped in the admin, so a collision between two packs of the same
+    /// tenant means the same server; a collision across tenants in one host is
+    /// pre-existing and not made worse here (spec §11 O-3).
+    ///
+    /// The dedup cannot mix UNITS: `packs` is one revision's pack list (the
+    /// runtime is built per `TenantRuntime`, i.e. per deployed unit), so every
+    /// record here belongs to the unit named by `unit`. `unit` is that
+    /// revision's `bundle_id` and scopes the credential read (see
+    /// [`greentic_aw_runtime::mcp_secrets::read_mcp_secret_for_unit`]); `None`
+    /// on the legacy tenant-only runtime keeps the team / `_` lookup exactly.
+    /// The secrets manager an agent's `mcp:` tools resolve their credential
+    /// with — the injected host manager, UNLESS `SECRETS_BACKEND` explicitly
+    /// names one.
+    ///
+    /// # Why this is not simply the injected manager
+    ///
+    /// It was, and that made the pack-backed MCP path unreachable in the lane
+    /// it was built for. `greentic-start` injects its own manager
+    /// (`HostBuilder::with_secrets_manager`, `revision_boot.rs`) whose kind is
+    /// one of `dev-store` / `env` / `vault` — there is no broker variant — and
+    /// greentic-designer's `orchestrate::mcp_runtime` projects
+    /// `SECRETS_BACKEND=broker` + the two `SECRETS_BROKER_*` variables onto
+    /// exactly that child. So the operator asked for a broker, the projection
+    /// arrived intact, and the agent loop resolved against a manager that had
+    /// never heard of it: every `mcp:` tool failed with "no credential at
+    /// secrets://…", having sent no request to the broker at all. Verified end
+    /// to end on 2026-08-21 (greentic-designer `docs/superpowers/specs/
+    /// 2026-08-20-aw-mcp-in-deployed-bundles-design.md`, the Slice 8 note).
+    ///
+    /// The flow-node path had the SAME problem and was not fixed alongside
+    /// this one: it built its own manager from `SECRETS_BACKEND` and ignored
+    /// the injected one, so every `mcp` node in a Cloud Run or Kubernetes
+    /// deployment failed on a credential it never looked for in the right
+    /// store. This comment previously asserted the opposite, which is why that
+    /// went unnoticed for the life of #706. Both paths now share
+    /// [`crate::runner::mcp_node::aw::choose_mcp_secrets`].
+    ///
+    /// # Why it is gated on the variable being SET
+    ///
+    /// An unset `SECRETS_BACKEND` must keep the injected manager, or every host
+    /// that deliberately supplies one — the designer's in-process host, a
+    /// greentic-start pod on Vault — would be silently downgraded to the `env`
+    /// backend, which `SecretsBackend::from_env` returns for an absent value.
+    /// That would break working deployments to fix a broken one. The variable
+    /// being present is the operator's explicit instruction, and only then does
+    /// it win.
+    ///
+    /// A failure to build from the variable falls back to the injected manager
+    /// rather than to nothing: a malformed broker endpoint should degrade to
+    /// the host's own resolution, not strip the agent of every credential.
+    pub(crate) fn mcp_secrets_manager(
+        injected: &crate::secrets::DynSecretsManager,
+    ) -> crate::secrets::DynSecretsManager {
+        let requested = std::env::var("SECRETS_BACKEND").ok();
+        crate::runner::mcp_node::aw::choose_mcp_secrets(
+            requested.as_deref(),
+            crate::runner::mcp_node::aw::secrets_from_env(),
+            Some(injected),
+        )
+        // `choose_mcp_secrets` returns `None` only when nothing at all is
+        // available, and `injected` is `Some` here by construction.
+        .unwrap_or_else(|| injected.clone())
+    }
+
+    pub(crate) fn mcp_source_from_packs(
+        packs: &[Arc<crate::pack::PackRuntime>],
+        tenant: &str,
+        secrets: Option<crate::secrets::DynSecretsManager>,
+        unit: Option<&str>,
+    ) -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
+        if std::env::var("GREENTIC_AW_MCP").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_MCP=0; pack-backed MCP tool source disabled");
+            return None;
+        }
+        if packs.is_empty() {
+            return None;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut records = Vec::new();
+        for pack in packs {
+            let Some(routes) = pack.mcp_routes() else {
+                continue;
+            };
+            for route in routes.iter() {
+                if !seen.insert(route.server_id.clone()) {
+                    continue;
+                }
+                records.push(greentic_aw_runtime::McpPackRoute {
+                    server_id: route.server_id.clone(),
+                    transport: route.transport.clone(),
+                    transport_url: route.transport_url.clone(),
+                    auth_header_name: route.auth_header_name.clone(),
+                    auth_team: route.auth_team.clone(),
+                    component_ref: route.component_ref.clone(),
+                    component_version: route.component_version.clone(),
+                    component_digest: route.component_digest.clone(),
+                });
+            }
+        }
+
+        if records.is_empty() {
+            return None;
+        }
+        tracing::info!(
+            tenant = %tenant,
+            servers = records.len(),
+            "pack-backed MCP tool source constructed"
+        );
+        Some(Arc::new(
+            greentic_aw_runtime::McpToolSource::from_pack_routes(records, secrets)
+                .with_unit(unit.map(str::to_string)),
+        ))
     }
 
     /// Build the component tool source from the operator's loaded packs, gated
@@ -424,7 +794,7 @@ mod aw {
     /// when disabled or when no packs are loaded, so `component:` tool refs then
     /// resolve to nothing. Mirrors [`mcp_source_from_env`] but discovers tools
     /// from in-pack components rather than a remote admin.
-    fn component_source_from_packs(
+    pub(crate) fn component_source_from_packs(
         packs: &[Arc<crate::pack::PackRuntime>],
         tenant: &str,
     ) -> Option<Arc<greentic_aw_runtime::ComponentToolSource>> {
@@ -445,6 +815,56 @@ mod aw {
         Some(Arc::new(greentic_aw_runtime::ComponentToolSource::new(
             invoker,
         )))
+    }
+
+    /// Build the flow tool source from the operator's loaded packs, gated by
+    /// `GREENTIC_AW_FLOW_TOOLS` (set to "0" to disable). Returns `None` when
+    /// disabled or when no packs are loaded, so `flow:` tool refs then resolve
+    /// to nothing. Mirrors [`component_source_from_packs`] but discovers tools
+    /// from in-pack flows rather than in-pack components.
+    pub(crate) fn flow_source_from_packs(
+        packs: &[Arc<crate::pack::PackRuntime>],
+        tenant: &str,
+    ) -> Option<Arc<greentic_aw_runtime::FlowToolSource>> {
+        if std::env::var("GREENTIC_AW_FLOW_TOOLS").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_FLOW_TOOLS=0; flow tool source disabled");
+            return None;
+        }
+        if packs.is_empty() {
+            return None;
+        }
+        let invoker = Arc::new(crate::runner::flow_invoker::PackRuntimeFlowInvoker::new(
+            packs.to_vec(),
+            tenant.to_string(),
+        ));
+        tracing::info!(tenant = %tenant, packs = packs.len(), "flow tool source constructed");
+        Some(Arc::new(greentic_aw_runtime::FlowToolSource::new(invoker)))
+    }
+
+    /// Build the sorla (SoR BusinessAction) tool source from a configured
+    /// SoRX deployment, gated by `GREENTIC_AW_SORLA_TOOLS` (set to "0" to
+    /// disable) and addressed by `GREENTIC_AW_SORX_URL`. Returns `None` when
+    /// disabled or when no SoRX URL is configured, so `sorla:` tool refs then
+    /// resolve to nothing. Mirrors [`component_source_from_packs`] but
+    /// discovers tools from a deployed SoR's capability-admin API rather than
+    /// in-pack components.
+    ///
+    /// The capability fetch (`SorxHttpInvoker::fetch`) is infallible: a
+    /// down/unreachable SoR degrades to an empty operation set (logged)
+    /// rather than blocking worker startup, so this still returns `Some`
+    /// whenever a URL is configured.
+    pub(crate) async fn sorla_source_from_env() -> Option<Arc<greentic_aw_runtime::SorlaToolSource>>
+    {
+        if std::env::var("GREENTIC_AW_SORLA_TOOLS").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_SORLA_TOOLS=0; sorla tool source disabled");
+            return None;
+        }
+        let base = std::env::var("GREENTIC_AW_SORX_URL")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let invoker = Arc::new(crate::runner::sorx_invoker::SorxHttpInvoker::fetch(base).await);
+        tracing::info!("sorla tool source constructed");
+        Some(Arc::new(greentic_aw_runtime::SorlaToolSource::new(invoker)))
     }
 
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
@@ -481,17 +901,31 @@ mod aw {
     /// reference from the per-tenant secrets store first, then falls back to the
     /// process env. This is what makes `gtc start` zero-env: `gtc setup` persists
     /// the value in the dev store, and the injected secrets manager's read-side
-    /// candidate fallback bridges the canonical `secrets://{env}/{tenant}/_/{provider}/{key}`
-    /// scope to the pack-namespaced scope setup actually wrote. The env fallback
-    /// preserves existing `TAVILY_API_KEY`-style runs.
+    /// candidate fallback bridges the canonical store scope to the pack-namespaced
+    /// scope setup actually wrote. The env fallback preserves existing
+    /// `TAVILY_API_KEY`-style runs.
+    ///
+    /// `unit` is the deployed unit's `bundle_id` and scopes the store read. It
+    /// has to: one environment can run the same provider credential for two
+    /// workers, and without it both resolve
+    /// `secrets://{env}/{tenant}/_/{provider}/{key}` — ONE address for the whole
+    /// environment, so the second value staged wins and the other worker
+    /// silently authenticates as the wrong account. `None` on the legacy
+    /// tenant-only path and the process-level serve path, where there is no unit
+    /// to scope by.
     struct StoreToolSecretsBackend {
         secrets: crate::secrets::DynSecretsManager,
         tenant: String,
         env: String,
+        unit: Option<String>,
     }
 
     impl StoreToolSecretsBackend {
-        fn new(secrets: crate::secrets::DynSecretsManager, tenant: String) -> Self {
+        fn new(
+            secrets: crate::secrets::DynSecretsManager,
+            tenant: String,
+            unit: Option<String>,
+        ) -> Self {
             let env = std::env::var("GREENTIC_ENV")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -500,28 +934,61 @@ mod aw {
                 secrets,
                 tenant,
                 env,
+                unit,
             }
         }
 
-        /// Map `secret://<provider>/<key>` to the canonical store URI
-        /// `secrets://{env}/{tenant}/_/{provider}/{key}`. The injected manager's
-        /// candidate fallback handles the env/team/pack-namespace bridging.
-        fn canonical_store_uri(&self, uri: &str) -> Option<String> {
+        /// Every store URI a `secret://<provider>/<key>` read will try, in
+        /// order: this unit's own address first, then the env-wide one.
+        ///
+        /// Both are built by
+        /// [`crate::secrets::agent_tool_secret_uri`] — the one function the
+        /// designer stages through as well, so a writer cannot spell an address
+        /// this reader never asks for.
+        ///
+        /// REVIEW BY 2026-12-18: the env-wide candidate is a COMPATIBILITY
+        /// fallback when a unit is known, not a design choice. It exists so an
+        /// environment staged before this scope existed keeps working when its
+        /// runner moves; the next stage writes the unit-scoped address. Once
+        /// every lane stages unit-scoped tool secrets, it lets one unit read a
+        /// value another unit's writer left at the shared address — decide then
+        /// whether to drop it for the unit case. It remains the ONLY candidate
+        /// when no unit is known. This mirrors, deliberately, the same decision
+        /// `crate::secrets::pack_secret_path_candidates` records for a pack
+        /// secret and `greentic_aw_runtime::mcp_secrets` for an MCP token.
+        fn store_uri_candidates(&self, uri: &str) -> Vec<String> {
             let body = uri.strip_prefix("secret://").unwrap_or(uri);
-            let (provider, key) = body.split_once('/')?;
-            if provider.is_empty() || key.is_empty() {
-                return None;
+            let Some((provider, key)) = body.split_once('/') else {
+                return Vec::new();
+            };
+            let bare =
+                crate::secrets::agent_tool_secret_uri(&self.env, &self.tenant, provider, key, None);
+            let scoped = self.unit.as_deref().and_then(|unit| {
+                crate::secrets::agent_tool_secret_uri(
+                    &self.env,
+                    &self.tenant,
+                    provider,
+                    key,
+                    Some(unit),
+                )
+            });
+            // A scoped URI equal to the bare one would make the fallback a
+            // duplicate read rather than a fallback; it cannot happen (the unit
+            // segment always carries `_unit_<hash>`), but the guard keeps that a
+            // fact rather than a hope.
+            match (scoped, bare) {
+                (Some(scoped), Some(bare)) if scoped != bare => vec![scoped, bare],
+                (Some(scoped), None) => vec![scoped],
+                (_, Some(bare)) => vec![bare],
+                (None, None) => Vec::new(),
             }
-            Some(format!(
-                "secrets://{}/{}/_/{}/{}",
-                self.env, self.tenant, provider, key
-            ))
         }
     }
 
     impl greentic_ext_runtime::SecretsBackend for StoreToolSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
-            if let Some(store_uri) = self.canonical_store_uri(uri) {
+            let candidates = self.store_uri_candidates(uri);
+            if !candidates.is_empty() {
                 // Read off a dedicated thread with its own current-thread runtime:
                 // the extension runtime may invoke this from within the async
                 // runner, where a nested `block_on` would panic.
@@ -531,7 +998,14 @@ mod aw {
                         .enable_all()
                         .build()
                         .ok()?;
-                    runtime.block_on(async move { secrets.read(&store_uri).await.ok() })
+                    runtime.block_on(async move {
+                        for candidate in &candidates {
+                            if let Ok(bytes) = secrets.read(candidate).await {
+                                return Some(bytes);
+                            }
+                        }
+                        None
+                    })
                 })
                 .join()
                 .ok()
@@ -595,8 +1069,242 @@ mod aw {
         out.trim_matches('_').to_string()
     }
 
+    /// Env-keyed [`LlmPort`](greentic_ext_runtime::host_ports::LlmPort) for the
+    /// extension runtime.
+    ///
+    /// Tool extensions that call `host.llm.complete()` internally (e.g. the
+    /// adaptive-cards `generate_card` / `data_to_card` tools) route through this
+    /// port. Without it wired the ext-runtime returns `"llm not configured for
+    /// this runtime"`. It reuses the same env-keyed multi-provider backend the
+    /// agent's OWN reasoning LLM uses ([`GreenticLlmBackend`]), so a single
+    /// `GREENTIC_LLM_API_KEY` powers both the agent and its tools.
+    ///
+    /// Provider resolution is deliberately env-global (single key), mirroring the
+    /// agent's in-process backend: `ctx`, `role`, and `extension_id` do not select
+    /// a provider here (per-role/per-tenant resolution is the designer-admin's job,
+    /// not the in-process runner's). The synchronous `complete` drives the async
+    /// backend on a dedicated OS thread with its own current-thread runtime — the
+    /// same bridge [`StoreToolSecretsBackend::get`] uses — because the ext-runtime
+    /// may invoke it from within the async runner, where a nested `block_on`
+    /// would panic.
+    #[cfg(feature = "greentic-llm-backend")]
+    pub(crate) struct EnvLlmPort {
+        backend: Arc<dyn greentic_aw_runtime::llm::LlmBackend>,
+        provider: String,
+        model: String,
+    }
+
+    #[cfg(feature = "greentic-llm-backend")]
+    impl EnvLlmPort {
+        /// Default provider when `GREENTIC_LLM_PROVIDER` is unset. Mirrors the
+        /// runner's DeepSeek-first posture for the in-process worker.
+        const DEFAULT_PROVIDER: &'static str = "deepseek";
+        /// Default model when `GREENTIC_LLM_MODEL` is unset (DeepSeek's chat model,
+        /// matching `GreenticLlmBackend`'s live-test default).
+        const DEFAULT_MODEL: &'static str = "deepseek-chat";
+
+        /// Build an [`EnvLlmPort`] from the environment, or `None` when no LLM key
+        /// is present. Reads `GREENTIC_LLM_API_KEY` (fallback `OPENAI_API_KEY`),
+        /// `GREENTIC_LLM_PROVIDER` (default `deepseek`), `GREENTIC_LLM_MODEL`
+        /// (default `deepseek-chat`), and `GREENTIC_LLM_BASE_URL` — the SAME env
+        /// contract as [`in_process_llm_backend_with_key`], so the agent and its
+        /// tools never resolve to different credentials.
+        pub(crate) fn from_env() -> Option<Self> {
+            let api_key = std::env::var("GREENTIC_LLM_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("OPENAI_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })?;
+            let provider = std::env::var("GREENTIC_LLM_PROVIDER")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| Self::DEFAULT_PROVIDER.to_string());
+            let model = std::env::var("GREENTIC_LLM_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| Self::DEFAULT_MODEL.to_string());
+            let base_url = std::env::var("GREENTIC_LLM_BASE_URL").ok();
+            Some(Self {
+                backend: Arc::new(greentic_aw_runtime::GreenticLlmBackend::new(
+                    api_key, base_url,
+                )),
+                provider,
+                model,
+            })
+        }
+    }
+
+    /// Map a port request onto an AW request for `provider`/`model`.
+    ///
+    /// Tool-calling is not exposed to extension-internal completions, so
+    /// `tools` is empty; the port's `response_format` has no greentic-llm
+    /// counterpart at this layer (JSON coercion, when requested, is the
+    /// extension's own concern), so it is not forwarded. `credential_ref` is
+    /// `None` because the backend already holds the resolved key.
+    ///
+    /// Shared by every [`greentic_ext_runtime::host_ports::LlmPort`]
+    /// implementation in this crate (`EnvLlmPort` and
+    /// `crate::runner::ext_llm_port::AgentLlmPort`) so the mapping cannot
+    /// drift between them.
+    #[cfg(feature = "greentic-llm-backend")]
+    pub(crate) fn port_request_to_llm_request(
+        request: greentic_ext_runtime::host_ports::LlmPortRequest,
+        provider: &str,
+        model: &str,
+    ) -> greentic_aw_runtime::llm::LlmRequest {
+        use greentic_aw_runtime::state::ChatMessage;
+
+        let history = request
+            .messages
+            .into_iter()
+            .map(|(role, content)| match role.as_str() {
+                "assistant" => ChatMessage::Assistant {
+                    content,
+                    tool_calls: Vec::new(),
+                },
+                "system" => ChatMessage::System { content },
+                // Any non-assistant/non-system role (notably "user") maps to a
+                // user turn — the safe default for a chat completion.
+                _ => ChatMessage::User { content },
+            })
+            .collect();
+
+        greentic_aw_runtime::llm::LlmRequest {
+            system_prompt: request.system_prompt,
+            history,
+            tools: Vec::new(),
+            provider: greentic_aw_runtime::config::LlmProviderRef {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                credential_ref: None,
+            },
+        }
+    }
+
+    /// Drive an async completion on a dedicated OS thread with its own
+    /// current-thread runtime. The ext-runtime may call a port from inside the
+    /// async runner, where a nested `block_on` panics. Same bridge as
+    /// `StoreToolSecretsBackend::get`.
+    ///
+    /// Shared by every [`greentic_ext_runtime::host_ports::LlmPort`]
+    /// implementation in this crate so the thread bridge exists in exactly one
+    /// place.
+    #[cfg(feature = "greentic-llm-backend")]
+    pub(crate) fn complete_on_thread(
+        backend: Arc<dyn greentic_aw_runtime::llm::LlmBackend>,
+        request: greentic_aw_runtime::llm::LlmRequest,
+    ) -> Result<
+        greentic_ext_runtime::host_ports::LlmPortResponse,
+        greentic_ext_runtime::host_ports::LlmPortError,
+    > {
+        use greentic_ext_runtime::host_ports::{LlmPortError, LlmPortResponse};
+
+        let result = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| LlmPortError::Backend(error.to_string()))?;
+            runtime
+                .block_on(backend.complete(request))
+                .map_err(|error| LlmPortError::Backend(error.to_string()))
+        })
+        .join()
+        .map_err(|_| LlmPortError::Backend("llm completion thread panicked".to_string()))??;
+
+        let content = result.content.unwrap_or_default();
+        let total_tokens = result
+            .tokens_in
+            .checked_add(result.tokens_out)
+            .filter(|&total| total > 0);
+        Ok(LlmPortResponse {
+            content,
+            total_tokens,
+        })
+    }
+
+    #[cfg(feature = "greentic-llm-backend")]
+    impl greentic_ext_runtime::host_ports::LlmPort for EnvLlmPort {
+        fn complete(
+            &self,
+            _extension_id: &str,
+            _ctx: &greentic_ext_runtime::host_ports::HostCallContext,
+            _role: &str,
+            request: greentic_ext_runtime::host_ports::LlmPortRequest,
+        ) -> Result<
+            greentic_ext_runtime::host_ports::LlmPortResponse,
+            greentic_ext_runtime::host_ports::LlmPortError,
+        > {
+            let llm_request = port_request_to_llm_request(request, &self.provider, &self.model);
+            complete_on_thread(self.backend.clone(), llm_request)
+        }
+    }
+
+    /// Which tier of `select_ext_llm_port`'s precedence produced the chosen
+    /// port. Returned alongside the port so the tracing line naming which
+    /// tier won is DERIVED from this same decision — never a second,
+    /// hand-kept `match` re-expressing the same precedence, which could
+    /// silently drift from the real one if either copy were edited alone.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ExtLlmTier {
+        Host,
+        Agent,
+        Env,
+    }
+
+    /// Pick the extension runtime's LLM port. Pure so the tier order is
+    /// testable: the bug this exists to prevent was a wrong tier being
+    /// chosen silently. Returns the winning tier alongside the port for the
+    /// same reason.
+    fn select_ext_llm_port(
+        host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        env_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+    ) -> Option<(
+        ExtLlmTier,
+        Arc<dyn greentic_ext_runtime::host_ports::LlmPort>,
+    )> {
+        if let Some(port) = host_llm_port {
+            return Some((ExtLlmTier::Host, port));
+        }
+        if let Some(port) = agent_llm_port {
+            return Some((ExtLlmTier::Agent, port));
+        }
+        env_llm_port.map(|port| (ExtLlmTier::Env, port))
+    }
+
+    /// Whether `build_runtime_with_stores` should attempt to build tier 2 of
+    /// the extension LLM port (the worker's own resolved backend) at THIS
+    /// call. Pure, so the two call sites' `None`s share one TESTED decision
+    /// instead of each being an untested one-line condition that could
+    /// invert silently: `ExtensionRuntime` exposes no `llm_port` accessor, so
+    /// a test can only see this boolean, never the runtime it produced. An
+    /// inverted guard would have `AgentLlmPort::from_agents` build (and log)
+    /// a port that `select_ext_llm_port` then discards in favour of a
+    /// higher-priority tier — exactly the lying "wired (the worker's own
+    /// agent LLM)" log this whole change exists to remove.
+    ///
+    /// - `bridge_extension_configured`: the `GREENTIC_AW_LLM_EXTENSION`
+    ///   bridge branch never attempts tier 2 — its `llm` dispatches through
+    ///   `ext_runtime` itself, so there is no in-process backend to wrap yet.
+    /// - `host_port_present`: the zero-env branch attempts tier 2 only when
+    ///   the HOST has not already injected its own port. `select_ext_llm_port`
+    ///   prefers the host port unconditionally, so building the agent port
+    ///   anyway would be discarded work that also logs as though it mattered.
+    fn should_attempt_agent_llm_port(
+        bridge_extension_configured: bool,
+        host_port_present: bool,
+    ) -> bool {
+        !bridge_extension_configured && !host_port_present
+    }
+
     pub(crate) fn build_ext_runtime(
         secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend>,
+        host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: &[Arc<crate::pack::PackRuntime>],
     ) -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
         use greentic_ext_runtime::{
             DiscoveryPaths, ExtensionRuntime, HostOverrides, RuntimeConfig, discovery,
@@ -610,9 +1318,99 @@ mod aw {
         // silently breaks any AW tool that needs either (e.g. tavily_search).
         // The per-tenant path passes a store-backed backend (zero-env); the
         // process-level serve paths pass the env-only backend.
+        //
+        // `llm_port` powers tool extensions that call `host.llm.complete()`
+        // internally (e.g. adaptive-cards `generate_card`). The tier order is
+        // decided by `select_ext_llm_port`, which also reports WHICH tier won
+        // as an `ExtLlmTier` — kept pure and unit-tested so a wrong tier
+        // being chosen silently — the bug this whole change exists to fix —
+        // cannot creep back in unnoticed, and so the tracing line below can
+        // be derived from that single decision rather than a second copy of
+        // it:
+        //   1. A `host_llm_port` injected by the embedding host (e.g. the
+        //      designer) — its own per-tenant, admin-backed, metered path. NOT
+        //      feature-gated: a host can inject a port regardless of features.
+        //   2. The WORKER's own resolved backend, when this runtime serves
+        //      agents (`agent_llm_port`, built by the caller via
+        //      `AgentLlmPort::from_agents`). This is the model the operator
+        //      actually selected. It exists because `build_ext_runtime` used
+        //      to run BEFORE the worker's backend was resolved, so every
+        //      deployed lane fell straight through to tier 3's env-keyed
+        //      default (or tier 4's refusal) instead. Wired today at
+        //      `build_runtime_with_stores`'s zero-env branch, which also
+        //      serves the ephemeral desktop path via
+        //      `build_agent_node_wiring_ephemeral` — see tier 3 below for the
+        //      one agent-holding site this tier does not reach yet.
+        //   3. Otherwise, the env-keyed `EnvLlmPort` — the call sites that
+        //      serve no agents at all (`runner/mod.rs`'s process-level
+        //      ext-runtime field, `graph_node.rs`'s process-level graph serve
+        //      path), only when the `greentic-llm-backend` feature is on AND
+        //      an LLM key is present in env. `build_agent_runtime` (the
+        //      `serve_agentic` / process-level in-proc NATS path) is the
+        //      exception worth naming: it DOES hold agents (an empty map
+        //      returns `None` before reaching here) and is deliberately NOT
+        //      wired to tier 2 yet — its `llm` comes from
+        //      `build_llm_backend(&ext_runtime)`, which needs `ext_runtime`
+        //      to exist unconditionally (not only on a bridge branch, unlike
+        //      `build_runtime_with_stores`), so closing it needs the same
+        //      circular-dependency split, and that split has not been done
+        //      there. That lane still runs an extension's
+        //      `host.llm.complete` on this tier's env-keyed default even
+        //      though it serves agents — see the `tracing::warn!` at its own
+        //      `build_ext_runtime` call, which says so out loud rather than
+        //      leaving it to this comment alone.
+        //   4. Otherwise `None`, so the ext-runtime keeps returning "llm not
+        //      configured for this runtime" (unchanged no-key behaviour).
+        //
+        // Note `env_llm_port` below is now built EAGERLY on every call,
+        // regardless of which tier ends up winning — previously this line
+        // only ran when the host port was absent. `EnvLlmPort::from_env()` is
+        // env reads plus a struct construction, no I/O, so the redundant work
+        // when tier 1 or 2 wins is a remark, not a performance concern.
+        let env_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> = {
+            #[cfg(feature = "greentic-llm-backend")]
+            {
+                EnvLlmPort::from_env().map(|port| {
+                    Arc::new(port) as Arc<dyn greentic_ext_runtime::host_ports::LlmPort>
+                })
+            }
+            #[cfg(not(feature = "greentic-llm-backend"))]
+            {
+                None
+            }
+        };
+
+        // The tracing line is derived from the tier `select_ext_llm_port`
+        // actually chose, rather than a second `match` re-deciding the same
+        // precedence from the three `is_some()`s — that second copy is
+        // exactly what let the log claim "host-provided" while a different
+        // tier's port was the one actually wired. `AgentLlmPort::from_agents`
+        // already logs its own `info` line naming the agent, so tier 2 does
+        // not log again here.
+        let selected = select_ext_llm_port(host_llm_port, agent_llm_port, env_llm_port);
+        match &selected {
+            Some((ExtLlmTier::Host, _)) => {
+                tracing::info!("extension runtime LLM port wired (host-provided ext LLM)");
+            }
+            Some((ExtLlmTier::Agent, _)) => {}
+            Some((ExtLlmTier::Env, _)) => {
+                tracing::info!(
+                    "extension runtime LLM port wired (env ext LLM, env-keyed greentic-llm; \
+                     no host port, no agent port)"
+                );
+            }
+            None => {
+                tracing::info!(
+                    "extension runtime LLM port not configured (no host port, no agent port, no env key)"
+                );
+            }
+        }
+        let llm_port = selected.map(|(_, port)| port);
+
         let overrides = HostOverrides {
             secrets_backend,
             http_client: shared_blocking_http_client(),
+            llm_port,
             ..HostOverrides::default()
         };
         let config = RuntimeConfig::from_paths(paths).with_host_overrides(overrides);
@@ -627,26 +1425,197 @@ mod aw {
         // Initial load of on-disk design extensions (agentic-worker tools live
         // in `<root>/design/<ext>/`).
         let design_dir = root.join("design");
+        let mut on_disk = 0usize;
         match discovery::scan_kind_dir(&design_dir) {
             Ok(ext_dirs) => {
-                let mut loaded = 0usize;
                 for ext_dir in ext_dirs {
                     match runtime.register_loaded_from_dir(&ext_dir) {
-                        Ok(()) => loaded += 1,
+                        Ok(()) => on_disk += 1,
                         Err(error) => tracing::warn!(
                             error = %error, dir = %ext_dir.display(),
                             "skipping extension that failed to load"
                         ),
                     }
                 }
-                tracing::info!(loaded, dir = %design_dir.display(), "loaded design extensions");
             }
             Err(error) => {
                 tracing::warn!(error = %error, dir = %design_dir.display(), "scanning design extensions failed")
             }
         }
 
+        // Then the extensions the loaded packs carry at `extensions/*.gtxpack`.
+        //
+        // This runs SECOND on purpose: `register_loaded_from_dir` inserts by
+        // `ExtensionId`, so a pack pass ahead of the disk scan would let a
+        // pack-frozen copy overwrite the one an operator installed. See
+        // `pack_extensions::is_shadowed` for why disk wins and what that costs.
+        //
+        // In a k8s or Cloud Run container the directory above is empty — nothing
+        // writes `GREENTIC_EXTENSIONS_DIR` there — so this is the only source
+        // the worker has, and before it existed every extension tool an operator
+        // bound was dropped with a warn after the deploy reported success.
+        let from_packs = crate::runner::pack_extensions::register_from_packs(&mut runtime, packs);
+
+        // Log the cap ids, not just a count: an unresolved mandatory guardrail
+        // cap blocks every agent turn, and until now the only way to see which
+        // caps a runner has was to trigger that failure. Emitted after both
+        // sources so the line describes the registry the agent will actually
+        // dispatch against.
+        let mut cap_ids: Vec<String> = runtime
+            .capability_registry()
+            .offerings()
+            .map(|offering| offering.cap_id.to_string())
+            .collect();
+        cap_ids.sort();
+        tracing::info!(
+            loaded = on_disk,
+            from_packs = from_packs.loaded,
+            shadowed_by_disk = from_packs.shadowed,
+            pack_failures = from_packs.failed,
+            dir = %design_dir.display(),
+            caps = %cap_ids.join(","),
+            "loaded design extensions"
+        );
+
         Some(Arc::new(runtime))
+    }
+
+    /// Whether `provider` needs an API key to authenticate.
+    ///
+    /// Authoritative when `greentic-llm-backend` is compiled in: the answer
+    /// comes from `greentic_llm::ProviderKind::requires_api_key()`. The local
+    /// table is the fallback for builds without that feature (where
+    /// `greentic_llm` is not linked at all) and for a provider string that
+    /// crate does not recognise; `keyless_table_matches_greentic_llm` pins the
+    /// two together.
+    ///
+    /// Keyless providers talk to a local daemon with no auth (Ollama,
+    /// Llamafile) or authenticate out of band (Bedrock, via the AWS credential
+    /// chain), so an absent or empty `GREENTIC_LLM_API_KEY` is the NORMAL state
+    /// for them and must not disqualify the multi-provider backend.
+    ///
+    /// `None` — nothing named a provider anywhere — is treated as
+    /// key-requiring, because the historical default is OpenAI.
+    pub(super) fn provider_requires_api_key(provider: Option<&str>) -> bool {
+        let Some(provider) = provider.map(str::trim).filter(|p| !p.is_empty()) else {
+            return true;
+        };
+        #[cfg(feature = "greentic-llm-backend")]
+        if let Ok(kind) = provider.parse::<greentic_llm::ProviderKind>() {
+            return kind.requires_api_key();
+        }
+        keyless_table_requires_api_key(provider)
+    }
+
+    /// The local mirror of `greentic_llm::ProviderKind::requires_api_key()`,
+    /// used for builds without the `greentic-llm-backend` feature and for
+    /// provider strings greentic-llm does not recognise. Pinned to the real
+    /// thing by `keyless_table_matches_greentic_llm`.
+    fn keyless_table_requires_api_key(provider: &str) -> bool {
+        !matches!(
+            provider.to_ascii_lowercase().as_str(),
+            "ollama" | "llamafile" | "bedrock"
+        )
+    }
+
+    /// The operator's explicitly configured LLM endpoint, if any.
+    ///
+    /// Unset, blank or whitespace-only all mean "the operator configured
+    /// nothing", matching `llm_openai::normalize_base_url`'s reading of the
+    /// same variable.
+    #[cfg(feature = "greentic-llm-backend")]
+    fn custom_llm_base_url() -> Option<String> {
+        std::env::var("GREENTIC_LLM_BASE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+    }
+
+    /// Whether a resolved (key, provider) pair selects the in-process
+    /// multi-provider greentic-llm backend rather than the single-provider
+    /// OpenAI fall-through.
+    #[cfg(feature = "greentic-llm-backend")]
+    pub(super) fn selects_multi_provider_backend(api_key: &str, provider: Option<&str>) -> bool {
+        selects_multi_provider_backend_with(api_key, provider, custom_llm_base_url().as_deref())
+    }
+
+    /// The pure half of [`selects_multi_provider_backend`], split out so the
+    /// rules below are testable without mutating process-global env — which
+    /// races every other test in the binary, the same reasoning
+    /// `llm_openai::normalize_base_url` was split for.
+    ///
+    /// Three ways in, and the third is the one that had to be added:
+    ///
+    /// 1. **A non-empty key.** Always.
+    /// 2. **A keyless provider** (Ollama, Llamafile, Bedrock), which
+    ///    authenticates through a local daemon or the AWS credential chain.
+    /// 3. **An explicitly configured endpoint**, whatever the provider name.
+    ///
+    /// Rule 3 exists because `provider = "openai"` means "speaks the OpenAI
+    /// protocol", not "is api.openai.com". An operator pointing
+    /// `GREENTIC_LLM_BASE_URL` at Ollama's `/v1`, LM Studio, vLLM or any other
+    /// local gateway has named an endpoint that legitimately wants no key —
+    /// and without this they had to invent a dummy one, because an empty key
+    /// dropped them onto the fall-through client.
+    ///
+    /// **That fall-through does not merely lack a key — it cannot reach the
+    /// endpoint at all.** `OpenAiLlmBackend` appends `/v1/...` to whatever base
+    /// URL it is given (see `normalize_base_url`'s doc comment), so a base URL
+    /// that already ends in `/v1` becomes `/v1/v1/chat/completions` and every
+    /// request 404s. Recorded here because the symptom — "keyless works with a
+    /// dummy key, 404s without one" — reads like an authentication problem and
+    /// is a path-construction one. The path behaviour is that client's
+    /// documented contract and is deliberately left alone; this stops the
+    /// keyless case from landing on it.
+    #[cfg(feature = "greentic-llm-backend")]
+    fn selects_multi_provider_backend_with(
+        api_key: &str,
+        provider: Option<&str>,
+        base_url: Option<&str>,
+    ) -> bool {
+        !api_key.trim().is_empty()
+            || !provider_requires_api_key(provider)
+            || base_url.map(str::trim).is_some_and(|url| !url.is_empty())
+    }
+
+    /// The provider name an explicit `GREENTIC_LLM_PROVIDER` names, if any.
+    pub(super) fn env_llm_provider() -> Option<String> {
+        std::env::var("GREENTIC_LLM_PROVIDER")
+            .ok()
+            .filter(|provider| !provider.trim().is_empty())
+    }
+
+    /// The agent whose LLM configuration represents this runtime, chosen
+    /// deterministically: sorted id order, first agent declaring a non-empty
+    /// `llm.provider`. `None` when no agent declares one.
+    ///
+    /// Sorted, not `HashMap` order: this decides both which provider the
+    /// in-process agent backend is built for
+    /// ([`configured_llm_provider`]) and which provider
+    /// `crate::runner::ext_llm_port::AgentLlmPort` resolves an extension's
+    /// `host.llm.complete()` call to. An unstable pick means a worker that
+    /// answers on a different provider after every restart — and, since both
+    /// callers iterate the same map independently, a hash-order pick could
+    /// also let the agent's own reasoning LLM and its extensions' LLM calls
+    /// silently disagree with each other on the same boot.
+    pub(crate) fn first_declared_llm_agent(
+        agents: &HashMap<String, AgentConfig>,
+    ) -> Option<(&String, &AgentConfig)> {
+        let mut ids: Vec<&String> = agents.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| agents.get(id).map(|agent| (id, agent)))
+            .find(|(_, agent)| !agent.llm.provider.trim().is_empty())
+    }
+
+    /// The provider to judge keylessness by: the env override first (it is the
+    /// deployment's explicit statement), then the first agent that declares
+    /// one. The in-process backend carries a single key, so a single provider
+    /// decides — matching the one-key model in
+    /// [`in_process_llm_backend_with_key`].
+    pub(super) fn configured_llm_provider(agents: &HashMap<String, AgentConfig>) -> Option<String> {
+        env_llm_provider().or_else(|| {
+            first_declared_llm_agent(agents).map(|(_, agent)| agent.llm.provider.trim().to_string())
+        })
     }
 
     /// Resolve the [`LlmBackend`] from the environment.
@@ -690,8 +1659,10 @@ mod aw {
                     }
                     None => {
                         tracing::warn!(
-                            "GREENTIC_AW_LLM_EXTENSION set but no LLM API key; \
-                             falling back to in-process OpenAI client"
+                            provider = env_llm_provider().as_deref().unwrap_or("openai"),
+                            "GREENTIC_AW_LLM_EXTENSION set but no LLM API key and the \
+                             configured provider requires one; falling back to in-process \
+                             OpenAI client"
                         );
                         Arc::new(RetryingLlmBackend::new(
                             OpenAiLlmBackend::new(String::new()),
@@ -707,14 +1678,18 @@ mod aw {
 
     /// In-process LLM backend when no bridge extension is configured.
     ///
-    /// With the `greentic-llm-backend` feature and an LLM key present, routes the
-    /// worker's LLM call through greentic-llm so a `dw.agent` can use any provider
-    /// its `AgentConfig.llm` declares (DeepSeek, Anthropic, Gemini, …) — the
-    /// provider + model ride on each request, the key + optional base URL come
-    /// from the env. Otherwise falls back to the legacy env-keyed OpenAI client.
-    /// Shared by every non-bridge construction path so they never drift.
+    /// With the `greentic-llm-backend` feature and an LLM key present — or a
+    /// keyless provider configured — routes the worker's LLM call through
+    /// greentic-llm so a `dw.agent` can use any provider its `AgentConfig.llm`
+    /// declares (DeepSeek, Anthropic, Gemini, Ollama, …): the provider + model
+    /// ride on each request, the key + optional base URL come from the env.
+    /// Otherwise falls back to the legacy env-keyed OpenAI client. Shared by
+    /// every non-bridge construction path so they never drift.
+    ///
+    /// This path sees no agent configs, so the provider is whatever
+    /// `GREENTIC_LLM_PROVIDER` names.
     pub(crate) fn in_process_llm_backend() -> Arc<dyn greentic_aw_runtime::LlmBackend> {
-        in_process_llm_backend_with_key(None)
+        in_process_llm_backend_with_key(None, env_llm_provider())
     }
 
     /// In-process LLM backend, optionally given a store-resolved API key.
@@ -724,8 +1699,17 @@ mod aw {
     /// this is what makes the in-process desktop LLM path zero-env. When `None`,
     /// the key comes from `GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY` exactly as
     /// before, so env-based and bridge-less runs are unaffected.
+    ///
+    /// `provider` is the configured LLM provider (see
+    /// [`configured_llm_provider`]). It decides one thing: whether an EMPTY key
+    /// still selects the multi-provider backend. For a keyless provider it
+    /// must, or an Ollama worker silently talks to `api.openai.com` with an
+    /// empty bearer — which is what made `GREENTIC_LLM_API_KEY=ollama` a
+    /// necessary workaround. For every key-requiring provider the behaviour is
+    /// unchanged.
     pub(crate) fn in_process_llm_backend_with_key(
         override_key: Option<String>,
+        provider: Option<String>,
     ) -> Arc<dyn greentic_aw_runtime::LlmBackend> {
         use greentic_aw_runtime::{OpenAiLlmBackend, RetryingLlmBackend};
         use std::time::Duration;
@@ -746,10 +1730,23 @@ mod aw {
                 .or_else(|| std::env::var("GREENTIC_LLM_API_KEY").ok())
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                 .unwrap_or_default();
-            if !api_key.trim().is_empty() {
+            if selects_multi_provider_backend(&api_key, provider.as_deref()) {
                 let base_url = std::env::var("GREENTIC_LLM_BASE_URL").ok();
+                if api_key.trim().is_empty() {
+                    // Once per backend construction, not per token: the returned
+                    // `Arc` serves the whole agent handler's lifetime.
+                    tracing::warn!(
+                        provider = provider.as_deref().unwrap_or_default(),
+                        "AW LLM provider is keyless: running with an empty API key. \
+                         This is expected for Ollama / Llamafile / Bedrock (which \
+                         authenticate through a local daemon or the AWS credential \
+                         chain); set GREENTIC_LLM_API_KEY only if your endpoint \
+                         actually demands one"
+                    );
+                }
                 tracing::info!(
                     store_resolved = _store_resolved,
+                    provider = provider.as_deref().unwrap_or_default(),
                     "AW LLM via in-process greentic-llm (multi-provider)"
                 );
                 return Arc::new(RetryingLlmBackend::new(
@@ -763,6 +1760,37 @@ mod aw {
             .filter(|key| !key.trim().is_empty())
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             .unwrap_or_default();
+
+        // Fall-through: the single-provider OpenAI-protocol client. Reached
+        // either because `greentic-llm-backend` is not compiled in (the block
+        // above does not exist at all), or because it is compiled in and no
+        // key resolved for a provider that REQUIRES one — a keyless provider
+        // (Ollama, Llamafile, Bedrock) takes the branch above with an empty
+        // key. Both mean the agent's `AgentConfig.llm.provider` is IGNORED and
+        // every request goes to one OpenAI-shaped endpoint — which is a
+        // silent, total misroute if the agent declared DeepSeek/Anthropic/… So
+        // say so. This runs once per backend construction, not per token: the
+        // returned `Arc` is reused for the whole agent handler's lifetime.
+        #[cfg(feature = "greentic-llm-backend")]
+        let reason = "no LLM API key resolved (tried the agent's llm.credential_ref, \
+                      GREENTIC_LLM_API_KEY, then OPENAI_API_KEY)";
+        #[cfg(not(feature = "greentic-llm-backend"))]
+        let reason = "this binary was built WITHOUT the `greentic-llm-backend` feature, \
+                      so the multi-provider backend is not compiled in";
+        tracing::warn!(
+            reason,
+            provider = provider.as_deref().unwrap_or_default(),
+            endpoint = %std::env::var("GREENTIC_LLM_BASE_URL")
+                .ok()
+                .filter(|url| !url.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com".to_string()),
+            fix = "rebuild with `--features greentic-llm-backend` and supply a key via \
+                   GREENTIC_LLM_API_KEY or the agent's llm.credential_ref; or point \
+                   GREENTIC_LLM_BASE_URL at an OpenAI-compatible endpoint",
+            "AW LLM falling back to the single-provider OpenAI client: the agent's \
+             configured llm.provider is IGNORED and every request goes to this endpoint"
+        );
+
         Arc::new(RetryingLlmBackend::new(
             OpenAiLlmBackend::new(openai_key),
             3,
@@ -781,7 +1809,12 @@ mod aw {
     /// The in-process backend carries a single key, so when agents declare
     /// different credential_refs only the first is used — matching the existing
     /// one-key in-process model; the bridge-extension path resolves per-request.
-    async fn resolve_in_process_llm_key(
+    ///
+    /// `pub(crate)` (not private): also reused by `runtime.rs` to resolve the
+    /// `greentic_llm::LlmProvider` key for the in-process `operala.call`
+    /// (`DeepWorkerInvoker`) wiring, so the two in-process LLM paths (dw.agent,
+    /// operala.call) share one key-resolution policy instead of drifting.
+    pub(crate) async fn resolve_in_process_llm_key(
         secrets: &crate::secrets::DynSecretsManager,
         tenant: &str,
         merged_agents: &HashMap<String, AgentConfig>,
@@ -795,22 +1828,26 @@ mod aw {
         if key.is_empty() { None } else { Some(key) }
     }
 
-    /// Build a vault-style `BridgeCredential` from resolved parts. `None` when no
-    /// API key is present. Defaults: provider "openai", model "gpt-4o". Pure (no
-    /// env) so it is unit-testable without global state.
+    /// Build a vault-style `BridgeCredential` from resolved parts. `None` when
+    /// no API key is present AND the resolved provider needs one — a keyless
+    /// provider (Ollama, Llamafile, Bedrock) is credential-complete with an
+    /// empty key, and dropping it here is what used to route an Ollama worker
+    /// to the OpenAI fall-through. Defaults: provider "openai", model "gpt-4o".
+    /// Pure (no env) so it is unit-testable without global state.
     pub(super) fn bridge_credential(
         provider: Option<String>,
         model: Option<String>,
         api_key: String,
         base_url: Option<String>,
     ) -> Option<greentic_aw_runtime::BridgeCredential> {
-        if api_key.trim().is_empty() {
+        let provider = provider
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "openai".into());
+        if api_key.trim().is_empty() && provider_requires_api_key(Some(&provider)) {
             return None;
         }
         Some(greentic_aw_runtime::BridgeCredential {
-            provider: provider
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "openai".into()),
+            provider,
             model: model
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "gpt-4o".into()),
@@ -821,35 +1858,36 @@ mod aw {
 
     /// Shared store-agnostic tail: builds the extension runtime, LLM backend,
     /// config providers, and [`AgentRuntime`] given the three already-constructed
-    /// store trait objects.
+    /// store trait objects, then mounts the knowledge (RAG) and long-term-memory
+    /// seams so the returned in-process runtime grounds identically to the
+    /// out-of-process NATS serve path ([`build_agent_runtime`]).
     ///
     /// Extracted so both the Redis path ([`build_agent_node_handler`]) and the
     /// ephemeral desktop path ([`build_agent_node_handler_ephemeral`]) share
     /// identical post-store construction logic; store differences are the only
-    /// divergence between the two callers.
+    /// divergence between the two callers. Returning the bare [`AgentRuntime`]
+    /// (rather than the wrapped handler) also keeps the mounted knowledge seam
+    /// observable to the regression test that guards this wiring.
     ///
     /// Returns `None` when the extension runtime fails to initialise (the only
     /// failure mode at this layer — store errors are handled by callers).
     ///
-    /// `audit_sink` (EPIC-B B-3) is forwarded verbatim to the constructed
-    /// [`RuntimeAgentNodeHandler`] — `None` keeps `dw.agent` execution on the
-    /// plain [`AgentRuntime::step`] path.
-    ///
-    /// `project_id` is the deployed unit's `bundle_id`, forwarded verbatim so
-    /// billing can attribute this runtime's spend to a project. `None` on the
-    /// legacy tenant-only path, where the dimension is omitted entirely.
+    /// `unit` is the deployed unit's `bundle_id` (`None` on the legacy
+    /// tenant-only path); it scopes the pack-carried MCP credential read.
     #[allow(clippy::too_many_arguments)]
-    async fn build_runtime_handler_with_stores(
+    async fn build_runtime_with_stores(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore>,
         token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
         ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
-        audit_sink: Option<AuditSink>,
-        project_id: Option<String>,
-    ) -> Option<Arc<dyn AgentNodeHandler>> {
+        unit: Option<String>,
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+    ) -> Option<Arc<AgentRuntime>> {
         use std::time::Duration;
 
         use greentic_aw_runtime::LayeredConfigProvider;
@@ -862,19 +1900,47 @@ mod aw {
         // Per-tenant path: tool secrets resolve from the store first (zero-env),
         // env as fallback. `secrets` is the injected per-tenant manager whose
         // candidate fallback bridges the gtc-setup dev-store scope.
+        // The deployed unit scopes the tool-secret read for the same reason it
+        // scopes the MCP one below: this runtime is built per `TenantRuntime`,
+        // i.e. per deployed unit, so `unit` already names the only worker whose
+        // credentials this backend may resolve.
         let secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend> = Arc::new(
-            StoreToolSecretsBackend::new(secrets.clone(), tenant.clone()),
+            StoreToolSecretsBackend::new(secrets.clone(), tenant.clone(), unit.clone()),
         );
-        let ext_runtime = build_ext_runtime(secrets_backend)?;
 
-        // When the LLM bridge extension is configured, resolve credentials
-        // per-tenant from the secrets broker rather than from global env vars.
-        // The env-keyed OpenAI fallback is preserved for both branches.
-        let llm: Arc<dyn LlmBackend> = match std::env::var("GREENTIC_AW_LLM_EXTENSION")
+        // Resolving `llm` and building `ext_runtime` have a circular
+        // dependency in exactly one case: the LLM-bridge-extension branch
+        // below dispatches through `ext_runtime` itself, so it cannot run
+        // until `build_ext_runtime` returns. The zero-env branch has no such
+        // dependency, so when no bridge extension is configured it is
+        // resolved FIRST and fed into `build_ext_runtime` as tier 2 of the
+        // extension LLM port (see `select_ext_llm_port`) — this is the actual
+        // fix: `build_ext_runtime` used to always run before this
+        // resolution, so tier 2 was unreachable in every deployed lane. The
+        // bridge branch keeps exactly the order and construction it had
+        // before this change — tier 2 is `None` for that one case, and
+        // `build_ext_runtime` falls through to tier 3 (env) or tier 4 (none)
+        // for it, same as always.
+        let bridge_extension_id = std::env::var("GREENTIC_AW_LLM_EXTENSION")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-        {
+            .filter(|s| !s.trim().is_empty());
+
+        let (ext_runtime, llm): (
+            Arc<greentic_ext_runtime::ExtensionRuntime>,
+            Arc<dyn LlmBackend>,
+        ) = match bridge_extension_id {
             Some(ext_id) => {
+                // Bridge extension configured: `llm` must dispatch through
+                // `ext_runtime`, so build the runtime first with no
+                // agent-backed tier 2 — there is no worker backend yet to
+                // wire, and there never was for this branch.
+                // `should_attempt_agent_llm_port` is the single tested source
+                // of that decision; asserting it here too (not only in the
+                // zero-env branch's `if`) means an inversion of the shared
+                // logic is caught on this branch as well.
+                debug_assert!(!should_attempt_agent_llm_port(true, ext_llm_port.is_some()));
+                let ext_runtime = build_ext_runtime(secrets_backend, ext_llm_port, None, &packs)?;
+
                 use greentic_aw_runtime::llm_credential::SecretsBackedCredentialResolver;
                 let resolver = Arc::new(SecretsBackedCredentialResolver::new(
                     secrets.clone(),
@@ -885,7 +1951,7 @@ mod aw {
                     tenant = %tenant,
                     "AW LLM via bridge (per-tenant creds)"
                 );
-                Arc::new(RetryingLlmBackend::new(
+                let llm: Arc<dyn LlmBackend> = Arc::new(RetryingLlmBackend::new(
                     ExtensionLlmBackend::with_resolver_runtime(
                         ext_runtime.clone(),
                         ext_id,
@@ -893,7 +1959,8 @@ mod aw {
                     ),
                     3,
                     Duration::from_millis(250),
-                ))
+                ));
+                (ext_runtime, llm)
             }
             None => {
                 // Zero-env LLM: with no bridge extension and no env key, resolve
@@ -920,10 +1987,64 @@ mod aw {
                         "AW LLM key resolved from store via credential_ref (zero-env)"
                     );
                 }
-                in_process_llm_backend_with_key(store_key)
+                // This path DOES see the agent configs, so a worker that
+                // declares a keyless provider (Ollama) reaches the
+                // multi-provider backend even with no key anywhere.
+                let llm = in_process_llm_backend_with_key(
+                    store_key,
+                    configured_llm_provider(&merged_agents),
+                );
+
+                // Tier 2 of the extension LLM port: the worker's own resolved
+                // backend, so `host.llm.complete()` inside an extension runs
+                // on the provider the operator actually selected instead of
+                // falling through to the env-keyed default. Built only when
+                // the host has not already injected its own port:
+                // `select_ext_llm_port` prefers the host port regardless, so
+                // building this one anyway would have `AgentLlmPort::from_agents`
+                // log as if it were in play while it is silently discarded.
+                let agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> =
+                    if should_attempt_agent_llm_port(false, ext_llm_port.is_some()) {
+                        #[cfg(feature = "greentic-llm-backend")]
+                        {
+                            crate::runner::ext_llm_port::AgentLlmPort::from_agents(
+                                llm.clone(),
+                                &merged_agents,
+                            )
+                            .map(|port| {
+                                Arc::new(port) as Arc<dyn greentic_ext_runtime::host_ports::LlmPort>
+                            })
+                        }
+                        #[cfg(not(feature = "greentic-llm-backend"))]
+                        {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                let ext_runtime =
+                    build_ext_runtime(secrets_backend, ext_llm_port, agent_llm_port, &packs)?;
+                (ext_runtime, llm)
             }
         };
 
+        // Shared context (Phase A2): per-binding sharing modes from the packs.
+        // Computed here because `merged_agents` is moved just below.
+        let share_policy = crate::runner::run_context_policy::share_policy_from_packs(
+            &packs,
+            merged_agents.keys().map(String::as_str),
+        );
+        // Shared context (Phase C): the user ledger, when the host passed a
+        // door target AND a pack names an agent. Computed here, beside
+        // `share_policy`, because `merged_agents` is moved just below. Bound to
+        // `tenant`, the tenant this runtime's turns run under.
+        let ledger_binding = crate::runner::user_ledger_policy::user_ledger_binding(
+            &tenant,
+            &packs,
+            merged_agents.keys().map(String::as_str),
+            user_ledger,
+        );
         let agent_count = merged_agents.len();
         let overlay = ManifestToolOverlayProvider::new(
             HostConfigProvider::new(merged_agents),
@@ -937,36 +2058,142 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
+        // One manager for every remote tool source that reads a credential at
+        // run time (MCP and A2A). Hoisted out of the MCP block so both honour
+        // the same explicit `SECRETS_BACKEND` override; see
+        // `mcp_secrets_manager` for why that override must win over the
+        // injected manager.
+        let remote_tool_secrets = mcp_secrets_manager(&secrets);
+
+        // Hoisted into locals so the playbook turn host below can share the
+        // SAME source objects — and therefore the same TTL caches — rather than
+        // each nested turn re-enumerating the packs.
+        let components = component_source_from_packs(&packs, &tenant);
+        let flows = flow_source_from_packs(&packs, &tenant);
+        let sorla = match sorla_source_from_env().await {
+            Some(env) => Some(env),
+            None => {
+                crate::runner::sorla_pack_source::sorla_source_from_packs(
+                    &packs,
+                    &tenant,
+                    Some(remote_tool_secrets.clone()),
+                    unit.as_deref(),
+                )
+                .await
+            }
+        };
+        // Pack-only: there is no admin A2A source to prefer. This site covers
+        // deployed dw.agent units, the desktop runner and the designer's
+        // test-chat sidecar; `graph_node::graph_a2a_source` builds the graph
+        // turns' source from the same inputs through the same helper.
+        // `build_agent_runtime` (process-level serve, no packs) stays without
+        // one, as it is for pack MCP.
+        let a2a = crate::runner::a2a_pack_source::a2a_source_from_packs(
+            &packs,
+            &tenant,
+            Some(remote_tool_secrets.clone()),
+            unit.as_deref(),
+        );
+        // A playbook's own turn gets every source above and deliberately NOT a
+        // playbook one, so a skill cannot call a skill — see `playbook_turn`.
+        let playbooks = crate::runner::playbook_turn::playbook_source_from_packs(
+            &packs,
+            crate::runner::playbook_turn::PlaybookTurnHost {
+                state_store: state_store.clone(),
+                ext_runtime: ext_runtime.clone(),
+                llm: llm.clone(),
+                telemetry: telemetry.clone(),
+                token_meter: token_meter.clone(),
+                ledger: ledger.clone(),
+                mcp: None,
+                components: components.clone(),
+                flows: flows.clone(),
+                sorla: sorla.clone(),
+                a2a: a2a.clone(),
+            },
+        );
+
         let base = AgentRuntime::new(
             config_provider,
             state_store,
-            ext_runtime,
+            ext_runtime.clone(),
             llm,
             telemetry,
             token_meter,
             ledger,
-            mcp_source_from_env(),
+            // The env-configured ADMIN source wins; the pack-carried routes are
+            // the fallback. This is deliberately the OPPOSITE of the flow MCP
+            // node's precedence (`mcp_node::aw::invoke_with_secrets`, "A
+            // pack-carried route wins"), and the asymmetry is load-bearing:
+            //
+            // - A flow node's pack route strictly ADDS capability. The admin
+            //   catalog supplies the same route and nothing else, so preferring
+            //   the pack can only turn a failure into a success.
+            // - The agent catalog additionally carries LIVE tool schemas probed
+            //   from the server this run, and applies each server's
+            //   `allowed_tools`. Preferring the pack there would downgrade every
+            //   environment that has a working admin source — the designer's own
+            //   in-process host among them.
+            //
+            // A per-server merge (pack fills only the servers the admin catalog
+            // lacks) is a strictly better v2 and is out of scope: it needs a
+            // merge rule for a server present in both with different URLs.
+            mcp_source_from_env(Some(remote_tool_secrets.clone())).or_else(|| {
+                mcp_source_from_packs(
+                    &packs,
+                    &tenant,
+                    Some(remote_tool_secrets.clone()),
+                    unit.as_deref(),
+                )
+            }),
         )
-        .with_component_source(component_source_from_packs(&packs, &tenant));
+        .with_component_source(components)
+        .with_flow_source(flows)
+        .with_sorla_source(sorla)
+        .with_a2a_source(a2a)
+        .with_playbook_source(playbooks)
+        .with_share_policy(share_policy)
+        .with_user_ledger(ledger_binding);
 
-        // Billing metering, identical to the `build_agent_runtime` serve path.
-        // Without this the in-process `dw.agent` node ran on the default
-        // `NoopBillingMeter`: its LLM spend was never metered AND the credit
-        // gate never fired, so an out-of-credit tenant kept running for free
-        // through this node while the out-of-process path stopped them.
+        // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
+        // `dw.agent` workers ground on the ingested corpus exactly as the
+        // out-of-process NATS serve path does (see [`build_agent_runtime`], which
+        // makes the identical call). The backends come from the agent-runtime
+        // extensions the binary registered (see `runtime_ext`); with none
+        // registered, or the operator env unset, this leaves `base` unchanged.
+        // Without this call the in-process handler's `runtime.knowledge` stayed
+        // `None`, so `knowledge_active()` was false and `search_knowledge` was
+        // never invoked — the model hallucinated instead of retrieving from the
+        // corpus that had already been ingested at boot.
+        let base = crate::runner::runtime_ext::attach_all(base).await;
+        // Knowledge delegated to a design-extension tool. Unconditional and not
+        // feature-gated (see `knowledge_ext`): it wraps whatever corpus backend
+        // an extension above left in place and acts only on a worker whose knowledge
+        // binding names `provider.knowledge.extension`.
+        // Beneath it, retrieval from a Greentic-operated Chronicle index server
+        // (`provider.knowledge.chronicle-index`), whose credentials resolve
+        // through the same manager and tenant as the worker's MCP credentials.
+        let base = crate::runner::knowledge_index::attach(
+            base,
+            Some(mcp_secrets_manager(&secrets)),
+            Some(tenant.clone()),
+        );
+        let base = crate::runner::knowledge_ext::attach(base, ext_runtime);
+
+        // Billing metering. `billing_meter` is the one [`resolve_billing_meter`]
+        // chose: the meter the embedding host installed for this unit (a
+        // deployed env-canvas unit's `WorkerUsageMeter`), else the
+        // env-configured cloud-commerce sink, identical to the
+        // `build_agent_runtime` serve path. Without either the in-process
+        // `dw.agent` node would run on the default `NoopBillingMeter`: its LLM
+        // spend never metered AND the credit gate never firing.
         //
-        // Ship-dark, same as the serve path: a no-op until an operator sets
-        // GREENTIC_BILLING_BASE_URL + GREENTIC_BILLING_SERVICE_SECRET.
-        let billing_enabled;
-        let base = match greentic_aw_runtime::billing::HttpBillingMeter::from_env() {
-            Some(http_meter) => {
-                billing_enabled = true;
-                base.with_billing_meter(Arc::new(http_meter))
-            }
-            None => {
-                billing_enabled = false;
-                base
-            }
+        // Ship-dark: with no installed meter this stays a no-op until an
+        // operator sets GREENTIC_BILLING_BASE_URL + GREENTIC_BILLING_SERVICE_SECRET.
+        let billing_enabled = billing_meter.is_some();
+        let base = match billing_meter {
+            Some(meter) => base.with_billing_meter(meter),
+            None => base,
         };
         let runtime = Arc::new(base);
 
@@ -979,9 +2206,77 @@ mod aw {
             billing_enabled,
             "AW runtime constructed"
         );
-        Some(Arc::new(RuntimeAgentNodeHandler::new(
-            runtime, audit_sink, project_id,
-        )))
+        Some(runtime)
+    }
+
+    /// Wrap the shared in-process [`AgentRuntime`] (built by
+    /// [`build_runtime_with_stores`], including the mounted knowledge and
+    /// long-term-memory seams) in a flow-node handler. Both the Redis path
+    /// ([`build_agent_node_handler`]) and the ephemeral desktop path
+    /// ([`build_agent_node_handler_ephemeral`]) route through here.
+    ///
+    /// Returns `None` when the runtime could not be built (extension-runtime init
+    /// failure — the only failure mode at this layer).
+    ///
+    /// `audit_sink` (EPIC-B B-3) is forwarded verbatim to the constructed
+    /// [`RuntimeAgentNodeHandler`] — `None` keeps `dw.agent` execution on the
+    /// plain [`AgentRuntime::step`] path. `stream_observers` (R2) is likewise
+    /// forwarded verbatim — `None` keeps `execute` from consulting the
+    /// session-keyed streaming-observer registry at all.
+    ///
+    /// `project_id` is the deployed unit's `bundle_id`, forwarded verbatim so
+    /// billing can attribute this runtime's spend to a project. `None` on the
+    /// legacy tenant-only path, where the dimension is omitted entirely.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_runtime_handler_with_stores(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+        state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore>,
+        token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
+        ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
+        audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+    ) -> Option<AgentNodeWiring> {
+        // The deployed unit (`bundle_id`) doubles as the MCP credential scope:
+        // the same identity billing attributes this runtime's spend to.
+        let runtime = build_runtime_with_stores(
+            merged_agents,
+            tenant,
+            secrets,
+            ext_llm_port,
+            packs,
+            state_store,
+            token_meter,
+            ledger,
+            project_id.clone(),
+            billing_meter,
+            user_ledger,
+        )
+        .await?;
+        let handler: Arc<dyn AgentNodeHandler> = Arc::new(RuntimeAgentNodeHandler::new(
+            Arc::clone(&runtime),
+            audit_sink,
+            stream_observers,
+            project_id,
+        ));
+        Some(AgentNodeWiring { handler, runtime })
+    }
+
+    /// The `dw.agent` handler together with the [`AgentRuntime`] it drives.
+    ///
+    /// The runtime is exposed so other in-process node handlers of the SAME
+    /// `TenantRuntime` — the `operala.call` deep worker — can reuse its tool
+    /// catalogs, secrets scope and ledger instead of building a second,
+    /// divergent runtime.
+    pub struct AgentNodeWiring {
+        pub handler: Arc<dyn AgentNodeHandler>,
+        pub runtime: Arc<AgentRuntime>,
     }
 
     /// Build the production `DwAgent` handler if the environment is configured.
@@ -989,9 +2284,15 @@ mod aw {
     /// Returns `None` (so `DwAgent` flow dispatch errors clearly) under any of
     /// these graceful-degradation conditions:
     /// - `merged_agents` is empty (no agents from packs or operator config);
-    /// - `GREENTIC_AW_REDIS_URL` is unset/empty;
+    /// - `GREENTIC_AW_STATE_BACKEND=redis` with `GREENTIC_AW_REDIS_URL`
+    ///   unset/empty;
     /// - the AW Redis connection fails;
     /// - the extension runtime fails to initialise.
+    ///
+    /// An unset `GREENTIC_AW_REDIS_URL` on its own is NOT one of them: the
+    /// state backend then auto-selects the process-global in-memory store
+    /// (`aw_backends::build_aw_backends`), so this server path runs `dw.agent`
+    /// — and hands `operala.call` deep workers their tools — with no Redis.
     ///
     /// `merged_agents` is the result of merging pack-embedded agents (base)
     /// with operator-declared [`HostConfig::agents`] (operator wins on
@@ -1020,52 +2321,141 @@ mod aw {
     /// billing dimension. Pass `None` when no bundle is pinned (the legacy
     /// tenant-only pack path); billing then omits the dimension instead of
     /// attributing spend to a non-unique agent id.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_agent_node_handler(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
-        use greentic_aw_runtime::RedisAgentStateStore;
-        use greentic_aw_runtime::cost::RedisTokenMeter;
-        use greentic_aw_runtime::tools::RedisToolLedger;
+        // Boxed so this wrapper adds no depth to the caller's future layout:
+        // the runner-desktop `run_pack_async` future already sits close to
+        // rustc's query-depth limit.
+        Box::pin(build_agent_node_wiring(
+            merged_agents,
+            tenant,
+            secrets,
+            ext_llm_port,
+            packs,
+            audit_sink,
+            stream_observers,
+            project_id,
+        ))
+        .await
+        .map(|wiring| wiring.handler)
+    }
+
+    /// [`build_agent_node_handler`], also returning the [`AgentRuntime`] the
+    /// handler drives (see [`AgentNodeWiring`]). Same `None` conditions.
+    ///
+    /// Bills through [`resolve_billing_meter`]`(None)` — the env-configured
+    /// cloud-commerce sink, or nothing — exactly as before the host seam
+    /// existed. A host that installs a per-unit meter goes through
+    /// `TenantRuntime::load_revision_with` instead.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_agent_node_wiring(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+        audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
+    ) -> Option<AgentNodeWiring> {
+        build_agent_node_wiring_metered(
+            merged_agents,
+            tenant,
+            secrets,
+            ext_llm_port,
+            packs,
+            audit_sink,
+            stream_observers,
+            project_id,
+            resolve_billing_meter(None),
+            // The un-metered wrappers carry no host seam: no user ledger.
+            None,
+        )
+        .await
+    }
+
+    /// Which billing sink a runtime built for one unit installs.
+    ///
+    /// - An installed meter (for a deployed env-canvas unit, greentic-start's
+    ///   per-unit `greentic_aw_runtime::billing::WorkerUsageMeter`) AND the
+    ///   env-configured [`greentic_aw_runtime::billing::HttpBillingMeter`]
+    ///   (`GREENTIC_BILLING_BASE_URL` + `GREENTIC_BILLING_SERVICE_SECRET`):
+    ///   a [`greentic_aw_runtime::billing::FanOutBillingMeter`] — usage goes to
+    ///   both, and the credit gate is the env sink's. An installed meter must
+    ///   never switch the cloud-commerce credit gate off.
+    /// - Installed only: that meter.
+    /// - Env only, or neither: exactly the behaviour before the seam existed —
+    ///   the env sink, else `None` (the runtime's `NoopBillingMeter`).
+    ///
+    /// Resolved ONCE per `TenantRuntime` and shared by its `dw.agent`,
+    /// agent-graph and deep-worker paths, so all three bill through the same
+    /// sink (and, for the HTTP sink, one wallet cache).
+    pub fn resolve_billing_meter(
+        installed: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+    ) -> Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>> {
+        use greentic_aw_runtime::billing::{BillingMeter, FanOutBillingMeter, HttpBillingMeter};
+        let env =
+            HttpBillingMeter::from_env().map(|meter| Arc::new(meter) as Arc<dyn BillingMeter>);
+        match (installed, env) {
+            (Some(installed), Some(env)) => {
+                Some(Arc::new(FanOutBillingMeter::new(env, installed)) as Arc<dyn BillingMeter>)
+            }
+            (Some(installed), None) => Some(installed),
+            (None, env) => env,
+        }
+    }
+
+    /// [`build_agent_node_wiring`] with an explicit, already-resolved billing
+    /// sink (see [`resolve_billing_meter`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_agent_node_wiring_metered(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+        audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+    ) -> Option<AgentNodeWiring> {
+        use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
         if merged_agents.is_empty() {
             return None;
         }
 
-        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
-            Ok(url) if !url.is_empty() => url,
-            _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                tracing::warn!(error = %error, "AW Redis connect failed; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        let manager = state_store.manager();
-        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
-        let ledger = Arc::new(RedisToolLedger::new(manager));
+        let AwBackends {
+            state_store,
+            token_meter,
+            tool_ledger: ledger,
+            checkpoint_store: _,
+        } = build_aw_backends().await?;
 
         build_runtime_handler_with_stores(
             merged_agents,
             tenant,
             secrets,
+            ext_llm_port,
             packs,
             state_store,
             token_meter,
             ledger,
             audit_sink,
+            stream_observers,
             project_id,
+            billing_meter,
+            user_ledger,
         )
         .await
     }
@@ -1083,14 +2473,81 @@ mod aw {
     /// `bundle_id`, or `None` when none is pinned (billing then omits the
     /// dimension).
     #[cfg(feature = "desktop-agent-ephemeral")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_agent_node_handler_ephemeral(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
         project_id: Option<String>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
+        // Boxed so this wrapper adds no depth to the caller's future layout:
+        // the runner-desktop `run_pack_async` future already sits close to
+        // rustc's query-depth limit.
+        Box::pin(build_agent_node_wiring_ephemeral(
+            merged_agents,
+            tenant,
+            secrets,
+            ext_llm_port,
+            packs,
+            audit_sink,
+            stream_observers,
+            project_id,
+        ))
+        .await
+        .map(|wiring| wiring.handler)
+    }
+
+    /// [`build_agent_node_handler_ephemeral`], also returning the
+    /// [`AgentRuntime`] the handler drives (see [`AgentNodeWiring`]). Bills
+    /// through [`resolve_billing_meter`]`(None)`, as before the host seam.
+    #[cfg(feature = "desktop-agent-ephemeral")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_agent_node_wiring_ephemeral(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+        audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
+    ) -> Option<AgentNodeWiring> {
+        build_agent_node_wiring_ephemeral_metered(
+            merged_agents,
+            tenant,
+            secrets,
+            ext_llm_port,
+            packs,
+            audit_sink,
+            stream_observers,
+            project_id,
+            resolve_billing_meter(None),
+            // The un-metered wrappers carry no host seam: no user ledger.
+            None,
+        )
+        .await
+    }
+
+    /// [`build_agent_node_wiring_ephemeral`] with an explicit, already-resolved
+    /// billing sink (see [`resolve_billing_meter`]).
+    #[cfg(feature = "desktop-agent-ephemeral")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_agent_node_wiring_ephemeral_metered(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+        audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+    ) -> Option<AgentNodeWiring> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
         use std::sync::OnceLock;
@@ -1121,12 +2578,16 @@ mod aw {
             merged_agents,
             tenant,
             secrets,
+            ext_llm_port,
             packs,
             state_store,
             token_meter,
             ledger,
             audit_sink,
+            stream_observers,
             project_id,
+            billing_meter,
+            user_ledger,
         )
         .await
     }
@@ -1139,47 +2600,54 @@ mod aw {
     /// resolved LLM backend, design extensions, agent config providers, MCP).
     ///
     /// Returns `None` under the same graceful-degradation conditions as the node
-    /// handler: empty agent map, missing/unreachable `GREENTIC_AW_REDIS_URL`, or
-    /// extension-runtime init failure.
+    /// handler: empty agent map, a disabled or unreachable state backend (see
+    /// [`build_agent_node_handler`]), or extension-runtime init failure.
     pub async fn build_agent_runtime(
         merged_agents: HashMap<String, AgentConfig>,
     ) -> Option<Arc<AgentRuntime>> {
+        use crate::runner::aw_backends::{AwBackends, build_aw_backends};
         use greentic_aw_runtime::LayeredConfigProvider;
         use greentic_aw_runtime::ManifestToolOverlayProvider;
+        use greentic_aw_runtime::OtelTelemetry;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
-        use greentic_aw_runtime::cost::RedisTokenMeter;
-        use greentic_aw_runtime::tools::RedisToolLedger;
-        use greentic_aw_runtime::{OtelTelemetry, RedisAgentStateStore};
 
         if merged_agents.is_empty() {
             return None; // nothing to serve
         }
 
-        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
-            Ok(url) if !url.is_empty() => url,
-            _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                tracing::warn!(error = %error, "AW Redis connect failed; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        // The connection manager is cheap to clone (multiplexed, ref-counted);
-        // share it with the token meter and idempotency ledger.
-        let manager = state_store.manager();
-        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
-        let ledger = Arc::new(RedisToolLedger::new(manager));
+        let AwBackends {
+            state_store,
+            token_meter,
+            tool_ledger: ledger,
+            checkpoint_store: _,
+        } = build_aw_backends().await?;
 
         // Process-level serve path has no per-tenant secrets context, so tool
-        // secrets resolve from the env only.
-        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend))?;
+        // secrets resolve from the env only. It also has no embedding host,
+        // so tier 1 (host-injected) never applies here.
+        //
+        // Tier 2 (this worker's own resolved backend) is deliberately NOT
+        // wired at this call site, even though `merged_agents` is guaranteed
+        // non-empty by the early return above. Closing it needs the same
+        // circular-dependency split `build_runtime_with_stores` uses: `llm`
+        // below comes from `build_llm_backend(&ext_runtime)`, which needs
+        // `ext_runtime` to exist first UNCONDITIONALLY (not only on a bridge
+        // branch, unlike `build_runtime_with_stores`), so it cannot be
+        // resolved before this call the way it is there. Left for a
+        // follow-up — the `tracing::warn!` below says so at run time, not
+        // only in this comment, so the gap stays visible rather than
+        // silently assumed fixed.
+        //
+        // NO pack-carried extensions here, for the same reason this path has no
+        // pack-backed MCP fallback (see the `mcp_source_from_env` call below):
+        // it is the process-level serve path, its agents come from
+        // `GREENTIC_AGENT_MANIFESTS_DIR`, and it holds no `PackRuntime` at all.
+        tracing::warn!(
+            "extension runtime LLM port: this process-level serve path holds agents but is \
+             not wired to tier 2 (the worker's own backend); an extension's host.llm.complete \
+             here still falls through to tier 3 (env-keyed) or tier 4 (unconfigured)"
+        );
+        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, &[])?;
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
@@ -1213,7 +2681,23 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
-            mcp_source_from_env(),
+            // This process-level serve path has no per-tenant secrets context
+            // (see the `ext_runtime`/`llm` construction above), but a `local-wasm`
+            // MCP tool still needs to read its tenant secret — the tenant arrives
+            // per call and the URI is built from it. So supply the same
+            // env-built, tenant-agnostic secrets manager the flow-node path uses
+            // (`mcp_node::aw::secrets_from_env`, memoized once per process); the
+            // http transport ignores it, the local-wasm transport consumes it.
+            //
+            // NO pack-backed fallback here, unlike `build_runtime_with_stores`.
+            // This is the process-level serve path: its agents come from
+            // `GREENTIC_AGENT_MANIFESTS_DIR` and it holds no `PackRuntime` at
+            // all, so there is no `assets/mcp-routes.json` to read. A worker
+            // reached this way needs `GREENTIC_AW_ADMIN_ENDPOINT` +
+            // `GREENTIC_AW_ADMIN_TOKEN` for its `mcp:` tools to dispatch; its
+            // tools are still ADVERTISED to the LLM from the agent config's own
+            // `ToolRef` schemas.
+            mcp_source_from_env(crate::runner::mcp_node::aw::secrets_from_env()),
         )
         .with_guardrails(
             {
@@ -1249,16 +2733,23 @@ mod aw {
             } else {
                 base
             };
-        // Optionally attach an operator-configured native long-term memory
-        // backend. With the `long-term-chronicle` feature off (default) this is
-        // a no-op and `base` is wrapped unchanged.
-        #[cfg(feature = "long-term-chronicle")]
-        let base = crate::runner::long_term_memory::attach(base).await;
-        // Optionally attach an operator-configured Chronicle knowledge (document
-        // RAG) backend for auto pre-retrieval. No-op with the `knowledge-chronicle`
-        // feature off (default).
-        #[cfg(feature = "knowledge-chronicle")]
-        let base = crate::runner::knowledge_mount::attach(base).await;
+        // Optionally attach operator-configured long-term memory and knowledge
+        // (document RAG) backends from the registered agent-runtime extensions
+        // (see `runtime_ext`). With none registered `base` passes unchanged.
+        let base = crate::runner::runtime_ext::attach_all(base).await;
+        // Knowledge delegated to a design-extension tool — the out-of-process
+        // serve path's copy of the mount above. See `knowledge_ext` for why the
+        // adapter reads its target per turn rather than per runtime: THIS is the
+        // path that serves many agents from one runtime.
+        // Chronicle-index retrieval beneath it. This path has no injected
+        // secrets manager or tenant, so credentials resolve through the
+        // environment's manager under each turn's own tenant.
+        let base = crate::runner::knowledge_index::attach(
+            base,
+            crate::runner::mcp_node::aw::secrets_from_env(),
+            None,
+        );
+        let base = crate::runner::knowledge_ext::attach(base, ext_runtime.clone());
         let runtime = Arc::new(base);
 
         tracing::info!(agent_count, "AW runtime constructed");
@@ -1289,28 +2780,44 @@ mod aw {
 
         match build_agent_runtime(merged_agents).await {
             Some(runtime) => {
-                // Activate dispatch idempotency when Redis is reachable for the
-                // ledger. Best-effort: a connect failure disables idempotency
-                // but never blocks serving.
-                let (ledger, ledger_active): (Arc<dyn DispatchLedger>, bool) =
-                    match std::env::var("GREENTIC_AW_REDIS_URL") {
-                        Ok(url) if !url.is_empty() => {
-                            match RedisAgentStateStore::connect(&url).await {
-                                Ok(store) => {
-                                    (Arc::new(RedisDispatchLedger::new(store.manager())), true)
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        "dispatch ledger Redis connect failed; \
-                                         idempotency disabled"
-                                    );
-                                    (Arc::new(NoopDispatchLedger), false)
-                                }
+                // Dispatch idempotency ledger: only Redis provides cross-redelivery
+                // caching, so it is wired only when the resolved state backend is
+                // Redis (URL present AND backend redis/unset). Memory/disk backends
+                // use the no-op ledger (at-least-once). Best-effort: a connect
+                // failure disables idempotency but never blocks serving.
+                let redis_url = std::env::var("GREENTIC_AW_REDIS_URL")
+                    .ok()
+                    .filter(|url| !url.is_empty());
+                // Derive "is Redis" from the SAME selector the backends use, so an
+                // unusual value (e.g. `GREENTIC_AW_STATE_BACKEND=cassandra` with a
+                // URL) can't disagree between the state store and the ledger gate.
+                let backend_env = std::env::var("GREENTIC_AW_STATE_BACKEND").ok();
+                let backend_is_redis = matches!(
+                    crate::runner::aw_backends::select_state_backend(
+                        backend_env.as_deref(),
+                        redis_url.as_deref(),
+                        None,
+                    ),
+                    crate::runner::aw_backends::StateBackendChoice::Redis(_)
+                );
+                let (ledger, ledger_active): (Arc<dyn DispatchLedger>, bool) = match redis_url {
+                    Some(url) if backend_is_redis => {
+                        match RedisAgentStateStore::connect(&url).await {
+                            Ok(store) => {
+                                (Arc::new(RedisDispatchLedger::new(store.manager())), true)
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "dispatch ledger Redis connect failed; \
+                                     idempotency disabled"
+                                );
+                                (Arc::new(NoopDispatchLedger), false)
                             }
                         }
-                        _ => (Arc::new(NoopDispatchLedger), false),
-                    };
+                    }
+                    _ => (Arc::new(NoopDispatchLedger), false),
+                };
 
                 tracing::info!(
                     nats_url,
@@ -1396,7 +2903,29 @@ mod aw {
     }
 
     #[cfg(test)]
-    mod tests {
+    mod parked_card_tests {
+        use serde_json::json;
+
+        #[test]
+        fn a_failed_turn_with_a_kept_park_offers_its_reply_then_the_card() {
+            let mut out = json!({
+                "reply": super::SANITISED_ERROR_REPLY,
+                "trail": [],
+                "terminated_by": "error"
+            });
+            let card = json!({ "type": "AdaptiveCard", "body": [] });
+            super::reoffer_parked_card(&mut out, card.clone());
+            assert_eq!(out["terminated_by"], "awaiting_tool_input");
+            assert_eq!(out["reply"], super::SANITISED_ERROR_REPLY);
+            let rendered = crate::runner::engine::rendered_park(&out);
+            let items = rendered.as_array().expect("reply + card");
+            assert_eq!(items[0]["reply"], super::SANITISED_ERROR_REPLY);
+            assert_eq!(items[1], card);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) mod tests {
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -1411,7 +2940,7 @@ mod aw {
 
         use super::*;
 
-        fn sample_agent_config(agent_id: &str) -> AgentConfig {
+        pub(crate) fn sample_agent_config(agent_id: &str) -> AgentConfig {
             AgentConfig {
                 agent_id: agent_id.into(),
                 system_prompt: "sys".into(),
@@ -1425,6 +2954,9 @@ mod aw {
                 limits: AgentLimits::default(),
                 memory: None,
                 knowledge: None,
+                conversational: false,
+                opening_message: None,
+                on_text_while_parked: Default::default(),
             }
         }
 
@@ -1457,13 +2989,16 @@ mod aw {
                     limits: AgentLimits::default(),
                     memory: None,
                     knowledge: None,
+                    conversational: false,
+                    opening_message: None,
+                    on_text_while_parked: Default::default(),
                 },
             );
             let config_provider = Arc::new(config_provider);
 
             let token_meter = Arc::new(MockTokenMeter::new(0));
             let ledger = Arc::new(NoopToolLedger);
-            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
 
             let runtime = Arc::new(AgentRuntime::new(
                 config_provider,
@@ -1475,10 +3010,18 @@ mod aw {
                 ledger,
                 None,
             ));
-            let handler = RuntimeAgentNodeHandler::new(runtime, None, None);
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, None, None);
 
             let output = handler
-                .execute("t", "e", "greeter", "sess-1", &json!({"user_text": "ping"}))
+                .execute(
+                    "t",
+                    "e",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "ping"}),
+                    false,
+                    None,
+                )
                 .await
                 .expect("execute should succeed");
 
@@ -1549,7 +3092,7 @@ mod aw {
                 AgentRuntime::new(
                     Arc::new(config_provider),
                     Arc::new(MockAgentStateStore::new()),
-                    Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+                    Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
                     llm,
                     Arc::new(MockTelemetry::new()),
                     Arc::new(MockTokenMeter::new(0)),
@@ -1559,8 +3102,16 @@ mod aw {
                 .with_billing_meter(meter.clone()),
             );
 
-            RuntimeAgentNodeHandler::new(runtime, None, project_id)
-                .execute("t", "e", "greeter", "sess-1", &json!({"user_text": "ping"}))
+            RuntimeAgentNodeHandler::new(runtime, None, None, project_id)
+                .execute(
+                    "t",
+                    "e",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "ping"}),
+                    false,
+                    None,
+                )
                 .await
                 .expect("execute should succeed");
 
@@ -1638,18 +3189,33 @@ mod aw {
                 agents,
                 "acme".to_string(),
                 crate::secrets::default_manager().expect("env secrets manager"),
+                None,
                 vec![],
                 Arc::new(MockAgentStateStore::new()),
                 Arc::new(MockTokenMeter::new(0)),
                 Arc::new(NoopToolLedger),
                 None,
                 None,
+                None,
+                // No host-installed meter: the env-configured sink, exactly
+                // what every builder resolved before the seam existed.
+                resolve_billing_meter(None),
+                None,
             )
             .await
-            .expect("handler should build from mock stores");
+            .expect("handler should build from mock stores")
+            .handler;
 
             let _ = handler
-                .execute("acme", "prod", "greeter", "s", &json!({"user_text": "hi"}))
+                .execute(
+                    "acme",
+                    "prod",
+                    "greeter",
+                    "s",
+                    &json!({"user_text": "hi"}),
+                    false,
+                    None,
+                )
                 .await;
 
             unsafe {
@@ -1670,6 +3236,274 @@ mod aw {
                 "in-process dw.agent must consult the billing service; got {wallet_calls} \
                  wallet requests, which means it is still running on NoopBillingMeter \
                  and its LLM spend is never metered"
+            );
+        }
+
+        /// A host-installed meter used by the billing tests below: records
+        /// every emit and every budget question, and answers `over`.
+        struct ProbeMeter {
+            emits: std::sync::atomic::AtomicUsize,
+            budget_asks: std::sync::atomic::AtomicUsize,
+            over: bool,
+        }
+
+        impl ProbeMeter {
+            fn new(over: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    emits: std::sync::atomic::AtomicUsize::new(0),
+                    budget_asks: std::sync::atomic::AtomicUsize::new(0),
+                    over,
+                })
+            }
+        }
+
+        impl greentic_aw_runtime::billing::BillingMeter for ProbeMeter {
+            fn emit<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+                _input_tokens: u64,
+                _output_tokens: u64,
+                _agent_id: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(), greentic_aw_runtime::billing::BillingError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                self.emits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+
+            fn over_budget<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                self.budget_asks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(std::future::ready(self.over))
+            }
+        }
+
+        /// Build the in-process handler with `chosen` as its billing sink and
+        /// drive one turn for tenant `acme`.
+        async fn run_one_turn_billed_by(
+            chosen: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        ) {
+            let mut agents = HashMap::new();
+            agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+            let handler = build_runtime_handler_with_stores(
+                agents,
+                "acme".to_string(),
+                crate::secrets::default_manager().expect("env secrets manager"),
+                None,
+                vec![],
+                Arc::new(MockAgentStateStore::new()),
+                Arc::new(MockTokenMeter::new(0)),
+                Arc::new(NoopToolLedger),
+                None,
+                None,
+                Some("support-bot".to_string()),
+                chosen,
+                None,
+            )
+            .await
+            .expect("handler should build from mock stores")
+            .handler;
+            let _ = handler
+                .execute(
+                    "acme",
+                    "prod",
+                    "greeter",
+                    "s",
+                    &json!({"user_text": "hi"}),
+                    false,
+                    None,
+                )
+                .await;
+        }
+
+        /// A host-installed meter (a deployed unit's `WorkerUsageMeter`) must
+        /// NOT switch off the env-configured cloud-commerce credit gate. With
+        /// both present the credit gate is the env sink's: the wallet is asked
+        /// (`available: 0` stops the step), and the installed meter — which has
+        /// no wallet — is never asked for a budget.
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn an_installed_meter_keeps_the_env_credit_gate() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v1/tenants/acme/wallet"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"available": "0"})),
+                )
+                .mount(&server)
+                .await;
+            let empty_extensions = tempfile::tempdir().expect("tempdir");
+            unsafe {
+                std::env::set_var("GREENTIC_BILLING_BASE_URL", server.uri());
+                std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+                std::env::set_var("GREENTIC_EXTENSIONS_DIR", empty_extensions.path());
+            }
+            let installed = ProbeMeter::new(false);
+            let chosen = resolve_billing_meter(Some(
+                Arc::clone(&installed) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>
+            ));
+            run_one_turn_billed_by(chosen).await;
+            unsafe {
+                std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+                std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+                std::env::remove_var("GREENTIC_EXTENSIONS_DIR");
+            }
+
+            let wallet_calls = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/tenants/acme/wallet")
+                .count();
+            assert!(
+                wallet_calls >= 1,
+                "the env cloud-commerce credit gate must still run with a meter installed"
+            );
+            assert_eq!(
+                installed
+                    .budget_asks
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the installed recorder is never the credit gate"
+            );
+        }
+
+        /// With no env sink, the installed meter alone is the runtime's sink.
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn an_installed_meter_alone_is_the_sink_when_no_env_sink_is_configured() {
+            let empty_extensions = tempfile::tempdir().expect("tempdir");
+            unsafe {
+                std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+                std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+                std::env::set_var("GREENTIC_EXTENSIONS_DIR", empty_extensions.path());
+            }
+            // `over = true` stops the step at the gate, proving it was asked.
+            let installed = ProbeMeter::new(true);
+            let as_dyn =
+                Arc::clone(&installed) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>;
+            let chosen = resolve_billing_meter(Some(Arc::clone(&as_dyn)));
+            assert!(
+                chosen.as_ref().is_some_and(|c| Arc::ptr_eq(c, &as_dyn)),
+                "no env sink → the installed meter itself, not a wrapper"
+            );
+            run_one_turn_billed_by(chosen).await;
+            unsafe {
+                std::env::remove_var("GREENTIC_EXTENSIONS_DIR");
+            }
+            assert!(
+                installed
+                    .budget_asks
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    >= 1
+            );
+        }
+
+        /// With nothing installed, the choice is exactly the pre-seam one.
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn no_installed_meter_falls_back_to_the_env_configured_sink() {
+            unsafe {
+                std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+                std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+            }
+            assert!(resolve_billing_meter(None).is_none());
+            unsafe {
+                std::env::set_var("GREENTIC_BILLING_BASE_URL", "http://127.0.0.1:9");
+                std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+            }
+            let chosen = resolve_billing_meter(None);
+            unsafe {
+                std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+                std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+            }
+            assert!(chosen.is_some(), "the env-configured sink, as before");
+        }
+
+        // -------------------------------------------------------------------
+        // State-store prerequisite of the server (non-ephemeral) path
+        // -------------------------------------------------------------------
+
+        /// The SERVER builder — the one greentic-start and the distroless
+        /// image use, since they do not enable `desktop-agent-ephemeral` —
+        /// must build the agent runtime with NO Redis configured.
+        ///
+        /// That runtime is also the tool surface `runtime.rs` hands to
+        /// `operala.call` deep workers (`OperalaToolContext`), so this pins
+        /// both halves of one claim: a Redis-less deployment runs `dw.agent`
+        /// AND gives its deep workers their tools. It was documented as the
+        /// opposite ("no state store: set GREENTIC_AW_REDIS_URL") after
+        /// `build_aw_backends` had already made Redis optional.
+        ///
+        /// The control proves the assertion is about the backend selector,
+        /// not a builder that never returns `None`: naming the redis backend
+        /// without a URL is an honest misconfiguration and disables both.
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn server_builder_wires_the_agent_runtime_without_redis() {
+            let empty_extensions = tempfile::tempdir().expect("tempdir");
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_REDIS_URL");
+                std::env::remove_var("GREENTIC_AW_STATE_BACKEND");
+                std::env::remove_var("GREENTIC_AW_STATE_PATH");
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+                std::env::set_var("GREENTIC_EXTENSIONS_DIR", empty_extensions.path());
+            }
+
+            async fn build() -> Option<AgentNodeWiring> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                build_agent_node_wiring(
+                    agents,
+                    "acme".to_string(),
+                    crate::secrets::default_manager().expect("env secrets manager"),
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+
+            let without_redis = build().await;
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_STATE_BACKEND", "redis");
+            }
+            let explicit_redis_without_url = build().await;
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_STATE_BACKEND");
+                std::env::remove_var("GREENTIC_EXTENSIONS_DIR");
+            }
+
+            assert!(
+                without_redis.is_some(),
+                "with GREENTIC_AW_REDIS_URL unset the server builder must fall back to \
+                 the in-memory state store and build the runtime dw.agent and \
+                 operala.call deep workers share"
+            );
+            assert!(
+                explicit_redis_without_url.is_none(),
+                "GREENTIC_AW_STATE_BACKEND=redis with no URL must disable the runtime"
             );
         }
 
@@ -1725,7 +3559,7 @@ mod aw {
 
             let token_meter = Arc::new(MockTokenMeter::new(0));
             let ledger = Arc::new(NoopToolLedger);
-            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
 
             Arc::new(
                 AgentRuntime::new(
@@ -1748,7 +3582,7 @@ mod aw {
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
             let sink = AuditSink::from_sender(tx);
-            let handler = RuntimeAgentNodeHandler::new(runtime, Some(sink), None);
+            let handler = RuntimeAgentNodeHandler::new(runtime, Some(sink), None, None);
 
             let output = handler
                 .execute(
@@ -1757,6 +3591,8 @@ mod aw {
                     "greeter",
                     "sess-1",
                     &json!({"user_text": "remember this"}),
+                    false,
+                    None,
                 )
                 .await
                 .expect("execute should succeed");
@@ -1773,10 +3609,114 @@ mod aw {
             let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
             assert_eq!(value["payload"]["tool"], json!("remember"));
 
+            // EPIC-D D-1: a per-run metering event follows the per-step
+            // agent-audit events once the run completes successfully.
+            let (subject, bytes) = rx.try_recv().expect("metering event enqueued");
+            assert_eq!(subject, "audit.t1.metering.agent_run");
+            let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(value["type"], json!("greentic.runner.metering.agent_run"));
+            assert_eq!(value["payload"]["unit"], json!("agent_run"));
+            assert_eq!(value["payload"]["quantity"], json!(1));
+            assert_eq!(value["payload"]["agent_id"], json!("greeter"));
+            assert_eq!(
+                value["payload"]["steps"],
+                json!(output["trail"].as_array().expect("trail is an array").len())
+            );
+
             assert!(
                 rx.try_recv().is_err(),
-                "exactly two audit events enqueued (one tool_call, one tool_result)"
+                "exactly three audit events enqueued (tool_call, tool_result, metering.agent_run)"
             );
+        }
+
+        // -----------------------------------------------------------------------
+        // stream_observers registry lookup (R2)
+        // -----------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn execute_routes_registered_stream_observer_and_receives_tool_events() {
+            use crate::http::agent_stream::StreamObserverRegistry;
+            use std::sync::Mutex;
+
+            // A recording StepObserver we register under the session id. The
+            // scripted-tool-call runtime (shared with the audit test above)
+            // drives `MockLlmBackend`, which does not stream token deltas, so
+            // this asserts on `on_tool_call`/`on_tool_result` (per the R2
+            // design note) rather than `on_token_delta`.
+            #[derive(Default)]
+            struct Rec {
+                hits: Mutex<Vec<String>>,
+            }
+            impl StepObserver for Rec {
+                fn wants_streaming(&self) -> bool {
+                    true
+                }
+                fn on_tool_call(&self, name: &str, _call_id: &str, _args: &Value) {
+                    self.hits.lock().unwrap().push(format!("c:{name}"));
+                }
+                fn on_tool_result(&self, name: &str, _call_id: &str, _result: &Value) {
+                    self.hits.lock().unwrap().push(format!("r:{name}"));
+                }
+                fn on_tool_failed(&self, name: &str, _call_id: &str, _error: &Value) {
+                    self.hits.lock().unwrap().push(format!("f:{name}"));
+                }
+            }
+
+            let runtime = runtime_with_scripted_remember_call("t1", "e1");
+            let registry: StreamObserverRegistry = Arc::new(dashmap::DashMap::new());
+            let rec = Arc::new(Rec::default());
+            registry.insert("sess-1".to_string(), rec.clone() as Arc<dyn StepObserver>);
+
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, Some(registry), None);
+            let output = handler
+                .execute(
+                    "t1",
+                    "e1",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "remember this"}),
+                    false,
+                    None,
+                )
+                .await
+                .expect("execute should succeed");
+            assert_eq!(output["reply"].as_str(), Some("done"));
+
+            let hits = rec.hits.lock().unwrap();
+            assert!(
+                hits.iter().any(|h| h == "c:remember"),
+                "tool call forwarded to the registered stream observer: {hits:?}"
+            );
+            assert!(
+                hits.iter().any(|h| h == "r:remember"),
+                "tool result forwarded to the registered stream observer: {hits:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn execute_ignores_stream_registry_when_session_not_registered() {
+            use crate::http::agent_stream::StreamObserverRegistry;
+
+            // A registry that exists but has no entry for this session must
+            // behave exactly like `None` — no observer is built at all, so
+            // the plain `self.runtime.step(...)` path runs unchanged.
+            let runtime = runtime_with_scripted_remember_call("t1", "e1");
+            let registry: StreamObserverRegistry = Arc::new(dashmap::DashMap::new());
+
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, Some(registry), None);
+            let output = handler
+                .execute(
+                    "t1",
+                    "e1",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "remember this"}),
+                    false,
+                    None,
+                )
+                .await
+                .expect("execute should succeed");
+            assert_eq!(output["reply"].as_str(), Some("done"));
         }
 
         #[tokio::test]
@@ -1787,7 +3727,7 @@ mod aw {
             // the tool call and returns the same reply, exactly as it did
             // before AgentAuditObserver existed.
             let runtime = runtime_with_scripted_remember_call("t1", "e1");
-            let handler = RuntimeAgentNodeHandler::new(runtime, None, None);
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, None, None);
 
             let output = handler
                 .execute(
@@ -1796,6 +3736,8 @@ mod aw {
                     "greeter",
                     "sess-1",
                     &json!({"user_text": "remember this"}),
+                    false,
+                    None,
                 )
                 .await
                 .expect("execute should succeed");
@@ -1865,7 +3807,10 @@ mod aw {
                 cfg.tools,
                 vec![ToolRef {
                     extension_id: "greentic.tavily".into(),
-                    tool_name: "web_search".into()
+                    tool_name: "web_search".into(),
+                    description: None,
+                    input_schema: None,
+                    usage_note: None,
                 }]
             );
         }
@@ -1898,6 +3843,191 @@ mod aw {
             assert!(
                 super::bridge_credential(Some("openai".into()), None, "  ".into(), None).is_none()
             );
+        }
+
+        #[test]
+        fn bridge_credential_allows_a_keyless_provider_without_a_key() {
+            let c = super::bridge_credential(Some("ollama".into()), None, String::new(), None)
+                .expect("Ollama needs no API key, so an empty one must still build a credential");
+            assert_eq!(c.provider, "ollama");
+            assert!(c.api_key.is_empty());
+        }
+
+        #[test]
+        fn keyless_providers_do_not_require_an_api_key() {
+            for provider in ["ollama", "llamafile", "bedrock", "Ollama", " ollama "] {
+                assert!(
+                    !super::provider_requires_api_key(Some(provider)),
+                    "{provider} authenticates without an API key"
+                );
+            }
+            for provider in ["openai", "anthropic", "deepseek", "gemini"] {
+                assert!(
+                    super::provider_requires_api_key(Some(provider)),
+                    "{provider} needs an API key"
+                );
+            }
+            // Nothing named a provider, or a name nothing recognises: assume the
+            // historical OpenAI default, which needs a key.
+            assert!(super::provider_requires_api_key(None));
+            assert!(super::provider_requires_api_key(Some("  ")));
+            assert!(super::provider_requires_api_key(Some("not-a-provider")));
+        }
+
+        /// The local table and greentic-llm must agree, or a build without the
+        /// `greentic-llm-backend` feature judges keylessness differently from
+        /// one with it.
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn keyless_table_matches_greentic_llm() {
+            for kind in greentic_llm::ProviderKind::all() {
+                assert_eq!(
+                    super::keyless_table_requires_api_key(kind.as_str()),
+                    kind.requires_api_key(),
+                    "local keyless table disagrees with greentic-llm about {}",
+                    kind.as_str()
+                );
+            }
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn ollama_without_a_key_selects_the_multi_provider_backend() {
+            assert!(
+                super::selects_multi_provider_backend_with("", Some("ollama"), None),
+                "an Ollama worker with no key must reach greentic-llm, not the \
+                 OpenAI fall-through"
+            );
+            assert!(super::selects_multi_provider_backend_with(
+                "  ",
+                Some("bedrock"),
+                None
+            ));
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn openai_without_a_key_or_an_endpoint_keeps_the_openai_fall_through() {
+            // Nothing configured: the historical default really is OpenAI, and
+            // a keyless request to it is going to fail either way.
+            assert!(!super::selects_multi_provider_backend_with(
+                "",
+                Some("openai"),
+                None
+            ));
+            assert!(!super::selects_multi_provider_backend_with(
+                "  ", None, None
+            ));
+            // A key still selects the multi-provider backend for everyone.
+            assert!(super::selects_multi_provider_backend_with(
+                "sk-x",
+                Some("openai"),
+                None
+            ));
+            assert!(super::selects_multi_provider_backend_with(
+                "sk-x", None, None
+            ));
+        }
+
+        /// `provider = "openai"` means "speaks the OpenAI protocol", not "is
+        /// api.openai.com". An operator who pointed the endpoint at a local
+        /// gateway had to invent a dummy key, because an empty one dropped them
+        /// onto a fall-through client that appends `/v1/...` to a base URL
+        /// already ending in `/v1` and 404s every request.
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn a_configured_endpoint_makes_an_empty_key_legitimate() {
+            assert!(super::selects_multi_provider_backend_with(
+                "",
+                Some("openai"),
+                Some("http://127.0.0.1:11434/v1")
+            ));
+            // Also for a provider nobody named at all.
+            assert!(super::selects_multi_provider_backend_with(
+                "",
+                None,
+                Some("http://127.0.0.1:1234/v1")
+            ));
+        }
+
+        /// Blank and whitespace-only mean "configured nothing", matching how
+        /// `llm_openai::normalize_base_url` reads the same variable. Without
+        /// this, an env var someone exported empty would silently change which
+        /// backend every keyless deployment gets.
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        fn a_blank_endpoint_is_not_a_configured_one() {
+            assert!(!super::selects_multi_provider_backend_with(
+                "",
+                Some("openai"),
+                Some("")
+            ));
+            assert!(!super::selects_multi_provider_backend_with(
+                "",
+                Some("openai"),
+                Some("   ")
+            ));
+        }
+
+        /// `#[serial_test::serial]` for the same reason as its sibling below
+        /// (`configured_llm_provider_is_stable_across_hashmap_orderings`):
+        /// this test also guards its assertions behind
+        /// `env_llm_provider().is_none()`, so it must join the same serial
+        /// group as the `EnvLlmPort` tests that mutate
+        /// `GREENTIC_LLM_PROVIDER` — without it, a parallel run can observe
+        /// the var mid-mutation between the guard check and the assertions.
+        #[test]
+        #[serial_test::serial]
+        fn configured_llm_provider_falls_back_to_an_agents_declared_provider() {
+            // No env var is read here beyond `GREENTIC_LLM_PROVIDER`, which this
+            // test does not set: the agent's own declaration must be found.
+            let mut agents = HashMap::new();
+            let mut agent = sample_agent_config("greeter");
+            agent.llm.provider = "ollama".into();
+            agents.insert("greeter".to_string(), agent);
+            // Only assert the agent leg when the env is not overriding it, so the
+            // test is not at the mercy of the developer's shell.
+            if super::env_llm_provider().is_none() {
+                assert_eq!(
+                    super::configured_llm_provider(&agents).as_deref(),
+                    Some("ollama")
+                );
+                assert_eq!(super::configured_llm_provider(&HashMap::new()), None);
+            }
+        }
+
+        /// `configured_llm_provider` iterated a HashMap, so a worker declaring
+        /// several agents with different providers got a provider chosen by hash
+        /// order — a different one across process starts, with nothing
+        /// reporting it. The pick must be stable.
+        ///
+        /// `#[serial_test::serial]` because this test reads `GREENTIC_LLM_PROVIDER`
+        /// (via the `env_llm_provider().is_some()` guard below) and several
+        /// `EnvLlmPort` tests in this module set that same process-global env var
+        /// under their own `#[serial_test::serial]` — without joining that group,
+        /// a parallel run could observe the var mid-mutation between the guard
+        /// check and the assertions, failing for a reason that has nothing to do
+        /// with the sort this test actually exercises.
+        #[test]
+        #[serial_test::serial]
+        fn configured_llm_provider_is_stable_across_hashmap_orderings() {
+            if super::env_llm_provider().is_some() {
+                // The env leg wins by design; this test is about the agent leg.
+                return;
+            }
+            for _ in 0..50 {
+                let mut agents = HashMap::new();
+                for (id, provider) in [("zz", "ollama"), ("aa", "anthropic"), ("mm", "groq")] {
+                    let mut agent = sample_agent_config(id);
+                    agent.llm.provider = provider.into();
+                    agents.insert(id.to_string(), agent);
+                }
+                assert_eq!(
+                    super::configured_llm_provider(&agents).as_deref(),
+                    Some("anthropic"),
+                    "the sorted-first agent id must decide the provider"
+                );
+            }
         }
 
         #[tokio::test]
@@ -2112,7 +4242,7 @@ mod aw {
                 std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
             }
             assert!(
-                super::mcp_source_from_env().is_some(),
+                super::mcp_source_from_env(None).is_some(),
                 "MCP is on by default when admin credentials are configured"
             );
 
@@ -2121,7 +4251,7 @@ mod aw {
                 std::env::set_var("GREENTIC_AW_MCP", "0");
             }
             assert!(
-                super::mcp_source_from_env().is_none(),
+                super::mcp_source_from_env(None).is_none(),
                 "GREENTIC_AW_MCP=0 disables MCP regardless of credentials"
             );
 
@@ -2129,7 +4259,7 @@ mod aw {
             unsafe {
                 std::env::set_var("GREENTIC_AW_MCP", "1");
             }
-            assert!(super::mcp_source_from_env().is_some());
+            assert!(super::mcp_source_from_env(None).is_some());
 
             // (c) Missing credential → None even without an opt-out.
             unsafe {
@@ -2137,7 +4267,7 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
             }
             assert!(
-                super::mcp_source_from_env().is_none(),
+                super::mcp_source_from_env(None).is_none(),
                 "no endpoint → no MCP source"
             );
 
@@ -2146,7 +4276,7 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
             assert!(
-                super::mcp_source_from_env().is_none(),
+                super::mcp_source_from_env(None).is_none(),
                 "no token → no MCP source"
             );
 
@@ -2198,16 +4328,127 @@ mod aw {
                 agents,
                 "t1".to_string(),
                 secrets,
+                None,
                 Vec::new(),
                 None,
-                // project_id: no pack identity to attribute billing to, matching
-                // the desktop ephemeral call site in greentic-runner-desktop.
+                None,
                 None,
             )
             .await;
             assert!(
                 handler.is_some(),
                 "ephemeral builder must not require Redis"
+            );
+        }
+
+        /// Regression guard for the in-process knowledge (RAG) mount.
+        ///
+        /// Before the fix `build_runtime_with_stores` built the in-process
+        /// [`AgentRuntime`] via `AgentRuntime::new(...)` and returned it WITHOUT
+        /// mounting the corpus backend, so `runtime.knowledge` stayed `None`,
+        /// `knowledge_active()` was false and `search_knowledge` was never
+        /// invoked — the in-process `dw.agent` worker hallucinated instead of
+        /// grounding on the ingested corpus. The corpus backend now comes from a
+        /// registered [`crate::runner::runtime_ext::AgentRuntimeExtension`] (the
+        /// Chronicle one lives in a private crate), so this proves the in-process
+        /// path calls every registered extension, and does so BEFORE the
+        /// extension-delegated adapter wraps the result.
+        ///
+        /// Asserted through [`crate::runner::knowledge_ext::corpus_backend`]
+        /// rather than `has_knowledge()`, and that is not cosmetic:
+        /// [`crate::runner::knowledge_ext::attach`] mounts unconditionally, so
+        /// `has_knowledge()` is true on this path whether the extension ran or
+        /// not. Asserting it would pass forever over a deleted
+        /// `runtime_ext::attach_all` — which is precisely the failure this was
+        /// written to catch. And a backend mounted AFTER the adapter would sit on
+        /// top of it and replace it, which `corpus_backend` would still find but
+        /// the adapter check below would not.
+        ///
+        /// The extension is process-global once registered, so it acts only
+        /// inside this test's task-local scope and leaves every other test's
+        /// runtime untouched.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn in_process_runtime_attaches_registered_extensions() {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockAgentStateStore, MockKnowledge, NoopToolLedger};
+
+            tokio::task_local! {
+                static IN_THIS_TEST: ();
+            }
+
+            struct CorpusExtension;
+
+            #[async_trait::async_trait]
+            impl crate::runner::runtime_ext::AgentRuntimeExtension for CorpusExtension {
+                async fn attach(&self, rt: AgentRuntime) -> AgentRuntime {
+                    if IN_THIS_TEST.try_with(|_| ()).is_err() {
+                        return rt;
+                    }
+                    rt.with_knowledge(Arc::new(MockKnowledge::new(Vec::new())))
+                }
+            }
+
+            static REGISTER: std::sync::Once = std::sync::Once::new();
+            REGISTER.call_once(|| {
+                crate::runner::runtime_ext::register_agent_runtime_extension(Arc::new(
+                    CorpusExtension,
+                ));
+            });
+
+            // Build the in-process runtime through the SAME shared tail both
+            // in-process handlers use (Redis + ephemeral), with cheap mock stores.
+            async fn build_runtime() -> Option<Arc<AgentRuntime>> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                let secrets: crate::secrets::DynSecretsManager =
+                    Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+                let state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore> =
+                    Arc::new(MockAgentStateStore::new());
+                let token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter> =
+                    Arc::new(MockTokenMeter::new(0));
+                let ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger> =
+                    Arc::new(NoopToolLedger);
+                super::build_runtime_with_stores(
+                    agents,
+                    "t1".to_string(),
+                    secrets,
+                    None,
+                    Vec::new(),
+                    state_store,
+                    token_meter,
+                    ledger,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+
+            // Control: the extension declines outside the scope, so no corpus
+            // backend may be mounted — proving the positive case below is the
+            // extension doing its job, not a tautology.
+            let runtime_optout = build_runtime().await.expect("runtime should build");
+            assert!(
+                crate::runner::knowledge_ext::corpus_backend(&runtime_optout).is_none(),
+                "no corpus backend may be mounted when no extension provides one"
+            );
+
+            let runtime = IN_THIS_TEST
+                .scope((), build_runtime())
+                .await
+                .expect("runtime should build");
+            assert!(
+                crate::runner::knowledge_ext::corpus_backend(&runtime).is_some(),
+                "in-process dw.agent runtime must mount a registered extension's \
+                 corpus backend, so an ingested corpus is retrievable"
+            );
+            let top = runtime
+                .knowledge_backend()
+                .expect("the extension adapter is always mounted");
+            assert!(
+                top.wrapped_backend().is_some(),
+                "the extension-delegated adapter must be the OUTER layer, wrapping \
+                 the extension's corpus backend rather than being replaced by it"
             );
         }
 
@@ -2231,6 +4472,132 @@ mod aw {
             }
         }
 
+        /// Build a backend for one unit over a seeded store.
+        fn backend_for(
+            unit: Option<&str>,
+            seed: &[(&str, &str)],
+        ) -> super::StoreToolSecretsBackend {
+            let map = seed
+                .iter()
+                .map(|(uri, value)| (uri.to_string(), value.as_bytes().to_vec()))
+                .collect::<std::collections::HashMap<_, _>>();
+            super::StoreToolSecretsBackend {
+                secrets: Arc::new(MapSecrets(map)),
+                tenant: "acme".to_string(),
+                env: "dev".to_string(),
+                unit: unit.map(str::to_string),
+            }
+        }
+
+        fn tool_uri(provider: &str, key: &str, unit: Option<&str>) -> String {
+            crate::secrets::agent_tool_secret_uri("dev", "acme", provider, key, unit)
+                .expect("agent tool uri")
+        }
+
+        /// The defect this scope exists for: one environment, two workers, one
+        /// `hubspot/access_token`, two different accounts. Before the unit
+        /// segment both read one address and the second staged value won, so
+        /// one worker silently authenticated as the other's account.
+        #[test]
+        fn two_units_with_one_provider_and_key_each_read_their_own_value() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let seed = [
+                (
+                    tool_uri("hubspot", "access_token", Some("sales-bot")),
+                    "sales-token",
+                ),
+                (
+                    tool_uri("hubspot", "access_token", Some("support-bot")),
+                    "support-token",
+                ),
+            ];
+            let seed: Vec<(&str, &str)> = seed
+                .iter()
+                .map(|(uri, value)| (uri.as_str(), *value))
+                .collect();
+
+            assert_eq!(
+                backend_for(Some("sales-bot"), &seed)
+                    .get("secret://hubspot/access_token")
+                    .expect("sales value"),
+                "sales-token"
+            );
+            assert_eq!(
+                backend_for(Some("support-bot"), &seed)
+                    .get("secret://hubspot/access_token")
+                    .expect("support value"),
+                "support-token"
+            );
+        }
+
+        /// A unit's own value beats the env-wide one left by an older stage.
+        #[test]
+        fn the_unit_scope_wins_over_the_env_wide_address() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let scoped = tool_uri("tavily", "api_key", Some("web-chat"));
+            let bare = tool_uri("tavily", "api_key", None);
+            let backend = backend_for(
+                Some("web-chat"),
+                &[(scoped.as_str(), "mine"), (bare.as_str(), "shared")],
+            );
+            assert_eq!(
+                backend.get("secret://tavily/api_key").expect("value"),
+                "mine"
+            );
+        }
+
+        /// The compatibility fallback: an environment staged before the unit
+        /// scope existed keeps resolving when its runner moves.
+        #[test]
+        fn a_unit_with_no_own_value_falls_back_to_the_env_wide_address() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let bare = tool_uri("tavily", "api_key", None);
+            let backend = backend_for(Some("web-chat"), &[(bare.as_str(), "shared")]);
+            assert_eq!(
+                backend.get("secret://tavily/api_key").expect("value"),
+                "shared"
+            );
+        }
+
+        /// With no unit — the legacy tenant-only path and the process-level
+        /// serve path — the env-wide address is the ONLY one tried, and a
+        /// unit-scoped value is never picked up by accident.
+        #[test]
+        fn no_unit_reads_exactly_the_env_wide_address() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let backend = backend_for(None, &[]);
+            assert_eq!(
+                backend.store_uri_candidates("secret://tavily/api_key"),
+                vec![tool_uri("tavily", "api_key", None)]
+            );
+
+            let scoped = tool_uri("tavily", "api_key", Some("web-chat"));
+            let other = backend_for(None, &[(scoped.as_str(), "someone-elses")]);
+            // Falls through to the env fallback, which has nothing either.
+            assert!(other.get("secret://tavily/api_key").is_err());
+        }
+
+        #[test]
+        fn the_candidates_are_the_unit_address_then_the_env_wide_one() {
+            let backend = backend_for(Some("web-chat"), &[]);
+            assert_eq!(
+                backend.store_uri_candidates("secret://tavily/api_key"),
+                vec![
+                    tool_uri("tavily", "api_key", Some("web-chat")),
+                    tool_uri("tavily", "api_key", None),
+                ]
+            );
+        }
+
+        /// A reference with no `<provider>/<key>` split has no store address at
+        /// all, and must fall through to the env rather than build a malformed
+        /// URI.
+        #[test]
+        fn a_reference_with_no_key_has_no_store_candidates() {
+            let backend = backend_for(Some("web-chat"), &[]);
+            assert!(backend.store_uri_candidates("secret://tavily").is_empty());
+        }
+
         #[test]
         fn store_tool_secret_backend_maps_secret_uri_to_store_scope() {
             use greentic_ext_runtime::SecretsBackend as _;
@@ -2247,6 +4614,7 @@ mod aw {
                 secrets,
                 tenant: "acme".to_string(),
                 env: "dev".to_string(),
+                unit: None,
             };
             let got = backend
                 .get("secret://tavily/api_key")
@@ -2264,6 +4632,7 @@ mod aw {
                 secrets,
                 tenant: "acme".to_string(),
                 env: "dev".to_string(),
+                unit: None,
             };
             // SAFETY: single-threaded test; no concurrent env mutation.
             unsafe {
@@ -2327,6 +4696,607 @@ mod aw {
             assert_eq!(blobs["a"]["from"], "manifest"); // manifest wins
             assert_eq!(blobs["b"]["from"], "sidecar"); // gap filled
             assert_eq!(blobs.len(), 2);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn flow_source_disabled_by_env_and_empty_packs() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_FLOW_TOOLS", "0");
+            }
+            assert!(
+                super::flow_source_from_packs(&[], "acme").is_none(),
+                "GREENTIC_AW_FLOW_TOOLS=0 must disable the flow tool source"
+            );
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_FLOW_TOOLS");
+            }
+            assert!(
+                super::flow_source_from_packs(&[], "acme").is_none(),
+                "empty packs => None even when gate is unset"
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn pack_mcp_source_disabled_by_env_and_empty_packs() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_MCP", "0");
+            }
+            assert!(
+                super::mcp_source_from_packs(&[], "acme", None, None).is_none(),
+                "an operator who disabled outbound MCP must not have it \
+                 re-enabled by a pack-carried sidecar"
+            );
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_MCP");
+            }
+            assert!(
+                super::mcp_source_from_packs(&[], "acme", None, None).is_none(),
+                "empty packs => None even when the gate is unset"
+            );
+        }
+
+        /// Wiring guard: the in-process runtime built by
+        /// `build_runtime_with_stores` carries the pack-backed A2A source.
+        /// Without this, a dropped `.with_a2a_source(..)` fails only at run
+        /// time, as a bound tool that silently vanished.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn the_in_process_runtime_wires_the_pack_carried_a2a_source() {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_A2A");
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+            }
+
+            async fn build(pack_dir: &std::path::Path) -> Arc<AgentRuntime> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                let secrets: crate::secrets::DynSecretsManager =
+                    Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+                let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(pack_dir));
+                super::build_runtime_with_stores(
+                    agents,
+                    "t1".to_string(),
+                    secrets,
+                    None,
+                    vec![pack],
+                    Arc::new(MockAgentStateStore::new()),
+                    Arc::new(MockTokenMeter::new(0)),
+                    Arc::new(NoopToolLedger),
+                    Some("worker-a".to_string()),
+                    None,
+                    None,
+                )
+                .await
+                .expect("runtime should build")
+            }
+
+            let with_sidecar = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(with_sidecar.path().join("assets")).unwrap();
+            std::fs::write(
+                with_sidecar.path().join("assets/a2a-routes.json"),
+                br#"[{"agent_id":"recipe","base_url":"https://agent.example.com"}]"#,
+            )
+            .unwrap();
+            assert!(
+                build(with_sidecar.path()).await.has_a2a_source(),
+                "a pack carrying assets/a2a-routes.json must wire an A2A source"
+            );
+
+            let without = tempfile::tempdir().unwrap();
+            assert!(
+                !build(without.path()).await.has_a2a_source(),
+                "control: no sidecar, no source"
+            );
+        }
+
+        /// Wiring guard: the in-process runtime carries the pack's sharing
+        /// policy. A dropped `.with_share_policy(..)` would only show as nested
+        /// calls that silently share nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn the_in_process_runtime_wires_the_pack_carried_share_policy() {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+            }
+
+            async fn build(pack_dir: &std::path::Path) -> Arc<AgentRuntime> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                let secrets: crate::secrets::DynSecretsManager =
+                    Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+                let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(pack_dir));
+                super::build_runtime_with_stores(
+                    agents,
+                    "t1".to_string(),
+                    secrets,
+                    None,
+                    vec![pack],
+                    Arc::new(MockAgentStateStore::new()),
+                    Arc::new(MockTokenMeter::new(0)),
+                    Arc::new(NoopToolLedger),
+                    Some("worker-a".to_string()),
+                    None,
+                    None,
+                )
+                .await
+                .expect("runtime should build")
+            }
+
+            let with_sidecar = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(with_sidecar.path().join("assets")).unwrap();
+            std::fs::write(
+                with_sidecar.path().join("assets/run-context.json"),
+                br#"{"greeter":{"flow:refund":"read"}}"#,
+            )
+            .unwrap();
+            let rt = build(with_sidecar.path()).await;
+            assert!(
+                rt.share_policy()
+                    .is_some_and(|p| p.has_sharing_binding("greeter"))
+            );
+
+            let without = tempfile::tempdir().unwrap();
+            assert!(
+                build(without.path()).await.share_policy().is_none(),
+                "control"
+            );
+        }
+
+        /// Wiring guard: the in-process runtime carries the user ledger only
+        /// when the host passed a target AND the pack names an agent. A dropped
+        /// `.with_user_ledger(..)` would only show as a ledger that never runs.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn the_in_process_runtime_carries_the_user_ledger_binding() {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+                std::env::remove_var("GREENTIC_AW_USER_LEDGER");
+            }
+
+            fn target() -> Option<greentic_aw_runtime::user_ledger::UserLedgerTarget> {
+                Some(greentic_aw_runtime::user_ledger::UserLedgerTarget::new(
+                    "https://admin.example/api/v1/ingest/ledger",
+                    "gtm_t",
+                    "alpha",
+                ))
+            }
+
+            async fn build(
+                pack_dir: &std::path::Path,
+                user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+            ) -> Arc<AgentRuntime> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                let secrets: crate::secrets::DynSecretsManager =
+                    Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+                let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(pack_dir));
+                super::build_runtime_with_stores(
+                    agents,
+                    "t1".to_string(),
+                    secrets,
+                    None,
+                    vec![pack],
+                    Arc::new(MockAgentStateStore::new()),
+                    Arc::new(MockTokenMeter::new(0)),
+                    Arc::new(NoopToolLedger),
+                    Some("worker-a".to_string()),
+                    None,
+                    user_ledger,
+                )
+                .await
+                .expect("runtime should build")
+            }
+
+            let with_sidecar = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(with_sidecar.path().join("assets")).unwrap();
+            std::fs::write(
+                with_sidecar.path().join("assets/user-ledger.json"),
+                br#"{"greeter":"read_write"}"#,
+            )
+            .unwrap();
+            let rt = build(with_sidecar.path(), target()).await;
+            let binding = rt
+                .user_ledger()
+                .expect("a target plus a sidecar naming the agent must install a binding");
+            // Bound to the tenant the runtime was built for ("t1").
+            let alice = greentic_aw_runtime::VerifiedCaller {
+                user_verified: true,
+                sub: Some("alice".into()),
+                ..Default::default()
+            };
+            let said = greentic_aw_runtime::AgentInput {
+                text: "hi".into(),
+                ..Default::default()
+            };
+            assert!(
+                binding
+                    .turn_for(
+                        &TenantContext::new("t1", "e").with_caller(Some(alice.clone())),
+                        "greeter",
+                        &said
+                    )
+                    .is_some(),
+                "the binding must serve a verified turn of the runtime's own tenant"
+            );
+            assert!(
+                binding
+                    .turn_for(
+                        &TenantContext::new("other", "e").with_caller(Some(alice)),
+                        "greeter",
+                        &said
+                    )
+                    .is_none()
+            );
+            assert!(
+                build(with_sidecar.path(), None)
+                    .await
+                    .user_ledger()
+                    .is_none(),
+                "control: a sidecar with no host target is off"
+            );
+            let without = tempfile::tempdir().unwrap();
+            assert!(
+                build(without.path(), target())
+                    .await
+                    .user_ledger()
+                    .is_none(),
+                "control: a target with no sidecar is off"
+            );
+        }
+
+        /// The agent path prefers the env-configured ADMIN source and uses the
+        /// pack routes only as a fallback — deliberately the opposite of the
+        /// flow node, because the admin catalog carries LIVE tool schemas and
+        /// `allowed_tools` that a pack cannot. `or_else` is what makes the
+        /// fallback lazy, so an admin-backed deployment never even reads its
+        /// packs' sidecars; this pins that shape.
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn the_admin_source_wins_and_the_pack_fallback_is_never_consulted() {
+            use std::cell::Cell;
+
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "https://admin.example");
+                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
+                std::env::remove_var("GREENTIC_AW_MCP");
+            }
+
+            let consulted = Cell::new(false);
+            let chosen = super::mcp_source_from_env(None).or_else(|| {
+                consulted.set(true);
+                super::mcp_source_from_packs(&[], "acme", None, None)
+            });
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+
+            assert!(chosen.is_some(), "the admin source must be built");
+            assert!(
+                !consulted.get(),
+                "the pack fallback must not be consulted when the admin \
+                 credentials are present"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn sorla_source_from_env_none_when_gate_opted_out() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_SORLA_TOOLS", "0");
+                std::env::set_var("GREENTIC_AW_SORX_URL", "http://localhost:9999");
+            }
+            assert!(
+                super::sorla_source_from_env().await.is_none(),
+                "GREENTIC_AW_SORLA_TOOLS=0 must disable the sorla tool source even with a URL set"
+            );
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_SORLA_TOOLS");
+                std::env::remove_var("GREENTIC_AW_SORX_URL");
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn sorla_source_from_env_none_when_url_unset() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_SORLA_TOOLS");
+                std::env::remove_var("GREENTIC_AW_SORX_URL");
+            }
+            assert!(
+                super::sorla_source_from_env().await.is_none(),
+                "no GREENTIC_AW_SORX_URL => no sorla source"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn sorla_source_from_env_some_when_url_set_even_if_sor_unreachable() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_SORLA_TOOLS");
+                // Nothing listens here: `SorxHttpInvoker::fetch` must degrade to an
+                // empty-ops invoker (logged) rather than failing, so the source is
+                // still `Some` — a down/unreachable SoR must never block startup.
+                std::env::set_var("GREENTIC_AW_SORX_URL", "http://127.0.0.1:1");
+            }
+            let source = super::sorla_source_from_env().await;
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_SORX_URL");
+            }
+            assert!(
+                source.is_some(),
+                "a configured URL yields Some(source) even when the SoR is unreachable"
+            );
+        }
+
+        /// The LLM-key env vars `EnvLlmPort::from_env` reads. Process-global, so
+        /// these tests serialize and restore them to avoid cross-test bleed.
+        #[cfg(feature = "greentic-llm-backend")]
+        const LLM_ENV_VARS: &[&str] = &[
+            "GREENTIC_LLM_API_KEY",
+            "OPENAI_API_KEY",
+            "GREENTIC_LLM_PROVIDER",
+            "GREENTIC_LLM_MODEL",
+            "GREENTIC_LLM_BASE_URL",
+        ];
+
+        /// Run `body` with every LLM env var cleared, restoring prior values
+        /// afterwards. Keeps the `EnvLlmPort` tests hermetic and side-effect-free.
+        #[cfg(feature = "greentic-llm-backend")]
+        #[allow(unsafe_code)]
+        fn with_clean_llm_env(body: impl FnOnce()) {
+            let saved: Vec<(&str, Option<String>)> = LLM_ENV_VARS
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars restored at the end.
+            unsafe {
+                for name in LLM_ENV_VARS {
+                    std::env::remove_var(name);
+                }
+            }
+            body();
+            unsafe {
+                for (name, value) in saved {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        #[serial_test::serial]
+        fn env_llm_port_none_without_key() {
+            with_clean_llm_env(|| {
+                assert!(
+                    super::EnvLlmPort::from_env().is_none(),
+                    "no LLM key in env => no port (ext-runtime stays 'llm not configured')"
+                );
+            });
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn env_llm_port_some_with_key_and_defaults() {
+            with_clean_llm_env(|| {
+                // SAFETY: within `with_clean_llm_env` under #[serial].
+                unsafe {
+                    std::env::set_var("GREENTIC_LLM_API_KEY", "sk-test-key");
+                }
+                let port = super::EnvLlmPort::from_env().expect("key present => port");
+                // Provider/model fall back to the DeepSeek-first defaults.
+                assert_eq!(port.provider, super::EnvLlmPort::DEFAULT_PROVIDER);
+                assert_eq!(port.model, super::EnvLlmPort::DEFAULT_MODEL);
+            });
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn env_llm_port_honours_provider_and_model_overrides() {
+            with_clean_llm_env(|| {
+                // OPENAI_API_KEY is the documented fallback for the key.
+                // SAFETY: within `with_clean_llm_env` under #[serial].
+                unsafe {
+                    std::env::set_var("OPENAI_API_KEY", "sk-openai");
+                    std::env::set_var("GREENTIC_LLM_PROVIDER", "openai");
+                    std::env::set_var("GREENTIC_LLM_MODEL", "gpt-4o-mini");
+                }
+                let port = super::EnvLlmPort::from_env().expect("fallback key present => port");
+                assert_eq!(port.provider, "openai");
+                assert_eq!(port.model, "gpt-4o-mini");
+            });
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn env_llm_port_maps_request_without_network() {
+            use greentic_aw_runtime::state::ChatMessage;
+            use greentic_ext_runtime::host_ports::{LlmPortRequest, LlmPortResponseFormat};
+
+            with_clean_llm_env(|| {
+                // SAFETY: within `with_clean_llm_env` under #[serial].
+                unsafe {
+                    std::env::set_var("GREENTIC_LLM_API_KEY", "sk-test-key");
+                }
+                let port = super::EnvLlmPort::from_env().expect("key present => port");
+                let request = LlmPortRequest {
+                    system_prompt: "be a card generator".into(),
+                    messages: vec![
+                        ("user".into(), "hello".into()),
+                        ("assistant".into(), "hi".into()),
+                        ("system".into(), "note".into()),
+                        ("weird".into(), "fallback-to-user".into()),
+                    ],
+                    response_format: LlmPortResponseFormat::Json,
+                };
+                // Pure mapping — no provider is built, no network call.
+                let llm_request =
+                    super::port_request_to_llm_request(request, &port.provider, &port.model);
+                assert_eq!(llm_request.system_prompt, "be a card generator");
+                assert!(llm_request.tools.is_empty(), "tools not exposed to ext LLM");
+                assert_eq!(llm_request.provider.provider, "deepseek");
+                assert_eq!(llm_request.history.len(), 4);
+                assert!(matches!(llm_request.history[0], ChatMessage::User { .. }));
+                assert!(matches!(
+                    llm_request.history[1],
+                    ChatMessage::Assistant { .. }
+                ));
+                assert!(matches!(llm_request.history[2], ChatMessage::System { .. }));
+                // Unknown role falls back to a user turn.
+                assert!(matches!(llm_request.history[3], ChatMessage::User { .. }));
+            });
+        }
+
+        /// A marker `LlmPort` whose only job is to be distinguishable by
+        /// `Arc::ptr_eq` — these tests assert WHICH tier's candidate was
+        /// returned, never anything about a port's behaviour.
+        struct MarkerLlmPort;
+
+        impl greentic_ext_runtime::host_ports::LlmPort for MarkerLlmPort {
+            fn complete(
+                &self,
+                _extension_id: &str,
+                _ctx: &greentic_ext_runtime::host_ports::HostCallContext,
+                _role: &str,
+                _request: greentic_ext_runtime::host_ports::LlmPortRequest,
+            ) -> Result<
+                greentic_ext_runtime::host_ports::LlmPortResponse,
+                greentic_ext_runtime::host_ports::LlmPortError,
+            > {
+                unreachable!("marker port for tier-selection tests; never invoked")
+            }
+        }
+
+        fn marker_port() -> Arc<dyn greentic_ext_runtime::host_ports::LlmPort> {
+            Arc::new(MarkerLlmPort)
+        }
+
+        /// Table-driven over all eight `(host, agent, env)` presence
+        /// combinations, asserting both WHICH TIER won (via the returned
+        /// `ExtLlmTier`) and which candidate's pointer came back. A test that
+        /// only ever supplies one candidate at a time (the earlier shape of
+        /// this test) cannot discriminate the precedence order at all — with
+        /// a single candidate present, every permutation of `.or()` returns
+        /// it regardless of order. Every row here has at least the winning
+        /// candidate plus, for every row but the all-absent one, a losing
+        /// candidate the function must reject in favour of it.
+        #[test]
+        fn select_ext_llm_port_precedence_table() {
+            use super::ExtLlmTier;
+
+            let cases: &[(bool, bool, bool, Option<ExtLlmTier>)] = &[
+                (true, true, true, Some(ExtLlmTier::Host)),
+                (true, true, false, Some(ExtLlmTier::Host)),
+                (true, false, true, Some(ExtLlmTier::Host)),
+                (true, false, false, Some(ExtLlmTier::Host)),
+                (false, true, true, Some(ExtLlmTier::Agent)),
+                (false, true, false, Some(ExtLlmTier::Agent)),
+                (false, false, true, Some(ExtLlmTier::Env)),
+                (false, false, false, None),
+            ];
+
+            for &(host_present, agent_present, env_present, expected_tier) in cases {
+                let host = host_present.then(marker_port);
+                let agent = agent_present.then(marker_port);
+                let env = env_present.then(marker_port);
+
+                let expected_port = match expected_tier {
+                    Some(ExtLlmTier::Host) => host.clone(),
+                    Some(ExtLlmTier::Agent) => agent.clone(),
+                    Some(ExtLlmTier::Env) => env.clone(),
+                    None => None,
+                };
+
+                let picked = super::select_ext_llm_port(host.clone(), agent.clone(), env.clone());
+
+                match (picked, expected_tier, expected_port) {
+                    (Some((tier, port)), Some(expected), Some(expected_port)) => {
+                        assert_eq!(
+                            tier, expected,
+                            "host={host_present} agent={agent_present} env={env_present}: wrong tier won"
+                        );
+                        assert!(
+                            Arc::ptr_eq(&port, &expected_port),
+                            "host={host_present} agent={agent_present} env={env_present}: wrong candidate for the winning tier"
+                        );
+                    }
+                    (None, None, None) => {}
+                    (picked, _, _) => panic!(
+                        "host={host_present} agent={agent_present} env={env_present}: expected {expected_tier:?}, got {:?}",
+                        picked.map(|(tier, _)| tier)
+                    ),
+                }
+            }
+        }
+
+        /// The two `None`s in `build_runtime_with_stores` (the bridge arm's
+        /// hardcoded one, and the zero-env arm's `if`) both route through
+        /// `should_attempt_agent_llm_port` — this is the only place either
+        /// decision is actually exercised by a test, since `ExtensionRuntime`
+        /// has no `llm_port` accessor to assert on after the fact. All four
+        /// combinations: the bridge branch (`bridge_extension_configured`)
+        /// must always refuse regardless of the host port, and the zero-env
+        /// branch must attempt tier 2 only when the host has not already
+        /// supplied one.
+        #[test]
+        fn should_attempt_agent_llm_port_truth_table() {
+            let cases: &[(bool, bool, bool)] = &[
+                // (bridge_extension_configured, host_port_present, expected)
+                (false, false, true),
+                (false, true, false),
+                (true, false, false),
+                (true, true, false),
+            ];
+            for &(bridge, host, expected) in cases {
+                assert_eq!(
+                    super::should_attempt_agent_llm_port(bridge, host),
+                    expected,
+                    "bridge_extension_configured={bridge} host_port_present={host}"
+                );
+            }
         }
     }
 }
@@ -2461,13 +5431,61 @@ pub fn dw_agent_dispatch_mode(get_env: impl Fn(&str) -> Option<String>) -> DwAge
 
 #[cfg(feature = "agentic-worker")]
 pub use aw::{
-    HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
-    build_agent_node_handler, build_agent_runtime, load_process_agent_configs, merge_agent_sources,
-    merge_sidecar_into, serve_agentic,
+    AgentNodeWiring, HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
+    build_agent_node_handler, build_agent_node_wiring, build_agent_runtime,
+    load_process_agent_configs, merge_agent_sources, merge_sidecar_into, resolve_billing_meter,
+    serve_agentic,
 };
 
 #[cfg(feature = "desktop-agent-ephemeral")]
-pub use aw::build_agent_node_handler_ephemeral;
+pub use aw::{build_agent_node_handler_ephemeral, build_agent_node_wiring_ephemeral};
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) use aw::{EnvSecretsBackend, build_ext_runtime, build_llm_backend};
+pub(crate) use aw::{
+    EnvSecretsBackend, build_agent_node_wiring_metered, build_ext_runtime, build_llm_backend,
+    component_source_from_packs, mcp_secrets_manager, mcp_source_from_env,
+};
+
+#[cfg(feature = "desktop-agent-ephemeral")]
+pub(crate) use aw::build_agent_node_wiring_ephemeral_metered;
+
+// `first_declared_llm_agent` itself needs only `agentic-worker`, but its only
+// consumer outside this module is `ext_llm_port`, which is gated on
+// `greentic-llm-backend` too — so re-exporting it unconditionally under plain
+// `agentic-worker` would trip `unused_imports` on a build that has
+// `agentic-worker` without `greentic-llm-backend`.
+//
+// Shared by every `LlmPort` impl in this crate — `EnvLlmPort` here and
+// `crate::runner::ext_llm_port::AgentLlmPort` — so the request mapping and the
+// dedicated-thread completion bridge exist in exactly one place. Both need
+// `greentic-llm-backend` regardless of who calls them: `EnvLlmPort` already
+// does, and `ext_llm_port` is gated on it too (it also needs
+// `greentic_llm::ProviderKind`, which is only pulled in by that feature).
+#[cfg(feature = "greentic-llm-backend")]
+pub(crate) use aw::{complete_on_thread, first_declared_llm_agent, port_request_to_llm_request};
+
+// Only consumed by `runtime.rs`'s in-process operala.call wiring, which is
+// itself gated behind `operala-in-process` — re-exporting unconditionally
+// under plain `agentic-worker` would trip `unused_imports` on builds that have
+// `agentic-worker` without `operala-in-process`.
+#[cfg(feature = "operala-in-process")]
+pub(crate) use aw::resolve_in_process_llm_key;
+
+// flow_source_from_packs is used only inside the aw module (build_runtime_handler_with_stores
+// + tests) so it stays pub(crate) there without a top-level re-export.
+
+// Test-only helpers other `runner` submodules' tests reuse rather than
+// re-implementing. Its only consumer today is `ext_llm_port`'s test module
+// (which needs an agent config to vary the provider/model on), and that
+// module is itself gated on `greentic-llm-backend` (it uses
+// `greentic_llm::ProviderKind` directly) — so this module must carry the
+// same gate, not just `agentic-worker`, or an `agentic-worker`-only build
+// (the crate's own DEFAULT feature set) sees `sample_agent_config` re-exported
+// to nobody and trips `unused_imports`. Introduced in the task that added
+// `ext_llm_port`; missing this gate broke `cargo clippy --all-targets
+// --features agentic-worker -- -D warnings` from that point on, invisible
+// until someone actually built test targets in that configuration.
+#[cfg(all(test, feature = "agentic-worker", feature = "greentic-llm-backend"))]
+pub(crate) mod test_support {
+    pub(crate) use super::aw::tests::sample_agent_config;
+}

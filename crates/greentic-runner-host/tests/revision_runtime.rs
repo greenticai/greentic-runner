@@ -186,6 +186,12 @@ async fn build_legacy() -> Result<Arc<TenantRuntime>> {
         state_store,
         state_host,
         manager,
+        #[cfg(feature = "agentic-worker")]
+        None,
+        #[cfg(feature = "agentic-worker")]
+        None,
+        #[cfg(feature = "agentic-worker")]
+        None,
     )
     .await
 }
@@ -217,6 +223,56 @@ async fn load_revision_derives_rollout_identity_and_records_digests() -> Result<
     // The verified digest is threaded into the runtime (parity with the legacy
     // index path), not dropped to `None`.
     assert_eq!(runtime.pack_digests(), &[Some(refs[0].digest.clone())]);
+    Ok(())
+}
+
+/// Every pack in a revision is bound to the revision's `bundle_id`, which is
+/// what scopes the extension credentials its `component.exec` nodes read — so
+/// two units of the SAME pack in one environment can hold different values.
+///
+/// The legacy tenant-only runtime carries no unit and must keep resolving the
+/// bare pack scope; asserting both here is what stops the threading being
+/// dropped silently, since a missing unit degrades to today's address rather
+/// than failing.
+#[tokio::test]
+async fn load_revision_binds_every_pack_to_the_revisions_unit() -> Result<()> {
+    let refs = pinned_pack_refs()?;
+    let runtime = build_revision(
+        &refs,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+    )
+    .await?;
+
+    let packs = runtime.all_packs();
+    assert!(!packs.is_empty(), "the revision loaded no packs");
+    for pack in packs {
+        assert_eq!(
+            pack.unit_id(),
+            Some("customer.support"),
+            "pack `{}` is not bound to the revision's unit",
+            pack.metadata().pack_id,
+        );
+    }
+
+    // The unit is the SAME value the engine reports as its rollout bundle id,
+    // so the flow-node MCP lane and the component lane cannot disagree about
+    // which unit is running.
+    assert_eq!(
+        runtime.engine().rollout_ids().bundle_id.as_deref(),
+        packs[0].unit_id(),
+    );
+
+    let legacy = build_legacy().await?;
+    for pack in legacy.all_packs() {
+        assert_eq!(
+            pack.unit_id(),
+            None,
+            "the tenant-only runtime must carry no unit",
+        );
+    }
     Ok(())
 }
 

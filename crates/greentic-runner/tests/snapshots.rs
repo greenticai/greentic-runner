@@ -436,6 +436,7 @@ fn run_flow(
         observer,
         mocks: None,
         reply_scope: None,
+        caller: None,
     };
 
     let execution = runtime.block_on(engine.execute(ctx, Value::Null));
@@ -675,6 +676,18 @@ impl StateStore for FlakyStateStore {
         }
         self.inner
             .set_json(tenant, prefix, key, path, value, ttl_secs)
+    }
+
+    fn set_json_if_absent(
+        &self,
+        tenant: &greentic_types::TenantCtx,
+        prefix: &str,
+        key: &greentic_types::StateKey,
+        value: &Value,
+        ttl_secs: Option<u32>,
+    ) -> greentic_types::GResult<bool> {
+        self.inner
+            .set_json_if_absent(tenant, prefix, key, value, ttl_secs)
     }
 
     fn del(

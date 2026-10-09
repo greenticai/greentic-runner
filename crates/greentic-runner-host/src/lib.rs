@@ -26,6 +26,7 @@ use tokio::signal;
 
 pub mod boot;
 pub mod cache;
+pub mod caller_identity;
 pub mod component_api;
 pub mod config;
 pub mod engine;
@@ -44,6 +45,7 @@ pub mod provider;
 pub mod provider_core;
 pub mod provider_core_only;
 pub mod routing;
+pub mod run_outcome;
 pub mod runner;
 pub mod runtime;
 pub mod runtime_refs;
@@ -64,13 +66,14 @@ pub mod watcher;
 
 mod activity;
 mod host;
+mod http_timeout_hooks;
 pub mod oauth;
 
 pub use activity::{Activity, ActivityKind, WelcomeFlowHint};
 pub use config::HostConfig;
 pub use gtbind::{PackBinding, TenantBindings};
 pub use host::TelemetryCfg;
-pub use host::{HostBuilder, RunnerHost, TenantHandle};
+pub use host::{HostBuilder, RunnerHost, TenantHandle, TurnTrace};
 pub use wasi::{PreopenSpec, RunnerWasiPolicy};
 
 pub use greentic_types::{EnvId, FlowId, PackId, TenantCtx, TenantId};
@@ -79,6 +82,17 @@ pub use http::auth::AdminAuth;
 pub use routing::RoutingConfig;
 use routing::TenantRouting;
 pub use runner::HostServer;
+
+/// Build a worker's sorla tool source over exactly the given SoRs, each
+/// resolved through its own route document at
+/// `secrets://default/<tenant>/<team|_>/sorla/<sor>`. Re-exported for the
+/// designer's in-process Test chat, which knows a worker's bound SoRs
+/// directly and has no `PackRuntime` of its own to read a
+/// `assets/sorla-routes.json` sidecar from — see
+/// `runner::sorla_pack_source` for the pack-routed counterpart this crate
+/// uses internally.
+#[cfg(feature = "agentic-worker")]
+pub use runner::sorla_pack_source::sorla_source_for_sors;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -140,6 +154,12 @@ timers: []
             Arc::clone(&state_store),
             state_host,
             secrets,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
         )
         .await?;
         Ok((workspace, runtime))
@@ -479,7 +499,9 @@ fn telemetry_from_env(
 ///
 /// Skips with a warning (continuing normal startup) when no agents are
 /// configured; [`serve_agentic`] itself further degrades gracefully when the
-/// runtime cannot be built (no `GREENTIC_AW_REDIS_URL` / LLM key). The spawned
+/// runtime cannot be built (an explicit redis backend with no URL, an
+/// unreachable Redis, or a failed extension runtime; a missing
+/// `GREENTIC_AW_REDIS_URL` alone selects the in-memory store). The spawned
 /// task owns the subscriber for the lifetime of the process.
 #[cfg(feature = "agentic-worker")]
 fn maybe_spawn_inproc_agentic_serve() {

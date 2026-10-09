@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::error::LlmError;
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse, LlmToolSchema, OnDelta};
 use crate::state::{ChatMessage, ToolCallRecord};
+use crate::tool_wire_name::{ToolNameCodec, wire_tool_name};
 
 /// Maximum time to wait between consecutive bytes from the streaming
 /// response before treating the connection as dead. reqwest's client
@@ -20,6 +21,20 @@ use crate::state::{ChatMessage, ToolCallRecord};
 /// indefinitely. Overridable only in tests for fast, deterministic checks.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Endpoint used when [`ENV_BASE_URL`] names none.
+const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+
+/// Names an OpenAI-compatible endpoint (Ollama, vLLM, LiteLLM, a gateway, …).
+///
+/// This is the ORIGIN, not the API root: the request paths below append
+/// `/v1/chat/completions` themselves, so the value is `http://127.0.0.1:11434`
+/// and not `http://127.0.0.1:11434/v1`.
+///
+/// Already read by the `greentic-llm-backend` path in greentic-runner-host;
+/// honouring it here too is what lets a STOCK default build reach a non-OpenAI
+/// endpoint with no feature flag.
+const ENV_BASE_URL: &str = "GREENTIC_LLM_BASE_URL";
+
 pub struct OpenAiLlmBackend {
     api_key: String,
     base_url: String,
@@ -27,10 +42,25 @@ pub struct OpenAiLlmBackend {
 }
 
 impl OpenAiLlmBackend {
+    /// Build a backend against the endpoint named by [`ENV_BASE_URL`], falling
+    /// back to OpenAI's own host when that variable is unset or blank.
+    ///
+    /// Reading the env HERE rather than only at the call sites is deliberate.
+    /// This type is what `in_process_llm_backend_with_key` constructs on the
+    /// default build, where the `greentic-llm-backend` block that reads the same
+    /// variable is not compiled in — so until this change an Ollama or other
+    /// OpenAI-compatible endpoint was unreachable from a stock binary no matter
+    /// how it was configured, and every dw.agent call went to api.openai.com.
+    /// The two paths now agree on one variable.
+    ///
+    /// [`with_base_url`](Self::with_base_url) still takes an explicit endpoint
+    /// and ignores the env, for callers that must pin one (tests included).
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_base_url(api_key, "https://api.openai.com")
+        Self::with_base_url(api_key, base_url_from_env())
     }
 
+    /// Build a backend against an explicitly supplied endpoint, ignoring
+    /// [`ENV_BASE_URL`].
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -41,6 +71,25 @@ impl OpenAiLlmBackend {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
+}
+
+/// Resolve the endpoint from [`ENV_BASE_URL`], falling back to [`DEFAULT_BASE_URL`].
+fn base_url_from_env() -> String {
+    normalize_base_url(std::env::var(ENV_BASE_URL).ok())
+}
+
+/// The pure half of [`base_url_from_env`], split out so it is testable without
+/// mutating process-global env (which races every other test in the binary).
+///
+/// An unset, blank or whitespace-only value means "the operator configured
+/// nothing", not "use the empty string" — both fall back to OpenAI's host. A
+/// trailing slash is trimmed because the request paths append `/v1/...`, and
+/// `https://host//v1/chat/completions` is a 404 on several gateways.
+fn normalize_base_url(configured: Option<String>) -> String {
+    configured
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 #[derive(Serialize)]
@@ -153,6 +202,9 @@ impl LlmBackend for OpenAiLlmBackend {
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
             let messages = build_messages(&req);
+            // Built from the list the model is about to be shown: a sanitised
+            // wire name cannot be split back apart by string surgery.
+            let codec = ToolNameCodec::for_tools(&req.tools);
             let tools: Option<Vec<OaTool<'_>>> = if req.tools.is_empty() {
                 None
             } else {
@@ -197,7 +249,9 @@ impl LlmBackend for OpenAiLlmBackend {
                 .tool_calls
                 .unwrap_or_default()
                 .into_iter()
-                .map(|c| build_tool_call_record(c.id, &c.function.name, &c.function.arguments))
+                .map(|c| {
+                    build_tool_call_record(&codec, c.id, &c.function.name, &c.function.arguments)
+                })
                 .collect();
             Ok(LlmResponse {
                 content: choice.message.content,
@@ -225,6 +279,9 @@ impl LlmBackend for OpenAiLlmBackend {
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
             let messages = build_messages(&req);
+            // Built from the list the model is about to be shown: a sanitised
+            // wire name cannot be split back apart by string surgery.
+            let codec = ToolNameCodec::for_tools(&req.tools);
             let tools: Option<Vec<OaTool<'_>>> = if req.tools.is_empty() {
                 None
             } else {
@@ -281,7 +338,7 @@ impl LlmBackend for OpenAiLlmBackend {
             {
                 on_delta(&text);
             }
-            Ok(acc.finish())
+            Ok(acc.finish(&codec))
         })
     }
 }
@@ -415,11 +472,11 @@ impl StreamAccumulator {
         Ok(emit)
     }
 
-    fn finish(self) -> LlmResponse {
+    fn finish(self, codec: &ToolNameCodec) -> LlmResponse {
         let tool_calls = self
             .tool_calls
             .into_values()
-            .map(|frag| build_tool_call_record(frag.id, &frag.name, &frag.arguments))
+            .map(|frag| build_tool_call_record(codec, frag.id, &frag.name, &frag.arguments))
             .collect();
         let content = if self.content.is_empty() {
             None
@@ -481,9 +538,14 @@ struct OaStreamToolFn {
 /// degrades to an empty object rather than failing the whole turn.
 ///
 /// [`complete`]: OpenAiLlmBackend::complete
-fn build_tool_call_record(call_id: String, name: &str, raw_args: &str) -> ToolCallRecord {
+fn build_tool_call_record(
+    codec: &ToolNameCodec,
+    call_id: String,
+    name: &str,
+    raw_args: &str,
+) -> ToolCallRecord {
     let args: serde_json::Value = serde_json::from_str(raw_args).unwrap_or(serde_json::json!({}));
-    let (extension_id, tool_name) = split_tool_name(name);
+    let (extension_id, tool_name) = codec.decode(name);
     ToolCallRecord {
         call_id,
         extension_id,
@@ -539,7 +601,7 @@ fn build_messages(req: &LlmRequest) -> Vec<OaMessage> {
                         id: tc.call_id.clone(),
                         typ: "function",
                         function: OaToolFn {
-                            name: encode_tool_name(&tc.extension_id, &tc.tool_name),
+                            name: wire_tool_name(&tc.extension_id, &tc.tool_name),
                             arguments: tc.args.to_string(),
                         },
                     })
@@ -564,7 +626,7 @@ fn build_tool(t: &LlmToolSchema) -> OaTool<'_> {
     OaTool {
         typ: "function",
         function: OaToolDef {
-            name: encode_tool_name(&t.extension_id, &t.tool_name),
+            name: wire_tool_name(&t.extension_id, &t.tool_name),
             description: &t.description,
             parameters: &t.parameters,
         },
@@ -575,6 +637,37 @@ fn build_tool(t: &LlmToolSchema) -> OaTool<'_> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_url_falls_back_to_openai_when_unconfigured() {
+        // Unset, empty and whitespace-only all mean "operator configured
+        // nothing" — none of them may produce an empty base URL, which would
+        // build the request path `/v1/chat/completions` against no host.
+        assert_eq!(normalize_base_url(None), "https://api.openai.com");
+        assert_eq!(
+            normalize_base_url(Some(String::new())),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            normalize_base_url(Some("   ".to_string())),
+            "https://api.openai.com"
+        );
+    }
+
+    #[test]
+    fn base_url_honours_a_configured_endpoint_and_trims_it() {
+        assert_eq!(
+            normalize_base_url(Some("http://127.0.0.1:11434".to_string())),
+            "http://127.0.0.1:11434"
+        );
+        // Surrounding whitespace and a trailing slash are operator typos, not
+        // part of the host: `https://host//v1/chat/completions` 404s on several
+        // OpenAI-compatible gateways.
+        assert_eq!(
+            normalize_base_url(Some("  http://127.0.0.1:11434/  ".to_string())),
+            "http://127.0.0.1:11434"
+        );
+    }
 
     #[test]
     fn tool_name_round_trips_and_is_openai_safe() {
@@ -714,7 +807,7 @@ mod tests {
                 deltas.push(text);
             }
         }
-        let resp = acc.finish();
+        let resp = acc.finish(&ToolNameCodec::default());
         assert_eq!(deltas, vec!["Hel".to_string(), "lo".to_string()]);
         assert_eq!(resp.content.as_deref(), Some("Hello"));
         assert_eq!(resp.tool_calls.len(), 1);

@@ -30,6 +30,7 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
         cap_id: mandatory_cap_id.to_string(),
         offer_id: None,
         config: serde_json::Value::Null,
+        mode: greentic_aw_runtime::config::GuardrailMode::Enforce,
     }];
 
     let llm_script = vec![Ok(LlmResponse {
@@ -56,6 +57,9 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
         },
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
+        on_text_while_parked: Default::default(),
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -64,7 +68,7 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
 
     // `ExtensionRuntime::for_test()` initialises an empty capability registry —
     // any mandatory cap_id will fail to resolve, triggering the fail-closed path.
-    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
 
     let runtime = AgentRuntime::new(
         Arc::new(cp),
@@ -102,6 +106,8 @@ async fn fail_closed_mandatory_unresolved_returns_guardrail_denied() {
             "a",
             AgentInput {
                 text: "hello — please process this".into(),
+                conversational: false,
+                resume_payload: None,
             },
         )
         .await;
@@ -153,6 +159,9 @@ async fn no_mandatory_guardrails_passes_through() {
         },
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
+        on_text_while_parked: Default::default(),
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -162,7 +171,7 @@ async fn no_mandatory_guardrails_passes_through() {
     let runtime = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
-        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
         Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
             content: Some("all good".into()),
             tool_calls: vec![],
@@ -182,7 +191,11 @@ async fn no_mandatory_guardrails_passes_through() {
             tc,
             "session-guardrail-2",
             "a",
-            AgentInput { text: "hi".into() },
+            AgentInput {
+                text: "hi".into(),
+                conversational: false,
+                resume_payload: None,
+            },
         )
         .await
         .expect("no guardrails configured — step must succeed");
@@ -214,6 +227,8 @@ async fn mandatory_ref_with_empty_registry_fails_closed() {
             "a",
             AgentInput {
                 text: "sensitive input".into(),
+                conversational: false,
+                resume_payload: None,
             },
         )
         .await;
@@ -295,6 +310,9 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
         },
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
+        on_text_while_parked: Default::default(),
     };
 
     let cp = greentic_aw_runtime::mock::MockConfigProvider::new();
@@ -307,7 +325,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
         tokens_out: 1,
     })];
 
-    let ext = std::sync::Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = std::sync::Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
     let runtime = AgentRuntime::new(
         std::sync::Arc::new(cp),
         std::sync::Arc::new(greentic_aw_runtime::mock::MockAgentStateStore::new()),
@@ -330,6 +348,8 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
             "a",
             AgentInput {
                 text: "hello".into(),
+                conversational: false,
+                resume_payload: None,
             },
         )
         .await;

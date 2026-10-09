@@ -31,6 +31,11 @@ pub struct RunFlowRequest {
 pub struct RunFlowResult {
     /// Outcome is expressed using standard greentic-types semantics (Done/Pending/Error).
     pub outcome: serde_json::Value,
+    /// Per-step node outputs for this turn, keyed by the step's `operation`
+    /// (for a `dw.agent` step that is the agent_id). Observability only — this
+    /// never affects `outcome`. Defaults to `Null` for back-compat.
+    #[serde(default)]
+    pub node_outputs: serde_json::Value,
 }
 
 #[async_trait::async_trait]

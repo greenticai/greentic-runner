@@ -84,6 +84,9 @@ mod tests {
             memory: None,
             knowledge: None,
             guardrails: vec![],
+            conversational: false,
+            opening_message: None,
+            on_text_while_parked: Default::default(),
         };
         if present {
             c.memory = Some(MemorySettings {

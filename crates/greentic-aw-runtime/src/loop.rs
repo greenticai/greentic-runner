@@ -11,8 +11,8 @@ use crate::llm::LlmRequest;
 use crate::state::{ChatMessage, ConversationState};
 use crate::telemetry::StepTelemetryCtx;
 use crate::tenant::TenantContext;
-use crate::tools::{dispatch_tool_call, is_tool_allowed, list_tools_for_llm};
-use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep, StepObserver};
+use crate::tools::is_tool_allowed;
+use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep, StepObserver, StepUsage};
 
 /// Agents already warned about unavailable tools, so the loud preflight warning
 /// fires once per agent per process (the loop resolves tools every iteration —
@@ -55,7 +55,43 @@ fn preflight_warn_tools(agent_id: &str, missing: &[crate::tools::MissingTool], d
     );
 }
 
+/// One agent turn.
+///
+/// When a run context is open, the turn runs under a re-scoped copy whose
+/// `caller_policy` is THIS agent's bindings, so every nested call it makes —
+/// a new `flow:` call, the resume of a parked one, a `playbook:` call — is
+/// judged against the agent that made it. This is the only place that sets
+/// the policy for an agent turn. A context bound to another tenant is
+/// replaced by a detached one, so nothing below can reach its trace.
 pub async fn run_step(
+    runtime: &AgentRuntime,
+    tenant: TenantContext,
+    session_id: &str,
+    agent_id: &str,
+    message: AgentInput,
+    observer: Arc<dyn StepObserver>,
+) -> Result<AgentOutput, AgentError> {
+    let Some(ctx) = crate::run_trace::RunContext::current() else {
+        return run_step_scoped(runtime, tenant, session_id, agent_id, message, observer).await;
+    };
+    let ctx = if ctx.tenant_id() == tenant.tenant_id {
+        ctx.with_caller_policy(runtime.share_modes_for(agent_id))
+    } else {
+        warn!(
+            context_tenant = ctx.tenant_id(),
+            step_tenant = %tenant.tenant_id,
+            "ignoring a run context bound to another tenant"
+        );
+        crate::run_trace::RunContext::detached(tenant.tenant_id.clone())
+    };
+    crate::run_trace::RunContext::scope(
+        ctx,
+        run_step_scoped(runtime, tenant, session_id, agent_id, message, observer),
+    )
+    .await
+}
+
+async fn run_step_scoped(
     runtime: &AgentRuntime,
     tenant: TenantContext,
     session_id: &str,
@@ -68,6 +104,23 @@ pub async fn run_step(
         .config_provider
         .agent_config(&tenant, agent_id)
         .await?;
+
+    // The run this step belongs to, if the caller opened one (see
+    // `RunContext::scope`). `run_step` has already replaced a context bound to
+    // another tenant with a detached one; the tenant check stays as a second
+    // guard. A `none`-mode context is treated exactly like no context.
+    let run_ctx = crate::run_trace::RunContext::current().filter(|c| {
+        c.tenant_id() == tenant.tenant_id && c.mode() != crate::share_policy::ShareMode::None
+    });
+    let run_trace = run_ctx.as_ref().map(|c| c.trace().clone());
+    // Only a read-write context records; a read-only one shows the view.
+    let record_to = run_ctx
+        .as_ref()
+        .filter(|c| c.mode() == crate::share_policy::ShareMode::ReadWrite)
+        .map(|c| c.trace().clone());
+    // Who this step is, for the owned tool outcomes it records and the view it
+    // reads: a raw result is shown only to the step that called the tool.
+    let step_id = crate::run_trace::StepId::fresh();
 
     // --- Cost budget gate (spec Decision 14) ---
     if let Some(cap) = config.limits.daily_token_cap_per_tenant {
@@ -100,6 +153,60 @@ pub async fn run_step(
             ConversationState::empty(&tenant, session_id)
         }
     };
+    // --- Opening-message short-circuit ---
+    // On the FIRST turn with no user text (the flow entered the agent via a
+    // button/card rather than a typed message), reply with the author-configured
+    // opening message instead of spending an LLM call to fabricate a greeting.
+    // Recorded in state so the conversation has context; `FinalReply` so a
+    // conversational agent then parks, awaiting the user's real first message.
+    if state.messages.is_empty()
+        && message.text.trim().is_empty()
+        && let Some(opening) = config
+            .opening_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        let opening = opening.to_string();
+        state.messages.push(ChatMessage::Assistant {
+            content: opening.clone(),
+            tool_calls: vec![],
+        });
+        if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
+            warn!(error = %e, "state save failed after opening message");
+        }
+        return Ok(AgentOutput {
+            reply: opening,
+            trail: Vec::new(),
+            terminated_by: TerminationReason::FinalReply,
+            usage: StepUsage::default(),
+            pending_presentation: None,
+            side_turn: false,
+        });
+    }
+
+    // --- A flow tool parked on the user last turn ---
+    // Its `call_id` has no tool result in history yet, and nothing may reach
+    // the LLM until it does. Either resume the flow with the user's answer
+    // (below, once the tool catalogs are resolved) or cancel it here.
+    let (resuming, cancelled_step, side_pending) = match crate::flow_suspend::take_pending(
+        &mut state,
+        message.resume_payload.clone(),
+        chrono::Utc::now(),
+        observer.as_ref(),
+        config.on_text_while_parked,
+    ) {
+        crate::flow_suspend::Taken::Nothing => (None, None, false),
+        crate::flow_suspend::Taken::Resume(resume) => (Some(resume), None, false),
+        crate::flow_suspend::Taken::Cancelled(step) => (None, Some(step), false),
+        // The park stays; this turn answers the typed message and re-offers it.
+        crate::flow_suspend::Taken::Side => (None, None, true),
+    };
+
+    let resumed_after_side_turns = resuming
+        .as_ref()
+        .is_some_and(|resume| resume.pending.side_turns > 0);
+
     // --- Assemble guardrail chain (once per step, before any message push) ---
     // Mandatory refs from the platform policy are resolved first; if any
     // mandatory guardrail cannot be resolved the agent is blocked (fail-closed).
@@ -142,29 +249,74 @@ pub async fn run_step(
         env_id: tenant.env_id.clone(),
     };
 
+    // --- User ledger (shared context, Phase C): what this signed-in user did
+    // in any unit of the environment. Off unless the host installed a ledger,
+    // the pack names this agent, the caller is provider-verified and this is
+    // a TOP-LEVEL step (`turn_for` refuses inside a tool call frame, i.e. a
+    // nested agent of a `flow:` tool). `turn_for` must run here, on the
+    // step's own task: the nested check reads a task-local that a
+    // `tokio::spawn` would lose. The read runs alongside the catalog
+    // resolution (same task, no spawn) so the lock-held wait it can add is at
+    // most `READ_TIMEOUT` minus that time; a slow, failing or suspended
+    // ledger injects nothing and never fails the turn.
+    //
+    // Not subject to the #828 share modes in this version: the ledger is
+    // keyed by the verified caller, not by the run, and nested agents never
+    // see it. The view goes into this step's system prompt only and is never
+    // appended to the run trace.
+    //
+    // Decided here, before the inbound guardrail consumes `message.text`:
+    // `turn_for` judges the RAW input, and a turn the visitor did not take
+    // (blank text, no submit payload — a channel's auto-start turn) gets a
+    // handle that reads but never appends (`user_ledger::visitor_spoke`).
+    let ledger_turn = runtime
+        .user_ledger
+        .as_ref()
+        .and_then(|binding| binding.turn_for(&tenant, agent_id, &message));
+
     // --- Inbound guardrail hook ---
-    let user_text = match crate::guardrail::run_chain(
-        &guardrail_chain,
-        crate::guardrail::GuardrailDirection::Inbound,
-        message.text,
-        &guardrail_ctx,
-        runtime.guardrail_evaluator.as_ref(),
-    ) {
-        crate::guardrail::ChainOutcome::Pass(text) => text,
-        crate::guardrail::ChainOutcome::Denied { info, direction } => {
-            return Err(AgentError::GuardrailDenied {
+    // Skipped when resuming a parked flow tool: the user's answer goes to the
+    // flow, not the LLM, and returns as a tool result like any other tool's.
+    let user_message = if resuming.is_some() {
+        crate::flow_suspend::last_user_text(&state)
+    } else {
+        let user_text = match crate::guardrail::run_chain(
+            &guardrail_chain,
+            crate::guardrail::GuardrailDirection::Inbound,
+            message.text,
+            &guardrail_ctx,
+            runtime.guardrail_evaluator.as_ref(),
+        ) {
+            crate::guardrail::ChainOutcome::Pass {
+                content,
+                observations,
+            } => {
+                for obs in &observations {
+                    observer.on_guardrail(obs);
+                }
+                content
+            }
+            crate::guardrail::ChainOutcome::Denied {
+                info,
                 direction,
-                code: info.code,
-                message: info.message,
-                details: info.details,
-            });
-        }
+                observation,
+            } => {
+                observer.on_guardrail(&observation);
+                return Err(AgentError::GuardrailDenied {
+                    direction,
+                    code: info.code,
+                    message: info.message,
+                    details: info.details,
+                });
+            }
+        };
+        // Keep user_message for long-term memory recall query below.
+        let user_message = user_text.clone();
+        state
+            .messages
+            .push(ChatMessage::User { content: user_text });
+        user_message
     };
-    // Keep user_message for long-term memory recall query below.
-    let user_message = user_text.clone();
-    state
-        .messages
-        .push(ChatMessage::User { content: user_text });
 
     // Whether long-term memory is active for this turn (provider wired + the
     // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,
@@ -174,6 +326,12 @@ pub async fn run_step(
     // wired + the agent's binding enabled). Drives `remember`/`recall` tools.
     let st_active =
         crate::short_term::short_term_active(runtime.short_term_memory.is_some(), &config);
+    // Whether the `end_conversation` tool + system-prompt note are offered
+    // this turn. Enabled when EITHER the agent's own config opts in OR this
+    // invocation does (the flow node marked `conversational` — SP3). The node
+    // drives the engine park-loop, so it must also let the agent end it.
+    let conv_active =
+        message.conversational || crate::end_conversation::conversational_active(&config);
 
     // --- Long-term recall: inject relevant facts into this turn's prompt ---
     let system_prompt = if lt_active {
@@ -197,38 +355,116 @@ pub async fn run_step(
     // augment the same turn, the knowledge block appended after the LT facts.
     // Retrieval failures degrade to no injection rather than failing the turn.
     let kn_active = crate::knowledge::knowledge_active(runtime.knowledge.is_some(), &config);
-    let system_prompt = if kn_active {
-        let chunks = runtime
+    // The chunks injected this step are kept alongside the prompt so they can be
+    // recorded in the trail (`AgentStep::KnowledgeRetrieval`) once it exists.
+    let (system_prompt, retrieved_chunks) = if kn_active {
+        // The agent's own knowledge binding, threaded through so a backend that
+        // delegates retrieval to a per-worker target can read its ids from the
+        // binding's `params` (see `Knowledge::search_bound`).
+        let binding = config.knowledge.as_ref().and_then(|k| k.knowledge.as_ref());
+        let outcome = runtime
             .search_knowledge(
                 &tenant,
                 crate::knowledge::KnowledgeQuery {
                     query: user_message.clone(),
                     limit: Some(crate::knowledge::auto_top_k(&config)),
                 },
+                binding,
             )
-            .await
-            .unwrap_or_default();
-        crate::knowledge::augment_system_prompt(&system_prompt, &chunks)
+            .await;
+        // A retrieval failure still degrades to no injection — a dead backend
+        // must not fail the turn — but it is no longer SILENT. This used to end
+        // `.unwrap_or_default()`, which turned every `Err` into an empty vector
+        // with no log, no trace, and nothing to tell "the corpus held nothing
+        // relevant" apart from "the backend did not answer". The worker then
+        // answered confidently from nothing, and with a third-party retrieval
+        // service — which can be down, rate-limited, or holding a rotated
+        // credential — that case stops being rare.
+        let chunks = match outcome {
+            Ok(chunks) => {
+                // Surface the retrieval in the live trace (test-chat "Tools used")
+                // so the operator sees which chunks were pulled in. Observer-only
+                // — not the trail.
+                crate::knowledge::emit_retrieval_trace(observer.as_ref(), &user_message, &chunks);
+                chunks
+            }
+            // The normal state of every worker without a knowledge backend
+            // wired, so it must not warn — `knowledge_active` can be true from
+            // config alone while the host mounted nothing.
+            Err(e @ crate::knowledge::KnowledgeError::NotConfigured) => {
+                tracing::debug!(agent_id = %config.agent_id, error = %e, "knowledge retrieval skipped");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %config.agent_id,
+                    error = %e,
+                    "knowledge retrieval failed; the turn proceeds with no retrieved context"
+                );
+                crate::knowledge::emit_retrieval_failure_trace(
+                    observer.as_ref(),
+                    &user_message,
+                    &e,
+                );
+                Vec::new()
+            }
+        };
+        let augmented = crate::knowledge::augment_system_prompt(&system_prompt, &chunks);
+        (augmented, chunks)
+    } else {
+        (system_prompt, Vec::new())
+    };
+
+    // --- Conversational note: tell the model the `end_conversation` tool
+    // exists and when to call it. Applied only for conversational agents. ---
+    let system_prompt = if conv_active {
+        crate::end_conversation::augment_system_prompt(&system_prompt)
     } else {
         system_prompt
     };
 
-    // Resolve the per-tenant agentic-worker MCP catalog once per step. The
-    // source is infallible (degrades to an empty catalog on any admin/server
-    // failure) and TTL-cached, so a stable config does not re-hit the network
-    // across iterations. `None` source → no MCP tools at all.
-    let mcp_catalog = match runtime.mcp.as_ref() {
-        Some(src) => Some(src.catalog(&tenant).await),
-        None => None,
+    // The turn that resumes a flow after side turns tells the model the step
+    // just finished (its history ends in the last side answer otherwise).
+    let system_prompt = if resumed_after_side_turns {
+        format!(
+            "{system_prompt}\n\n{}",
+            crate::flow_suspend::RESUME_AFTER_SIDE_TURNS_NOTE
+        )
+    } else {
+        system_prompt
     };
 
-    // Resolve the per-tenant component tool catalog once per step (mirrors the
-    // MCP catalog above). Infallible + TTL-cached; `None` source → no
-    // `component:` tools at all.
-    let component_catalog = match runtime.components.as_ref() {
-        Some(src) => Some(src.catalog(&tenant).await),
-        None => None,
+    // A side turn tells the model a form step is pending.
+    let system_prompt = if side_pending {
+        format!("{system_prompt}\n\n{}", crate::flow_suspend::SIDE_TURN_NOTE)
+    } else {
+        system_prompt
     };
+
+    // Resolve the per-tenant tool catalogs (MCP, component, flow, playbook,
+    // SoRLa, A2A)
+    // once per step. Every source is infallible (degrades to an empty catalog
+    // on any admin/server failure) and TTL-cached, so a stable config does not
+    // re-hit the network across iterations. `None` source → no tools of that
+    // prefix. `ToolCatalogs` is shared with `AgentRuntime::tool_session`, so
+    // an external loop resolves exactly what this one does. The user ledger
+    // read (above) runs alongside it.
+    let ledger_read = async {
+        match &ledger_turn {
+            Some(turn) => turn.read_view().await,
+            None => None,
+        }
+    };
+    let (ledger_view, catalogs) = tokio::join!(
+        ledger_read,
+        crate::tool_session::ToolCatalogs::resolve(runtime, &tenant, &config.tools, &config.llm),
+    );
+    // Prompt block order: the agent's prompt, long-term facts, knowledge
+    // chunks, the conversational note, then `<user_history>` (bounded by
+    // `user_ledger::MAX_VIEW_CHARS`), and last, per iteration, the run
+    // context `<run_context>` (bounded by `run_trace::MAX_VIEW_CHARS`).
+    let system_prompt =
+        crate::run_trace::augment_system_prompt(&system_prompt, ledger_view.as_deref());
 
     // Preflight: surface declared tools that won't reach the LLM. Without this
     // the runtime drops unresolved tools silently (per-tool debug warns) and the
@@ -236,22 +472,67 @@ pub async fn run_step(
     // results. Warn loudly, once per agent per process, with the reason + fix.
     preflight_warn_tools(
         &config.agent_id,
-        &crate::tools::missing_tools(
-            &runtime.ext_runtime,
-            mcp_catalog.as_deref(),
-            component_catalog.as_deref(),
-            &config.tools,
-        ),
+        &catalogs.missing(&runtime.ext_runtime, &config.tools),
         config.tools.len(),
     );
 
     let mut total_tokens: u64 = 0;
+    // Separate in/out accumulators surfaced on `AgentOutput.usage` (total is
+    // still tracked for telemetry/metering below).
+    let mut tokens_in_total: u64 = 0;
+    let mut tokens_out_total: u64 = 0;
     let mut trail: Vec<AgentStep> = Vec::new();
+    // Record the built-in knowledge retrieval FIRST: it happened before any LLM
+    // call, and it is the only place a knowledge-grounded answer's sources are
+    // written down (the observer trace is live-only and never persisted).
+    if !retrieved_chunks.is_empty() {
+        trail.push(AgentStep::KnowledgeRetrieval {
+            chunks: retrieved_chunks,
+        });
+    }
     let mut terminated_by = TerminationReason::MaxIterations;
     let mut iterations: u32 = 0;
     let mut reply = String::new();
+    // Turn-scoped: set once any tool the agent tried failed (dispatch error or
+    // allow-list block). A tool failure often lands one iteration BEFORE the
+    // model decides to give up and call `end_conversation`, so this flag must
+    // survive across iterations of the Plan-Act-Observe loop. Consumed by the
+    // `end_conversation` short-circuit below to keep a conversational agent
+    // PARKED (surface the blocker) instead of silently ending the conversation.
+    let mut turn_had_tool_error = false;
+    if let Some(step) = cancelled_step {
+        trail.push(step);
+    }
+    // Set when a `flow:` tool parks on the user: the presentation to show.
+    // Ends the turn with `AwaitingToolInput`.
+    let mut suspension: Option<serde_json::Value> = None;
+    let mut first_iter: u32 = 0;
+    if let Some(resume) = resuming {
+        first_iter = resume.pending.iterations_used;
+        iterations = first_iter;
+        suspension = crate::flow_suspend::resume_pending(
+            runtime,
+            &lock,
+            &tenant,
+            session_id,
+            &catalogs,
+            &mut state,
+            &mut trail,
+            observer.as_ref(),
+            resume,
+        )
+        .await;
+        if suspension.is_some() {
+            terminated_by = TerminationReason::AwaitingToolInput;
+        }
+    }
+    let iter_range = if suspension.is_some() {
+        0..0
+    } else {
+        first_iter..config.limits.max_iter
+    };
 
-    for iter in 0..config.limits.max_iter {
+    for iter in iter_range {
         iterations = iter + 1;
 
         // Extend the lock TTL each iteration; losing the extension is
@@ -265,12 +546,7 @@ pub async fn run_step(
             break;
         }
 
-        let mut tools_schema = list_tools_for_llm(
-            &runtime.ext_runtime,
-            mcp_catalog.as_deref(),
-            component_catalog.as_deref(),
-            &config.tools,
-        );
+        let mut tools_schema = catalogs.list_for_llm(&runtime.ext_runtime, &config.tools);
         if lt_active {
             tools_schema.push(crate::long_term::recall_memory_tool_schema());
         }
@@ -278,8 +554,17 @@ pub async fn run_step(
             tools_schema.push(crate::short_term::remember_tool_schema());
             tools_schema.push(crate::short_term::recall_tool_schema());
         }
+        if conv_active {
+            tools_schema.push(crate::end_conversation::end_conversation_tool_schema());
+        }
         let request = LlmRequest {
-            system_prompt: system_prompt.clone(),
+            system_prompt: crate::run_trace::augment_system_prompt(
+                &system_prompt,
+                run_trace
+                    .as_ref()
+                    .and_then(|t| t.render_view_for(Some(step_id)))
+                    .as_deref(),
+            ),
             history: state.messages.clone(),
             tools: tools_schema,
             provider: config.llm.clone(),
@@ -315,6 +600,22 @@ pub async fn run_step(
 
         let step_tokens = u64::from(response.tokens_in) + u64::from(response.tokens_out);
         total_tokens += step_tokens;
+        tokens_in_total += u64::from(response.tokens_in);
+        tokens_out_total += u64::from(response.tokens_out);
+        // Per-call trace: record this LLM iteration's assistant content + token
+        // cost (before its tool calls) so a caller can show a per-message
+        // breakdown, not just the aggregate `AgentOutput.usage`.
+        trail.push(AgentStep::LlmCall {
+            content: response.content.clone().unwrap_or_default(),
+            tokens_in: u64::from(response.tokens_in),
+            tokens_out: u64::from(response.tokens_out),
+        });
+        // Stream the per-iteration token trace (a streaming consumer renders a
+        // per-message LLM/token line even when the turn calls no tools).
+        observer.on_llm_call(
+            u64::from(response.tokens_in),
+            u64::from(response.tokens_out),
+        );
         if let Err(e) = runtime.token_meter.add(&tenant, step_tokens).await {
             warn!(error = %e, "token meter add failed; continuing");
         }
@@ -335,6 +636,50 @@ pub async fn run_step(
 
         // --- Mixed text + tool_calls: tool_calls win (spec Decision 12) ---
         if !response.tool_calls.is_empty() {
+            // --- Host built-in: `end_conversation` (conversational agents) ---
+            // Agent-driven exit signal (SP1). Short-circuit BEFORE recording the
+            // multi-tool assistant message so saved history carries no dangling
+            // tool_call. Any co-occurring tool calls are ignored — the agent
+            // chose to end the conversation.
+            if conv_active
+                && let Some(end_call) = response
+                    .tool_calls
+                    .iter()
+                    .find(|c| c.tool_name == crate::end_conversation::END_CONVERSATION_TOOL)
+            {
+                observer.on_tool_call(&end_call.tool_name, &end_call.call_id, &end_call.args);
+                let closing = end_call
+                    .args
+                    .get("final_message")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| response.content.clone())
+                    .unwrap_or_default();
+                let ok = serde_json::json!({ "ok": true });
+                observer.on_tool_result(&end_call.tool_name, &end_call.call_id, &ok);
+                trail.push(AgentStep::ToolCall {
+                    name: end_call.tool_name.clone(),
+                    call_id: end_call.call_id.clone(),
+                    args: end_call.args.clone(),
+                    result: ok,
+                    duration_ms: 0,
+                });
+                reply = closing;
+                // Blocker guard: if a tool/backend failed earlier this turn, the
+                // model often gives up and asks to end. Honouring that would
+                // silently advance the flow past the failure with the user none
+                // the wiser. Instead keep the conversation PARKED (FinalReply,
+                // not ConversationEnded) so the closing message — which explains
+                // the failure — is shown and the user can respond or retry.
+                terminated_by = if turn_had_tool_error {
+                    TerminationReason::FinalReply
+                } else {
+                    TerminationReason::ConversationEnded
+                };
+                break;
+            }
+
             // Record the assistant's tool-call turn BEFORE the tool results.
             // OpenAI requires every `tool` message to follow an assistant
             // message carrying the matching `tool_calls`; without this the next
@@ -345,12 +690,28 @@ pub async fn run_step(
                 tool_calls: response.tool_calls.clone(),
             });
             for call in response.tool_calls {
+                // --- A flow tool earlier in this batch parked on the user ---
+                // Every later call still gets a result so no tool_call dangles
+                // in history, but none of them runs: the user must answer first.
+                // A side turn must not start a second flow while one is parked.
+                if suspension.is_some() || (side_pending && call.extension_id.starts_with("flow:"))
+                {
+                    crate::flow_suspend::refuse_behind_suspension(
+                        &mut state,
+                        &mut trail,
+                        observer.as_ref(),
+                        &call,
+                    );
+                    continue;
+                }
                 // --- Host built-in: `recall_memory` (long-term lookup) ---
                 // Intercepted before the allow-list + WASM dispatch; routed to
                 // the runtime's long-term backend instead of an extension.
                 if lt_active && call.tool_name == crate::long_term::RECALL_MEMORY_TOOL {
-                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let t0 = Instant::now();
                     let result = host_recall_memory(runtime, &tenant, &call).await;
+                    let duration_ms = t0.elapsed().as_millis() as u64;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -359,7 +720,9 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
+                        duration_ms,
                     });
                     continue;
                 }
@@ -367,8 +730,10 @@ pub async fn run_step(
                 // Intercepted before the allow-list + WASM dispatch; routed to
                 // the runtime's short-term backend instead of an extension.
                 if st_active && call.tool_name == crate::short_term::REMEMBER_TOOL {
-                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let t0 = Instant::now();
                     let result = host_remember(runtime, &tenant, session_id, &call).await;
+                    let duration_ms = t0.elapsed().as_millis() as u64;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -377,13 +742,17 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
+                        duration_ms,
                     });
                     continue;
                 }
                 if st_active && call.tool_name == crate::short_term::RECALL_TOOL {
-                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let t0 = Instant::now();
                     let result = host_recall(runtime, &tenant, session_id, &call).await;
+                    let duration_ms = t0.elapsed().as_millis() as u64;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -392,25 +761,34 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
+                        duration_ms,
                     });
                     continue;
                 }
                 if !is_tool_allowed(&call, &config.tools) {
+                    let reason = "not in allow-list";
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let err_obs = serde_json::json!({ "error": reason });
+                    observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
                         content: serde_json::json!({ "error": "tool not allowed for this agent" }),
                     });
                     trail.push(AgentStep::ToolCallBlocked {
                         name: call.tool_name.clone(),
-                        reason: "not in allow-list".into(),
+                        reason: reason.into(),
                     });
+                    turn_had_tool_error = true;
                     continue;
                 }
 
                 // --- Idempotency: reuse a previously-recorded result ---
                 match runtime.ledger.get(&tenant, session_id, &call.call_id).await {
                     Ok(Some(cached)) => {
+                        observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                        observer.on_tool_result(&call.tool_name, &call.call_id, &cached);
                         state.messages.push(ChatMessage::Tool {
                             call_id: call.call_id.clone(),
                             content: cached,
@@ -432,18 +810,92 @@ pub async fn run_step(
                 // the error as a Tool observation so the LLM can react, then
                 // continue. Failed calls are NOT recorded in the ledger
                 // (they should remain retryable on the next turn).
-                observer.on_tool_call(&call.tool_name, &call.call_id);
-                let result = match dispatch_tool_call(
-                    runtime.ext_runtime.clone(),
-                    mcp_catalog.clone(),
-                    component_catalog.clone(),
-                    call.clone(),
-                    &tenant,
-                )
-                .await
-                {
+                observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                let t0 = Instant::now();
+                // Bound to a `let` before the `match` on purpose: a `&mut`
+                // borrow of `state.a2a` inside a match scrutinee lives to the
+                // end of the match, and the error arm below pushes onto
+                // `state.messages`.
+                //
+                // A `flow:` tool may PARK on the user (a card). It is the one
+                // prefix dispatched interactively; the rest stay one-shot.
+                let dispatched = if let Some(flow_ref) = call.extension_id.strip_prefix("flow:") {
+                    // The host running this flow derives a nested agent's
+                    // session from the caller's session and this call id, and
+                    // its caller from the host-stamped one (`tool_call_frame`).
+                    //
+                    // The call can run a whole nested agent turn, so the lock
+                    // is kept alive while it is pending.
+                    match crate::lock_keepalive::keep_alive(
+                        &lock,
+                        crate::lock_keepalive::LOCK_KEEPALIVE_INTERVAL,
+                        crate::tool_call_frame::within(
+                            crate::tool_call_frame::ToolCallFrame::new(
+                                Some(session_id),
+                                &call.call_id,
+                            )
+                            .with_caller(tenant.caller_or_anonymous()),
+                            crate::tools::dispatch_flow_tool_interactive(
+                                catalogs.flows.as_deref(),
+                                flow_ref,
+                                &call,
+                            ),
+                        ),
+                    )
+                    .await
+                    {
+                        crate::tools::FlowToolDispatch::Value(value) => Ok(value),
+                        crate::tools::FlowToolDispatch::Suspend {
+                            snapshot,
+                            presentation,
+                        } => {
+                            state.pending_tool = Some(crate::state::PendingToolCall {
+                                call_id: call.call_id.clone(),
+                                tool_name: call.tool_name.clone(),
+                                extension_id: call.extension_id.clone(),
+                                args: call.args.clone(),
+                                flow_ref: flow_ref.to_string(),
+                                flow_snapshot: snapshot,
+                                iterations_used: iterations,
+                                expires_at: crate::state::PendingToolCall::expiry_from(
+                                    chrono::Utc::now(),
+                                ),
+                                presentation: Some(presentation.clone()),
+                                parked_at: Some(chrono::Utc::now()),
+                                side_turns: 0,
+                            });
+                            if config.on_text_while_parked
+                                == crate::config::ParkedTextPolicy::SideTurn
+                            {
+                                // Answer the parked call now so side turns can
+                                // be appended after it without breaking the
+                                // provider's tool-call pairing; resume or
+                                // cancel patches this result in place.
+                                state.messages.push(ChatMessage::Tool {
+                                    call_id: call.call_id.clone(),
+                                    content: serde_json::json!({
+                                        "status": crate::flow_suspend::AWAITING_PLACEHOLDER
+                                    }),
+                                });
+                            }
+                            suspension = Some(presentation);
+                            continue;
+                        }
+                    }
+                } else {
+                    catalogs
+                        .dispatch(
+                            runtime.ext_runtime.clone(),
+                            call.clone(),
+                            &tenant,
+                            Some(&mut state.a2a),
+                        )
+                        .await
+                };
+                let result = match dispatched {
                     Ok(r) => r,
                     Err(e) => {
+                        let duration_ms = t0.elapsed().as_millis() as u64;
                         warn!(
                             error = %e, tool = %call.tool_name,
                             "tool dispatch failed; recording as observation and continuing"
@@ -453,19 +905,41 @@ pub async fn run_step(
                             call_id: call.call_id.clone(),
                             content: err_obs.clone(),
                         });
-                        // Surface the failure as a tool result too, so audit/stream
-                        // observers see a matching result instead of a dangling call.
-                        observer.on_tool_result(&call.tool_name, &call.call_id, &err_obs);
+                        // Surface the failure so audit/stream observers see a matching
+                        // outcome instead of a dangling call.
+                        observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
+                        if let Some(t) = &record_to {
+                            t.append_tool_outcome(
+                                step_id,
+                                agent_id,
+                                &call.tool_name,
+                                crate::run_trace::ToolOutcome::Failed,
+                                &crate::run_trace::summarise_result(&call.tool_name, &err_obs),
+                            );
+                        }
                         trail.push(AgentStep::ToolCall {
                             name: call.tool_name.clone(),
                             call_id: call.call_id.clone(),
+                            args: call.args.clone(),
                             result: err_obs,
+                            duration_ms,
                         });
+                        turn_had_tool_error = true;
                         continue;
                     }
                 };
+                let duration_ms = t0.elapsed().as_millis() as u64;
 
                 observer.on_tool_result(&call.tool_name, &call.call_id, &result);
+                if let Some(t) = &record_to {
+                    t.append_tool_outcome(
+                        step_id,
+                        agent_id,
+                        &call.tool_name,
+                        crate::run_trace::ToolOutcome::of(&result),
+                        &crate::run_trace::summarise_result(&call.tool_name, &result),
+                    );
+                }
 
                 // Record successful result in ledger (best-effort).
                 if let Err(e) = runtime
@@ -483,8 +957,17 @@ pub async fn run_step(
                 trail.push(AgentStep::ToolCall {
                     name: call.tool_name.clone(),
                     call_id: call.call_id,
+                    args: call.args.clone(),
                     result,
+                    duration_ms,
                 });
+            }
+            if suspension.is_some() {
+                // The turn ends here, waiting on the user. The assistant text
+                // that accompanied the tool call (if any) is the reply.
+                reply = response.content.unwrap_or_default();
+                terminated_by = TerminationReason::AwaitingToolInput;
+                break;
             }
             continue; // next LLM turn with tool observations
         }
@@ -506,7 +989,10 @@ pub async fn run_step(
     // Only a real final reply (where the LLM produced content) is subject to
     // outbound policy; the assistant message and audit trail are written only
     // after this check passes, so saved state reflects the guarded reply.
-    if terminated_by == TerminationReason::FinalReply {
+    if matches!(
+        terminated_by,
+        TerminationReason::FinalReply | TerminationReason::ConversationEnded
+    ) {
         let reply = match crate::guardrail::run_chain(
             &guardrail_chain,
             crate::guardrail::GuardrailDirection::Outbound,
@@ -514,8 +1000,21 @@ pub async fn run_step(
             &guardrail_ctx,
             runtime.guardrail_evaluator.as_ref(),
         ) {
-            crate::guardrail::ChainOutcome::Pass(text) => text,
-            crate::guardrail::ChainOutcome::Denied { info, direction } => {
+            crate::guardrail::ChainOutcome::Pass {
+                content,
+                observations,
+            } => {
+                for obs in &observations {
+                    observer.on_guardrail(obs);
+                }
+                content
+            }
+            crate::guardrail::ChainOutcome::Denied {
+                info,
+                direction,
+                observation,
+            } => {
+                observer.on_guardrail(&observation);
                 return Err(AgentError::GuardrailDenied {
                     direction,
                     code: info.code,
@@ -524,6 +1023,12 @@ pub async fn run_step(
                 });
             }
         };
+        let side_turn = side_pending
+            && crate::flow_suspend::finish_side_turn(
+                &mut state,
+                &mut terminated_by,
+                &mut suspension,
+            );
         state.messages.push(ChatMessage::Assistant {
             content: reply.clone(),
             tool_calls: vec![],
@@ -565,6 +1070,21 @@ pub async fn run_step(
             }
         }
 
+        if !reply.is_empty()
+            && let Some(t) = &record_to
+        {
+            t.append(agent_id, "reply", &reply);
+        }
+        // The GUARDED reply only (spec 4.1): never tool results, arguments or
+        // the user's message. Background, bounded, never fails the turn.
+        // `ledger_turn` was decided on this task before anything spawned; the
+        // append itself may spawn. Only a read-write binding appends.
+        if !reply.is_empty()
+            && let Some(turn) = &ledger_turn
+        {
+            turn.record_reply(&reply);
+        }
+
         runtime.telemetry.record_step(&StepTelemetryCtx {
             tenant_id: tenant.tenant_id.clone(),
             env_id: tenant.env_id.clone(),
@@ -580,9 +1100,18 @@ pub async fn run_step(
             reply,
             trail,
             terminated_by,
+            usage: StepUsage {
+                tokens_in: tokens_in_total,
+                tokens_out: tokens_out_total,
+                iterations,
+            },
+            pending_presentation: suspension,
+            side_turn,
         });
     }
 
+    let side_turn = side_pending
+        && crate::flow_suspend::finish_side_turn(&mut state, &mut terminated_by, &mut suspension);
     state.truncate_history(config.limits.max_history_turns);
     if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
         warn!(error = %e, "state save failed at end of step");
@@ -603,6 +1132,13 @@ pub async fn run_step(
         reply,
         trail,
         terminated_by,
+        usage: StepUsage {
+            tokens_in: tokens_in_total,
+            tokens_out: tokens_out_total,
+            iterations,
+        },
+        pending_presentation: suspension,
+        side_turn,
     })
 }
 
@@ -713,10 +1249,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::config::{AgentConfig, AgentLimits, LlmProviderRef};
+    use crate::error::{AgentError, LlmError, TerminationReason};
     use crate::llm::LlmResponse;
     use crate::mock::{MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry};
     use crate::tenant::TenantContext;
-    use crate::{AgentInput, AgentRuntime};
+    use crate::{AgentInput, AgentRuntime, AgentStep};
 
     fn cfg() -> AgentConfig {
         AgentConfig {
@@ -732,6 +1269,9 @@ mod tests {
             limits: AgentLimits::default(),
             memory: None,
             knowledge: None,
+            conversational: false,
+            opening_message: None,
+            on_text_while_parked: Default::default(),
         }
     }
 
@@ -751,7 +1291,7 @@ mod tests {
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(
@@ -772,12 +1312,348 @@ mod tests {
                 "a",
                 AgentInput {
                     text: "hello".into(),
+                    ..Default::default()
                 },
             )
             .await
             .unwrap();
         assert_eq!(out.reply, "hi from llm");
         assert_eq!(telemetry.recorded.lock().unwrap().len(), 1);
+        // Per-turn usage is surfaced on the output (one LLM call: 10 in / 20 out).
+        assert_eq!(out.usage.tokens_in, 10);
+        assert_eq!(out.usage.tokens_out, 20);
+        assert_eq!(out.usage.iterations, 1);
+        // The trail records the LLM call (per-message breakdown) before the reply.
+        assert!(matches!(
+            out.trail.first(),
+            Some(crate::AgentStep::LlmCall {
+                tokens_in: 10,
+                tokens_out: 20,
+                ..
+            })
+        ));
+    }
+
+    /// An empty wallet must stop the run BEFORE any LLM spend. The mock backend is
+    /// primed with zero responses: if the gate were removed, the loop would reach
+    /// the LLM and fail with an LLM error instead of `CreditBudgetExceeded`.
+    #[tokio::test]
+    async fn empty_wallet_refuses_the_run_before_any_llm_call() {
+        let llm = Arc::new(MockLlmBackend::new(vec![]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        cp.insert(&tc, "a", cfg());
+        let cp = Arc::new(cp);
+
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(
+            cp,
+            store,
+            ext,
+            llm,
+            telemetry.clone(),
+            token_meter,
+            ledger,
+            None,
+        )
+        .with_billing_meter(Arc::new(crate::mock::MockBillingMeter::new(true)));
+
+        let err = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hello".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an empty wallet must refuse the run");
+
+        assert!(
+            matches!(err, AgentError::CreditBudgetExceeded),
+            "expected CreditBudgetExceeded, got {err:?}"
+        );
+        assert!(
+            telemetry.recorded.lock().unwrap().is_empty(),
+            "nothing should have been executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_message_short_circuits_first_empty_turn() {
+        // The mock LLM would reply "from llm" if called — but an opening message
+        // on an empty FIRST turn must be returned verbatim WITHOUT an LLM call.
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("from llm".into()),
+            tool_calls: vec![],
+            tokens_in: 5,
+            tokens_out: 5,
+        })]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        let mut c = cfg();
+        c.opening_message = Some("Welcome to support!".into());
+        cp.insert(&tc, "a", c);
+        let cp = Arc::new(cp);
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                // Blank input (whitespace only) — e.g. a button click, no message.
+                AgentInput {
+                    text: "  ".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "Welcome to support!");
+        // No LLM call → zero usage, empty trail.
+        assert_eq!(out.usage.tokens_in, 0);
+        assert_eq!(out.usage.tokens_out, 0);
+        assert!(out.trail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opening_message_ignored_when_user_typed() {
+        // With actual user text, the opening message is NOT used — the LLM runs.
+        let (runtime, tc) = {
+            let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+                content: Some("real answer".into()),
+                tool_calls: vec![],
+                tokens_in: 3,
+                tokens_out: 4,
+            })]));
+            let store = Arc::new(MockAgentStateStore::new());
+            let telemetry = Arc::new(MockTelemetry::new());
+            let cp = MockConfigProvider::new();
+            let tc = TenantContext::new("acme", "prod");
+            let mut c = cfg();
+            c.opening_message = Some("Welcome!".into());
+            cp.insert(&tc, "a", c);
+            let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+            let runtime = AgentRuntime::new(
+                Arc::new(cp),
+                store,
+                ext,
+                llm,
+                telemetry,
+                Arc::new(crate::cost::MockTokenMeter::new(0)),
+                Arc::new(crate::mock::NoopToolLedger),
+                None,
+            );
+            (runtime, tc)
+        };
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "track my order".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "real answer");
+    }
+
+    /// Build a runtime whose mock LLM replays `responses` in order, for a
+    /// conversational agent with the given allow-listed `tools`.
+    fn conversational_runtime(
+        responses: Vec<Result<LlmResponse, LlmError>>,
+        tools: Vec<crate::config::ToolRef>,
+    ) -> (AgentRuntime, TenantContext) {
+        runtime_with_config_conversational(responses, tools, true)
+    }
+
+    /// Like [`conversational_runtime`] but the agent CONFIG's `conversational`
+    /// is caller-controlled, so tests can exercise the node/invocation flag
+    /// (`AgentInput.conversational`) independently of the config default.
+    fn runtime_with_config_conversational(
+        responses: Vec<Result<LlmResponse, LlmError>>,
+        tools: Vec<crate::config::ToolRef>,
+        config_conversational: bool,
+    ) -> (AgentRuntime, TenantContext) {
+        let llm = Arc::new(MockLlmBackend::new(responses));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        let mut c = cfg();
+        c.conversational = config_conversational;
+        c.tools = tools;
+        cp.insert(&tc, "a", c);
+        let cp = Arc::new(cp);
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
+        (runtime, tc)
+    }
+
+    fn end_conversation_call(final_message: &str) -> crate::state::ToolCallRecord {
+        crate::state::ToolCallRecord {
+            call_id: "end-call".into(),
+            extension_id: "host".into(),
+            tool_name: crate::end_conversation::END_CONVERSATION_TOOL.into(),
+            args: serde_json::json!({ "final_message": final_message }),
+        }
+    }
+
+    /// Blocker guard: when a tool fails during the turn, the model's subsequent
+    /// `end_conversation` request must NOT end the conversation — it parks
+    /// (`FinalReply`) so the closing message (which explains the failure) is
+    /// shown and the flow does not silently advance past the blocker.
+    #[tokio::test]
+    async fn conversational_tool_error_then_end_conversation_stays_parked() {
+        // Iteration 1: the model calls a tool that is not in the allow-list →
+        // recorded as a tool failure. Iteration 2: it gives up and asks to end.
+        let responses = vec![
+            Ok(LlmResponse {
+                content: Some("let me look that up".into()),
+                tool_calls: vec![crate::state::ToolCallRecord {
+                    call_id: "c1".into(),
+                    extension_id: "greentic.test".into(),
+                    tool_name: "lookup".into(),
+                    args: serde_json::json!({}),
+                }],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+            Ok(LlmResponse {
+                content: Some("reasoning".into()),
+                tool_calls: vec![end_conversation_call("Sorry, my systems are unavailable.")],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+        ];
+        // Empty allow-list → the `lookup` call is blocked (a tool failure).
+        let (runtime, tc) = conversational_runtime(responses, vec![]);
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.terminated_by, TerminationReason::FinalReply);
+        assert_eq!(out.reply, "Sorry, my systems are unavailable.");
+    }
+
+    /// Control: with no tool failure in the turn, `end_conversation` ends the
+    /// conversation normally (`ConversationEnded`) so the flow routes onward.
+    #[tokio::test]
+    async fn conversational_clean_end_conversation_ends() {
+        let responses = vec![Ok(LlmResponse {
+            content: Some("reasoning".into()),
+            tool_calls: vec![end_conversation_call("All set — goodbye!")],
+            tokens_in: 1,
+            tokens_out: 1,
+        })];
+        let (runtime, tc) = conversational_runtime(responses, vec![]);
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+        assert_eq!(out.reply, "All set — goodbye!");
+    }
+
+    /// SP3: the flow node's `conversational` flag (carried on `AgentInput`) must
+    /// enable the host `end_conversation` tool EVEN WHEN the agent's own config
+    /// default is non-conversational — so a node-marked-conversational segment
+    /// can be ended by the agent (and the engine advances past the park-loop).
+    #[tokio::test]
+    async fn node_conversational_input_enables_end_conversation_over_config() {
+        let responses = vec![Ok(LlmResponse {
+            content: Some("bye".into()),
+            tool_calls: vec![end_conversation_call("Take care!")],
+            tokens_in: 1,
+            tokens_out: 1,
+        })];
+        // Agent CONFIG is NON-conversational; only the invocation opts in.
+        let (runtime, tc) = runtime_with_config_conversational(responses, vec![], false);
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    conversational: true,
+                    resume_payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        // end_conversation was honoured because the invocation flag turned
+        // conv_active on despite the config default.
+        assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+        assert_eq!(out.reply, "Take care!");
+    }
+
+    /// Control: a non-conversational config AND a non-conversational invocation
+    /// means `end_conversation` is NOT offered, so the model's call is treated as
+    /// an ordinary (disallowed) tool and the turn ends as a normal FinalReply.
+    #[tokio::test]
+    async fn non_conversational_ignores_end_conversation() {
+        let responses = vec![
+            Ok(LlmResponse {
+                content: Some("trying to end".into()),
+                tool_calls: vec![end_conversation_call("bye")],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+            Ok(LlmResponse {
+                content: Some("final answer".into()),
+                tool_calls: vec![],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+        ];
+        let (runtime, tc) = runtime_with_config_conversational(responses, vec![], false);
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    conversational: false,
+                    resume_payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.terminated_by, TerminationReason::FinalReply);
     }
 
     /// 4b: when a knowledge backend is wired and the agent's binding is enabled,
@@ -810,7 +1686,7 @@ mod tests {
         cp.insert(&tc, "a", c);
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let kb = Arc::new(crate::mock::MockKnowledge::new(vec![
@@ -834,17 +1710,53 @@ mod tests {
         )
         .with_knowledge(kb);
 
-        runtime
+        let out = runtime
             .step(
                 tc,
                 "sess-k",
                 "a",
                 AgentInput {
                     text: "do I get refunds?".into(),
+                    ..Default::default()
                 },
             )
             .await
             .unwrap();
+
+        // #770: the retrieval is recorded in the trail, ahead of the LLM call,
+        // with the chunk exactly as retrieved — this is what lets a consumer
+        // cite a knowledge-grounded answer.
+        assert!(
+            matches!(
+                out.trail.first(),
+                Some(AgentStep::KnowledgeRetrieval { .. })
+            ),
+            "first trail step must be KnowledgeRetrieval: {:?}",
+            out.trail
+        );
+        let chunks = out
+            .trail
+            .iter()
+            .find_map(|s| match s {
+                AgentStep::KnowledgeRetrieval { chunks } => Some(chunks),
+                _ => None,
+            })
+            .expect("retrieval step");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].text,
+            "Refunds are processed within 5 business days."
+        );
+        assert!((chunks[0].score - 0.9).abs() < f64::EPSILON);
+        assert_eq!(
+            out.trail
+                .iter()
+                .filter(|s| matches!(s, AgentStep::KnowledgeRetrieval { .. }))
+                .count(),
+            1,
+            "one retrieval per step: {:?}",
+            out.trail
+        );
 
         let prompts = llm.seen_system_prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1);
@@ -860,6 +1772,64 @@ mod tests {
         );
     }
 
+    /// #770: a retrieval that returns nothing injected nothing, so it has
+    /// nothing to cite and must not add an (empty) `KnowledgeRetrieval` step.
+    #[tokio::test]
+    async fn empty_knowledge_retrieval_records_no_trail_step() {
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("ok".into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]));
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        let mut c = cfg();
+        c.knowledge = Some(crate::config::KnowledgeSettings {
+            knowledge: Some(crate::config::MemoryProviderRef {
+                provider: "provider.knowledge.chronicle".into(),
+                capability: "cap://dw.knowledge".into(),
+                params: serde_json::Map::new(),
+                credential_ref: None,
+            }),
+            embedding: None,
+            top_k: 3,
+        });
+        cp.insert(&tc, "a", c);
+        let runtime = AgentRuntime::new(
+            Arc::new(cp),
+            Arc::new(MockAgentStateStore::new()),
+            Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
+            llm,
+            Arc::new(MockTelemetry::new()),
+            Arc::new(crate::cost::MockTokenMeter::new(0)),
+            Arc::new(crate::mock::NoopToolLedger),
+            None,
+        )
+        .with_knowledge(Arc::new(crate::mock::MockKnowledge::new(Vec::new())));
+
+        let out = runtime
+            .step(
+                tc,
+                "sess-k0",
+                "a",
+                AgentInput {
+                    text: "anything?".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !out.trail
+                .iter()
+                .any(|s| matches!(s, AgentStep::KnowledgeRetrieval { .. })),
+            "empty retrieval must not be recorded: {:?}",
+            out.trail
+        );
+    }
+
     #[derive(Default)]
     struct Collecting {
         deltas: std::sync::Mutex<Vec<String>>,
@@ -872,7 +1842,7 @@ mod tests {
         fn on_token_delta(&self, chunk: &str) {
             self.deltas.lock().expect("lock").push(chunk.to_string());
         }
-        fn on_tool_call(&self, name: &str, _call_id: &str) {
+        fn on_tool_call(&self, name: &str, _call_id: &str, _args: &serde_json::Value) {
             self.tool_calls.lock().expect("lock").push(name.to_string());
         }
     }
@@ -896,7 +1866,7 @@ mod tests {
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(
@@ -918,6 +1888,7 @@ mod tests {
                 "a",
                 AgentInput {
                     text: "hello".into(),
+                    ..Default::default()
                 },
                 obs.clone(),
             )
@@ -956,7 +1927,7 @@ mod tests {
         let tc = TenantContext::new("acme", "prod");
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
@@ -969,6 +1940,7 @@ mod tests {
                 "a",
                 AgentInput {
                     text: "hello".into(),
+                    ..Default::default()
                 },
                 obs.clone(),
             )
@@ -980,5 +1952,520 @@ mod tests {
             0,
             "no deltas on the non-streaming path"
         );
+    }
+
+    /// A tool call for a tool NOT in the agent's allow-list must still fire
+    /// `on_tool_call` (so a chip renders with real args) followed by
+    /// `on_tool_failed` (so it renders as failed/blocked) — NOT
+    /// `on_tool_result`, which would make a blocked tool look like it
+    /// succeeded.
+    #[tokio::test]
+    async fn blocked_tool_fires_on_tool_call_then_on_tool_failed() {
+        use crate::state::ToolCallRecord;
+
+        #[derive(Default)]
+        struct ToolEvents {
+            calls: std::sync::Mutex<Vec<(String, String, serde_json::Value)>>,
+            results: std::sync::Mutex<Vec<(String, String, serde_json::Value)>>,
+            failures: std::sync::Mutex<Vec<(String, String, serde_json::Value)>>,
+        }
+        impl crate::StepObserver for ToolEvents {
+            fn on_tool_call(&self, name: &str, call_id: &str, args: &serde_json::Value) {
+                self.calls.lock().unwrap().push((
+                    name.to_string(),
+                    call_id.to_string(),
+                    args.clone(),
+                ));
+            }
+            fn on_tool_result(&self, name: &str, call_id: &str, result: &serde_json::Value) {
+                self.results.lock().unwrap().push((
+                    name.to_string(),
+                    call_id.to_string(),
+                    result.clone(),
+                ));
+            }
+            fn on_tool_failed(&self, name: &str, call_id: &str, error: &serde_json::Value) {
+                self.failures.lock().unwrap().push((
+                    name.to_string(),
+                    call_id.to_string(),
+                    error.clone(),
+                ));
+            }
+        }
+
+        let llm = Arc::new(MockLlmBackend::new(vec![
+            Ok(LlmResponse {
+                content: None,
+                tool_calls: vec![ToolCallRecord {
+                    call_id: "call_1".into(),
+                    extension_id: "http".into(),
+                    tool_name: "fetch".into(),
+                    args: serde_json::json!({"url": "https://example.com"}),
+                }],
+                tokens_in: 10,
+                tokens_out: 5,
+            }),
+            Ok(LlmResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                tokens_in: 3,
+                tokens_out: 2,
+            }),
+        ]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        // `cfg()` has an empty tools allow-list, so the tool call is blocked.
+        cp.insert(&tc, "a", cfg());
+        let cp = Arc::new(cp);
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
+
+        let obs = Arc::new(ToolEvents::default());
+        let out = runtime
+            .step_with_observer(
+                tc.clone(),
+                "sess-4",
+                "a",
+                AgentInput {
+                    text: "please fetch".into(),
+                    ..Default::default()
+                },
+                obs.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "done");
+
+        let calls = obs.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "fetch");
+        assert_eq!(calls[0].1, "call_1");
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({"url": "https://example.com"})
+        );
+        drop(calls);
+
+        assert!(
+            obs.results.lock().unwrap().is_empty(),
+            "a blocked tool must not fire on_tool_result"
+        );
+        let failures = obs.failures.lock().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "fetch");
+        assert_eq!(failures[0].1, "call_1");
+        assert_eq!(
+            failures[0].2,
+            serde_json::json!({"error": "not in allow-list"})
+        );
+    }
+
+    // --- StepObserver::on_guardrail wiring ------------------------------
+    //
+    // A genuine `run_step` integration test would need a `ResolvedGuardrail`
+    // chain entry whose capability actually resolves, which in turn needs a
+    // populated `CapabilityRegistry` on the `ExtensionRuntime`. There is no
+    // public seam to inject offerings directly: `ExtensionRuntime::for_test()`
+    // builds an empty registry, and the only way to populate one is
+    // `register_loaded_from_dir`, which requires a real, signed WASM
+    // extension on disk (see `tests/guardrail_e2e.rs`, which does exactly
+    // that for the full e2e suite — real component-guardrail-pii binary,
+    // ephemeral Ed25519 signing key, tempdir). That is too heavy for a
+    // focused unit test of the observer seam, so per the plan's authorised
+    // fallback these tests exercise `run_chain` directly and apply the exact
+    // notify pattern the two `run_step` call sites use (mirrored above),
+    // without building a full `AgentRuntime`. This still proves the
+    // regression this task guards against: a BLOCKED denial (Enforce) must
+    // reach the observer, not just a Monitored one.
+    #[derive(Default)]
+    struct RecordingObserver {
+        guardrails: std::sync::Mutex<Vec<crate::guardrail::GuardrailObservation>>,
+    }
+    impl crate::StepObserver for RecordingObserver {
+        fn on_guardrail(&self, obs: &crate::guardrail::GuardrailObservation) {
+            self.guardrails.lock().unwrap().push(obs.clone());
+        }
+    }
+
+    struct DenyingEvaluator {
+        code: String,
+        message: String,
+    }
+    impl crate::guardrail::GuardrailEvaluator for DenyingEvaluator {
+        fn evaluate(
+            &self,
+            _extension_id: &str,
+            _input: &crate::guardrail::GuardrailInput,
+        ) -> Result<crate::guardrail::GuardrailVerdict, crate::guardrail::GuardrailInvokeError>
+        {
+            Ok(crate::guardrail::GuardrailVerdict::Deny(
+                crate::guardrail::GuardrailDenyInfo {
+                    code: self.code.clone(),
+                    message: self.message.clone(),
+                    details: None,
+                },
+            ))
+        }
+    }
+
+    fn guardrail_run_ctx() -> crate::guardrail::GuardrailRunCtx {
+        crate::guardrail::GuardrailRunCtx {
+            agent_id: "a".into(),
+            session_id: "s1".into(),
+            tenant_id: "acme".into(),
+            env_id: "prod".into(),
+        }
+    }
+
+    /// Mirrors the notify logic at the loop.rs guardrail call sites: forward
+    /// every `Pass` observation, or the `Denied` observation, to the observer.
+    fn run_chain_and_notify(
+        chain: &[crate::guardrail::ResolvedGuardrail],
+        direction: crate::guardrail::GuardrailDirection,
+        content: String,
+        observer: &dyn crate::StepObserver,
+        evaluator: &dyn crate::guardrail::GuardrailEvaluator,
+    ) -> Result<String, crate::error::AgentError> {
+        match crate::guardrail::run_chain(
+            chain,
+            direction,
+            content,
+            &guardrail_run_ctx(),
+            evaluator,
+        ) {
+            crate::guardrail::ChainOutcome::Pass {
+                content,
+                observations,
+            } => {
+                for obs in &observations {
+                    observer.on_guardrail(obs);
+                }
+                Ok(content)
+            }
+            crate::guardrail::ChainOutcome::Denied {
+                info,
+                direction,
+                observation,
+            } => {
+                observer.on_guardrail(&observation);
+                Err(AgentError::GuardrailDenied {
+                    direction,
+                    code: info.code,
+                    message: info.message,
+                    details: info.details,
+                })
+            }
+        }
+    }
+
+    // NOTE: these two tests pin the notify *pattern* mirrored above (call
+    // `on_guardrail` for every `Pass` observation, or for a `Denied`
+    // observation) — they do NOT exercise `run_step`'s real wiring of that
+    // pattern (see the module doc above for why a genuine `run_step`
+    // integration test isn't feasible as a focused unit test here). The real
+    // `run_step` → `observer.on_guardrail` wiring is covered by
+    // `crates/greentic-aw-runtime/tests/guardrail_e2e.rs`, and the
+    // `CompositeObserver` fan-out regression (dropping `on_guardrail` when
+    // fanning out to multiple observers) is covered by
+    // `crates/greentic-runner-host/src/http/agent_stream.rs`'s
+    // `composite_fans_out_to_all_members_and_ors_streaming` test.
+    #[test]
+    fn guardrail_notify_pattern_reports_a_monitored_denial() {
+        // A recording observer proves the observation escapes run_chain and
+        // reaches the seam the host emits from.
+        let observer = RecordingObserver::default();
+        let chain = vec![crate::guardrail::ResolvedGuardrail {
+            extension_id: "ext-pii".into(),
+            cap_id: "greentic:guardrail/pii".into(),
+            mandatory: false,
+            mode: crate::config::GuardrailMode::Monitor,
+            config: serde_json::Value::Null,
+        }];
+        let evaluator = DenyingEvaluator {
+            code: "pii".into(),
+            message: "blocked pii".into(),
+        };
+        let out = run_chain_and_notify(
+            &chain,
+            crate::guardrail::GuardrailDirection::Inbound,
+            "hi".into(),
+            &observer,
+            &evaluator,
+        );
+        assert!(out.is_ok(), "monitor mode must not fail the turn");
+        let seen = observer.guardrails.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].action, crate::guardrail::GuardrailAction::Monitored);
+    }
+
+    #[test]
+    fn guardrail_notify_pattern_reports_a_blocked_denial() {
+        let observer = RecordingObserver::default();
+        let chain = vec![crate::guardrail::ResolvedGuardrail {
+            extension_id: "ext-pii".into(),
+            cap_id: "greentic:guardrail/pii".into(),
+            mandatory: false,
+            mode: crate::config::GuardrailMode::Enforce,
+            config: serde_json::Value::Null,
+        }];
+        let evaluator = DenyingEvaluator {
+            code: "pii".into(),
+            message: "blocked pii".into(),
+        };
+        let out = run_chain_and_notify(
+            &chain,
+            crate::guardrail::GuardrailDirection::Inbound,
+            "hi".into(),
+            &observer,
+            &evaluator,
+        );
+        assert!(matches!(out, Err(AgentError::GuardrailDenied { .. })));
+        let seen = observer.guardrails.lock().unwrap();
+        assert_eq!(seen.len(), 1, "a blocked denial must still be observed");
+        assert_eq!(seen[0].action, crate::guardrail::GuardrailAction::Blocked);
+    }
+
+    fn runtime_for_prompt_tests(llm: Arc<MockLlmBackend>, tc: &TenantContext) -> AgentRuntime {
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        cp.insert(tc, "a", cfg());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
+        AgentRuntime::new(
+            Arc::new(cp),
+            store,
+            ext,
+            llm,
+            telemetry,
+            Arc::new(crate::cost::MockTokenMeter::new(0)),
+            Arc::new(crate::mock::NoopToolLedger),
+            None,
+        )
+    }
+
+    fn one_reply(text: &str) -> Arc<MockLlmBackend> {
+        Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some(text.into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]))
+    }
+
+    /// The reply recorded on the run trace must be the GUARDED one, so the
+    /// record has to come after the outbound chain. A behavioural test needs a
+    /// real guardrail WASM (`tests/guardrail_e2e.rs`, skipped when it is not
+    /// built); this pins the ordering in the source so the pin holds without it.
+    #[test]
+    fn the_reply_is_recorded_after_the_outbound_guardrail_chain() {
+        let src = include_str!("loop.rs");
+        let prod = &src[..src
+            .find("#[cfg(all(test, feature = \"test-mock\"))]")
+            .unwrap()];
+        let outbound = prod
+            .find("crate::guardrail::GuardrailDirection::Outbound,")
+            .expect("outbound chain call");
+        let record = prod
+            .find("t.append(agent_id, \"reply\", &reply)")
+            .expect("reply record");
+        assert!(
+            outbound < record,
+            "the reply must be recorded after the outbound chain"
+        );
+        assert_eq!(
+            prod.matches("t.append(agent_id, \"reply\"").count(),
+            1,
+            "exactly one reply record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_trace_view_is_injected_into_the_system_prompt() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        trace.append("outer", "tool", "refund flow approved 40 USD");
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", trace),
+            runtime.step(
+                tc.clone(),
+                "sess-trace",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert!(prompts[0].starts_with("sys"));
+        assert!(prompts[0].contains("<run_context>"));
+        assert!(prompts[0].contains("refund flow approved 40 USD"));
+    }
+
+    #[tokio::test]
+    async fn without_a_run_ctx_the_prompt_is_unchanged() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        runtime
+            .step(
+                tc.clone(),
+                "sess-none",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(prompts[0], "sys");
+    }
+
+    #[tokio::test]
+    async fn the_final_reply_is_recorded_on_the_trace() {
+        let llm = one_reply("all done");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm, &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", trace.clone()),
+            runtime.step(
+                tc.clone(),
+                "sess-rec",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let events = trace.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "a");
+        assert_eq!(events[0].kind, "reply");
+        assert_eq!(events[0].summary, "all done");
+    }
+
+    #[tokio::test]
+    async fn a_context_for_another_tenant_is_ignored() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = Arc::new(crate::run_trace::RunTrace::new());
+        trace.append("outer", "tool", "other tenant secret");
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("other", trace.clone()),
+            runtime.step(
+                tc.clone(),
+                "sess-foreign",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(prompts[0], "sys");
+        assert_eq!(trace.events().len(), 1, "no event may be recorded");
+    }
+
+    fn seeded_trace() -> Arc<crate::run_trace::RunTrace> {
+        let t = Arc::new(crate::run_trace::RunTrace::new());
+        t.append("outer", "reply", "SEED-EVENT");
+        t
+    }
+
+    fn hi() -> AgentInput {
+        AgentInput {
+            text: "hi".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_none_mode_context_neither_injects_nor_records() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = seeded_trace();
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", trace.clone())
+                .with_mode(crate::share_policy::ShareMode::None),
+            runtime.step(tc.clone(), "sess-mode-none", "a", hi()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(llm.seen_system_prompts.lock().unwrap()[0], "sys");
+        assert_eq!(trace.events().len(), 1, "a none-mode step records nothing");
+    }
+
+    #[tokio::test]
+    async fn a_detached_context_shadows_the_open_one() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let outer = seeded_trace();
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", outer.clone()),
+            crate::run_trace::RunContext::scope(
+                crate::run_trace::RunContext::detached("acme"),
+                runtime.step(tc.clone(), "sess-detached", "a", hi()),
+            ),
+        )
+        .await
+        .unwrap();
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(
+            prompts[0], "sys",
+            "the outer view must not leak through the shadow"
+        );
+        assert_eq!(outer.events().len(), 1, "nothing reaches the outer trace");
+    }
+
+    #[tokio::test]
+    async fn a_read_mode_context_injects_but_records_nothing() {
+        let llm = one_reply("ok");
+        let tc = TenantContext::new("acme", "prod");
+        let runtime = runtime_for_prompt_tests(llm.clone(), &tc);
+        let trace = seeded_trace();
+        crate::run_trace::RunContext::scope(
+            crate::run_trace::RunContext::new("acme", trace.clone())
+                .with_mode(crate::share_policy::ShareMode::Read),
+            runtime.step(tc.clone(), "sess-read", "a", hi()),
+        )
+        .await
+        .unwrap();
+        assert!(llm.seen_system_prompts.lock().unwrap()[0].contains("SEED-EVENT"));
+        assert_eq!(trace.events().len(), 1, "a read-only step records nothing");
+    }
+
+    #[test]
+    fn the_runtime_hands_out_its_policy_per_agent() {
+        let tc = TenantContext::new("acme", "prod");
+        let mut modes = crate::share_policy::BindingModes::new();
+        modes.insert("flow:x".into(), crate::share_policy::ShareMode::Read);
+        let mut agents = std::collections::HashMap::new();
+        agents.insert("a".to_string(), modes);
+        let runtime = runtime_for_prompt_tests(one_reply("ok"), &tc).with_share_policy(Some(
+            Arc::new(crate::share_policy::SharePolicy::new(agents)),
+        ));
+        assert!(runtime.share_policy().is_some());
+        assert!(runtime.share_modes_for("a").is_some());
+        assert!(runtime.share_modes_for("b").is_none());
     }
 }

@@ -12,5 +12,5 @@ jobs:
   publish:
     uses: greenticai/.github/.github/workflows/crates-publish.yml@main
     with:
-      crates: "runner-core aw-event-bridge greentic-aw-runtime greentic-runner-host greentic-runner-desktop greentic-runner"
+      crates: "runner-core greentic-a2a aw-event-bridge greentic-aw-runtime greentic-runner-host greentic-runner-desktop greentic-runner"
     secrets: inherit

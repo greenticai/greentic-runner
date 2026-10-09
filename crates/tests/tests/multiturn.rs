@@ -98,6 +98,7 @@ fn ingress_with_text(text: &str, session_hint: Option<String>) -> IngressEnvelop
         channel: Some("chat".into()),
         conversation: Some("chat".into()),
         user: Some("user".into()),
+        entry_node: None,
         activity_id: Some("activity-1".into()),
         timestamp: None,
         payload: json!({ "text": text }),

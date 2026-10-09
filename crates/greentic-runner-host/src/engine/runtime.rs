@@ -28,7 +28,11 @@ use super::state_machine::{FlowDefinition, FlowStep, PAYLOAD_FROM_LAST_INPUT};
 
 use crate::config::{HostConfig, SecretsPolicy};
 use crate::pack::FlowDescriptor;
-use crate::runner::engine::{FlowContext, FlowEngine, FlowSnapshot, FlowStatus, FlowWait};
+use crate::run_outcome::RunOutcomeSink;
+use crate::run_outcome::turn::{RunMarker, RunOutcomeObserver, RunOutcomeReporter, TurnContext};
+use crate::runner::engine::{
+    FlowContext, FlowEngine, FlowExecution, FlowSnapshot, FlowStatus, FlowWait,
+};
 use crate::runner::mocks::MockLayer;
 use crate::secrets::{DynSecretsManager, read_secret_blocking};
 use crate::storage::session::DynSessionStore;
@@ -38,6 +42,18 @@ use crate::trace::{PackTraceInfo, TraceContext, TraceMode, TraceRecorder};
 const DEFAULT_ENV: &str = "local";
 const PACK_FLOW_ADAPTER: &str = "pack_flow";
 
+/// Reads and writes the parked-flow wait that makes a conversation resumable.
+///
+/// Every method is `async` because the backing `SessionStore` may be Redis, and
+/// `SessionStore` is a SYNCHRONOUS trait whose Redis implementation blocks on a
+/// socket. The store round-trips run on [`tokio::task::spawn_blocking`]; the key
+/// derivation around them is pure and stays on the caller's thread.
+///
+/// These three were synchronous before durable storage was configurable, which
+/// was harmless while the only backend was an in-process `HashMap`. It is not
+/// harmless now: this is the hot path of every parked turn, so leaving it
+/// blocking would park one tokio worker per concurrent resume — invisible in a
+/// test and a throughput collapse in a deployment.
 #[derive(Clone)]
 pub struct FlowResumeStore {
     store: DynSessionStore,
@@ -48,7 +64,50 @@ impl FlowResumeStore {
         Self { store }
     }
 
-    pub fn fetch(&self, envelope: &IngressEnvelope) -> GResult<Option<FlowSnapshot>> {
+    pub async fn fetch(&self, envelope: &IngressEnvelope) -> GResult<Option<FlowSnapshot>> {
+        Ok(self
+            .fetch_with_run(envelope)
+            .await?
+            .map(|(snapshot, _)| snapshot))
+    }
+
+    /// [`fetch`](Self::fetch), plus the run-audit marker stored with the
+    /// snapshot (absent on a wait parked before markers existed, or by a host
+    /// with no run-outcome sink).
+    pub(crate) async fn fetch_with_run(
+        &self,
+        envelope: &IngressEnvelope,
+    ) -> GResult<Option<(FlowSnapshot, Option<RunMarker>)>> {
+        Ok(self
+            .fetch_record(envelope)
+            .await?
+            .map(|record| (record.snapshot, record.run)))
+    }
+
+    /// Rewrite the run marker stored with the CURRENT wait, leaving the
+    /// snapshot and reason as they are; a no-op when nothing is parked.
+    ///
+    /// Used when a resumed turn fails: the snapshot stays parked (the user may
+    /// retry), but the run has emitted one more event, so the marker's `seq`
+    /// must move with it or the next event would repeat a `seq` the admin
+    /// already holds — and be dropped as a duplicate.
+    pub(crate) async fn restamp_run(
+        &self,
+        envelope: &IngressEnvelope,
+        run: RunMarker,
+    ) -> GResult<()> {
+        let Some(record) = self.fetch_record(envelope).await? else {
+            return Ok(());
+        };
+        let wait = FlowWait {
+            reason: record.reason,
+            snapshot: record.snapshot,
+        };
+        self.save_with_run(envelope, &wait, Some(run)).await?;
+        Ok(())
+    }
+
+    async fn fetch_record(&self, envelope: &IngressEnvelope) -> GResult<Option<FlowResumeRecord>> {
         let (mut ctx, user, _, scope) = build_store_ctx(envelope)?;
         ctx = ctx.with_user(Some(user.clone()));
 
@@ -59,43 +118,53 @@ impl FlowResumeStore {
             scopes.push(base);
         }
 
-        for lookup in scopes {
-            if let Some(key) = self
-                .store
-                .find_wait_by_scope(&ctx, &user, &lookup)
-                .map_err(map_store_error)?
-            {
-                let Some(data) = self.store.get_session(&key).map_err(map_store_error)? else {
+        let expected_pack = envelope.pack_id.clone();
+        let store = Arc::clone(&self.store);
+        offload(move || {
+            for lookup in scopes {
+                let Some(key) = store.find_wait_by_scope(&ctx, &user, &lookup)? else {
+                    continue;
+                };
+                let Some(data) = store.get_session(&key)? else {
                     continue;
                 };
                 let record: FlowResumeRecord =
                     serde_json::from_str(&data.context_json).map_err(|err| {
-                        RunnerError::Session {
-                            reason: format!("failed to decode flow resume snapshot: {err}"),
-                        }
+                        decode_failure(format!("failed to decode flow resume snapshot: {err}"))
                     })?;
-                if let Some(pack_id) = envelope.pack_id.as_deref()
+                if let Some(pack_id) = expected_pack.as_deref()
                     && record.snapshot.pack_id != pack_id
                 {
-                    return Err(RunnerError::Session {
-                        reason: format!(
-                            "resume pack mismatch: expected {pack_id}, found {}",
-                            record.snapshot.pack_id
-                        ),
-                    });
+                    return Err(decode_failure(format!(
+                        "resume pack mismatch: expected {pack_id}, found {}",
+                        record.snapshot.pack_id
+                    )));
                 }
-                return Ok(Some(record.snapshot));
+                return Ok(Some(record));
             }
-        }
-
-        Ok(None)
+            Ok(None)
+        })
+        .await
     }
 
-    pub fn save(&self, envelope: &IngressEnvelope, wait: &FlowWait) -> GResult<ReplyScope> {
+    pub async fn save(&self, envelope: &IngressEnvelope, wait: &FlowWait) -> GResult<ReplyScope> {
+        self.save_with_run(envelope, wait, None).await
+    }
+
+    /// [`save`](Self::save), persisting `run` beside the snapshot so the next
+    /// resume reports under the same run id. `None` stores exactly what
+    /// [`save`](Self::save) always stored.
+    pub(crate) async fn save_with_run(
+        &self,
+        envelope: &IngressEnvelope,
+        wait: &FlowWait,
+        run: Option<RunMarker>,
+    ) -> GResult<ReplyScope> {
         let (ctx, user, hint, scope) = build_store_ctx(envelope)?;
         let record = FlowResumeRecord {
             snapshot: wait.snapshot.clone(),
             reason: wait.reason.clone(),
+            run,
         };
         let data = record_to_session_data(&record, ctx.clone(), &user, &hint)?;
         let mut reply_scope = scope.clone();
@@ -105,13 +174,13 @@ impl FlowResumeStore {
         let mut store_scope = scope;
         store_scope.correlation = None;
         let session_key = StoreSessionKey::new(format!("{hint}::{}", store_scope.scope_hash()));
-        self.store
-            .register_wait(&ctx, &user, &store_scope, &session_key, data, None)
-            .map_err(map_store_error)?;
+        let store = Arc::clone(&self.store);
+        offload(move || store.register_wait(&ctx, &user, &store_scope, &session_key, data, None))
+            .await?;
         Ok(reply_scope)
     }
 
-    pub fn clear(&self, envelope: &IngressEnvelope) -> GResult<()> {
+    pub async fn clear(&self, envelope: &IngressEnvelope) -> GResult<()> {
         let (ctx, user, _, scope) = build_store_ctx(envelope)?;
         let mut scopes = vec![scope.clone()];
         if scope.correlation.is_some() {
@@ -119,12 +188,14 @@ impl FlowResumeStore {
             base.correlation = None;
             scopes.push(base);
         }
-        for lookup in scopes {
-            self.store
-                .clear_wait(&ctx, &user, &lookup)
-                .map_err(map_store_error)?;
-        }
-        Ok(())
+        let store = Arc::clone(&self.store);
+        offload(move || {
+            for lookup in scopes {
+                store.clear_wait(&ctx, &user, &lookup)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Returns the `(tenant_ctx, user_id)` pair this store derives from
@@ -144,6 +215,11 @@ struct FlowResumeRecord {
     snapshot: FlowSnapshot,
     #[serde(default)]
     reason: Option<String>,
+    /// Run-audit marker (`crate::run_outcome`). Skipped when absent, so a host
+    /// without a run-outcome sink persists byte-identical records, and a
+    /// record written before this field existed decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<RunMarker>,
 }
 
 fn build_store_ctx(envelope: &IngressEnvelope) -> GResult<(TenantCtx, UserId, String, ReplyScope)> {
@@ -210,6 +286,34 @@ fn map_store_error(err: GreenticError) -> RunnerError {
     }
 }
 
+/// A decode/consistency failure raised from inside an offloaded closure.
+///
+/// The closure's error channel is the store's own `GreenticError`, so a reason
+/// that did not come from the store still travels as one and is mapped back to
+/// `RunnerError::Session` by [`offload`] — the same variant the caller saw when
+/// these methods were synchronous.
+fn decode_failure(reason: impl Into<String>) -> GreenticError {
+    GreenticError::new(greentic_types::ErrorCode::Internal, reason)
+}
+
+/// Run a blocking session-store call on the blocking pool.
+///
+/// `spawn_blocking` rather than `block_in_place`: the latter panics on a
+/// `current_thread` runtime and inside a `LocalSet`, and this is a library —
+/// the embedder picks the runtime flavour, not us.
+async fn offload<F, T>(f: F) -> GResult<T>
+where
+    F: FnOnce() -> Result<T, GreenticError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result.map_err(map_store_error),
+        Err(err) => Err(RunnerError::Session {
+            reason: format!("session store call panicked or was cancelled: {err}"),
+        }),
+    }
+}
+
 fn generate_correlation_id() -> String {
     let mut bytes = [0u8; 16];
     rng().fill(&mut bytes);
@@ -237,6 +341,7 @@ mod tests {
             channel: Some("chan".into()),
             conversation: Some("conv".into()),
             user: Some("user".into()),
+            entry_node: None,
             activity_id: Some("act-1".into()),
             timestamp: None,
             payload: json!({ "text": "hi" }),
@@ -264,6 +369,7 @@ mod tests {
                 flow_id: "flow.main".into(),
                 next_flow: None,
                 next_node: "node-2".into(),
+                awaiting_submit: false,
                 state,
             },
         }
@@ -278,53 +384,117 @@ mod tests {
         assert!(a.as_str().starts_with("sess"));
     }
 
-    #[test]
-    fn resume_store_roundtrip() -> GResult<()> {
+    #[tokio::test]
+    async fn resume_store_roundtrip() -> GResult<()> {
         let store = FlowResumeStore::new(new_session_store());
         let envelope = sample_envelope();
-        assert!(store.fetch(&envelope)?.is_none());
+        assert!(store.fetch(&envelope).await?.is_none());
 
         let wait = sample_wait();
-        let _ = store.save(&envelope, &wait)?;
-        let snapshot = store.fetch(&envelope)?.expect("snapshot missing");
+        let _ = store.save(&envelope, &wait).await?;
+        let snapshot = store.fetch(&envelope).await?.expect("snapshot missing");
         assert_eq!(snapshot.flow_id, wait.snapshot.flow_id);
         assert_eq!(snapshot.next_node, wait.snapshot.next_node);
 
-        store.clear(&envelope)?;
-        assert!(store.fetch(&envelope)?.is_none());
+        store.clear(&envelope).await?;
+        assert!(store.fetch(&envelope).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_store_round_trips_the_run_marker() -> GResult<()> {
+        let store = FlowResumeStore::new(new_session_store());
+        let envelope = sample_envelope();
+        let marker = RunMarker::mint();
+        let _ = store
+            .save_with_run(&envelope, &sample_wait(), Some(marker.clone()))
+            .await?;
+        let (_, run) = store
+            .fetch_with_run(&envelope)
+            .await?
+            .expect("snapshot missing");
+        assert_eq!(run, Some(marker));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restamping_moves_the_marker_and_keeps_the_wait() -> GResult<()> {
+        let store = FlowResumeStore::new(new_session_store());
+        let envelope = sample_envelope();
+        // Nothing parked: a no-op, never a new wait.
+        store.restamp_run(&envelope, RunMarker::mint()).await?;
+        assert!(store.fetch(&envelope).await?.is_none());
+
+        let mut marker = RunMarker::mint();
+        marker.seq = 1;
+        let _ = store
+            .save_with_run(&envelope, &sample_wait(), Some(marker.clone()))
+            .await?;
+        let mut moved = marker.clone();
+        moved.seq = 2;
+        store.restamp_run(&envelope, moved.clone()).await?;
+        let (snapshot, run) = store
+            .fetch_with_run(&envelope)
+            .await?
+            .expect("snapshot missing");
+        assert_eq!(run, Some(moved));
+        assert_eq!(snapshot.next_node, sample_wait().snapshot.next_node);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wait_saved_without_a_marker_resumes_without_one() -> GResult<()> {
+        let store = FlowResumeStore::new(new_session_store());
+        let envelope = sample_envelope();
+        let _ = store.save(&envelope, &sample_wait()).await?;
+        let (_, run) = store
+            .fetch_with_run(&envelope)
+            .await?
+            .expect("snapshot missing");
+        assert_eq!(run, None);
         Ok(())
     }
 
     #[test]
-    fn resume_store_overwrites_existing() -> GResult<()> {
+    fn a_record_written_before_run_markers_decodes_and_a_markerless_one_is_unchanged() {
+        let wait = sample_wait();
+        let legacy = json!({ "snapshot": wait.snapshot, "reason": "await-user" });
+        let record: FlowResumeRecord = serde_json::from_value(legacy.clone()).expect("decode");
+        assert!(record.run.is_none());
+        // No marker ⇒ the exact bytes a pre-audit runtime wrote.
+        assert_eq!(serde_json::to_value(&record).expect("encode"), legacy);
+    }
+
+    #[tokio::test]
+    async fn resume_store_overwrites_existing() -> GResult<()> {
         let store = FlowResumeStore::new(new_session_store());
         let envelope = sample_envelope();
         let mut wait = sample_wait();
-        let _ = store.save(&envelope, &wait)?;
+        let _ = store.save(&envelope, &wait).await?;
 
         wait.snapshot.next_node = "node-3".into();
         wait.reason = Some("retry".into());
-        let _ = store.save(&envelope, &wait)?;
+        let _ = store.save(&envelope, &wait).await?;
 
-        let snapshot = store.fetch(&envelope)?.expect("snapshot missing");
+        let snapshot = store.fetch(&envelope).await?.expect("snapshot missing");
         assert_eq!(snapshot.next_node, "node-3");
-        store.clear(&envelope)?;
+        store.clear(&envelope).await?;
         Ok(())
     }
 
-    #[test]
-    fn resume_store_uses_snapshot_even_if_envelope_flow_differs() -> GResult<()> {
+    #[tokio::test]
+    async fn resume_store_uses_snapshot_even_if_envelope_flow_differs() -> GResult<()> {
         let store = FlowResumeStore::new(new_session_store());
         let envelope = sample_envelope();
         let wait = sample_wait();
-        let _ = store.save(&envelope, &wait)?;
+        let _ = store.save(&envelope, &wait).await?;
 
         let mut redirected = envelope.clone();
         redirected.flow_id = "flow.other".into();
-        let snapshot = store.fetch(&redirected)?.expect("snapshot missing");
+        let snapshot = store.fetch(&redirected).await?.expect("snapshot missing");
         assert_eq!(snapshot.flow_id, wait.snapshot.flow_id);
 
-        store.clear(&envelope)?;
+        store.clear(&envelope).await?;
         Ok(())
     }
 
@@ -343,6 +513,7 @@ mod tests {
             channel: None,
             conversation: None,
             user: None,
+            entry_node: None,
             activity_id: Some("activity-1".into()),
             timestamp: None,
             payload: json!({}),
@@ -529,6 +700,14 @@ mod tests {
 
 pub struct StateMachineRuntime {
     runner: Runner,
+    /// Reports a turn that failed after every retry, once — see
+    /// `run_outcome::turn::TurnScope`. `None` without a sink.
+    run_outcome: Option<RunOutcomeReporter>,
+    /// The same resume store the pack-flow adapter parks into, kept so the
+    /// dispatch resume path can inspect a park before resuming it (see
+    /// [`Self::parked_approvals`]). `None` for [`Self::new`],
+    /// which has no pack-flow adapter and therefore never parks.
+    resume: Option<FlowResumeStore>,
 }
 
 impl StateMachineRuntime {
@@ -555,7 +734,11 @@ impl StateMachineRuntime {
             builder = builder.with_flow(flow);
         }
         let runner = builder.build()?;
-        Ok(Self { runner })
+        Ok(Self {
+            runner,
+            run_outcome: None,
+            resume: None,
+        })
     }
 
     /// Build a state-machine runtime that proxies pack flows through the legacy FlowEngine.
@@ -571,6 +754,37 @@ impl StateMachineRuntime {
         mocks: Option<Arc<MockLayer>>,
         audit_nats_client: Option<async_nats::Client>,
     ) -> Result<Self> {
+        Self::from_flow_engine_with_run_outcome_sink(
+            config,
+            engine,
+            pack_trace,
+            session_host,
+            session_store,
+            state_host,
+            secrets_manager,
+            mocks,
+            audit_nats_client,
+            None,
+        )
+    }
+
+    /// [`from_flow_engine`](Self::from_flow_engine), additionally reporting one
+    /// [`crate::run_outcome::RunOutcome`] per flow turn to `run_outcome_sink`.
+    /// `None` is exactly [`from_flow_engine`](Self::from_flow_engine).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_flow_engine_with_run_outcome_sink(
+        config: Arc<HostConfig>,
+        engine: Arc<FlowEngine>,
+        pack_trace: HashMap<String, PackTraceInfo>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        mocks: Option<Arc<MockLayer>>,
+        audit_nats_client: Option<async_nats::Client>,
+        run_outcome_sink: Option<Arc<dyn RunOutcomeSink>>,
+    ) -> Result<Self> {
+        let run_outcome = run_outcome_sink.map(RunOutcomeReporter::new);
         let policy = Arc::new(config.secrets_policy.clone());
         let tenant_ctx = config.tenant_ctx();
         let secrets = Arc::new(PolicySecretsHost::new(policy, secrets_manager, tenant_ctx));
@@ -588,9 +802,10 @@ impl StateMachineRuntime {
                 Arc::clone(&config),
                 Arc::clone(&engine),
                 pack_trace,
-                resume_store,
+                resume_store.clone(),
                 mocks,
                 audit_nats_client,
+                run_outcome.clone(),
             )),
         );
 
@@ -605,11 +820,62 @@ impl StateMachineRuntime {
         let runner = builder
             .build()
             .map_err(|err| anyhow!("state machine init failed: {err}"))?;
-        Ok(Self { runner })
+        Ok(Self {
+            runner,
+            run_outcome,
+            resume: Some(resume_store),
+        })
+    }
+
+    /// The approvals the conversation `envelope` addresses is parked on, each
+    /// with the correlation id it was published under and the fingerprint of
+    /// the `decision_token` it was issued (`None` for marks recorded before
+    /// either existed). `Ok(None)` means nothing is parked.
+    ///
+    /// Reads the SAME slot the pack-flow adapter would resume (the envelope is
+    /// canonicalised exactly as the adapter canonicalises it), so a response
+    /// can be matched to its own gate before it is allowed to resume anything.
+    pub(crate) async fn parked_approvals(
+        &self,
+        envelope: &IngressEnvelope,
+    ) -> Result<Option<Vec<crate::runner::engine::ParkedApproval>>> {
+        let Some(resume) = self.resume.as_ref() else {
+            return Ok(None);
+        };
+        let envelope = envelope.clone().canonicalize();
+        let snapshot = resume
+            .fetch(&envelope)
+            .await
+            .map_err(|err| anyhow!("failed to read the parked flow: {err}"))?;
+        Ok(snapshot.map(|snapshot| snapshot.state.pending_approvals()))
     }
 
     /// Execute the flow associated with the provided ingress event.
     pub async fn handle(&self, envelope: IngressEnvelope) -> Result<Value> {
+        let result = self.run_flow_result(envelope).await?;
+        let outcome = result.outcome;
+        Ok(outcome.get("response").cloned().unwrap_or(outcome))
+    }
+
+    /// Like [`Self::handle`], but also returns this turn's per-step node-output
+    /// map (keyed by each step's `operation`; for a `dw.agent` step that is the
+    /// agent_id). Observability only — the returned response `Value` is computed
+    /// byte-identically to [`Self::handle`].
+    pub async fn handle_traced(&self, envelope: IngressEnvelope) -> Result<(Value, Value)> {
+        let result = self.run_flow_result(envelope).await?;
+        let node_outputs = result.node_outputs;
+        let outcome = result.outcome;
+        let response = outcome.get("response").cloned().unwrap_or(outcome);
+        Ok((response, node_outputs))
+    }
+
+    /// Shared body for [`Self::handle`] / [`Self::handle_traced`]: build the
+    /// ingress request and run the flow. Keeping this single seam guarantees the
+    /// traced and untraced paths can never diverge on the outcome.
+    async fn run_flow_result(
+        &self,
+        envelope: IngressEnvelope,
+    ) -> Result<super::api::RunFlowResult> {
         let tenant_ctx = envelope.tenant_ctx();
         let session_hint = envelope
             .session_hint
@@ -627,13 +893,12 @@ impl StateMachineRuntime {
             input,
             session_hint: Some(session_hint),
         };
-        let result: super::api::RunFlowResult = self
-            .runner
-            .run_flow(request)
-            .await
-            .map_err(|err| anyhow!("flow execution failed: {err}"))?;
-        let outcome = result.outcome;
-        Ok(outcome.get("response").cloned().unwrap_or(outcome))
+        let run = self.runner.run_flow(request);
+        let result = match self.run_outcome.as_ref() {
+            Some(reporter) => reporter.scoped(run).await,
+            None => run.await,
+        };
+        result.map_err(|err| anyhow!("flow execution failed: {err}"))
     }
 }
 
@@ -653,6 +918,16 @@ impl PolicySecretsHost {
     }
 }
 
+/// Pseudo-pack segment for [`PolicySecretsHost`].
+///
+/// **Deliberately NOT unit-scoped**, for a blunter reason than
+/// `TenantRuntime::get_secret`'s: this host is unreachable. It is installed on
+/// `HostBundle.secrets`, a field nothing in the workspace ever reads — every
+/// live secret read goes through `HostState` (`pack.rs`) or
+/// `TenantRuntime::get_secret`. Threading a unit through dead code would be
+/// one more thing to keep in step with the live path for no behaviour; removing
+/// it means removing `HostBundle.secrets`, the `SecretsHost` trait and
+/// `FnSecretsHost` with it, which is a wider cleanup than this change.
 const POLICY_SECRETS_PACK_ID: &str = "_runner";
 
 #[async_trait]
@@ -717,6 +992,9 @@ struct PackFlowAdapter {
     /// default, off path) when `GREENTIC_EVENTS_NATS_URL` is unset or NATS
     /// could not be reached — see `docs/superpowers/specs/2026-07-03-runner-audit-emitter-design.md`.
     audit_nats_client: Option<async_nats::Client>,
+    /// Run-audit reporter; `None` (the default) installs no observer, mints no
+    /// run id and changes nothing — see `crate::run_outcome`.
+    run_outcome: Option<RunOutcomeReporter>,
 }
 
 impl PackFlowAdapter {
@@ -727,6 +1005,7 @@ impl PackFlowAdapter {
         resume: FlowResumeStore,
         mocks: Option<Arc<MockLayer>>,
         audit_nats_client: Option<async_nats::Client>,
+        run_outcome: Option<RunOutcomeReporter>,
     ) -> Self {
         Self {
             tenant: config.tenant.clone(),
@@ -736,6 +1015,7 @@ impl PackFlowAdapter {
             resume,
             mocks,
             audit_nats_client,
+            run_outcome,
         }
     }
 }
@@ -743,6 +1023,13 @@ impl PackFlowAdapter {
 #[async_trait::async_trait]
 impl Adapter for PackFlowAdapter {
     async fn call(&self, call: &AdapterCall) -> GResult<Value> {
+        Ok(self.call_traced(call).await?.0)
+    }
+
+    async fn call_traced(
+        &self,
+        call: &AdapterCall,
+    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
         let envelope: IngressEnvelope =
             serde_json::from_value(call.payload.clone()).map_err(|err| {
                 RunnerError::AdapterCall {
@@ -759,7 +1046,10 @@ impl Adapter for PackFlowAdapter {
         let provider_owned = envelope.provider.clone();
         let payload = envelope.payload.clone();
         let retry_config = self.config.retry_config().into();
-        let resume_snapshot = self.resume.fetch(&envelope)?;
+        let (resume_snapshot, resume_run) = match self.resume.fetch_with_run(&envelope).await? {
+            Some((snapshot, run)) => (Some(snapshot), run),
+            None => (None, None),
+        };
         let resume_flow_id = resume_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.next_flow.clone())
@@ -837,6 +1127,48 @@ impl Adapter for PackFlowAdapter {
         };
 
         let mocks = self.mocks.as_deref();
+        // Read ONCE, here, from the provider's own envelope — see
+        // `crate::caller_identity`. Everything downstream propagates this
+        // value; nothing downstream may establish one from a node payload.
+        // Cloned rather than borrowed: `payload` is moved into the run below,
+        // and the context must outlive that move.
+        let caller_block = crate::caller_identity::caller_block(&payload).cloned();
+        // Run audit: only when a sink is installed. The wrapper observer
+        // forwards to the trace recorder, so trace output is unchanged.
+        let turn = self.run_outcome.as_ref().map(|reporter| {
+            // A retried attempt of the same turn reuses its first attempt's
+            // run rather than minting another (see `run_outcome::turn`). It
+            // wins over the stored marker: a failed resumed attempt restamps
+            // that marker, and a retry must not count the same turn twice.
+            let resumed = reporter.retried_marker().or(resume_run);
+            let mut turn = TurnContext::begin(
+                &envelope,
+                caller_block.as_ref(),
+                resumed,
+                effective_flow_id.as_str(),
+            );
+            if let Some((pack_id, name, version)) =
+                self.engine.pack_identity(effective_pack_id.as_str())
+            {
+                turn = turn.with_pack(pack_id, name, version);
+            }
+            turn.retries = reporter.remember(&turn.marker);
+            turn
+        });
+        let outcome_observer = turn.as_ref().map(|_| {
+            RunOutcomeObserver::new(
+                trace
+                    .as_ref()
+                    .map(|recorder| recorder as &dyn crate::runner::engine::ExecutionObserver),
+            )
+        });
+        let observer: Option<&dyn crate::runner::engine::ExecutionObserver> =
+            match outcome_observer.as_ref() {
+                Some(observer) => Some(observer),
+                None => trace
+                    .as_ref()
+                    .map(|recorder| recorder as &dyn crate::runner::engine::ExecutionObserver),
+            };
         let ctx = FlowContext {
             tenant: &self.tenant,
             pack_id: effective_pack_id.as_str(),
@@ -852,26 +1184,43 @@ impl Adapter for PackFlowAdapter {
             reply_scope: envelope.reply_scope.as_ref(),
             retry_config,
             attempt: 1,
-            observer: trace
-                .as_ref()
-                .map(|recorder| recorder as &dyn crate::runner::engine::ExecutionObserver),
+            observer,
             mocks,
+            caller: caller_block.as_ref(),
         };
 
-        let execution = if let Some(snapshot) = resume_snapshot {
-            let resume_pack_id = snapshot.pack_id.clone();
-            let resume_flow_id = snapshot
-                .next_flow
-                .clone()
-                .unwrap_or_else(|| snapshot.flow_id.clone());
-            let resume_ctx = FlowContext {
-                pack_id: resume_pack_id.as_str(),
-                flow_id: resume_flow_id.as_str(),
-                ..ctx
-            };
-            self.engine.resume(resume_ctx, snapshot, payload).await
-        } else {
-            self.engine.execute(ctx, payload).await
+        let was_resume = resume_snapshot.is_some();
+        let execution = async {
+            if let Some(snapshot) = resume_snapshot {
+                let resume_pack_id = snapshot.pack_id.clone();
+                let resume_flow_id = snapshot
+                    .next_flow
+                    .clone()
+                    .unwrap_or_else(|| snapshot.flow_id.clone());
+                let resume_ctx = FlowContext {
+                    pack_id: resume_pack_id.as_str(),
+                    flow_id: resume_flow_id.as_str(),
+                    ..ctx
+                };
+                self.engine.resume(resume_ctx, snapshot, payload).await
+            } else if let Some(entry) = envelope.entry_node.as_deref() {
+                self.engine.execute_from(ctx, payload, entry).await
+            } else {
+                self.engine.execute(ctx, payload).await
+            }
+        };
+        // With a run: the turn's span carries its `run_id`, and so does every
+        // worker-usage event the turn's agents emit (task-local, read inline
+        // by `WorkerUsageMeter::emit`). Without a sink, nothing changes.
+        let execution = match turn.as_ref() {
+            Some(turn) => {
+                let run_id = turn.marker.run_id.clone();
+                let span = tracing::info_span!("flow_turn", run_id = %run_id);
+                #[cfg(feature = "agentic-worker")]
+                let execution = greentic_aw_runtime::billing::with_run_id(run_id, execution);
+                tracing::Instrument::instrument(execution, span).await
+            }
+            None => execution.await,
         };
         let execution = match execution {
             Ok(execution) => {
@@ -888,26 +1237,70 @@ impl Adapter for PackFlowAdapter {
                 {
                     tracing::warn!(error = %write_err, "failed to write trace");
                 }
+                // The error text is read only to pick a class; it is never
+                // part of the reported outcome.
+                if let (Some(reporter), Some(turn), Some(observer)) = (
+                    self.run_outcome.as_ref(),
+                    turn.as_ref(),
+                    outcome_observer.as_ref(),
+                ) {
+                    let observed = observer.observed();
+                    reporter.record_failure(turn.failed(&observed, &err));
+                    // A resumed run stays parked; move its stored `seq` past
+                    // the event just reported (see `restamp_run`).
+                    if was_resume
+                        && let Err(restamp_err) = self
+                            .resume
+                            .restamp_run(&envelope, turn.marker_after(&observed))
+                            .await
+                    {
+                        tracing::warn!(
+                            error = %restamp_err,
+                            "failed to restamp the run marker of a parked run after a failed turn"
+                        );
+                    }
+                }
                 return Err(RunnerError::AdapterCall {
-                    reason: err.to_string(),
+                    // `{:#}` flattens the full anyhow source chain; a bare
+                    // `to_string()` keeps only the outermost context and drops
+                    // the real root cause (e.g. the underlying LLM/dispatch
+                    // error behind "in-process operala dispatch … failed").
+                    reason: format!("{err:#}"),
                 });
             }
         };
 
-        match execution.status {
+        let FlowExecution {
+            output,
+            status,
+            node_outputs,
+        } = execution;
+        let observed = outcome_observer
+            .as_ref()
+            .map(RunOutcomeObserver::observed)
+            .unwrap_or_default();
+        match status {
             FlowStatus::Completed => {
-                self.resume.clear(&envelope)?;
-                Ok(execution.output)
+                if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
+                    reporter.record(turn.completed(&observed, &output));
+                }
+                self.resume.clear(&envelope).await?;
+                Ok((output, node_outputs))
             }
             FlowStatus::Waiting(wait) => {
-                let reply_scope = self.resume.save(&envelope, &wait)?;
-                Ok(json!({
+                let marker = turn.as_ref().map(|turn| turn.marker_after(&observed));
+                let reply_scope = self.resume.save_with_run(&envelope, &wait, marker).await?;
+                if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
+                    reporter.record(turn.waiting(&observed, &wait));
+                }
+                let outcome = json!({
                     "status": "pending",
                     "reason": wait.reason,
                     "resume": wait.snapshot,
                     "reply_scope": reply_scope,
-                    "response": execution.output,
-                }))
+                    "response": output,
+                });
+                Ok((outcome, node_outputs))
             }
         }
     }
@@ -941,6 +1334,14 @@ pub struct IngressEnvelope {
     pub conversation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Flow node this run must START at, lifted from a card-navigation target
+    /// that names a node rather than a card asset — see
+    /// [`crate::runner::card_nav`]. `None` starts at the flow's entrypoint.
+    ///
+    /// A parked snapshot still outranks it: resuming a waiting run is never
+    /// the same thing as re-entering the flow at a node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_node: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

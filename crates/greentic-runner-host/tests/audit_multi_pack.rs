@@ -204,6 +204,7 @@ async fn flow_engine_allows_duplicate_flow_ids_across_packs() -> Result<()> {
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
     let ctx_b = FlowContext {
         tenant: "tenant-a",
@@ -219,6 +220,7 @@ async fn flow_engine_allows_duplicate_flow_ids_across_packs() -> Result<()> {
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     };
 
     let exec_a = engine.execute(ctx_a, json!({})).await?;

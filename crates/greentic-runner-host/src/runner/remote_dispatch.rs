@@ -23,6 +23,14 @@ pub struct RemoteDispatch {
     pub correlation_id: String,
     pub input: Value,
     pub deadline_ms: Option<u64>,
+    /// The single-use `decision_token` an `approval` dispatch is issued
+    /// (approval rail contract v2 §4; see [`crate::runner::approval_token`]).
+    /// Published at `routing.decision_token` and echoed by the runner's own
+    /// deadline watchdog at `output.decision_token`. `None` for every other
+    /// runtime, whose request body is unchanged.
+    ///
+    /// A bearer credential: never log it.
+    pub decision_token: Option<String>,
 }
 
 /// Outcome of a dispatch: the flow waits for a response, or it was fire-and-forget.
@@ -50,7 +58,22 @@ pub fn build_request(req: &RemoteDispatch) -> Result<BuiltRequest> {
         input: req.input.clone(),
         deadline_ms: req.deadline_ms,
     };
-    let body = serde_json::to_vec(&body_struct)?;
+    let body = match req.decision_token.as_deref() {
+        None => serde_json::to_vec(&body_struct)?,
+        Some(token) => {
+            // Contract §2: the token rides in a top-level `routing` object
+            // beside `target` / `operation` / `input`. greentic-designer-admin
+            // seals it from exactly `routing.decision_token`.
+            let mut value = serde_json::to_value(&body_struct)?;
+            if let Value::Object(map) = &mut value {
+                map.insert(
+                    "routing".to_string(),
+                    serde_json::json!({ "decision_token": token }),
+                );
+            }
+            serde_json::to_vec(&value)?
+        }
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert("Greentic-Correlation-Id", req.correlation_id.as_str());
@@ -96,6 +119,28 @@ pub fn build_timeout_response_message(
     env: &str,
     deadline_ms: u64,
 ) -> (String, HeaderMap, Vec<u8>) {
+    build_timeout_response_message_with_token(
+        runtime,
+        correlation_id,
+        tenant,
+        env,
+        deadline_ms,
+        None,
+    )
+}
+
+/// [`build_timeout_response_message`] for a dispatch that was issued a
+/// `decision_token`: the watchdog is a sender like any other, so its `timeout`
+/// must carry the token at `output.decision_token` or the parked gate refuses
+/// it and the `timeout` branch never fires.
+pub fn build_timeout_response_message_with_token(
+    runtime: &str,
+    correlation_id: &str,
+    tenant: &str,
+    env: &str,
+    deadline_ms: u64,
+    decision_token: Option<&str>,
+) -> (String, HeaderMap, Vec<u8>) {
     let subject = response_topic(runtime);
 
     let mut headers = HeaderMap::new();
@@ -103,9 +148,13 @@ pub fn build_timeout_response_message(
     headers.insert("Greentic-Tenant", tenant);
     headers.insert("Greentic-Env", env);
 
+    let output = match decision_token {
+        Some(token) => serde_json::json!({ "decision_token": token }),
+        None => Value::Null,
+    };
     let response = RuntimeDispatchResponse {
         ok: false,
-        output: Value::Null,
+        output,
         events: vec![],
         error: Some(DispatchError {
             code: "timeout".into(),
@@ -149,6 +198,7 @@ impl RemoteDispatchHandler for NatsDispatcher {
                 request.correlation_id.clone(),
                 request.tenant.clone(),
                 request.env.clone(),
+                request.decision_token.clone(),
             )),
             _ => None,
         };
@@ -159,16 +209,19 @@ impl RemoteDispatchHandler for NatsDispatcher {
             .await?;
 
         // Spawn the deadline watchdog AFTER the request is on the wire.
-        if let Some((deadline_ms, runtime, correlation_id, tenant, env)) = maybe_timeout {
+        if let Some((deadline_ms, runtime, correlation_id, tenant, env, decision_token)) =
+            maybe_timeout
+        {
             let timeout_client = self.client.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_millis(deadline_ms)).await;
-                let (subject, headers, body) = build_timeout_response_message(
+                let (subject, headers, body) = build_timeout_response_message_with_token(
                     &runtime,
                     &correlation_id,
                     &tenant,
                     &env,
                     deadline_ms,
+                    decision_token.as_deref(),
                 );
                 if let Err(publish_error) = timeout_client
                     .publish_with_headers(subject, headers, body.into())
@@ -205,7 +258,45 @@ mod tests {
             correlation_id: "t1:web:chan:conv:user::pack=p".into(), // opaque hint, contains ':'
             input: json!({"a": 1}),
             deadline_ms: Some(1000),
+            decision_token: None,
         }
+    }
+
+    #[test]
+    fn a_request_without_a_token_has_no_routing_block() {
+        let built = build_request(&sample(DispatchMode::Await)).unwrap();
+        let body: Value = serde_json::from_slice(&built.body).unwrap();
+        assert!(body.get("routing").is_none());
+    }
+
+    #[test]
+    fn an_approval_token_rides_at_routing_decision_token() {
+        let mut dispatch = sample(DispatchMode::Await);
+        dispatch.runtime = "approval".into();
+        dispatch.decision_token = Some("tok-abc".into());
+        let built = build_request(&dispatch).unwrap();
+        let body: Value = serde_json::from_slice(&built.body).unwrap();
+        assert_eq!(body["routing"]["decision_token"], "tok-abc");
+        // The v1 half is untouched, so a v1 consumer still decodes it.
+        let decoded: RuntimeDispatchRequest = serde_json::from_slice(&built.body).unwrap();
+        assert_eq!(decoded.target, "dep-1");
+        assert_eq!(decoded.input, json!({"a": 1}));
+    }
+
+    #[test]
+    fn the_watchdog_timeout_carries_the_token_at_output() {
+        let (_s, _h, body) = build_timeout_response_message_with_token(
+            "approval",
+            "corr-1",
+            "t1",
+            "default",
+            200,
+            Some("tok-abc"),
+        );
+        let response: RuntimeDispatchResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.output["decision_token"], "tok-abc");
+        assert_eq!(response.error.expect("error").code, "timeout");
     }
 
     #[test]

@@ -5,6 +5,7 @@ use tempfile::TempDir;
 
 use crate::cache::engine_profile::{CpuPolicy, EngineProfile};
 use crate::cache::keys::ArtifactKey;
+use crate::cache::metadata::ArtifactMetadata;
 use crate::cache::{CacheConfig, CacheManager};
 
 fn fixture_bytes() -> Vec<u8> {
@@ -275,4 +276,75 @@ async fn warmup_writes_cwasm_to_disk_and_skips_existing() {
         .expect("second warmup");
     assert_eq!(report2.warmed, 0);
     assert_eq!(report2.skipped, 1);
+}
+
+#[tokio::test]
+async fn corrupt_disk_entry_logs_and_recompiles() {
+    let temp = TempDir::new().expect("temp dir");
+    let engine = Arc::new(wasmtime::Engine::default());
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let config = CacheConfig {
+        root: temp.path().to_path_buf(),
+        disk_enabled: true,
+        memory_enabled: false,
+        ..CacheConfig::default()
+    };
+    let key = ArtifactKey::new(profile.id().to_string(), "sha256:corrupt".to_string());
+
+    // Seed a disk entry whose metadata passes try_read validation but whose
+    // artifact bytes are not a valid serialized component.
+    let corrupt_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let meta = ArtifactMetadata::new(
+        &profile,
+        key.wasm_digest.clone(),
+        corrupt_bytes.len() as u64,
+    );
+    let disk_root = config.disk_root(profile.id());
+    let artifacts_dir = disk_root.join("artifacts");
+    std::fs::create_dir_all(&artifacts_dir).expect("create artifacts dir");
+    std::fs::write(artifacts_dir.join("sha256_corrupt.cwasm"), &corrupt_bytes)
+        .expect("write corrupt artifact");
+    std::fs::write(
+        artifacts_dir.join("sha256_corrupt.json"),
+        serde_json::to_vec_pretty(&meta).expect("serialize meta"),
+    )
+    .expect("write meta");
+
+    let cache = CacheManager::new(config.clone(), profile.clone());
+    let bytes = fixture_bytes();
+
+    // get_component should recover by recompiling from wasm_bytes.
+    let _ = cache
+        .get_component(engine.as_ref(), &key, {
+            let bytes = bytes.clone();
+            move || Ok(bytes)
+        })
+        .await
+        .expect("component after corrupt entry");
+
+    let m = cache.metrics();
+    assert_eq!(
+        m.deserialize_failures, 1,
+        "expected one deserialize failure"
+    );
+    assert_eq!(m.compiles, 1, "expected one recompile");
+
+    // The corrupt entry should have been replaced. A fresh CacheManager over the
+    // same disk root should get a clean disk hit with no further failures.
+    let cache2 = CacheManager::new(config, profile);
+    let _ = cache2
+        .get_component(engine.as_ref(), &key, {
+            let bytes = bytes.clone();
+            move || Ok(bytes)
+        })
+        .await
+        .expect("component from healed entry");
+
+    let m2 = cache2.metrics();
+    assert_eq!(
+        m2.deserialize_failures, 0,
+        "expected no deserialize failures on healed entry"
+    );
+    assert_eq!(m2.disk_hits, 1, "expected a clean disk hit");
+    assert_eq!(m2.compiles, 0, "expected no recompile on healed entry");
 }

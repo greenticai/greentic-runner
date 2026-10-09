@@ -4,10 +4,15 @@ version     = { workspace = true }
 edition     = { workspace = true }
 license     = { workspace = true }
 description = "Enterprise Agentic Worker runtime — Plan-Act-Observe loop, Redis state, tool dispatch via greentic-ext-runtime"
+repository  = "https://github.com/greentic-ai/greentic-runner"
 
 [features]
-default   = []
+default   = ["state-disk"]
 test-mock = []
+# On-disk state backend (redb, pure-Rust embedded KV). Default-on; compile out
+# with --no-default-features to drop the redb dependency (disk selection then
+# falls back to the in-memory backend with a warning).
+state-disk = ["dep:redb"]
 # Multi-provider in-process LLM backend: routes the worker's LLM call through
 # greentic-llm (DeepSeek, Anthropic, Gemini, … — the full provider matrix)
 # instead of the hardwired OpenAI client. Pulls in rig-core, so it is opt-in.
@@ -28,8 +33,8 @@ required-features = ["serve", "test-mock"]
 [dependencies]
 anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
-async-nats          = { version = "0.49", optional = true }
-aw-event-bridge     = { path = "../aw-event-bridge", version = ">=1.1.0-0, <1.2.0-0", optional = true }
+async-nats          = { version = "0.47", optional = true }
+aw-event-bridge     = { path = "../aw-event-bridge", version = ">=1.2.0-0, <1.3.0-0", optional = true }
 # Store-pull + verify (Task 2): download a .gtxpack, verify sha256 + the Ed25519
 # signature on its describe.json, extract extension.wasm into the local cache.
 # Versions track the runner workspace lock (zip 8, ed25519-dalek 2, sha2 0.11,
@@ -41,24 +46,54 @@ zip                 = { workspace = true }
 chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
-greentic-dw-manifest = "=1.1.1"
+# A2A (Agent2Agent) wire types and agent-card retrieval, for the a2a: tool
+# source (letting an agentic worker call an external A2A agent as a tool).
+greentic-a2a        = { path = "../greentic-a2a", version = ">=1.2.0-0, <1.3.0-0" }
+greentic-dw-manifest = ">=1.2.0-0, <1.3.0-0"
 # Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
-greentic-dw-memory-long-term = "=1.1.0"
-greentic-ext-runtime = "=1.2.24"
-greentic-extension-sdk-contract = "=1.1.2"
+greentic-dw-memory-long-term = ">=1.2.0-0, <1.3.0-0"
+greentic-ext-runtime = ">=1.2.0-0, <1.3.0-0"
+greentic-extension-sdk-contract = ">=1.2.24-dev, <1.2.25"
 # Multi-provider LLM door (rig-core under the hood). Optional — see the
 # `greentic-llm-backend` feature.
-greentic-llm = { version = "=1.2.6-research", optional = true }
+# The range is the PLAIN lane one, and the lane form is the right one here.
+# Recorded because it was got wrong once: greentic-llm briefly carried a
+# `1.2.7-dev.0` base, and following it to `>=1.2.7-dev, <1.2.8` stops this
+# workspace RESOLVING at all. A comparator admits prereleases only at its OWN
+# major.minor.patch, so the published `greentic-dw-operala-invoker` -- which
+# asks for `>=1.2.0-dev, <1.3.0-0` -- can select `1.2.0-*` and nothing else,
+# and the two requirements are then disjoint: `failed to select a version for
+# greentic-llm`. That base bump was the mistake and was reverted
+# (greentic-llm#41); dw's plain range was always correct. Do not re-raise this
+# one to chase a base bump -- fix the base instead.
+greentic-llm = { version = ">=1.2.0-0, <1.3.0-0", optional = true }
 greentic-secrets-lib = { workspace = true }
 greentic-types       = { workspace = true }
 # MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
-greentic-mcp-client = { version = "=1.2.0-research", features = ["native"] }
+#
+# Keeping a tool's `title` (greentic-mcp-client#11) is load-bearing here:
+# `map_tools_list` read four fields and that was not one of them, so a human
+# label the server DID advertise was discarded at that boundary and no consumer
+# could recover it — greentic-designer's tool picker was listing 60-character
+# identifiers. Every 1.2 dev publish carries it, which is why this is a range
+# rather than the exact pin it was on the research line.
+#
+# The base is 1.2.1-dev, NOT the lane's 1.2.0-dev, and that is load-bearing:
+# a prerelease sorts by ASCII, so `1.2.0-research` OUTRANKS every
+# `1.2.0-dev.<RUN_ID>` and a plain `>=1.2.0-dev, <1.3.0-0` resolved to it --
+# a build whose `McpToolDef` has neither `title` nor `output_schema`, i.e.
+# exactly the regression the paragraph above exists to prevent, and the
+# workspace failed to compile. Raising the BASE past the stray prerelease is
+# the fix; an `=` pin would instead freeze this crate off the lane.
+greentic-mcp-client = { version = ">=1.2.0-0, <1.3.0-0", features = ["native"] }
 # Local (in-process) wasix:mcp executor for the local-wasm transport (Task 3).
-greentic-mcp-exec = { version = "=1.1.2" }
+greentic-mcp-exec = { version = ">=1.2.0-0, <1.3.0-0" }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
+greentic-trust      = { workspace = true }
+redb                = { version = "2", optional = true }
 redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
 reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 secrecy             = "0.10"
@@ -71,10 +106,15 @@ serde_jcs           = "0.1"
 thiserror           = { workspace = true }
 tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing             = { workspace = true }
+unicode-normalization = "0.1"
 url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
+# ULID event ids for the worker-usage ingest door (the admin keys a
+# time-ordered table on them; greentic-start's interop reporter does the same).
+ulid                = "1"
 
 [dev-dependencies]
+greentic-trust = { workspace = true, features = ["testing"] }
 semver = "1"
 serial_test = { workspace = true }
 tempfile = "3"

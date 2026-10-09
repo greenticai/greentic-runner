@@ -305,6 +305,10 @@ pub struct TenantRuntime {
     operator_registry: OperatorRegistry,
     operator_metrics: Arc<OperatorMetrics>,
     contract_cache: ContractCache,
+    /// The HTTP approval inbox, when this runtime serves one. Shut down on
+    /// drop: the poller stops, held decision tokens are forgotten, and a
+    /// superseded revision can never resume into a store it no longer owns.
+    approval_inbox: Option<crate::runner::approval_http::HttpApprovalDispatcher>,
 }
 
 #[derive(Clone)]
@@ -323,6 +327,141 @@ pub struct ResolvedComponent {
 pub struct RevisionPackRef {
     pub path: PathBuf,
     pub digest: String,
+}
+
+/// The arguments of [`TenantRuntime::load_revision`], as one struct, for
+/// [`TenantRuntime::load_revision_with`]. Field meanings are exactly
+/// `load_revision`'s parameters of the same names.
+pub struct RevisionLoad<'a> {
+    pub pack_refs: &'a [RevisionPackRef],
+    pub config: Arc<HostConfig>,
+    pub mocks: Option<Arc<MockLayer>>,
+    pub wasi_policy: Arc<RunnerWasiPolicy>,
+    pub session_host: Arc<dyn SessionHost>,
+    pub session_store: DynSessionStore,
+    pub state_store: DynStateStore,
+    pub state_host: Arc<dyn StateHost>,
+    pub secrets_manager: DynSecretsManager,
+    pub deployment_id: DeploymentId,
+    pub bundle_id: BundleId,
+    pub revision_id: RevisionId,
+    pub customer_id: Option<String>,
+    pub runtime_configs_by_pack_id: &'a BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+    pub runtime_refs_by_pack_id: &'a BTreeMap<String, Arc<BTreeMap<String, String>>>,
+    pub runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+}
+
+/// What the embedding HOST decides for one revision, beyond its pinned packs.
+/// `Default` is exactly [`TenantRuntime::load_revision`]'s behaviour.
+/// Non-exhaustive so a later host seam is an additive field, not a breaking
+/// change: construct with `RevisionHostOptions::default()` plus the `with_*`
+/// setters.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct RevisionHostOptions {
+    #[cfg(feature = "agentic-worker")]
+    billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+    run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
+    approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
+    #[cfg(feature = "agentic-worker")]
+    user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
+}
+
+impl std::fmt::Debug for RevisionHostOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("RevisionHostOptions");
+        #[cfg(feature = "agentic-worker")]
+        out.field("billing_meter", &self.billing_meter.is_some());
+        out.field("run_outcome_sink", &self.run_outcome_sink.is_some());
+        out.field("approval_inbox", &self.approval_inbox.is_some());
+        #[cfg(feature = "agentic-worker")]
+        out.field("user_ledger", &self.user_ledger.is_some());
+        out.finish()
+    }
+}
+
+impl RevisionHostOptions {
+    /// Record this unit's agentic-worker LLM usage through `meter` as well —
+    /// see [`TenantRuntime::load_revision_with`] for how it combines with the
+    /// env-configured cloud-commerce sink.
+    #[cfg(feature = "agentic-worker")]
+    #[must_use]
+    pub fn with_billing_meter(
+        mut self,
+        meter: Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
+    ) -> Self {
+        self.billing_meter = Some(meter);
+        self
+    }
+
+    /// Report one [`crate::run_outcome::RunOutcome`] per flow turn of this
+    /// unit through `sink` — the deployed run audit. greentic-start installs a
+    /// [`crate::run_outcome::HttpRunOutcomeSink`] built from the same staged
+    /// `metering` block as the billing meter. Without one, flow execution and
+    /// the persisted resume state are unchanged.
+    #[must_use]
+    pub fn with_run_outcome_sink(
+        mut self,
+        sink: Arc<dyn crate::run_outcome::RunOutcomeSink>,
+    ) -> Self {
+        self.run_outcome_sink = Some(sink);
+        self
+    }
+
+    /// File this unit's human approvals with the admin's HTTP approval inbox
+    /// and poll for the decisions, instead of needing a NATS broker — the
+    /// HTTP approval rail (greentic-designer
+    /// `docs/superpowers/specs/2026-09-29-approval-rail-http-design.md`).
+    /// greentic-start builds the target from the same staged `metering`
+    /// block as the run-outcome sink.
+    ///
+    /// Serves ONLY `approval.call`: it goes into the engine's own approval
+    /// slot, so `sorla.call` still fails with `sorla_route_missing` on a lane
+    /// with no broker. When `GREENTIC_EVENTS_NATS_URL` also connects, NATS
+    /// wins and the inbox is not installed. A target that fails validation
+    /// (blank field, cleartext URL off loopback) is logged and skipped; the
+    /// runtime loads either way, and an approval that needs a human then fails
+    /// at the node as it did before. Validate early with
+    /// [`crate::runner::approval_http::HttpApprovalDispatcher::new`].
+    #[must_use]
+    pub fn with_approval_inbox(
+        mut self,
+        target: crate::runner::approval_http::ApprovalInboxTarget,
+    ) -> Self {
+        self.approval_inbox = Some(target);
+        self
+    }
+
+    /// Read and append this unit's user ledger (shared context, Phase C) at
+    /// the admin's ledger door. greentic-start builds the target from the same
+    /// staged `metering` block as the approval inbox: `base_url` is the
+    /// worker-usage endpoint with its last segment swapped for `ledger`,
+    /// `token` the unit's metering token, `tenant_slug` the block's slug. The
+    /// runner never reads that block itself.
+    ///
+    /// Nothing happens unless a pack also names an agent in
+    /// `assets/user-ledger.json`, and only a turn whose caller the provider
+    /// verified, outside any tool call, touches the ledger. That sidecar alone
+    /// decides `read` versus `read_write` for the pack's own agents: there is
+    /// no host-side ceiling on the mode. The gates are the door token's
+    /// `ledger` purpose (the admin refuses a token without it), the
+    /// `GREENTIC_AW_USER_LEDGER` kill switch, the tenant match between the
+    /// runtime and the turn, and a provider-verified subject. A target that
+    /// fails validation (blank field, cleartext URL off loopback, userinfo in
+    /// the URL) is one warning and the runtime loads without the ledger;
+    /// validate early with
+    /// [`greentic_aw_runtime::user_ledger::HttpUserLedger::new`]. The admin
+    /// refuses a token without the `ledger` purpose, and the client then
+    /// stops asking for a while. `GREENTIC_AW_USER_LEDGER=0` turns it off.
+    #[cfg(feature = "agentic-worker")]
+    #[must_use]
+    pub fn with_user_ledger(
+        mut self,
+        target: greentic_aw_runtime::user_ledger::UserLedgerTarget,
+    ) -> Self {
+        self.user_ledger = Some(target);
+        self
+    }
 }
 
 /// Block on a future whether or not we're already inside a tokio runtime.
@@ -350,6 +489,11 @@ impl TenantRuntime {
         state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
     ) -> Result<Arc<Self>> {
         let pack = Self::load_pack_runtime(
             pack_path,
@@ -363,6 +507,9 @@ impl TenantRuntime {
             &BTreeMap::new(),
             &BTreeMap::new(),
             None,
+            // Tenant-only path: no deployed unit, so pack secrets resolve the
+            // bare pack scope exactly as before.
+            None,
         )
         .await?;
         Self::from_packs(
@@ -374,6 +521,12 @@ impl TenantRuntime {
             state_store,
             state_host,
             secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers,
         )
         .await
     }
@@ -390,6 +543,13 @@ impl TenantRuntime {
     /// identity is **derived from** `deployment_id` / `bundle_id` /
     /// `revision_id` / `customer_id`, so the engine's attribution cannot drift
     /// from the key the runtime is later inserted under.
+    ///
+    /// Installs no host billing meter: agentic-worker usage goes to the
+    /// env-configured cloud-commerce sink when `GREENTIC_BILLING_*` is set,
+    /// else nowhere. Graph turns and in-process deep workers are now metered
+    /// and graph turns run under the real tenant; see
+    /// [`load_revision_with`](Self::load_revision_with) for the four
+    /// behaviour changes that brings, and for installing a per-unit meter.
     #[allow(clippy::too_many_arguments)]
     pub async fn load_revision(
         pack_refs: &[RevisionPackRef],
@@ -408,6 +568,134 @@ impl TenantRuntime {
         runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
         runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
         runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+    ) -> Result<Arc<Self>> {
+        Self::load_revision_impl(
+            pack_refs,
+            config,
+            mocks,
+            wasi_policy,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            deployment_id,
+            bundle_id,
+            revision_id,
+            customer_id,
+            runtime_configs_by_pack_id,
+            runtime_refs_by_pack_id,
+            runtime_ref_resolver,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            None,
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
+        )
+        .await
+    }
+
+    /// [`load_revision`](Self::load_revision), taking its arguments as one
+    /// struct plus the host-chosen [`RevisionHostOptions`] for this unit.
+    ///
+    /// Two options exist: the run-outcome sink
+    /// ([`RevisionHostOptions::with_run_outcome_sink`], the deployed run audit
+    /// — see `crate::run_outcome`) and the billing sink
+    /// ([`RevisionHostOptions::with_billing_meter`]). For the latter, greentic-start installs a
+    /// [`greentic_aw_runtime::billing::WorkerUsageMeter`] built from the unit's
+    /// staged `metering` block, so the unit's LLM spend is recorded at the
+    /// admin's per-unit ingest door. It is per-REVISION rather than a
+    /// `HostBuilder` setting on purpose: one greentic-start process serves every
+    /// unit of an environment, and each unit has its own worker-usage token.
+    ///
+    /// # Which sink runs (see `agent_node::resolve_billing_meter`)
+    ///
+    /// - An installed meter AND `GREENTIC_BILLING_BASE_URL` +
+    ///   `GREENTIC_BILLING_SERVICE_SECRET` set: every usage event goes to BOTH
+    ///   (a [`greentic_aw_runtime::billing::FanOutBillingMeter`]), and the
+    ///   credit gate (`over_budget`) is the env cloud-commerce sink's. An
+    ///   installed meter never removes the credit gate.
+    /// - An installed meter only: that meter alone (it has no credit gate).
+    /// - No installed meter: exactly [`load_revision`] — the env sink when
+    ///   configured, else none.
+    ///
+    /// # Behaviour that changed with this seam, for BOTH entry points
+    ///
+    /// Recorded because a publish on the dev lane reaches every consumer:
+    ///
+    /// - (a) agent-graph agent and supervisor turns now emit usage and pass
+    ///   the credit gate when `GREENTIC_BILLING_*` is set. Before, they ran on
+    ///   a `NoopBillingMeter` and were never metered or gated;
+    /// - (b) in-process deep workers (`operala.call`) now emit their own
+    ///   reasoning-loop tokens to the chosen sink, cloud-commerce included;
+    /// - (c) graph turns now run under the real tenant/env, so their tokens
+    ///   count against that tenant's `daily_token_cap_per_tenant` bucket,
+    ///   shared with `dw.agent` (before: one global `graph/run` bucket);
+    /// - (d) long-term memory previously written under the synthetic
+    ///   `graph/run` tenant by `agent_ref` graph turns is no longer reachable.
+    ///   That key was shared by every tenant, so losing it is intended.
+    ///   Per-visit conversation state is re-seeded from the graph checkpoint on
+    ///   every visit, so in-flight runs lose nothing.
+    ///
+    /// [`load_revision`]: Self::load_revision
+    pub async fn load_revision_with(
+        args: RevisionLoad<'_>,
+        options: RevisionHostOptions,
+    ) -> Result<Arc<Self>> {
+        Self::load_revision_impl(
+            args.pack_refs,
+            args.config,
+            args.mocks,
+            args.wasi_policy,
+            args.session_host,
+            args.session_store,
+            args.state_store,
+            args.state_host,
+            args.secrets_manager,
+            args.deployment_id,
+            args.bundle_id,
+            args.revision_id,
+            args.customer_id,
+            args.runtime_configs_by_pack_id,
+            args.runtime_refs_by_pack_id,
+            args.runtime_ref_resolver,
+            #[cfg(feature = "agentic-worker")]
+            options.billing_meter,
+            options.run_outcome_sink,
+            options.approval_inbox,
+            #[cfg(feature = "agentic-worker")]
+            options.user_ledger,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn load_revision_impl(
+        pack_refs: &[RevisionPackRef],
+        config: Arc<HostConfig>,
+        mocks: Option<Arc<MockLayer>>,
+        wasi_policy: Arc<RunnerWasiPolicy>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        customer_id: Option<String>,
+        runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+        runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
+        runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+        #[cfg(feature = "agentic-worker")] billing_meter: Option<
+            Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
+        >,
+        run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
+        approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
+        #[cfg(feature = "agentic-worker")] user_ledger: Option<
+            greentic_aw_runtime::user_ledger::UserLedgerTarget,
+        >,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -459,6 +747,11 @@ impl TenantRuntime {
                 runtime_configs_by_pack_id,
                 runtime_refs_by_pack_id,
                 runtime_ref_resolver.as_ref(),
+                // The unit every extension credential in this pack is scoped
+                // to. Same value `FlowEngine::mcp_credential_unit` reads off
+                // `rollout_ids.bundle_id` below, so the flow-node MCP lane and
+                // the component lane cannot disagree about which unit is running.
+                Some(bundle_id.as_str()),
             )
             .await?;
             // Reject duplicate pack_id within a single revision — two refs
@@ -490,7 +783,24 @@ impl TenantRuntime {
             state_store,
             state_host,
             secrets_manager,
+            // No host-injected ports on the revision-keyed path: it is
+            // constructed from a pinned pack list rather than from a
+            // `RunnerHost`, so there is none to read them from. Matches what
+            // `ext_llm_port` already does here — an engine built this way
+            // falls back to env for both.
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
             rollout,
+            #[cfg(feature = "agentic-worker")]
+            billing_meter,
+            run_outcome_sink,
+            approval_inbox,
+            #[cfg(feature = "agentic-worker")]
+            user_ledger,
         )
         .await
     }
@@ -509,6 +819,15 @@ impl TenantRuntime {
     /// `runtime_refs_by_pack_id` mirrors the same shape for the C5
     /// `pack-config.v1.runtime_refs` channel; a matching entry is injected
     /// via [`PackRuntime::set_runtime_refs`] alongside `runtime_ref_resolver`.
+    ///
+    /// `unit_id` is the deployed unit this pack belongs to — the revision's
+    /// `bundle_id` on the [`load_revision`](Self::load_revision) path, `None`
+    /// on the legacy tenant-only [`load`](Self::load) path. It scopes every
+    /// extension credential the pack's components read, so two units of the
+    /// SAME pack in one environment can hold different values. It is taken as
+    /// a parameter rather than read from a process environment variable
+    /// because one greentic-start process serves every revision of an
+    /// environment, so an env var could not differ per unit.
     #[allow(clippy::too_many_arguments)]
     async fn load_pack_runtime(
         pack_path: &Path,
@@ -522,6 +841,7 @@ impl TenantRuntime {
         runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
         runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
         runtime_ref_resolver: Option<&Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+        unit_id: Option<&str>,
     ) -> Result<Arc<PackRuntime>> {
         let oauth_config = config.oauth_broker_config();
         let mut pack = PackRuntime::load(
@@ -549,6 +869,7 @@ impl TenantRuntime {
         if let Some(non_secret) = runtime_configs_by_pack_id.get(pack_id.as_str()) {
             pack.set_runtime_config_non_secret(Some(Arc::clone(non_secret)));
         }
+        pack.set_unit_id(unit_id.map(str::to_string));
         if let Some(refs) = runtime_refs_by_pack_id.get(pack_id.as_str()) {
             let resolver = runtime_ref_resolver.ok_or_else(|| {
                 anyhow!(
@@ -574,6 +895,11 @@ impl TenantRuntime {
         state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
     ) -> Result<Arc<Self>> {
         Self::from_packs_with_rollout(
             config,
@@ -584,7 +910,22 @@ impl TenantRuntime {
             state_store,
             state_host,
             secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers,
             RolloutIds::default(),
+            // The tenant-only path has no unit, so no host-chosen meter and
+            // no run-outcome sink.
+            #[cfg(feature = "agentic-worker")]
+            None,
+            None,
+            None,
+            // ... and no host-provided user ledger target.
+            #[cfg(feature = "agentic-worker")]
+            None,
         )
         .await
     }
@@ -603,7 +944,20 @@ impl TenantRuntime {
         _state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
         rollout: RolloutIds,
+        #[cfg(feature = "agentic-worker")] installed_billing_meter: Option<
+            Arc<dyn greentic_aw_runtime::billing::BillingMeter>,
+        >,
+        run_outcome_sink: Option<Arc<dyn crate::run_outcome::RunOutcomeSink>>,
+        approval_inbox: Option<crate::runner::approval_http::ApprovalInboxTarget>,
+        #[cfg(feature = "agentic-worker")] user_ledger: Option<
+            greentic_aw_runtime::user_ledger::UserLedgerTarget,
+        >,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
@@ -641,11 +995,26 @@ impl TenantRuntime {
         // to a non-unique in-pack agent id.
         #[cfg(feature = "agentic-worker")]
         let agent_project_id = rollout.bundle_id.clone();
-        #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
-        let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
+        let engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
             .await
             .context("failed to prime flow engine")?
             .with_rollout_ids(rollout);
+        // A host-injected MCP source replaces the one `FlowEngine::new` derives
+        // from env; `None` leaves that env-derived source alone, so a
+        // standalone runner is unaffected.
+        #[cfg(feature = "agentic-worker")]
+        let engine = engine.with_mcp_source(mcp_source);
+        // An `mcp` flow node resolves its credential through the manager this
+        // runtime already holds — dev-store in a Cloud Run or Kubernetes
+        // deployment, which is the only backend there that can read a
+        // `secrets://` URI. Without this the node built its own manager from
+        // `SECRETS_BACKEND`, which no remote deployment sets, and every lookup
+        // missed. An explicit `SECRETS_BACKEND` still wins; see
+        // `mcp_node::aw::choose_mcp_secrets`.
+        #[cfg(feature = "agentic-worker")]
+        let engine = engine.with_mcp_secrets(Some(Arc::clone(&secrets_manager)));
+        #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
+        let mut engine = engine;
 
         // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
         // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
@@ -682,6 +1051,36 @@ impl TenantRuntime {
             Err(_) => None,
         };
 
+        // The HTTP approval rail (greentic-designer approval-rail-http design
+        // §4.6): into the engine's OWN approval slot, never the shared one, so
+        // `sorla.call` keeps failing with `sorla_route_missing` here. NATS
+        // stays authoritative where it connected.
+        if approval_inbox.is_some() && dispatch_nats_client.is_some() {
+            tracing::info!(
+                "GREENTIC_EVENTS_NATS_URL connected; approvals go over NATS and the HTTP approval inbox is not installed"
+            );
+        }
+        let approval_inbox = crate::runner::approval_http::inbox_to_install(
+            dispatch_nats_client.is_some(),
+            approval_inbox,
+        )
+        .and_then(
+            |target| match crate::runner::approval_http::HttpApprovalDispatcher::new(target) {
+                Ok(inbox) => {
+                    engine.set_approval_dispatch_handler(Arc::new(inbox.clone()));
+                    tracing::info!("HTTP approval inbox wired into runtime: approval.call");
+                    Some(inbox)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "HTTP approval inbox not installed; approval.call needing a human will fail"
+                    );
+                    None
+                }
+            },
+        );
+
         // Clone the (possibly connected) client for the audit sink (EPIC-B
         // B-2/B-3): threaded into `StateMachineRuntime::from_flow_engine` so
         // `TraceRecorder` can publish best-effort audit events over NATS, and
@@ -691,6 +1090,13 @@ impl TenantRuntime {
         // `None` when NATS is unset/unreachable, which keeps both audit paths
         // off by default (zero behaviour change).
         let audit_nats_client = dispatch_nats_client.clone();
+
+        // The dw.agent handler, kept so flow-tool engines can borrow it
+        // (`runner::nested_flow`) once the dispatch mode is known below.
+        #[cfg(feature = "agentic-worker")]
+        let mut nested_agent_handler: Option<
+            Arc<dyn crate::runner::agent_node::AgentNodeHandler>,
+        > = None;
 
         #[cfg(feature = "agentic-worker")]
         {
@@ -731,25 +1137,27 @@ impl TenantRuntime {
             // Operator config overrides pack-provided agents on collision.
             let merged_agents = merge_agent_sources(pack_agents, config.agents.clone());
 
-            // First-boot ingest of any pack-baked knowledge corpus (W4 4c). Runs
-            // BEFORE the agent runtime mounts its serving knowledge connection:
-            // embedded SurrealDB allows one handle per store directory, so the
-            // temporary ingest connection must open and drop before the serving
-            // mount (inside build_agent_node_handler) opens its own. No-op without
-            // the `knowledge-chronicle` feature or when no pack carries a corpus.
-            #[cfg(feature = "knowledge-chronicle")]
-            {
-                let corpus = crate::runner::knowledge_corpus::collect(&pack_runtimes);
-                crate::runner::knowledge_mount::ingest_corpus(&config.tenant_ctx(), corpus).await;
-            }
+            // First-boot ingest of any pack-baked knowledge corpus (W4 4c), handed
+            // to every registered agent-runtime extension. Runs BEFORE the agent
+            // runtime mounts its serving knowledge connection: embedded SurrealDB
+            // allows one handle per store directory, so the temporary ingest
+            // connection must open and drop before the serving mount (inside
+            // build_agent_node_handler) opens its own. No-op when no extension is
+            // registered or no pack carries a corpus. `runtime_ext`'s
+            // `boot_ingests_before_any_runtime_is_built` pins this order.
+            crate::runner::runtime_ext::ingest_all_corpora(&pack_runtimes, &config.tenant_ctx())
+                .await;
 
             // DwAgent state-store selection. With GREENTIC_AW_REDIS_URL set, use the
-            // Redis-backed stores (production multi-process default). Without it, when
-            // built with `desktop-agent-ephemeral`, fall back to the process-global
-            // in-memory stores so a single-process runner (e.g. the designer's
-            // loopback test-chat sidecar) runs agentic-worker turns with NO external
-            // infra. Otherwise DwAgent nodes stay disabled — unchanged server
-            // behaviour (build_agent_node_handler returns None when Redis is unset).
+            // Redis-backed stores. Without it, a `desktop-agent-ephemeral` build
+            // uses its own process-global in-memory stores; every OTHER build
+            // (greentic-start, the distroless image) goes through
+            // `build_aw_backends`, which with no Redis URL auto-selects the
+            // shared in-memory KV (or redb under GREENTIC_AW_STATE_BACKEND=disk).
+            // So a missing Redis URL does NOT disable dw.agent in any build. The
+            // runtime is absent only when there are no agents, when
+            // GREENTIC_AW_STATE_BACKEND=redis names no URL, when Redis is
+            // unreachable, or when the extension runtime fails to initialise.
             let redis_set = std::env::var("GREENTIC_AW_REDIS_URL")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
@@ -761,45 +1169,236 @@ impl TenantRuntime {
             let agent_audit_sink = audit_nats_client
                 .clone()
                 .map(crate::trace::audit_sink::AuditSink::new);
+            // `merged_agents` is MOVED into `build_agent_node_handler` below
+            // (redis/ephemeral branches); clone for the graph handler first so
+            // it can resolve a graph node's `agent_ref` (SP1) against the same
+            // process-level merged config map.
+            let graph_agents = merged_agents.clone();
+            // Also needed after `merged_agents` is moved into
+            // `build_agent_node_handler`/`_ephemeral` below, to resolve the
+            // in-process operala.call LLM key the same way (see the
+            // `operala-in-process` block after the DwAgent wiring).
+            #[cfg(feature = "operala-in-process")]
+            let operala_agents = merged_agents.clone();
+            // ONE billing sink for this unit, shared by dw.agent, agent-graph
+            // turns and in-process deep workers: the meter the embedding host
+            // installed (a deployed unit's `WorkerUsageMeter`), else the
+            // env-configured cloud-commerce sink, else none.
+            let billing_meter =
+                crate::runner::agent_node::resolve_billing_meter(installed_billing_meter);
             let agent_handler = if redis_set {
-                crate::runner::agent_node::build_agent_node_handler(
+                crate::runner::agent_node::build_agent_node_wiring_metered(
                     merged_agents,
                     config.tenant.clone(),
                     Arc::clone(&secrets_manager),
+                    ext_llm_port.clone(),
                     pack_runtimes.clone(),
                     agent_audit_sink.clone(),
+                    stream_observers.clone(),
                     agent_project_id.clone(),
+                    billing_meter.clone(),
+                    user_ledger.clone(),
                 )
                 .await
             } else {
                 #[cfg(feature = "desktop-agent-ephemeral")]
                 {
-                    crate::runner::agent_node::build_agent_node_handler_ephemeral(
+                    crate::runner::agent_node::build_agent_node_wiring_ephemeral_metered(
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
+                        ext_llm_port.clone(),
                         pack_runtimes.clone(),
                         agent_audit_sink.clone(),
+                        stream_observers.clone(),
                         agent_project_id.clone(),
+                        billing_meter.clone(),
+                        user_ledger.clone(),
                     )
                     .await
                 }
                 #[cfg(not(feature = "desktop-agent-ephemeral"))]
                 {
-                    crate::runner::agent_node::build_agent_node_handler(
+                    crate::runner::agent_node::build_agent_node_wiring_metered(
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
+                        ext_llm_port.clone(),
                         pack_runtimes.clone(),
                         agent_audit_sink.clone(),
+                        stream_observers.clone(),
                         agent_project_id.clone(),
+                        billing_meter.clone(),
+                        user_ledger.clone(),
                     )
                     .await
                 }
             };
-            if let Some(handler) = agent_handler {
-                engine.set_agent_node_handler(handler);
+            // The AgentRuntime behind dw.agent is also the tool surface of
+            // in-process deep workers (operala.call, below).
+            #[cfg(feature = "operala-in-process")]
+            let operala_agent_runtime = agent_handler
+                .as_ref()
+                .map(|wiring| Arc::clone(&wiring.runtime));
+            if let Some(wiring) = agent_handler {
+                nested_agent_handler = Some(Arc::clone(&wiring.handler));
+                engine.set_agent_node_handler(wiring.handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
+            }
+
+            // In-process deep-worker runtime for `operala.call` nodes
+            // (`operala-in-process`; `desktop-agent-ephemeral` implies it, so
+            // the designer's offline Test-chat sidecar keeps it). Reuses the
+            // exact key-resolution policy the
+            // in-process dw.agent LLM backend uses (env key wins; otherwise
+            // the first agent's `llm.credential_ref` resolved from the
+            // per-tenant secrets store), then builds a
+            // `greentic_llm::RigBackend` — the same OpenAI-compatible,
+            // multi-provider client `GreenticLlmBackend` uses for dw.agent —
+            // and wraps it in `DeepWorkerInvoker`. No handler is wired (and
+            // `operala.call` falls back to the NATS `RemoteDispatchHandler`,
+            // failing without it) when no LLM key resolves or the provider
+            // fails to build.
+            #[cfg(feature = "operala-in-process")]
+            {
+                use crate::runner::operala_node::{
+                    OPERALA_DISPATCH_ENV, OperalaSelection, select_operala_handler_metered,
+                };
+                use crate::runner::operala_tools::OperalaToolContext;
+
+                // Deep workers call their agent's bound tools through the SAME
+                // AgentRuntime dw.agent uses, so the two share one prerequisite.
+                // A missing Redis URL is NOT one (see the state-store selection
+                // above). Without a runtime — an explicit redis backend with no
+                // URL, an unreachable Redis, or a failed extension runtime, all of
+                // which also leave dw.agent unwired — deep workers run tool-less,
+                // which an operator must be able to see.
+                let operala_tools = match operala_agent_runtime {
+                    Some(runtime) => Some(Arc::new(OperalaToolContext::new(
+                        runtime,
+                        &operala_agents,
+                        agent_project_id.clone(),
+                    ))),
+                    None => {
+                        if operala_agents.values().any(|agent| !agent.tools.is_empty()) {
+                            tracing::warn!(
+                                tenant = %config.tenant,
+                                "no agent runtime was built for this tenant (dw.agent is \
+                                 unwired too: GREENTIC_AW_STATE_BACKEND=redis without \
+                                 GREENTIC_AW_REDIS_URL, Redis unreachable, or the extension \
+                                 runtime failed; see the earlier log lines); operala.call deep \
+                                 workers will run WITHOUT the tools their agents declare"
+                            );
+                        }
+                        None
+                    }
+                };
+
+                // Provider/model are resolved PER WORKER from each
+                // `operala.call` node's `input.llm` binding (stamped by
+                // greentic-dw-authoring for authored deep-worker packs); the
+                // handler builds the LLM per dispatch. For a node that carries
+                // NO `input.llm` — e.g. an operala.call synthesized at runtime
+                // for a dw.agent's chronicle knowledge/memory retrieval — fall
+                // back to the agent's OWN configured provider/model (the same
+                // `operala_agents` the api_key is resolved from). The
+                // process-level env still OVERRIDES both. Only when neither the
+                // node, the agent config, nor the env carries a provider/model
+                // does the dispatch error explicitly.
+                let agent_llm = operala_agents
+                    .values()
+                    .map(|agent| &agent.llm)
+                    .find(|llm| !llm.provider.trim().is_empty() && !llm.model.trim().is_empty());
+                let fallback_provider = std::env::var("GREENTIC_LLM_PROVIDER")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| agent_llm.map(|llm| llm.provider.clone()));
+                let fallback_model = std::env::var("GREENTIC_LLM_MODEL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| agent_llm.map(|llm| llm.model.clone()));
+                let base_url = std::env::var("GREENTIC_LLM_BASE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty());
+
+                // Same key policy the in-process dw.agent backend uses: env key
+                // wins; otherwise the first agent's `llm.credential_ref` from the
+                // per-tenant secrets store.
+                let key_secrets = &secrets_manager;
+                let key_tenant = config.tenant.as_str();
+                let key_agents = &operala_agents;
+                let resolve_key = move || async move {
+                    let env_key = std::env::var("GREENTIC_LLM_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| {
+                            std::env::var("OPENAI_API_KEY")
+                                .ok()
+                                .filter(|value| !value.trim().is_empty())
+                        });
+                    match env_key {
+                        Some(key) => Some(key),
+                        None => {
+                            crate::runner::agent_node::resolve_in_process_llm_key(
+                                key_secrets,
+                                key_tenant,
+                                key_agents,
+                            )
+                            .await
+                        }
+                    }
+                };
+
+                let dispatch_env = std::env::var(OPERALA_DISPATCH_ENV).ok();
+                match select_operala_handler_metered(
+                    dispatch_env.as_deref(),
+                    resolve_key,
+                    base_url,
+                    fallback_provider,
+                    fallback_model,
+                    operala_tools,
+                    // The deep worker's OWN loop bills through the same sink
+                    // as dw.agent, attributed to the same unit.
+                    billing_meter.clone(),
+                    agent_project_id.clone(),
+                )
+                .await
+                {
+                    OperalaSelection::InProcess(handler) => {
+                        engine.set_operala_node_handler(handler);
+                        tracing::info!(
+                            dispatch = "in-process",
+                            "operala.call in-process deep-worker runtime wired into FlowEngine \
+                             (provider/model resolved per-worker from node input.llm)"
+                        );
+                    }
+                    OperalaSelection::Nats => {
+                        tracing::info!(
+                            dispatch = "nats",
+                            "GREENTIC_OPERALA_DISPATCH=nats: operala.call dispatches over NATS; \
+                             in-process deep-worker handler not wired"
+                        );
+                        if std::env::var("GREENTIC_EVENTS_NATS_URL")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .is_none()
+                        {
+                            tracing::warn!(
+                                "GREENTIC_OPERALA_DISPATCH=nats but GREENTIC_EVENTS_NATS_URL is \
+                                 unset; operala.call nodes will fail (no remote dispatch \
+                                 handler). Set the NATS URL or unset the flag."
+                            );
+                        }
+                    }
+                    OperalaSelection::NoKey => {
+                        tracing::warn!(
+                            dispatch = "nats",
+                            "no LLM API key resolved (env or store) for operala.call \
+                             in-process wiring; operala.call nodes will fall back to NATS \
+                             (and fail without it)"
+                        );
+                    }
+                }
             }
 
             // Collect agent-graph sidecars from each pack. Unlike agents (a
@@ -834,9 +1433,19 @@ impl TenantRuntime {
                 graphs.insert(graph_id, graph_config);
             }
 
-            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(
+            // Tenant, secrets manager and deployed unit are the same three
+            // values the `dw.agent` handler above receives, so a graph turn's
+            // `a2a:` tools resolve the same credentials a single-turn worker's
+            // would.
+            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler_metered(
                 graphs,
                 agent_audit_sink.clone(),
+                Arc::new(pack_runtimes.clone()),
+                graph_agents,
+                config.tenant.clone(),
+                Arc::clone(&secrets_manager),
+                agent_project_id.clone(),
+                billing_meter.clone(),
             )
             .await
             {
@@ -853,6 +1462,28 @@ impl TenantRuntime {
             let dw_dispatch =
                 crate::runner::agent_node::dw_agent_dispatch_mode(|k| std::env::var(k).ok());
             engine.set_dw_agent_dispatch(dw_dispatch);
+            // Lend the handler to flow-tool engines, on the SAME
+            // `Arc<PackRuntime>`s the agent runtime's flow invoker holds (the
+            // slot lives on the instance). Only for in-process dispatch: over
+            // NATS a nested engine has no remote handler and must keep
+            // failing loudly. `GREENTIC_AW_NESTED_FLOW_AGENTS=0` opts out.
+            // The opt-out is reported only when it changed something: with
+            // nothing to lend (NATS, no handler) there is nothing opted out of.
+            if let Some(handlers) =
+                crate::runner::nested_flow::for_dispatch(dw_dispatch, nested_agent_handler.as_ref())
+            {
+                if crate::runner::nested_flow::nested_flow_agents_enabled() {
+                    for pack in &pack_runtimes {
+                        pack.set_nested_flow_handlers(handlers.clone());
+                    }
+                    tracing::info!("dw.agent handler lent to flow-tool engines");
+                } else {
+                    tracing::info!(
+                        env = crate::runner::nested_flow::NESTED_FLOW_AGENTS_ENV,
+                        "dw.agent handler not lent to flow-tool engines (opted out)"
+                    );
+                }
+            }
             if matches!(
                 dw_dispatch,
                 crate::runner::agent_node::DwAgentDispatch::Nats
@@ -871,7 +1502,7 @@ impl TenantRuntime {
 
         let engine = Arc::new(engine);
         let state_machine = Arc::new(
-            StateMachineRuntime::from_flow_engine(
+            StateMachineRuntime::from_flow_engine_with_run_outcome_sink(
                 Arc::clone(&config),
                 Arc::clone(&engine),
                 pack_trace,
@@ -881,9 +1512,21 @@ impl TenantRuntime {
                 Arc::clone(&secrets_manager),
                 mocks.clone(),
                 audit_nats_client,
+                run_outcome_sink,
             )
             .context("failed to initialise state machine runtime")?,
         );
+
+        // The inbox resumes through a STRICT resumer: a decision for a gate
+        // that is no longer parked under exactly its nonced id is dropped and
+        // never starts a fresh run.
+        if let Some(inbox) = &approval_inbox {
+            inbox.attach_resumer(Arc::new(
+                crate::runner::runtime_session_resumer::RuntimeSessionResumer::strict(Arc::clone(
+                    &state_machine,
+                )),
+            ));
+        }
 
         // Spawn the response listeners now that the ingress handle
         // (`state_machine`) exists. Each listener resumes paused flows by feeding
@@ -935,6 +1578,7 @@ impl TenantRuntime {
             operator_registry,
             operator_metrics,
             contract_cache: ContractCache::from_env(),
+            approval_inbox,
         }))
     }
 
@@ -1048,6 +1692,17 @@ impl TenantRuntime {
         self.timer_handles.lock().extend(handles);
     }
 
+    /// Read a RUNTIME-level secret, at the `_runner` pseudo-pack segment.
+    ///
+    /// **Deliberately NOT unit-scoped**, unlike every pack secret a component
+    /// reads (see [`crate::secrets::unit_pack_segment`]). Its only caller is
+    /// the operator HTTP attachments path (`runner::operator::resolve_attachments`),
+    /// and `_runner` is not a deployed pack: nothing stages a per-unit value
+    /// there, in any lane. Scoping it per unit would move an address no writer
+    /// produces, so every currently-working `_runner` secret would resolve only
+    /// through the compatibility fallback — a strictly worse address for no
+    /// isolation gained. Revisit only if a per-unit writer for `_runner`
+    /// appears.
     pub fn get_secret(&self, key: &str) -> Result<String> {
         if crate::provider_core_only::is_enabled() {
             bail!(crate::provider_core_only::blocked_message("secrets"))
@@ -1128,6 +1783,9 @@ impl Drop for TenantRuntime {
     fn drop(&mut self) {
         for handle in self.timer_handles.lock().drain(..) {
             handle.abort();
+        }
+        if let Some(inbox) = &self.approval_inbox {
+            inbox.shutdown();
         }
     }
 }
@@ -1303,3 +1961,7 @@ mod runtime_key_tests {
         assert_eq!(next.len(), 1);
     }
 }
+
+#[cfg(all(test, feature = "agentic-worker"))]
+#[path = "runtime_billing_ratchet_tests.rs"]
+mod runtime_billing_ratchet_tests;

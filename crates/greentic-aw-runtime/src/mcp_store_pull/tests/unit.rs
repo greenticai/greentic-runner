@@ -6,6 +6,12 @@ use super::super::*;
 use super::{pubkey_env_value, sample_describe, sign_describe_like_store};
 use ed25519_dalek::SigningKey;
 
+#[test]
+fn greentic_trust_dependency_links() {
+    // Smoke: the cross-org git dependency resolves, builds, and links.
+    assert!(greentic_trust::DidWeb::parse("did:web:example.com").is_ok());
+}
+
 /// The gtxpack marker is what makes a cache hit honour version/digest
 /// upgrades: a cached wasm is only reused when its marker equals the
 /// requested `component_digest`. Missing or mismatched => false => re-pull.
@@ -127,4 +133,67 @@ fn trusted_signers_parses_and_rejects_garbage() {
     unsafe { std::env::remove_var(TRUSTED_SIGNERS_ENV) };
     assert_eq!(keys.len(), 1, "only the one valid ed25519 entry survives");
     assert_eq!(keys[0].to_bytes(), signing.verifying_key().to_bytes());
+}
+
+#[test]
+#[serial_test::serial]
+fn trust_did_is_none_when_unset() {
+    unsafe { std::env::remove_var(crate::mcp_store_pull::TRUST_DID_ENV) };
+    assert_eq!(crate::mcp_store_pull::trust_did(), None);
+}
+
+#[test]
+#[serial_test::serial]
+fn trust_did_is_none_when_empty() {
+    unsafe { std::env::set_var(crate::mcp_store_pull::TRUST_DID_ENV, "") };
+    assert_eq!(crate::mcp_store_pull::trust_did(), None);
+    unsafe { std::env::remove_var(crate::mcp_store_pull::TRUST_DID_ENV) };
+}
+
+#[test]
+#[serial_test::serial]
+fn trust_did_returns_the_configured_did() {
+    unsafe {
+        std::env::set_var(
+            crate::mcp_store_pull::TRUST_DID_ENV,
+            "did:web:trust.greentic.cloud",
+        )
+    };
+    assert_eq!(
+        crate::mcp_store_pull::trust_did(),
+        Some("did:web:trust.greentic.cloud".to_string())
+    );
+    unsafe { std::env::remove_var(crate::mcp_store_pull::TRUST_DID_ENV) };
+}
+
+#[test]
+#[serial_test::serial]
+fn trust_did_trims_surrounding_whitespace() {
+    // A file-sourced (e.g. mounted-secret) value can carry a trailing
+    // newline; that must never reach `DidWeb::parse`.
+    unsafe {
+        std::env::set_var(
+            crate::mcp_store_pull::TRUST_DID_ENV,
+            "  did:web:trust.greentic.cloud\n",
+        )
+    };
+    assert_eq!(
+        crate::mcp_store_pull::trust_did(),
+        Some("did:web:trust.greentic.cloud".to_string())
+    );
+    unsafe { std::env::remove_var(crate::mcp_store_pull::TRUST_DID_ENV) };
+}
+
+#[test]
+fn map_trust_error_folds_into_signature() {
+    let mapped = crate::mcp_store_pull::map_trust_error(greentic_trust::TrustError::CertMissing);
+    match mapped {
+        crate::mcp_store_pull::StorePullError::Signature(msg) => {
+            assert!(
+                msg.contains("trust verification"),
+                "reason should be legible: {msg}"
+            );
+        }
+        other => panic!("expected Signature, got {other:?}"),
+    }
 }

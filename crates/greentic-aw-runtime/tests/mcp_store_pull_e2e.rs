@@ -276,6 +276,9 @@ fn build_agent_config(allowed_tools: Vec<ToolRef>) -> AgentConfig {
         },
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
+        on_text_while_parked: Default::default(),
     }
 }
 
@@ -292,7 +295,7 @@ fn build_runtime(
     let config_provider = Arc::new(config_provider);
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let tool_ledger = Arc::new(NoopToolLedger);
-    let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
     let runtime = AgentRuntime::new(
         config_provider,
         state_store,
@@ -361,6 +364,9 @@ async fn verified_store_pull_tool_offered_and_result_in_trail() {
     let allowed_tools = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "echo".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let (runtime, tenant_ctx) = build_runtime(
         llm.clone(),
@@ -375,6 +381,8 @@ async fn verified_store_pull_tool_offered_and_result_in_trail() {
             "a",
             AgentInput {
                 text: "e2e-go".into(),
+                conversational: false,
+                resume_payload: None,
             },
         )
         .await
@@ -478,6 +486,9 @@ async fn tampered_digest_degrades_tool_not_offered() {
     let allowed_tools = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "echo".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let (runtime, tenant_ctx) = build_runtime(
         llm.clone(),
@@ -492,6 +503,8 @@ async fn tampered_digest_degrades_tool_not_offered() {
             "a",
             AgentInput {
                 text: "e2e-go".into(),
+                conversational: false,
+                resume_payload: None,
             },
         )
         .await

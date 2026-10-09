@@ -1,0 +1,480 @@
+//! Retrieving an agent card from its well-known location, with a TTL cache.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::card::AgentCard;
+
+/// Where an agent publishes its card. `/.well-known/agent.json` is the 0.x
+/// path and is superseded; this one has an IANA registration template.
+pub const WELL_KNOWN_PATH: &str = "/.well-known/agent-card.json";
+
+#[derive(Debug, thiserror::Error)]
+pub enum A2aError {
+    #[error("agent URL must be https (plaintext is allowed only on loopback), got {base}")]
+    InsecureBase { base: String },
+    #[error("an agent reached at a remote base may not name a loopback interface: {url}")]
+    LoopbackFromRemote { url: String },
+    #[error("agent base URL is not a URL: {base}")]
+    BadBase { base: String },
+    #[error("fetching the agent card failed: {0}")]
+    Transport(String),
+    #[error("the agent card at {url} did not parse: {source}")]
+    Malformed {
+        url: String,
+        source: serde_json::Error,
+    },
+}
+
+/// Build the card URL for an agent base, refusing plaintext except on loopback.
+///
+/// Plaintext is refused rather than warned about: the card names the address we will later
+/// send a credential to, so trusting one fetched over plaintext would hand an
+/// on-path attacker the agent's endpoint. On loopback (`127.0.0.1`, `::1`, `localhost`),
+/// there is no on-path attacker — the packets never leave the host — so plaintext is allowed
+/// for in-process test servers and sidecar agents.
+pub fn card_url(base: &str) -> Result<String, A2aError> {
+    let parsed = require_secure(base)?;
+    // `join` re-roots at the origin rather than concatenating the base's raw
+    // text, so a base carrying a path, query or fragment (`https://a.com/x?y=1`)
+    // still resolves to the well-known location instead of appending onto it.
+    let card = parsed
+        .join(WELL_KNOWN_PATH)
+        .map_err(|_| A2aError::BadBase {
+            base: base.to_string(),
+        })?;
+    Ok(card.to_string())
+}
+
+/// The card URL under the base's OWN path, or `None` when the base is a bare origin.
+///
+/// Agents hosted behind a shared origin (several workers in one Cloud Run
+/// service, each under `/<unit>`) publish their card at
+/// `<origin>/<unit>/.well-known/agent-card.json`; the origin root serves
+/// nothing. Query and fragment are dropped, the path is kept.
+fn card_url_under_path(base: &str) -> Result<Option<String>, A2aError> {
+    let mut parsed = require_secure(base)?;
+    let path = parsed.path().trim_end_matches('/').to_string();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.set_path(&format!("{path}{WELL_KNOWN_PATH}"));
+    Ok(Some(parsed.to_string()))
+}
+
+/// Parse `url` and refuse it unless it is `https`, or plaintext on loopback.
+///
+/// The rule [`card_url`] applies to a base, exposed so a caller can apply the
+/// SAME rule to every other address it will send to — above all the interface
+/// URL an agent card names. Checking only the card's own address is not
+/// enough: an https card may still name a plaintext interface, and the message
+/// (and any credential with it) would then leave in the clear.
+pub fn require_secure(url: &str) -> Result<url::Url, A2aError> {
+    let parsed = url::Url::parse(url).map_err(|_| A2aError::BadBase {
+        base: url.to_string(),
+    })?;
+    if parsed.scheme() != "https" && !is_loopback(&parsed) {
+        return Err(A2aError::InsecureBase {
+            base: url.to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Check the interface URL an agent card names, before sending anything to it.
+///
+/// [`require_secure`] alone is not enough here. Its loopback carve-out exists
+/// because a plaintext hop that never leaves the host cannot be observed — a
+/// fact about the BASE the operator configured. An interface URL is only text
+/// inside a card the agent controls, so a remote agent naming
+/// `http://127.0.0.1:<port>/` would otherwise turn this client into a way to
+/// reach services on the runner's own host. A loopback interface is therefore
+/// accepted only when the configured base is itself loopback.
+pub fn require_secure_interface(base: &str, interface: &str) -> Result<url::Url, A2aError> {
+    let target = require_secure(interface)?;
+    let base = url::Url::parse(base).map_err(|_| A2aError::BadBase {
+        base: base.to_string(),
+    })?;
+    if is_loopback(&target) && !is_loopback(&base) {
+        return Err(A2aError::LoopbackFromRemote {
+            url: interface.to_string(),
+        });
+    }
+    Ok(target)
+}
+
+/// Whether a base names this host, and so cannot be observed on the wire.
+///
+/// Matched on the PARSED host: `http://127.0.0.1.evil.example` carries the
+/// loopback address as a substring of a completely different name.
+///
+/// "This host" has more spellings than `Ipv4Addr::is_loopback` knows: the
+/// unspecified address (`0.0.0.0`, `::`) reaches local services on Linux, an
+/// IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) is still IPv4 loopback, and a
+/// trailing dot or a `*.localhost` name resolves to loopback too (RFC 6761).
+/// Missing one would let a remote card aim at a local port through
+/// [`require_secure_interface`] — refused plaintext, but still a port probe.
+fn is_loopback(url: &url::Url) -> bool {
+    fn v4_local(ip: std::net::Ipv4Addr) -> bool {
+        ip.is_loopback() || ip.is_unspecified()
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => v4_local(ip),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.is_unspecified() || ip.to_ipv4_mapped().is_some_and(v4_local)
+        }
+        Some(url::Host::Domain(name)) => {
+            let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
+struct Entry {
+    card: Arc<AgentCard>,
+    fetched_at: Instant,
+}
+
+/// A TTL cache over agent cards.
+///
+/// The spec asks servers to send `Cache-Control` and `ETag` (§8.6); honouring
+/// those is a later refinement. A flat TTL is enough for C2, whose cost we are
+/// avoiding is an HTTP round trip inside the agent loop.
+pub struct CardCache {
+    ttl: Duration,
+    entries: Mutex<HashMap<String, Entry>>,
+    client: reqwest::Client,
+}
+
+impl CardCache {
+    /// A cache whose entries are trusted for `ttl`.
+    ///
+    /// Fails only if the HTTP client cannot be built. The error is returned
+    /// rather than papered over with a default client, which would follow
+    /// redirects and have no timeout — the two properties set below.
+    pub fn new(ttl: Duration) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+            // Redirects are refused outright rather than merely limited: a
+            // plaintext downgrade (`https://` -> `http://`) arrives as a
+            // redirect, and no legitimate well-known card location needs one.
+            // A timeout is set for the same reason `card_url` refuses
+            // plaintext — this fetch can run inside an agent loop, and a hung
+            // agent must not block its caller forever.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+        })
+    }
+
+    /// Fetch the card for an agent base, or serve it from cache.
+    ///
+    /// This is the entry point, and it is what enforces the https rule: it
+    /// builds the URL through [`card_url`] before ever handing it to the
+    /// internal fetch below.
+    ///
+    /// A base with a path is tried under that path first, then at the origin
+    /// root. Only a `404` from the path-scoped URL falls through to the root:
+    /// any other failure is the agent's real answer and is reported as is.
+    pub async fn get(&self, base: &str) -> Result<Arc<AgentCard>, A2aError> {
+        let root = card_url(base)?;
+        match card_url_under_path(base)? {
+            None => self.get_from_url(&root).await,
+            Some(scoped) => match self.get_from_url(&scoped).await {
+                Err(A2aError::Transport(msg)) if msg.contains("404") => {
+                    self.get_from_url(&root).await
+                }
+                other => other,
+            },
+        }
+    }
+
+    /// The internal fetch, by an already-built URL.
+    ///
+    /// It applies no scheme rule of its own — [`get`](Self::get) does, through
+    /// [`card_url`] — which is why it stays private: a public by-URL entry
+    /// point would let a caller skip the https rule entirely.
+    async fn get_from_url(&self, url: &str) -> Result<Arc<AgentCard>, A2aError> {
+        if let Some(hit) = self.cached(url) {
+            return Ok(hit);
+        }
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| A2aError::Transport(err.to_string()))?;
+        if !response.status().is_success() {
+            return Err(A2aError::Transport(format!(
+                "unexpected status {}",
+                response.status()
+            )));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|err| A2aError::Transport(err.to_string()))?;
+        let card: AgentCard =
+            serde_json::from_str(&body).map_err(|source| A2aError::Malformed {
+                url: url.to_string(),
+                source,
+            })?;
+        let card = Arc::new(card);
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                url.to_string(),
+                Entry {
+                    card: Arc::clone(&card),
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+        Ok(card)
+    }
+
+    fn cached(&self, url: &str) -> Option<Arc<AgentCard>> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(url)?;
+        (entry.fetched_at.elapsed() < self.ttl).then(|| Arc::clone(&entry.card))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn the_well_known_path_is_the_v1_one_not_the_superseded_agent_json() {
+        // `/.well-known/agent.json` is the 0.x path and is superseded.
+        assert_eq!(WELL_KNOWN_PATH, "/.well-known/agent-card.json");
+    }
+
+    #[test]
+    fn a_card_url_is_built_from_a_base_without_doubling_the_slash() {
+        assert_eq!(
+            card_url("https://api.example.com").unwrap(),
+            "https://api.example.com/.well-known/agent-card.json"
+        );
+        assert_eq!(
+            card_url("https://api.example.com/").unwrap(),
+            "https://api.example.com/.well-known/agent-card.json"
+        );
+    }
+
+    #[test]
+    fn a_non_https_base_is_refused() {
+        // The card carries the address we will send a credential to, so a
+        // plaintext base is refused rather than warned about.
+        assert!(matches!(
+            card_url("http://api.example.com"),
+            Err(A2aError::InsecureBase { .. })
+        ));
+    }
+
+    #[test]
+    fn plaintext_is_allowed_on_loopback_because_there_is_no_on_path_attacker() {
+        // A sidecar agent on loopback is a real deployment, and it is the only
+        // shape an in-process test server can offer. The refusal exists to stop
+        // an on-path attacker learning the endpoint we will send a credential
+        // to; on loopback the packets never leave the host.
+        assert_eq!(
+            card_url("http://127.0.0.1:8080").unwrap(),
+            "http://127.0.0.1:8080/.well-known/agent-card.json"
+        );
+        assert!(card_url("http://localhost:8080").is_ok());
+        assert!(card_url("http://[::1]:8080").is_ok());
+    }
+
+    #[test]
+    fn a_remote_agent_may_not_name_a_loopback_interface() {
+        // The loopback carve-out is about the BASE the operator configured. An
+        // interface URL is text in a card the agent controls; honouring a
+        // loopback one from a remote agent would let it aim this client at
+        // services on the runner's own host.
+        for interface in [
+            "http://127.0.0.1:8080/a2a",
+            "https://127.0.0.1:8443/a2a",
+            "http://localhost/a2a",
+            "http://[::1]/a2a",
+            // Spellings `is_loopback` in std does not recognise, each of which
+            // still reaches this host.
+            "https://0.0.0.0:8443/a2a",
+            "https://[::]/a2a",
+            "https://[::ffff:127.0.0.1]/a2a",
+            "https://localhost./a2a",
+            "https://api.localhost/a2a",
+        ] {
+            assert!(
+                matches!(
+                    require_secure_interface("https://agent.example.com", interface),
+                    Err(A2aError::LoopbackFromRemote { .. })
+                ),
+                "{interface} must be refused for a remote base"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loopback_agent_may_name_a_loopback_interface() {
+        assert!(
+            require_secure_interface("http://127.0.0.1:9000", "http://127.0.0.1:9000/a2a").is_ok()
+        );
+    }
+
+    #[test]
+    fn a_remote_agent_may_name_a_remote_https_interface_but_not_a_plaintext_one() {
+        assert!(
+            require_secure_interface("https://agent.example.com", "https://api.example.com/a2a")
+                .is_ok()
+        );
+        assert!(matches!(
+            require_secure_interface("https://agent.example.com", "http://api.example.com/a2a"),
+            Err(A2aError::InsecureBase { .. })
+        ));
+    }
+
+    #[test]
+    fn plaintext_is_still_refused_for_every_non_loopback_host() {
+        for base in [
+            "http://api.example.com",
+            "http://10.0.0.1",
+            // Not loopback, and the name is attacker-chosen: only the literal
+            // loopback names and addresses qualify.
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+        ] {
+            assert!(
+                matches!(card_url(base), Err(A2aError::InsecureBase { .. })),
+                "{base} must still be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_base_with_a_path_has_a_path_scoped_card_url() {
+        assert_eq!(
+            card_url_under_path("https://a.run.app/partner-signup/?x=1#f").unwrap(),
+            Some("https://a.run.app/partner-signup/.well-known/agent-card.json".to_string())
+        );
+        assert_eq!(card_url_under_path("https://a.run.app/").unwrap(), None);
+        assert!(card_url_under_path("http://a.example.com/x").is_err());
+    }
+
+    #[test]
+    fn a_base_with_a_path_still_resolves_to_the_well_known_location() {
+        // String concatenation would have produced
+        // ".../foo/bar/.well-known/agent-card.json"; the well-known location
+        // is origin-rooted, so a base's own path must be discarded.
+        assert_eq!(
+            card_url("https://api.example.com/foo/bar").unwrap(),
+            "https://api.example.com/.well-known/agent-card.json"
+        );
+    }
+
+    #[test]
+    fn a_base_with_a_query_still_resolves_to_the_well_known_location() {
+        // String concatenation would have produced
+        // ".../?x=1/.well-known/agent-card.json"; the query must not survive.
+        assert_eq!(
+            card_url("https://api.example.com/?x=1").unwrap(),
+            "https://api.example.com/.well-known/agent-card.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_served_card_is_fetched_once_and_then_cached() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let base = spawn_card_server(Arc::clone(&hits));
+        let url = format!("{base}{WELL_KNOWN_PATH}");
+
+        let cache = CardCache::new(Duration::from_secs(300)).expect("client builds");
+        let first = cache.get_from_url(&url).await.expect("first fetch");
+        let second = cache.get_from_url(&url).await.expect("cached");
+
+        assert_eq!(first.name, "Recipe Agent");
+        assert_eq!(second.name, "Recipe Agent");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the second get must not reach the network"
+        );
+    }
+
+    // --- test server -------------------------------------------------------
+
+    const CARD_JSON: &str = r#"{
+      "name": "Recipe Agent",
+      "description": "Helps with recipes and cooking.",
+      "version": "1.0.0",
+      "supportedInterfaces": [
+        { "url": "https://api.example.com/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
+      ],
+      "capabilities": { "streaming": false, "pushNotifications": false },
+      "defaultInputModes": ["text/plain"],
+      "defaultOutputModes": ["text/plain"],
+      "skills": [
+        { "id": "suggest", "name": "Suggest a recipe", "description": "Suggests a dish.", "tags": ["cooking"] }
+      ]
+    }"#;
+
+    /// Like `spawn_card_server`, but the card exists ONLY under `/unit/` and
+    /// every other path answers 404, as a shared multi-worker origin does.
+    fn spawn_path_scoped_card_server() -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind loopback");
+        let port = server.server_addr().to_ip().expect("an ip addr").port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                if request.url() == "/unit/.well-known/agent-card.json" {
+                    let _ = request.respond(tiny_http::Response::from_string(CARD_JSON));
+                } else {
+                    let _ = request
+                        .respond(tiny_http::Response::from_string("no").with_status_code(404));
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn a_worker_behind_a_shared_origin_is_found_under_its_own_path() {
+        let base = format!("{}/unit", spawn_path_scoped_card_server());
+        let cache = CardCache::new(Duration::from_secs(300)).expect("client builds");
+        assert!(cache.get(&base).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_path_base_whose_card_is_at_the_origin_root_still_works() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let base = format!("{}/elsewhere", spawn_card_server(hits));
+        let cache = CardCache::new(Duration::from_secs(300)).expect("client builds");
+        assert!(cache.get(&base).await.is_ok());
+    }
+
+    /// Serve `CARD_JSON` on an ephemeral loopback port, counting requests, and
+    /// return the base URL. The thread ends with the test process.
+    fn spawn_card_server(hits: Arc<AtomicUsize>) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind loopback");
+        let port = server.server_addr().to_ip().expect("an ip addr").port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("a valid header");
+                let response = tiny_http::Response::from_string(CARD_JSON).with_header(header);
+                let _ = request.respond(response);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+}

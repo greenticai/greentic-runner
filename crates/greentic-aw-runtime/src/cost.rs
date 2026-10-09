@@ -7,12 +7,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use chrono::Utc;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
 use crate::error::StateError;
+use crate::kv::AwKv;
 use crate::tenant::TenantContext;
 
 /// Daily per-tenant token accounting. Dyn-safe (`Arc<dyn TokenMeter>`),
@@ -92,6 +94,47 @@ impl TokenMeter for RedisTokenMeter {
     }
 }
 
+const TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(86_400); // 24h
+
+/// Daily per-tenant token meter over [`AwKv`] (Redis-free). Same key format
+/// and 24h window as [`RedisTokenMeter`].
+pub struct KvTokenMeter {
+    kv: Arc<dyn AwKv>,
+}
+
+impl KvTokenMeter {
+    pub fn new(kv: Arc<dyn AwKv>) -> Self {
+        Self { kv }
+    }
+
+    fn key(tenant: &TenantContext) -> String {
+        let day = Utc::now().format("%Y%m%d").to_string();
+        format!("{}:cost:tokens:{day}", tenant.key_prefix())
+    }
+}
+
+impl TokenMeter for KvTokenMeter {
+    fn current<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, StateError>> + Send + 'a>> {
+        Box::pin(async move { self.kv.get_u64(&Self::key(tenant)).await })
+    }
+
+    fn add<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        tokens: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.kv
+                .incr_by(&Self::key(tenant), tokens, TOKEN_TTL)
+                .await?;
+            Ok(())
+        })
+    }
+}
+
 /// In-memory token meter for unit tests. Gated behind `test-mock`.
 #[cfg(feature = "test-mock")]
 pub struct MockTokenMeter {
@@ -135,5 +178,32 @@ impl TokenMeter for MockTokenMeter {
             *v += tokens;
         }
         Box::pin(async move { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod kv_meter_tests {
+    use super::*;
+    use crate::kv::MemoryKv;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn add_accumulates_within_day() {
+        let meter = KvTokenMeter::new(Arc::new(MemoryKv::new()));
+        let t = TenantContext::new("acme", "prod");
+        assert_eq!(meter.current(&t).await.unwrap(), 0);
+        meter.add(&t, 100).await.unwrap();
+        meter.add(&t, 50).await.unwrap();
+        assert_eq!(meter.current(&t).await.unwrap(), 150);
+    }
+
+    #[tokio::test]
+    async fn counters_are_isolated_per_tenant() {
+        let meter = KvTokenMeter::new(Arc::new(MemoryKv::new()));
+        let a = TenantContext::new("a", "prod");
+        let b = TenantContext::new("b", "prod");
+        meter.add(&a, 10).await.unwrap();
+        assert_eq!(meter.current(&b).await.unwrap(), 0);
     }
 }

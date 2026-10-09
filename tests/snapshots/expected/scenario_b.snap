@@ -28,9 +28,6 @@ expression: normalized_actual
   "output": [
     {
       "text": "Echo: hello"
-    },
-    {
-      "text": "Echo: hello"
     }
   ],
   "status": "completed"

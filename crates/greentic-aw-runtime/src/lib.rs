@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod a2a_source;
 pub mod billing;
 pub mod component_source;
 pub mod config;
@@ -20,12 +21,16 @@ pub mod config_provider;
 pub mod cost;
 pub mod dispatch_ledger;
 pub mod dw;
+pub mod end_conversation;
 pub mod error;
+pub mod flow_source;
+mod flow_suspend;
 pub mod graph;
 pub mod guardrail;
 pub mod guardrail_provider;
 pub mod http_provider;
 pub mod knowledge;
+pub mod kv;
 pub mod layered_provider;
 pub mod llm;
 pub mod llm_credential;
@@ -33,20 +38,33 @@ pub mod llm_extension;
 #[cfg(feature = "greentic-llm-backend")]
 pub mod llm_greentic;
 pub mod llm_openai;
+mod lock_keepalive;
 pub mod long_term;
 pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod mcp_local;
+pub mod mcp_scope;
+pub mod mcp_secrets;
 pub mod mcp_source;
 pub mod mcp_store_pull;
 pub mod memory;
+pub mod playbook_source;
+pub mod run_trace;
+pub mod scoped_secrets;
+pub mod share_policy;
 pub mod short_term;
+pub mod sorla_source;
 pub mod state;
+pub mod state_kv;
 pub mod state_redis;
 pub mod telemetry;
 pub mod tenant;
+pub mod tool_call_frame;
+pub mod tool_session;
+pub mod tool_wire_name;
 pub mod tools;
+pub mod user_ledger;
 
 #[cfg(feature = "test-mock")]
 pub mod mock;
@@ -54,21 +72,29 @@ pub mod mock;
 #[cfg(feature = "serve")]
 pub mod serve;
 
+pub use a2a_source::{A2aRoute, A2aToolCatalog, A2aToolEntry, A2aToolSource};
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
 };
 pub use config::{
-    AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ToolRef,
+    AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ParkedTextPolicy,
+    ToolRef,
 };
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
-pub use cost::{RedisTokenMeter, TokenMeter};
+pub use cost::{KvTokenMeter, RedisTokenMeter, TokenMeter};
 pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
+pub use flow_source::{
+    FlowInvokeOutcome, FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource,
+};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
+#[cfg(feature = "state-disk")]
+pub use kv::RedbKv;
+pub use kv::{AwKv, MemoryKv};
 pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use llm_extension::{
@@ -83,15 +109,30 @@ pub use long_term::{
 };
 pub use manifest_provider::ManifestToolOverlayProvider;
 pub use mcp_source::{
-    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpRoute, McpToolCatalog, McpToolEntry,
-    McpToolSource, dispatch_route,
+    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpCallerIdentity, McpPackRoute, McpRoute,
+    McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route,
 };
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
+pub use playbook_source::{
+    PlaybookLlmCapability, PlaybookLlmRequirement, PlaybookLlmTier, PlaybookOperation,
+    PlaybookSource, PlaybookToolCatalog, PlaybookToolEntry, PlaybookToolSource, PlaybookTurnFn,
+    PlaybookTurnRequest, PlaybookTurnResult,
+};
+pub use run_trace::{RunContext, RunTrace, StepId, ToolOutcome};
+pub use share_policy::{BindingModes, ShareMode, SharePolicy};
+pub use sorla_source::{
+    SorlaToolCatalog, SorlaToolEntry, SorlaToolSource, SorxInvoker, SorxOperation,
+};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
+pub use state_kv::KvAgentStateStore;
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
-pub use tenant::TenantContext;
-pub use tools::{RedisToolLedger, ToolLedger};
+pub use tenant::{TenantContext, VerifiedCaller};
+pub use tool_call_frame::{ToolCallFrame, current_tool_call};
+pub use tool_session::{ToolSession, ToolSessionError, ToolSessionSchema};
+pub use tool_wire_name::{ToolNameCodec, is_wire_safe, wire_tool_name};
+pub use tools::{KvToolLedger, RedisToolLedger, ToolLedger};
+pub use user_ledger::{UserLedgerBinding, UserLedgerTarget};
 
 use std::sync::Arc;
 
@@ -121,10 +162,23 @@ pub trait StepObserver: Send + Sync {
     /// Called with each incremental text chunk of the assistant reply.
     /// Only invoked when [`StepObserver::wants_streaming`] returns `true`.
     fn on_token_delta(&self, _chunk: &str) {}
-    /// Called just before a tool is dispatched.
-    fn on_tool_call(&self, _name: &str, _call_id: &str) {}
+    /// Called just before a tool is dispatched, with its arguments.
+    fn on_tool_call(&self, _name: &str, _call_id: &str, _args: &serde_json::Value) {}
     /// Called after a tool dispatch succeeds, with the tool's result.
     fn on_tool_result(&self, _name: &str, _call_id: &str, _result: &serde_json::Value) {}
+    /// Called after a tool dispatch fails or is blocked (e.g. not in the
+    /// agent's allow-list), with the error/reason payload. Additive hook —
+    /// see the "Extending this trait" note above.
+    fn on_tool_failed(&self, _name: &str, _call_id: &str, _error: &serde_json::Value) {}
+    /// Called after each LLM iteration completes, with that call's token usage.
+    /// Additive hook — lets a streaming consumer surface a per-message LLM/token
+    /// trace even for turns that call no tools (the token trail is otherwise
+    /// only in the final `AgentOutput.trail`, which the SSE stream omits).
+    fn on_llm_call(&self, _tokens_in: u64, _tokens_out: u64) {}
+    /// Called for every guardrail denial — blocked (Enforce) or merely recorded
+    /// (Monitor). Default no-op: only the audit observer forwards these.
+    /// Additive hook — see the "Extending this trait" note above.
+    fn on_guardrail(&self, _obs: &crate::guardrail::GuardrailObservation) {}
 }
 
 /// No-op observer used by the non-streaming [`AgentRuntime::step`].
@@ -165,6 +219,29 @@ pub struct AgentRuntime {
     /// invoker (over the runner-host `PackRuntime` component host) is injected
     /// at the runner-host edge, never compiled in.
     pub(crate) components: Option<Arc<crate::component_source::ComponentToolSource>>,
+    /// Per-tenant agentic-worker flow tool source. `None` disables flow tools
+    /// entirely (`flow:`-prefixed tool refs then resolve to nothing). Set via
+    /// [`AgentRuntime::with_flow_source`]; the concrete invoker (over the
+    /// runner-host pack flow runtime) is injected at the runner-host edge, never
+    /// compiled in.
+    pub(crate) flows: Option<Arc<crate::flow_source::FlowToolSource>>,
+    /// Set by [`AgentRuntime::with_playbook_source`]; the pack reader and the
+    /// turn effect both live in the host (see `playbook_source`'s header for
+    /// why the turn cannot be resolved here).
+    pub(crate) playbooks: Option<Arc<crate::playbook_source::PlaybookToolSource>>,
+    /// Per-tenant agentic-worker SoRLa SoR tool source. `None` disables sorla
+    /// tools entirely (`sorla:`-prefixed tool refs then resolve to nothing).
+    /// Set via [`AgentRuntime::with_sorla_source`]; the concrete invoker (over
+    /// the host SoRX interact client) is injected at the runner-host edge,
+    /// never compiled in.
+    pub(crate) sorla: Option<Arc<crate::sorla_source::SorlaToolSource>>,
+    /// Agentic-worker A2A tool source. `None` disables A2A tools entirely
+    /// (`a2a:`-prefixed tool refs are then dropped from the tool list and
+    /// reported by the preflight check). Set via
+    /// [`AgentRuntime::with_a2a_source`]. Unlike the flow and component
+    /// sources this one owns its transport, since an A2A agent is plain
+    /// HTTP(S) reachable from here.
+    pub(crate) a2a: Option<Arc<crate::a2a_source::A2aToolSource>>,
     /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
     /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
     /// concrete backend is injected at the runner-host edge, never compiled in.
@@ -179,6 +256,13 @@ pub struct AgentRuntime {
     /// available in-memory provider, and the tools are gated by
     /// `config.memory.short_term`.
     pub(crate) short_term_memory: Option<Arc<dyn crate::memory::MemoryProvider>>,
+    /// Per-binding sharing modes from the pack's `assets/run-context.json`
+    /// (shared context, Phase A2). `None` means every NESTED binding is `none`
+    /// (a top-level turn under an open context still injects and records).
+    pub(crate) share_policy: Option<Arc<crate::share_policy::SharePolicy>>,
+    /// The user ledger (shared context, Phase C): a durable, per verified
+    /// end-user history shared by the environment's units. `None` = off.
+    pub(crate) user_ledger: Option<Arc<crate::user_ledger::UserLedgerBinding>>,
 }
 
 impl AgentRuntime {
@@ -209,9 +293,15 @@ impl AgentRuntime {
             guardrail_policy: Arc::new(crate::guardrail::NoMandatoryGuardrails),
             guardrail_evaluator: Arc::new(crate::guardrail::AcceptAllEvaluator),
             components: None,
+            flows: None,
+            playbooks: None,
+            sorla: None,
+            a2a: None,
             long_term_memory: None,
             knowledge: None,
             short_term_memory: None,
+            share_policy: None,
+            user_ledger: None,
         }
     }
 
@@ -250,6 +340,96 @@ impl AgentRuntime {
         components: Option<Arc<crate::component_source::ComponentToolSource>>,
     ) -> Self {
         self.components = components;
+        self
+    }
+
+    /// Wire the flow tool source so `flow:`-prefixed tool refs resolve to pack
+    /// flows invoked over the host flow runtime. Coexists with the
+    /// MCP/extension/component tool surfaces; defaults off when not set.
+    #[must_use]
+    pub fn with_flow_source(
+        mut self,
+        flows: Option<Arc<crate::flow_source::FlowToolSource>>,
+    ) -> Self {
+        self.flows = flows;
+        self
+    }
+
+    /// Wire the playbook tool source so `playbook:`-prefixed tool refs resolve
+    /// to the playbooks the loaded packs carry. Defaults off when not set.
+    ///
+    /// Unlike every sibling source this one carries a TURN EFFECT as well as a
+    /// reader, because running a playbook is an LLM turn rather than an outbound
+    /// call — see `playbook_source`'s header.
+    #[must_use]
+    pub fn with_playbook_source(
+        mut self,
+        playbooks: Option<Arc<crate::playbook_source::PlaybookToolSource>>,
+    ) -> Self {
+        self.playbooks = playbooks;
+        self
+    }
+
+    /// Install the pack-carried sharing policy (`assets/run-context.json`).
+    /// Defaults off: with no policy every nested call shares nothing.
+    #[must_use]
+    pub fn with_share_policy(
+        mut self,
+        policy: Option<Arc<crate::share_policy::SharePolicy>>,
+    ) -> Self {
+        self.share_policy = policy;
+        self
+    }
+
+    /// The installed sharing policy, if any.
+    pub fn share_policy(&self) -> Option<&Arc<crate::share_policy::SharePolicy>> {
+        self.share_policy.as_ref()
+    }
+
+    /// Install the user ledger. Defaults off; the runner host installs one
+    /// only when the embedding host passed a door target AND a pack names the
+    /// agent (`assets/user-ledger.json`).
+    #[must_use]
+    pub fn with_user_ledger(
+        mut self,
+        binding: Option<Arc<crate::user_ledger::UserLedgerBinding>>,
+    ) -> Self {
+        self.user_ledger = binding;
+        self
+    }
+
+    /// The installed user ledger, if any.
+    pub fn user_ledger(&self) -> Option<&Arc<crate::user_ledger::UserLedgerBinding>> {
+        self.user_ledger.as_ref()
+    }
+
+    pub(crate) fn share_modes_for(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::share_policy::BindingModes>> {
+        self.share_policy
+            .as_ref()
+            .and_then(|p| p.for_agent(agent_id))
+    }
+
+    /// Attach a per-tenant SoRLa SoR tool source: `sorla:<pack>` tool refs
+    /// resolve to a SoR BusinessAction invoked over the host SoRX interact
+    /// client. Coexists with the mcp/component/flow sources.
+    #[must_use]
+    pub fn with_sorla_source(
+        mut self,
+        sorla: Option<Arc<crate::sorla_source::SorlaToolSource>>,
+    ) -> Self {
+        self.sorla = sorla;
+        self
+    }
+
+    /// Wire the A2A tool source so `a2a:`-prefixed tool refs resolve to
+    /// external A2A agents invoked over HTTP(S). Coexists with the
+    /// mcp/component/flow/sorla sources; defaults off when not set.
+    #[must_use]
+    pub fn with_a2a_source(mut self, a2a: Option<Arc<crate::a2a_source::A2aToolSource>>) -> Self {
+        self.a2a = a2a;
         self
     }
 
@@ -311,19 +491,81 @@ impl AgentRuntime {
         self
     }
 
+    /// Whether a knowledge / RAG backend is mounted. Mirrors the check
+    /// [`knowledge::knowledge_active`] applies against `runtime.knowledge` in the
+    /// agentic loop, exposed so hosts and tests can confirm the seam is wired
+    /// without issuing a (network-bound) [`Self::search_knowledge`] call.
+    ///
+    /// This answers "can retrieval be attempted at all", NOT "is a corpus
+    /// mounted": a host may mount a backend that delegates elsewhere per turn,
+    /// in which case this is true with no corpus behind it. Ask
+    /// [`knowledge::Knowledge::wrapped_backend`] for that, via
+    /// [`Self::knowledge_backend`].
+    #[must_use]
+    pub fn has_knowledge(&self) -> bool {
+        self.knowledge.is_some()
+    }
+
+    /// Whether an A2A tool source is wired, so `a2a:` refs can resolve.
+    ///
+    /// Exposed for the host's wiring regression test. The runtime is built in
+    /// runner-host, where this field is not visible, and a dropped
+    /// `with_a2a_source` call otherwise fails only as "the tool vanished" at
+    /// run time.
+    #[must_use]
+    pub fn has_a2a_source(&self) -> bool {
+        self.a2a.is_some()
+    }
+
+    /// The mounted knowledge backend, if any.
+    ///
+    /// Exposed so a host that mounts a SECOND backend can wrap the first
+    /// instead of replacing it: [`Self::with_knowledge`] overwrites the field,
+    /// and two mounts that each assume they are the only one would silently
+    /// disable whichever ran first.
+    #[must_use]
+    pub fn knowledge_backend(&self) -> Option<Arc<dyn knowledge::Knowledge>> {
+        self.knowledge.clone()
+    }
+
     /// Hybrid retrieval over the agent's knowledge corpus. Returns
     /// [`knowledge::KnowledgeError::NotConfigured`] when no backend is wired.
+    ///
+    /// `binding` is the agent's own `config.knowledge.knowledge` provider ref
+    /// for this turn. It is threaded through because a backend may delegate to
+    /// a target named in the binding's `params` — see
+    /// [`knowledge::Knowledge::search_bound`] for why that cannot ride on the
+    /// runtime-level field or inside [`knowledge::KnowledgeQuery`].
     pub async fn search_knowledge(
         &self,
         tenant: &TenantContext,
         query: knowledge::KnowledgeQuery,
+        binding: Option<&config::MemoryProviderRef>,
     ) -> knowledge::KnowledgeResult<Vec<knowledge::RetrievedChunk>> {
         let kb = self
             .knowledge
             .as_ref()
             .ok_or(knowledge::KnowledgeError::NotConfigured)?;
         let ctx = knowledge::to_types_tenant(tenant)?;
-        kb.search(&ctx, query).await
+        kb.search_bound(&ctx, query, binding).await
+    }
+
+    /// The card of the session's live parked `flow:` tool, if any. A host uses
+    /// it to keep the card on offer when a turn fails after the park was kept
+    /// (an LLM error or a lock timeout during a side turn), so the user's next
+    /// submit is not lost. `None` when nothing is parked, the park expired, or
+    /// the state cannot be read.
+    pub async fn parked_card(
+        &self,
+        tenant: &TenantContext,
+        session_id: &str,
+    ) -> Option<serde_json::Value> {
+        let state = self.state_store.load(tenant, session_id).await.ok()?;
+        let pending = state.pending_tool?;
+        if pending.is_expired(chrono::Utc::now()) {
+            return None;
+        }
+        pending.presentation
     }
 
     /// Execute one agentic step against the given session.
@@ -361,9 +603,39 @@ impl AgentRuntime {
 }
 
 /// Inbound user message handed to [`AgentRuntime::step`].
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentInput {
     pub text: String,
+    /// Whether THIS invocation is a conversational segment. Set from the flow
+    /// node's `conversational` flag so a node marked conversational makes the
+    /// agent's host `end_conversation` tool available (and the closing prompt
+    /// note) even when the agent's own [`AgentConfig::conversational`] default
+    /// is false — the node, not just the agent config, can opt in. OR-ed with
+    /// the agent config in the loop.
+    #[serde(default)]
+    pub conversational: bool,
+    /// The user's answer to a flow tool that parked this agent on a card
+    /// ([`TerminationReason::AwaitingToolInput`]) — typically the card's
+    /// submit. `Some` resumes the pending tool flow with it; `None` while a
+    /// tool is pending cancels that tool and treats `text` as an ordinary
+    /// message. Ignored when no tool is pending.
+    ///
+    /// [`TerminationReason::AwaitingToolInput`]: crate::error::TerminationReason::AwaitingToolInput
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_payload: Option<serde_json::Value>,
+}
+
+/// Token + iteration accounting for one [`AgentRuntime::step`]. Surfaced on
+/// [`AgentOutput`] so a caller (e.g. the designer's Run Demo trace) can show
+/// per-turn LLM usage without a separate telemetry channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StepUsage {
+    /// Prompt tokens summed across every LLM call in this step.
+    pub tokens_in: u64,
+    /// Completion tokens summed across every LLM call in this step.
+    pub tokens_out: u64,
+    /// Plan-Act-Observe iterations the loop ran this step.
+    pub iterations: u32,
 }
 
 /// Outbound reply produced by [`AgentRuntime::step`].
@@ -372,6 +644,23 @@ pub struct AgentOutput {
     pub reply: String,
     pub trail: Vec<AgentStep>,
     pub terminated_by: TerminationReason,
+    /// Per-step token + iteration usage (default zero for callers that don't
+    /// track it, e.g. mocks).
+    #[serde(default)]
+    pub usage: StepUsage,
+    /// What to show the user while the agent waits on a flow tool — set only
+    /// when `terminated_by` is [`TerminationReason::AwaitingToolInput`]. It is
+    /// the parked flow's own output at its park point (typically an Adaptive
+    /// Card), rendered in place of `reply`.
+    ///
+    /// [`TerminationReason::AwaitingToolInput`]: crate::error::TerminationReason::AwaitingToolInput
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_presentation: Option<serde_json::Value>,
+    /// True when this turn answered a typed message as a side turn while the
+    /// flow tool stayed parked; `reply` is the answer and
+    /// `pending_presentation` the card re-offered after it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub side_turn: bool,
 }
 
 /// One iteration of the Plan-Act-Observe loop, surfaced in the audit
@@ -380,10 +669,28 @@ pub struct AgentOutput {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentStep {
+    /// One LLM iteration's assistant output + token cost, recorded before that
+    /// iteration's tool calls. Lets a caller show a per-message breakdown (each
+    /// model call), not just the aggregate `AgentOutput.usage`. `content` is the
+    /// assistant text for the turn (empty when the model only emitted tool calls).
+    LlmCall {
+        content: String,
+        tokens_in: u64,
+        tokens_out: u64,
+    },
     ToolCall {
         name: String,
         call_id: String,
+        /// The arguments the model passed to the tool (its input). Lets a caller
+        /// show what was actually requested, not just the tool name. Defaults to
+        /// `null` for older trails that predate this field.
+        #[serde(default)]
+        args: serde_json::Value,
         result: serde_json::Value,
+        /// Wall-clock time spent dispatching this tool call, in milliseconds.
+        /// `0` for host built-ins that resolve instantly and for older trails.
+        #[serde(default)]
+        duration_ms: u64,
     },
     ToolCallReused {
         name: String,
@@ -395,5 +702,27 @@ pub enum AgentStep {
     },
     Reply {
         text: String,
+    },
+    /// The worker's BUILT-IN knowledge base (`KnowledgeSettings`) was searched
+    /// for this turn and returned `chunks`, which were injected into the system
+    /// prompt before the first LLM call. Recorded once per step, ahead of every
+    /// `LlmCall`, and only when retrieval succeeded with at least one chunk — a
+    /// failed or empty retrieval injects nothing and so has nothing to cite.
+    ///
+    /// This is NOT a tool call: the model did not ask for it, the loop ran it.
+    /// Recording it as a synthetic `ToolCall` would inflate tool-call counts and
+    /// anything metering them. It exists so a trail consumer (greentic-start's
+    /// `agent_provenance`) can cite what a knowledge-grounded answer drew on.
+    ///
+    /// The chunks are recorded faithfully, text included: the trail is
+    /// server-side data. Whether a chunk's text may reach an end user's
+    /// browser is the CONSUMER's disclosure decision, not the runtime's.
+    ///
+    /// Adding a variant to this `#[serde(tag = "kind")]` enum is a contract
+    /// change: a strict `Vec<AgentStep>` deserialiser built against an older
+    /// runtime rejects `"kind": "knowledge_retrieval"`. Readers must skip kinds
+    /// they do not know.
+    KnowledgeRetrieval {
+        chunks: Vec<knowledge::RetrievedChunk>,
     },
 }

@@ -6,9 +6,6 @@ expression: normalized_actual
   "output": [
     {
       "status": "ok"
-    },
-    {
-      "status": "ok"
     }
   ],
   "state": null,

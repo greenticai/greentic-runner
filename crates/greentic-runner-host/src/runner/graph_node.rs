@@ -49,11 +49,12 @@ mod aw {
     use greentic_aw_runtime::tools::dispatch_tool_call;
     use greentic_aw_runtime::{
         AgentConfig, AgentInput, AgentLimits, AgentOutput, AgentRuntime, LlmBackend,
-        LlmProviderRef, StepObserver, Telemetry, TenantContext, TokenMeter,
+        LlmProviderRef, StepObserver, Telemetry, TenantContext, TokenMeter, ToolRef,
     };
     use greentic_ext_runtime::ExtensionRuntime;
     use serde_json::{Value, json};
 
+    use crate::runner::knowledge_index::IndexMount;
     use crate::trace::agent_audit::AgentAuditObserver;
     use crate::trace::audit_sink::AuditSink;
 
@@ -334,47 +335,76 @@ mod aw {
     /// telemetry, token meter, ledger) are built exactly as for the single-agent
     /// path; the durable checkpoint store reuses the same multiplexed Redis
     /// connection manager.
+    ///
+    /// `tenant`, `secrets` and `unit` are the values the `dw.agent` handler of
+    /// the same `TenantRuntime` receives (`unit` is the deployed unit's
+    /// `bundle_id`, `None` on the legacy tenant-only path). They feed only the
+    /// pack-carried A2A tool source ([`graph_a2a_source`]) and, `tenant` and
+    /// `secrets` only, the Chronicle-index knowledge mount ([`IndexMount`]);
+    /// the rest of this path keeps its env-only secrets, as before.
+    ///
+    /// Bills every turn through `agent_node::resolve_billing_meter(None)` (the
+    /// env-configured sink, or none); see [`build_graph_node_handler_metered`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_graph_node_handler(
         graphs: HashMap<String, GraphConfig>,
         audit_sink: Option<AuditSink>,
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        unit: Option<String>,
     ) -> Option<Arc<dyn GraphNodeHandler>> {
-        use greentic_aw_runtime::cost::RedisTokenMeter;
-        use greentic_aw_runtime::graph::RedisCheckpointStore;
-        use greentic_aw_runtime::tools::RedisToolLedger;
-        use greentic_aw_runtime::{OtelTelemetry, RedisAgentStateStore};
+        build_graph_node_handler_metered(
+            graphs,
+            audit_sink,
+            packs,
+            merged_agents,
+            tenant,
+            secrets,
+            unit,
+            super::super::agent_node::resolve_billing_meter(None),
+        )
+        .await
+    }
+
+    /// [`build_graph_node_handler`] with the `TenantRuntime`'s already-resolved
+    /// billing sink, shared with its `dw.agent` runtime. Every agent and
+    /// supervisor turn bills through it, attributed to `unit` as `project_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_graph_node_handler_metered(
+        graphs: HashMap<String, GraphConfig>,
+        audit_sink: Option<AuditSink>,
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        unit: Option<String>,
+        billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+    ) -> Option<Arc<dyn GraphNodeHandler>> {
+        use crate::runner::aw_backends::{AwBackends, build_aw_backends};
+        use greentic_aw_runtime::OtelTelemetry;
 
         if graphs.is_empty() {
             return None; // nothing to serve
         }
 
-        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
-            Ok(url) if !url.is_empty() => url,
-            _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgentGraph nodes disabled");
-                return None;
-            }
-        };
-
-        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                tracing::warn!(error = %error, "AW Redis connect failed; DwAgentGraph nodes disabled");
-                return None;
-            }
-        };
-
-        // Share the multiplexed connection manager across all Redis-backed
-        // stores (state, checkpoint, token meter, idempotency ledger).
-        let manager = state_store.manager();
-        let checkpoint = Arc::new(RedisCheckpointStore::new(manager.clone()));
-        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
-        let ledger = Arc::new(RedisToolLedger::new(manager));
+        let AwBackends {
+            state_store,
+            token_meter,
+            tool_ledger: ledger,
+            checkpoint_store: checkpoint,
+        } = build_aw_backends().await?;
 
         // Process-level graph serve path has no per-tenant secrets context;
-        // tool secrets resolve from the env only.
-        let ext_runtime = super::super::agent_node::build_ext_runtime(std::sync::Arc::new(
-            super::super::agent_node::EnvSecretsBackend,
-        ))?;
+        // tool secrets resolve from the env only. It likewise has no embedding
+        // host, so the ext LLM port falls back to the env-keyed `EnvLlmPort`.
+        let ext_runtime = super::super::agent_node::build_ext_runtime(
+            std::sync::Arc::new(super::super::agent_node::EnvSecretsBackend),
+            None,
+            None,
+            &packs,
+        )?;
         let llm = super::super::agent_node::build_llm_backend(&ext_runtime);
         let telemetry = Arc::new(OtelTelemetry);
 
@@ -399,6 +429,14 @@ mod aw {
             None => Arc::new(local),
         };
 
+        let a2a_source = graph_a2a_source(&packs, &tenant, &secrets, unit.as_deref());
+        // Chronicle-index retrieval for `agent_ref` turns. Captured here, with
+        // the runtime's own secrets tenant, so the mount does not depend on the
+        // tenant each turn happens to run under.
+        let index_mount = IndexMount {
+            secrets: Some(super::super::agent_node::mcp_secrets_manager(&secrets)),
+            secret_tenant: Some(tenant.clone()),
+        };
         let handler = RuntimeGraphNodeHandler::from_parts(
             provider,
             checkpoint,
@@ -409,10 +447,43 @@ mod aw {
             token_meter,
             ledger,
             audit_sink,
-        );
+            packs,
+            Arc::new(merged_agents),
+            a2a_source,
+            index_mount,
+        )
+        .with_billing(billing_meter, unit);
 
         tracing::info!(graph_count, "AW graph runtime constructed");
         Some(Arc::new(handler))
+    }
+
+    /// The pack-carried A2A tool source for a graph handler's agent turns and
+    /// Tool nodes.
+    ///
+    /// Built from exactly the inputs the single-turn `dw.agent` runtime uses —
+    /// the same packs, tenant and deployed unit, and the same remote-tool
+    /// secrets manager (`agent_node::mcp_secrets_manager`, so an explicit
+    /// `SECRETS_BACKEND` wins here too) — through the same helper, so
+    /// `GREENTIC_AW_A2A=0`, first-pack-wins dedup and the credential URI
+    /// (`secrets://default/<tenant>/<auth_team|_>/a2a/<agent_id>[.unit-<seg>]`)
+    /// cannot differ between the two paths.
+    ///
+    /// Built once per handler, not per turn: the handler belongs to one
+    /// `TenantRuntime`, so tenant, unit and packs are fixed for its lifetime,
+    /// and rebuilding per turn would throw away the source's agent-card cache.
+    pub(crate) fn graph_a2a_source(
+        packs: &[Arc<crate::pack::PackRuntime>],
+        tenant: &str,
+        secrets: &crate::secrets::DynSecretsManager,
+        unit: Option<&str>,
+    ) -> Option<Arc<greentic_aw_runtime::A2aToolSource>> {
+        crate::runner::a2a_pack_source::a2a_source_from_packs(
+            packs,
+            tenant,
+            Some(super::super::agent_node::mcp_secrets_manager(secrets)),
+            unit,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -445,12 +516,46 @@ mod aw {
             &self,
             audit_sink: Option<AuditSink>,
             real_tenant: greentic_types::TenantCtx,
+            billing: TurnBilling,
         ) -> AgentTurnFn;
         fn supervisor(
             &self,
             audit_sink: Option<AuditSink>,
             real_tenant: greentic_types::TenantCtx,
+            billing: TurnBilling,
         ) -> SupervisorFn;
+    }
+
+    /// How a graph turn's LLM spend is billed: the `TenantRuntime`'s shared
+    /// billing sink (`agent_node::resolve_billing_meter` — the host-installed
+    /// per-unit meter, else the env-configured one, else none) and the deployed
+    /// unit (`bundle_id`) the spend is attributed to as `project_id`.
+    ///
+    /// Before this existed every graph turn ran on the per-visit runtime's
+    /// default `NoopBillingMeter` under a synthetic `("graph", "run")` tenant,
+    /// so agent-graph workers emitted no usage at all.
+    #[derive(Clone, Default)]
+    pub(crate) struct TurnBilling {
+        pub(crate) meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+        pub(crate) project_id: Option<String>,
+    }
+
+    impl TurnBilling {
+        /// The [`TenantContext`] a graph turn runs (and bills) under: the REAL
+        /// tenant/env the flow node was dispatched with, plus the unit.
+        fn turn_tenant(&self, real_tenant: &greentic_types::TenantCtx) -> TenantContext {
+            TenantContext::new(real_tenant.tenant_id.as_str(), real_tenant.env.as_str())
+                .with_project_id(self.project_id.clone())
+        }
+
+        /// Install the shared sink on a per-visit runtime; no sink leaves the
+        /// runtime's `NoopBillingMeter` in place.
+        fn install(&self, runtime: AgentRuntime) -> AgentRuntime {
+            match &self.meter {
+                Some(meter) => runtime.with_billing_meter(Arc::clone(meter)),
+                None => runtime,
+            }
+        }
     }
 
     /// Production [`TurnEffectSource`]: holds the constituent runtime Arcs
@@ -466,6 +571,27 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        /// MCP tool source, built ONCE (mirrors the other Arcs) so its 5-min
+        /// TTL catalog cache + warmed HTTP client are reused across every
+        /// graph-agent visit rather than rebuilt (empty-cache) per turn.
+        mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        /// Pack-carried A2A tool source ([`graph_a2a_source`]), built once for
+        /// the same reason as `mcp_source`: its agent-card cache is reused
+        /// across every graph-agent visit. The supervisor stays tool-free.
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+        /// The tenant's loaded packs, used to build a fresh, tenant-scoped
+        /// [`greentic_aw_runtime::ComponentToolSource`] on EVERY turn (unlike
+        /// `mcp_source`, this is NOT built once — the component source is
+        /// tenant-pinned, and building it per turn from the in-memory pack
+        /// list is cheap; see [`run_one_agent_turn`]).
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        /// Process-level merged agent configs (pack + operator-overridden),
+        /// threaded into [`run_one_agent_turn`] so a graph node's `agent_ref`
+        /// resolves to that agent's full [`AgentConfig`] at turn time.
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
+        /// Chronicle-index knowledge mount for `agent_ref` turns, carrying the
+        /// real tenant's secrets (see [`build_graph_node_handler`]).
+        index_mount: IndexMount,
     }
 
     impl TurnEffectSource for RuntimeTurnSource {
@@ -473,6 +599,7 @@ mod aw {
             &self,
             audit_sink: Option<AuditSink>,
             real_tenant: greentic_types::TenantCtx,
+            billing: TurnBilling,
         ) -> AgentTurnFn {
             build_agent_turn(
                 self.state_store.clone(),
@@ -481,8 +608,14 @@ mod aw {
                 self.telemetry.clone(),
                 self.token_meter.clone(),
                 self.ledger.clone(),
+                self.mcp_source.clone(),
+                self.a2a_source.clone(),
+                self.packs.clone(),
+                self.merged_agents.clone(),
+                self.index_mount.clone(),
                 audit_sink,
                 real_tenant,
+                billing,
             )
         }
 
@@ -490,6 +623,7 @@ mod aw {
             &self,
             audit_sink: Option<AuditSink>,
             real_tenant: greentic_types::TenantCtx,
+            billing: TurnBilling,
         ) -> SupervisorFn {
             build_supervisor(
                 self.state_store.clone(),
@@ -498,8 +632,10 @@ mod aw {
                 self.telemetry.clone(),
                 self.token_meter.clone(),
                 self.ledger.clone(),
+                self.merged_agents.clone(),
                 audit_sink,
                 real_tenant,
+                billing,
             )
         }
     }
@@ -520,6 +656,7 @@ mod aw {
             &self,
             _audit_sink: Option<AuditSink>,
             _real_tenant: greentic_types::TenantCtx,
+            _billing: TurnBilling,
         ) -> AgentTurnFn {
             self.agent_turn.clone()
         }
@@ -528,6 +665,7 @@ mod aw {
             &self,
             _audit_sink: Option<AuditSink>,
             _real_tenant: greentic_types::TenantCtx,
+            _billing: TurnBilling,
         ) -> SupervisorFn {
             self.supervisor.clone()
         }
@@ -535,8 +673,9 @@ mod aw {
 
     /// Production [`GraphNodeHandler`] wrapping the durable graph executor.
     ///
-    /// Tool dispatch goes straight through the shared [`ExtensionRuntime`] via
-    /// [`dispatch_tool_call`].
+    /// Tool dispatch goes through the shared [`ExtensionRuntime`] via
+    /// [`dispatch_tool_call`], with `a2a:` refs routed to the handler's
+    /// pack-carried A2A catalog.
     pub struct RuntimeGraphNodeHandler {
         graphs: Arc<dyn GraphConfigSource>,
         checkpoint: Arc<dyn CheckpointStore>,
@@ -550,9 +689,26 @@ mod aw {
         /// `run_agent_step` seam then stays on the plain `.step()` path,
         /// byte-identical regardless of this field's value.
         audit_sink: Option<AuditSink>,
+        /// Billing sink + unit for every agent and supervisor turn (see
+        /// [`TurnBilling`]). Default: no sink, no unit — set by
+        /// [`RuntimeGraphNodeHandler::with_billing`].
+        billing: TurnBilling,
     }
 
     impl RuntimeGraphNodeHandler {
+        /// Bill every agent and supervisor turn through `meter`, attributed to
+        /// the deployed unit `project_id` (the revision's `bundle_id`). `None`
+        /// keeps the per-visit runtimes on `NoopBillingMeter`.
+        #[must_use]
+        pub fn with_billing(
+            mut self,
+            meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
+            project_id: Option<String>,
+        ) -> Self {
+            self.billing = TurnBilling { meter, project_id };
+            self
+        }
+
         /// Build a handler from the runtime's constituent parts.
         ///
         /// **Deviation from the Task-7 `from_runtime(runtime: Arc<AgentRuntime>, …)`
@@ -575,8 +731,20 @@ mod aw {
             token_meter: Arc<dyn TokenMeter>,
             ledger: Arc<dyn ToolLedger>,
             audit_sink: Option<AuditSink>,
+            packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+            merged_agents: Arc<HashMap<String, AgentConfig>>,
+            a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+            index_mount: IndexMount,
         ) -> Self {
-            let tool = build_tool(ext_runtime.clone());
+            // The Tool node and the agent turns share one A2A source, so an
+            // `a2a:` ref resolves identically whichever of the two dispatches it.
+            let tool = build_tool(ext_runtime.clone(), a2a_source.clone());
+            // Built once here (like the other Arcs) so the MCP catalog cache +
+            // HTTP client are reused across every graph-agent turn.
+            // No per-tenant secrets manager reachable in this constructor
+            // (out of scope for this task — see `agent_node::mcp_source_from_env`'s
+            // doc comment); matches this path's pre-existing behavior.
+            let mcp_source = super::super::agent_node::mcp_source_from_env(None);
             let turn_source: Arc<dyn TurnEffectSource> = Arc::new(RuntimeTurnSource {
                 state_store: state_store.clone(),
                 ext_runtime,
@@ -584,6 +752,11 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                mcp_source,
+                a2a_source,
+                packs,
+                merged_agents,
+                index_mount,
             });
             // NOTE: the real `ApprovalFn` is designer-provided (it wires the
             // `greentic.approval.request.v1` / `.response.v1` NATS round trip
@@ -603,6 +776,7 @@ mod aw {
                 tool,
                 approval,
                 audit_sink,
+                billing: TurnBilling::default(),
             }
         }
 
@@ -633,6 +807,7 @@ mod aw {
                 tool,
                 approval,
                 audit_sink: None,
+                billing: TurnBilling::default(),
             }
         }
 
@@ -789,20 +964,24 @@ mod aw {
             };
 
             // The real tenant/env `execute` already received — the same one
-            // driving executor/checkpoint/run-id above. (The synthetic
-            // `"graph"`/`"run"` tenant is built *inside* the turn functions,
-            // for per-visit AgentRuntime *state* only.) Rebuilt fresh on
+            // driving executor/checkpoint/run-id above. (The turn functions
+            // build their per-visit `TenantContext` from it plus the unit —
+            // see `TurnBilling::turn_tenant`.) Rebuilt fresh on
             // every call — see `TurnEffectSource` — so the sink + real tenant
             // reach `run_one_agent_turn`/`run_one_supervisor_turn`, which feed
             // them into the shared `run_agent_step` seam that builds the
             // `AgentAuditObserver` (EPIC-B B-3b Task 2).
             let real_tenant = tenant_ctx_for_audit(tenant_id, env_id);
-            let agent_turn = self
-                .turn_source
-                .agent_turn(self.audit_sink.clone(), real_tenant.clone());
-            let supervisor = self
-                .turn_source
-                .supervisor(self.audit_sink.clone(), real_tenant);
+            let agent_turn = self.turn_source.agent_turn(
+                self.audit_sink.clone(),
+                real_tenant.clone(),
+                self.billing.clone(),
+            );
+            let supervisor = self.turn_source.supervisor(
+                self.audit_sink.clone(),
+                real_tenant,
+                self.billing.clone(),
+            );
 
             let executor = GraphExecutor::new(
                 self.checkpoint.clone(),
@@ -930,8 +1109,14 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
+        index_mount: IndexMount,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
+        billing: TurnBilling,
     ) -> AgentTurnFn {
         Arc::new(move |req: AgentTurnRequest| {
             let state_store = state_store.clone();
@@ -940,8 +1125,14 @@ mod aw {
             let telemetry = telemetry.clone();
             let token_meter = token_meter.clone();
             let ledger = ledger.clone();
+            let mcp_source = mcp_source.clone();
+            let a2a_source = a2a_source.clone();
+            let packs = packs.clone();
+            let merged_agents = merged_agents.clone();
             let audit_sink = audit_sink.clone();
             let real_tenant = real_tenant.clone();
+            let index_mount = index_mount.clone();
+            let billing = billing.clone();
             Box::pin(async move {
                 run_one_agent_turn(
                     req,
@@ -951,8 +1142,14 @@ mod aw {
                     telemetry,
                     token_meter,
                     ledger,
+                    mcp_source,
+                    a2a_source,
+                    packs,
+                    merged_agents,
                     audit_sink.as_ref(),
                     &real_tenant,
+                    &index_mount,
+                    &billing,
                 )
                 .await
             }) as BoxFut<'static, Result<AgentTurnResult, GraphExecError>>
@@ -965,13 +1162,11 @@ mod aw {
     /// [`run_one_agent_turn`] and [`run_one_supervisor_turn`] so the
     /// audit-injection seam is defined exactly once.
     ///
-    /// `tenant`/`session_id`/`agent_id` are the per-visit SYNTHETIC state
-    /// identifiers (`TenantContext::new("graph", "run")` + the derived
-    /// session/agent ids) — unchanged by this wiring, since the
-    /// `AgentRuntime`'s state store must keep using them for per-visit
-    /// durability. `real_tenant` is used ONLY to build the audit observer's
-    /// `TenantCtx`, so audit events publish under the real tenant while turn
-    /// state stays keyed under "graph"/"run".
+    /// `tenant`/`session_id`/`agent_id` are the per-visit state identifiers
+    /// (`TurnBilling::turn_tenant` — the real tenant/env plus the unit — and
+    /// the derived session/agent ids); `tenant` is also what the billing sink
+    /// attributes the turn to. `real_tenant` is used ONLY to build the audit
+    /// observer's `TenantCtx`, unchanged by the billing wiring.
     ///
     /// Off by default: when `audit_sink` is `None` (no NATS audit client
     /// configured), this is exactly `runtime.step(...)` — byte-identical to
@@ -1001,6 +1196,116 @@ mod aw {
         }
     }
 
+    /// Parse a graph node's declared tool reference string into a [`ToolRef`].
+    ///
+    /// Format convention: `"<extension_id>/<tool_name>"`, split on the LAST
+    /// `/` (so an `extension_id` that itself contains `/`, e.g.
+    /// `"component:owner/repo"`, is preserved intact). Returns `None` — with a
+    /// `tracing::warn!` naming the skipped string — when there is no `/`, or
+    /// when either side of the split is empty. Never panics: this runs against
+    /// node-authored config, not host-controlled input.
+    fn parse_tool_ref(s: &str) -> Option<ToolRef> {
+        match s.rsplit_once('/') {
+            Some((extension_id, tool_name))
+                if !extension_id.is_empty() && !tool_name.is_empty() =>
+            {
+                Some(ToolRef {
+                    extension_id: extension_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    description: None,
+                    input_schema: None,
+                    usage_note: None,
+                })
+            }
+            _ => {
+                tracing::warn!(tool_ref = %s, "skipping malformed graph-node tool ref (expected \"<extension_id>/<tool_name>\")");
+                None
+            }
+        }
+    }
+
+    /// Map a graph node's declared `tools: Vec<String>` (see
+    /// [`AgentTurnRequest::tools`]) to the `Vec<ToolRef>` the ephemeral
+    /// per-visit [`AgentConfig`] expects. Malformed entries are dropped by
+    /// [`parse_tool_ref`] (warned, never fatal) rather than failing the turn.
+    fn map_tool_refs(tools: &[String]) -> Vec<ToolRef> {
+        tools.iter().filter_map(|t| parse_tool_ref(t)).collect()
+    }
+
+    /// The [`AgentConfig`] a graph agent-turn runs.
+    ///
+    /// `req.agent_ref` present (`Some(id)`) → the full published config
+    /// resolved from `merged` (memory/knowledge/guardrails intact, exactly as
+    /// stored) — errors when `id` is not in the map. `req.agent_ref` absent
+    /// (`None`) → the stripped ephemeral config fabricated from the node's
+    /// own inline fields (today's unchanged one-shot behaviour: no
+    /// guardrails, no memory, no knowledge).
+    fn resolve_turn_config(
+        req: &AgentTurnRequest,
+        merged: &HashMap<String, AgentConfig>,
+        agent_id: &str,
+    ) -> Result<AgentConfig, GraphExecError> {
+        if let Some(id) = req.agent_ref.as_deref() {
+            return merged.get(id).cloned().ok_or_else(|| {
+                GraphExecError::AgentTurn(format!("referenced agent '{id}' not found"))
+            });
+        }
+        // `inherit_from` is the specialist case: keep this node's own prompt and
+        // model — that is what makes a specialist a specialist — but adopt the
+        // referenced worker's capability surface. Using `agent_ref` here instead
+        // would overwrite the prompt and collapse every specialist in a
+        // generated graph into an identical copy of its parent.
+        //
+        // Like the supervisor path, an id that does not resolve FAILS rather
+        // than running stripped: a specialist believed to be guarded and
+        // tool-equipped but running bare is worse than one that never claimed
+        // to be.
+        if let Some(id) = req.inherit_from.as_deref() {
+            let parent = merged.get(id).ok_or_else(|| {
+                GraphExecError::AgentTurn(format!(
+                    "node '{}': inherit_from '{}' not found in merged agents; \
+                     refusing to run without its tools and guardrails",
+                    req.node_id, id
+                ))
+            })?;
+            return Ok(AgentConfig {
+                agent_id: agent_id.to_string(),
+                system_prompt: req.system_prompt.clone(),
+                llm: LlmProviderRef {
+                    provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
+                    model: req.model.clone(),
+                    credential_ref: None,
+                },
+                // Inherited capability surface.
+                tools: parent.tools.clone(),
+                guardrails: parent.guardrails.clone(),
+                memory: parent.memory.clone(),
+                knowledge: parent.knowledge.clone(),
+                limits: parent.limits.clone(),
+                conversational: false,
+                opening_message: None,
+                on_text_while_parked: Default::default(),
+            });
+        }
+        Ok(AgentConfig {
+            agent_id: agent_id.to_string(),
+            system_prompt: req.system_prompt.clone(),
+            tools: map_tool_refs(&req.tools),
+            guardrails: vec![],
+            llm: LlmProviderRef {
+                provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
+                model: req.model.clone(),
+                credential_ref: None,
+            },
+            limits: AgentLimits::default(),
+            memory: None,
+            knowledge: None,
+            conversational: false,
+            opening_message: None,
+            on_text_while_parked: Default::default(),
+        })
+    }
+
     /// Drive one [`AgentRuntime::step`] for an agent-node visit. Derives the
     /// agent/session ids, seeds conversation context, runs the step, and maps the
     /// reply's resolution sentinel.
@@ -1008,6 +1313,13 @@ mod aw {
     /// `audit_sink`/`real_tenant` are forwarded to [`run_agent_step`], which
     /// injects an [`AgentAuditObserver`] built from `real_tenant` when a sink
     /// is configured (EPIC-B B-3b Task 2).
+    ///
+    /// When `req.agent_ref` is `Some`, [`resolve_turn_config`] resolves the
+    /// full published `AgentConfig` from `merged_agents` and the runtime is
+    /// built with the same fidelity as `agent_node::build_agent_runtime`
+    /// (guardrails + short-term memory + feature-gated long-term/knowledge).
+    /// `agent_ref: None` stays byte-unchanged: the stripped ephemeral config,
+    /// no guardrails/memory/knowledge attached.
     #[allow(clippy::too_many_arguments)]
     async fn run_one_agent_turn(
         req: AgentTurnRequest,
@@ -1017,15 +1329,25 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
+        index_mount: &IndexMount,
+        billing: &TurnBilling,
     ) -> Result<AgentTurnResult, GraphExecError> {
         // The request carries no tenant/graph/session — they live on the
         // GraphRunState's seeded session. The executor seeds the run state with
-        // the tenant-scoped messages, so we reconstruct a turn-scoped tenant +
-        // session purely for the per-visit runtime. Conversation durability is
-        // owned by the graph checkpoint, not this ephemeral store.
-        let tenant = TenantContext::new("graph", "run");
+        // the tenant-scoped messages, so we reconstruct a turn-scoped session
+        // purely for the per-visit runtime. Conversation durability is owned by
+        // the graph checkpoint, not this ephemeral store.
+        //
+        // The tenant is the REAL one the node was dispatched with (plus the
+        // deployed unit), not a synthetic `("graph", "run")`: it is also the
+        // tenant the billing sink attributes this turn's LLM spend to.
+        let tenant = billing.turn_tenant(real_tenant);
         let session_id = format!("graph__{}", req.node_id);
         let agent_id = format!("graph.{}", req.node_id);
 
@@ -1036,34 +1358,82 @@ mod aw {
             )));
         }
 
-        let cfg = AgentConfig {
-            agent_id: agent_id.clone(),
-            system_prompt: req.system_prompt.clone(),
-            tools: vec![],
-            guardrails: vec![],
-            llm: LlmProviderRef {
-                provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
-                model: req.model.clone(),
-                credential_ref: None,
-            },
-            limits: AgentLimits::default(),
-            memory: None,
-            knowledge: None,
-        };
+        let cfg = resolve_turn_config(&req, &merged_agents, &agent_id)?;
+        // Key the config provider — and the `.step()` call — by the id the
+        // runtime will actually resolve config under: the referenced agent's
+        // own id when `agent_ref` is set (so guardrail/memory/knowledge
+        // bindings on that published agent are addressed correctly), else the
+        // synthetic per-node id used today.
+        let step_agent_id = req.agent_ref.clone().unwrap_or_else(|| agent_id.clone());
         let mut provider = InMemoryConfigProvider::new();
-        provider.insert(&tenant, &agent_id, cfg);
+        provider.insert(&tenant, &step_agent_id, cfg.clone());
 
-        // TODO(guardrail): inline graph-node AgentRuntime bypasses guardrails (v1 scope is dw.agent flow nodes only).
-        let runtime = AgentRuntime::new(
+        // TODO(guardrail): inline (agent_ref: None) graph-node AgentRuntime bypasses
+        // guardrails (v1 scope is dw.agent flow nodes only). A referenced agent
+        // (agent_ref: Some) gets full guardrail/memory/knowledge fidelity below.
+        // MCP tool source: mirror the `dw.agent` path so a graph agent declaring an
+        // `mcp:<server>/<tool>` ref resolves it against the tenant's registered MCP
+        // servers (same double-authorization: tenant registers the server + the node's
+        // tool allowlist must reference it). `None` unless the admin creds are set.
+        //
+        // Component tool source: unlike `mcp_source` (built once, reused across
+        // every graph-agent visit), the component source is tenant-pinned, so it
+        // is rebuilt PER TURN from the in-memory `packs` list — cheap, and keeps
+        // a `component:<ref>` tool ref scoped to the real tenant.
+        let component_source = super::super::agent_node::component_source_from_packs(
+            &packs,
+            real_tenant.tenant_id.as_str(),
+        );
+        let mut runtime = AgentRuntime::new(
             Arc::new(provider),
             state_store,
-            ext_runtime,
+            ext_runtime.clone(),
             llm,
             telemetry,
             token_meter,
             ledger,
-            None,
-        );
+            mcp_source,
+        )
+        .with_component_source(component_source)
+        // A2A: the handler's pack-carried source (see `graph_a2a_source`),
+        // for inline, inheriting and referenced agents alike — exactly what
+        // the single-turn `dw.agent` runtime attaches.
+        .with_a2a_source(a2a_source);
+        runtime = billing.install(runtime);
+
+        // Full fidelity ONLY for a referenced agent — mirrors
+        // `agent_node::build_agent_runtime`'s guardrail/short-term-memory/
+        // long-term/knowledge attachment sequence exactly. The `agent_ref:
+        // None` inline path stays byte-unchanged (no guardrails/memory/
+        // knowledge), preserving today's one-shot graph-node behaviour.
+        if req.agent_ref.is_some() {
+            runtime = runtime
+                .with_guardrails(
+                    Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
+                        cfg.guardrails.clone(),
+                    )),
+                    Arc::new(
+                        greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
+                            ext_runtime: ext_runtime.clone(),
+                        },
+                    ),
+                )
+                .with_short_term_memory(Arc::new(
+                    greentic_aw_runtime::memory::InMemoryMemoryProvider::new(),
+                ));
+            // Long-term memory and corpus knowledge from every registered
+            // agent-runtime extension (see `runtime_ext`).
+            runtime = crate::runner::runtime_ext::attach_all(runtime).await;
+            // Knowledge delegated to a design-extension tool. Not feature-gated
+            // (see `knowledge_ext`); it wraps whatever corpus backend an
+            // extension above left in place. Inside the `agent_ref.is_some()` arm with the rest
+            // of the full-fidelity attachment sequence, so the `agent_ref: None`
+            // inline path stays byte-unchanged.
+            // Chronicle-index retrieval beneath it, reading its credentials
+            // under the secrets tenant the mount captured at construction.
+            runtime = index_mount.attach(runtime);
+            runtime = crate::runner::knowledge_ext::attach(runtime, ext_runtime.clone());
+        }
 
         // The latest user turn is the most recent user message in the seeded log
         // (the executor pushes the initial user message and re-seeds it here);
@@ -1071,13 +1441,14 @@ mod aw {
         // input as a fresh user turn, so an empty string keeps the history intact.
         let input = AgentInput {
             text: String::new(),
+            ..Default::default()
         };
 
         let out = run_agent_step(
             &runtime,
             tenant.clone(),
             &session_id,
-            &agent_id,
+            &step_agent_id,
             input,
             audit_sink,
             real_tenant,
@@ -1111,10 +1482,13 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
+        billing: TurnBilling,
     ) -> SupervisorFn {
         Arc::new(move |req: SupervisorRequest| {
+            let merged_agents = merged_agents.clone();
             let state_store = state_store.clone();
             let ext_runtime = ext_runtime.clone();
             let llm = llm.clone();
@@ -1123,6 +1497,7 @@ mod aw {
             let ledger = ledger.clone();
             let audit_sink = audit_sink.clone();
             let real_tenant = real_tenant.clone();
+            let billing = billing.clone();
             Box::pin(async move {
                 run_one_supervisor_turn(
                     req,
@@ -1132,12 +1507,44 @@ mod aw {
                     telemetry,
                     token_meter,
                     ledger,
+                    merged_agents,
                     audit_sink.as_ref(),
                     &real_tenant,
+                    &billing,
                 )
                 .await
             }) as BoxFut<'static, Result<SupervisorResult, GraphExecError>>
         })
+    }
+
+    /// Resolve the guardrails a supervisor node runs under.
+    ///
+    /// A supervisor inherits its worker's GUARDRAILS and nothing else — it
+    /// routes, it does not work, so tools, memory and knowledge stay unset.
+    /// Guardrails are the exception because this node sees the operator's raw
+    /// input first: it is where inbound content-safety has to run.
+    ///
+    /// An `agent_ref` that does not resolve FAILS the turn rather than routing
+    /// unguarded. A supervisor believed to be protected but running bare is the
+    /// precise failure this inheritance exists to prevent, and a silent
+    /// downgrade would be indistinguishable from success.
+    fn resolve_supervisor_guardrails(
+        agent_ref: Option<&str>,
+        merged: &HashMap<String, AgentConfig>,
+        node_id: &str,
+    ) -> Result<Vec<greentic_aw_runtime::config::GuardrailRef>, GraphExecError> {
+        let Some(id) = agent_ref else {
+            return Ok(vec![]);
+        };
+        merged
+            .get(id)
+            .map(|parent| parent.guardrails.clone())
+            .ok_or_else(|| {
+                GraphExecError::Supervisor(format!(
+                    "node '{node_id}': agent_ref '{id}' not found in merged agents; \
+                     refusing to route without its guardrails"
+                ))
+            })
     }
 
     /// Drive one supervisor routing turn via [`AgentRuntime::step`].
@@ -1170,10 +1577,13 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
+        billing: &TurnBilling,
     ) -> Result<SupervisorResult, GraphExecError> {
-        let tenant = TenantContext::new("graph", "run");
+        // Real tenant + unit, as for an agent turn: routing is an LLM call too.
+        let tenant = billing.turn_tenant(real_tenant);
         let session_id = format!("graph__{}_sup", req.node_id);
         let agent_id = format!("graph.{}.supervisor", req.node_id);
 
@@ -1193,11 +1603,14 @@ mod aw {
             )));
         }
 
+        let guardrails =
+            resolve_supervisor_guardrails(req.agent_ref.as_deref(), &merged_agents, &req.node_id)?;
+
         let cfg = AgentConfig {
             agent_id: agent_id.clone(),
             system_prompt: routing_system_prompt,
             tools: vec![],
-            guardrails: vec![],
+            guardrails,
             llm: LlmProviderRef {
                 provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
                 model: req.model.clone(),
@@ -1206,12 +1619,14 @@ mod aw {
             limits: AgentLimits::default(),
             memory: None,
             knowledge: None,
+            conversational: false,
+            opening_message: None,
+            on_text_while_parked: Default::default(),
         };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
-        // TODO(guardrail): inline graph-node AgentRuntime bypasses guardrails (v1 scope is dw.agent flow nodes only).
-        let runtime = AgentRuntime::new(
+        let runtime = billing.install(AgentRuntime::new(
             Arc::new(provider),
             state_store,
             ext_runtime,
@@ -1222,10 +1637,11 @@ mod aw {
             // Supervisor routing runs with an empty tool list; MCP tools are
             // never offered on this path.
             None,
-        );
+        ));
 
         let input = AgentInput {
             text: String::new(),
+            ..Default::default()
         };
 
         let out = run_agent_step(
@@ -1315,10 +1731,14 @@ mod aw {
     /// [`GraphExecError::Tool`]. Dispatch goes through the shared
     /// [`ExtensionRuntime`] via [`dispatch_tool_call`], which wraps the blocking
     /// `invoke_tool` in `spawn_blocking`.
-    fn build_tool(ext_runtime: Arc<ExtensionRuntime>) -> ToolFn {
+    fn build_tool(
+        ext_runtime: Arc<ExtensionRuntime>,
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+    ) -> ToolFn {
         Arc::new(move |req: ToolCallRequest| {
             let ext_runtime = ext_runtime.clone();
-            Box::pin(async move { run_one_tool(req, ext_runtime).await })
+            let a2a_source = a2a_source.clone();
+            Box::pin(async move { run_one_tool(req, ext_runtime, a2a_source).await })
                 as BoxFut<'static, Result<Value, GraphExecError>>
         })
     }
@@ -1344,6 +1764,7 @@ mod aw {
     async fn run_one_tool(
         req: ToolCallRequest,
         ext_runtime: Arc<ExtensionRuntime>,
+        a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
     ) -> Result<Value, GraphExecError> {
         let (extension_id, tool_name) = req.tool_name.split_once('/').ok_or_else(|| {
             GraphExecError::Tool(format!(
@@ -1367,14 +1788,30 @@ mod aw {
             args: json!({}),
         };
 
-        // Graph Tool nodes never carry mcp: or component: ids (they use
-        // 'extension_id/tool' syntax over the WASM runtime), so neither the MCP
-        // nor the component catalog is threaded here.
+        // A Tool node names 'extension_id/tool'. An `a2a:<agent_id>/ask` ref
+        // dispatches through the handler's pack-carried A2A catalog (the same
+        // source the agent turns use; see `graph_a2a_source`), which reads its
+        // credential with the tenant and unit it captured at build time, so
+        // the placeholder `TenantContext` below does not reach it. mcp:,
+        // component:, flow: and sorla: refs are still not wired here — the
+        // agent-graph Tool node has no catalog for them, and such a ref
+        // returns the dispatcher's "no catalog wired" error value.
         // No per-request TenantContext is available at the graph-node layer;
         // use a no-op placeholder so the extension's host-LLM port receives an
         // empty context (equivalent to the previous `invoke_tool` default).
+        let a2a = match a2a_source.as_ref() {
+            Some(source) => Some(source.catalog().await),
+            None => None,
+        };
         let tenant = TenantContext::new("", "");
-        dispatch_tool_call(ext_runtime, None, None, call, &tenant)
+        // `dispatch_tool_call`, not its `_in_conversation` sibling: a graph
+        // node holds no `ConversationState`, so there is nowhere to keep a
+        // remote A2A `contextId` between calls. An `a2a:` tool reached from
+        // here therefore opens a fresh remote task each time and cannot
+        // answer an `input-required`. Closing that needs the graph executor's
+        // own checkpoint to carry the continuations, which is a separate
+        // change to a different state machine.
+        dispatch_tool_call(ext_runtime, None, None, None, None, a2a, call, &tenant)
             .await
             .map_err(|e| GraphExecError::Tool(format!("dispatch '{}': {e}", req.tool_name)))
     }
@@ -1525,6 +1962,71 @@ mod aw {
                 supervisor_fn_noop(),
                 approval_fn_awaiting(),
             )
+        }
+
+        // -------------------------------------------------------------------
+        // parse_tool_ref / map_tool_refs tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn parse_tool_ref_splits_on_last_slash() {
+            assert_eq!(
+                super::parse_tool_ref("myext/dothing"),
+                Some(ToolRef {
+                    extension_id: "myext".into(),
+                    tool_name: "dothing".into(),
+                    description: None,
+                    input_schema: None,
+                    usage_note: None,
+                })
+            );
+            assert_eq!(
+                super::parse_tool_ref("component:owner/repo/list"),
+                Some(ToolRef {
+                    extension_id: "component:owner/repo".into(),
+                    tool_name: "list".into(),
+                    description: None,
+                    input_schema: None,
+                    usage_note: None,
+                })
+            );
+            assert_eq!(super::parse_tool_ref("noslash"), None);
+            assert_eq!(super::parse_tool_ref("trailing/"), None);
+        }
+
+        #[test]
+        fn parse_tool_ref_rejects_leading_slash() {
+            // Empty extension_id half — also malformed, never panics.
+            assert_eq!(super::parse_tool_ref("/dothing"), None);
+        }
+
+        #[test]
+        fn map_tool_refs_drops_malformed_entries_and_keeps_valid_ones() {
+            let tools = vec![
+                "myext/dothing".to_string(),
+                "noslash".to_string(),
+                "other/thing".to_string(),
+            ];
+            let refs = super::map_tool_refs(&tools);
+            assert_eq!(
+                refs,
+                vec![
+                    ToolRef {
+                        extension_id: "myext".into(),
+                        tool_name: "dothing".into(),
+                        description: None,
+                        input_schema: None,
+                        usage_note: None,
+                    },
+                    ToolRef {
+                        extension_id: "other".into(),
+                        tool_name: "thing".into(),
+                        description: None,
+                        input_schema: None,
+                        usage_note: None,
+                    },
+                ]
+            );
         }
 
         // -------------------------------------------------------------------
@@ -2406,6 +2908,9 @@ mod aw {
                     long_term: None,
                 }),
                 knowledge: None,
+                conversational: false,
+                opening_message: None,
+                on_text_while_parked: Default::default(),
             };
             let mut provider = InMemoryConfigProvider::new();
             provider.insert(tenant, agent_id, cfg);
@@ -2413,7 +2918,7 @@ mod aw {
             AgentRuntime::new(
                 Arc::new(provider),
                 Arc::new(MockAgentStateStore::new()),
-                Arc::new(ExtensionRuntime::for_test()),
+                Arc::new(ExtensionRuntime::for_test().unwrap()),
                 llm,
                 Arc::new(MockTelemetry::new()),
                 Arc::new(MockTokenMeter::new(0)),
@@ -2439,6 +2944,7 @@ mod aw {
 
             let input = AgentInput {
                 text: String::new(),
+                ..Default::default()
             };
             let out = run_agent_step(
                 &runtime,
@@ -2488,6 +2994,7 @@ mod aw {
 
             let input = AgentInput {
                 text: String::new(),
+                ..Default::default()
             };
             let out = run_agent_step(
                 &runtime,
@@ -2527,6 +3034,9 @@ mod aw {
                 model: "gpt-4o-mini".to_string(),
                 state: GraphRunState::default(),
                 provider: None,
+                tools: vec![],
+                agent_ref: None,
+                inherit_from: None,
             }
         }
 
@@ -2546,7 +3056,7 @@ mod aw {
 
             (
                 Arc::new(MockAgentStateStore::new()),
-                Arc::new(ExtensionRuntime::for_test()),
+                Arc::new(ExtensionRuntime::for_test().unwrap()),
                 Arc::new(MockTelemetry::new()),
                 Arc::new(MockTokenMeter::new(0)),
                 Arc::new(NoopToolLedger),
@@ -2567,7 +3077,13 @@ mod aw {
                 token_meter,
                 ledger,
                 None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(HashMap::new()),
+                None,
                 &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
             )
             .await
             .expect("turn should succeed");
@@ -2578,11 +3094,11 @@ mod aw {
 
         #[tokio::test]
         async fn run_one_agent_turn_with_audit_sink_completes_same_reply_as_without() {
-            // No tool call fires on this path (graph-node agent turns are
-            // built with an empty tool list today), so no audit event is
-            // expected here either — this test guards that routing through
-            // `step_with_observer` does not change the turn's outcome.
-            // Genuine tool-call audit-under-real-tenant coverage lives in
+            // `agent_turn_request` declares no tools, and the mock LLM never
+            // emits tool calls, so no audit event is expected here either —
+            // this test guards that routing through `step_with_observer` does
+            // not change the turn's outcome. Genuine tool-call
+            // audit-under-real-tenant coverage lives in
             // `run_agent_step_with_audit_sink_enqueues_events_under_real_tenant_not_state_tenant`.
             let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -2597,8 +3113,14 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(HashMap::new()),
                 Some(&sink),
                 &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
             )
             .await
             .expect("turn should succeed");
@@ -2609,6 +3131,421 @@ mod aw {
                 rx.try_recv().is_err(),
                 "no tool call happens on this path, so no audit event is expected"
             );
+        }
+
+        /// Wiring assertion (Task 2): a request whose `tools` field declares a
+        /// well-formed ref reaches the ephemeral per-visit `AgentConfig`
+        /// unharmed — the turn still completes (the runtime only warns, never
+        /// fails, on tools that don't resolve against the test `ExtensionRuntime`
+        /// — see `preflight_warn_tools`/`missing_tools` in `greentic-aw-runtime`).
+        /// `map_tool_refs`/`parse_tool_ref` above cover the mapping itself;
+        /// this proves `run_one_agent_turn` actually calls it instead of the
+        /// old hardcoded `tools: vec![]`.
+        #[tokio::test]
+        async fn run_one_agent_turn_with_declared_tools_still_completes() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let mut req = agent_turn_request("agent", "You triage.");
+            req.tools = vec!["myext/dothing".to_string()];
+
+            let result = run_one_agent_turn(
+                req,
+                state_store,
+                ext_runtime,
+                plain_reply_llm("all good [[RESOLVED]]"),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(HashMap::new()),
+                None,
+                &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
+            )
+            .await
+            .expect("turn should succeed even with a declared-but-unregistered tool");
+
+            assert!(result.resolved);
+            assert_eq!(result.reply, "all good");
+        }
+
+        // -------------------------------------------------------------------
+        // SP1 Task 3: `agent_ref` resolution
+        // -------------------------------------------------------------------
+
+        /// A published-agent config with a distinctive `system_prompt` marker
+        /// ("FAQ-BOT") plus non-empty `memory`/`knowledge` bindings, standing
+        /// in for a real `merged_agents` entry resolved by `agent_ref`.
+        fn faq_bot_agent_config() -> AgentConfig {
+            use greentic_aw_runtime::config::KnowledgeSettings;
+            use greentic_aw_runtime::{MemoryProviderRef, MemorySettings};
+
+            AgentConfig {
+                agent_id: "faq".to_string(),
+                system_prompt: "You are FAQ-BOT. Answer only from the knowledge base.".to_string(),
+                tools: vec![],
+                guardrails: vec![],
+                llm: LlmProviderRef {
+                    provider: "openai".to_string(),
+                    model: "gpt-4o-mini".to_string(),
+                    credential_ref: None,
+                },
+                limits: AgentLimits::default(),
+                memory: Some(MemorySettings {
+                    short_term: Some(MemoryProviderRef {
+                        provider: "inmemory".to_string(),
+                        capability: "cap://memory/short-term".to_string(),
+                        params: Default::default(),
+                        credential_ref: None,
+                    }),
+                    long_term: None,
+                }),
+                knowledge: Some(KnowledgeSettings {
+                    knowledge: Some(MemoryProviderRef {
+                        provider: "chronicle".to_string(),
+                        capability: "cap://dw.knowledge".to_string(),
+                        params: Default::default(),
+                        credential_ref: None,
+                    }),
+                    embedding: None,
+                    top_k: 5,
+                }),
+                conversational: false,
+                opening_message: None,
+                on_text_while_parked: Default::default(),
+            }
+        }
+
+        /// Like [`plain_reply_llm`] but returns the concrete
+        /// [`greentic_aw_runtime::mock::MockLlmBackend`] (not erased to
+        /// `Arc<dyn LlmBackend>`) so the test can inspect `seen_system_prompts`
+        /// after the turn completes.
+        fn recording_llm(reply: &str) -> Arc<greentic_aw_runtime::mock::MockLlmBackend> {
+            use greentic_aw_runtime::llm::LlmResponse;
+            use greentic_aw_runtime::mock::MockLlmBackend;
+
+            Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+                content: Some(reply.to_string()),
+                tool_calls: vec![],
+                tokens_in: 1,
+                tokens_out: 1,
+            })]))
+        }
+
+        #[test]
+        fn resolve_turn_config_agent_ref_present_returns_full_config_from_map() {
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), faq_bot_agent_config());
+
+            let mut req = agent_turn_request("s", "inline prompt, should be ignored");
+            req.agent_ref = Some("faq".to_string());
+
+            let cfg = resolve_turn_config(&req, &merged, "graph.s").expect("resolves");
+
+            assert!(cfg.system_prompt.contains("FAQ-BOT"));
+            assert!(cfg.memory.is_some(), "memory carried through unstripped");
+            assert!(
+                cfg.knowledge.is_some(),
+                "knowledge carried through unstripped"
+            );
+        }
+
+        #[test]
+        fn resolve_turn_config_agent_ref_none_returns_stripped_inline_config() {
+            let merged = HashMap::new();
+            let req = agent_turn_request("s", "You triage.");
+
+            let cfg = resolve_turn_config(&req, &merged, "graph.s").expect("resolves");
+
+            assert_eq!(cfg.system_prompt, "You triage.");
+            assert_eq!(cfg.agent_id, "graph.s");
+            assert!(cfg.memory.is_none());
+            assert!(cfg.knowledge.is_none());
+            assert!(cfg.guardrails.is_empty());
+        }
+
+        #[test]
+        fn resolve_turn_config_agent_ref_missing_returns_err() {
+            let merged = HashMap::new();
+            let mut req = agent_turn_request("s", "inline prompt");
+            req.agent_ref = Some("missing".to_string());
+
+            let err = resolve_turn_config(&req, &merged, "graph.s").expect_err("must error");
+
+            assert!(
+                err.to_string()
+                    .contains("referenced agent 'missing' not found"),
+                "unexpected error message: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_one_agent_turn_with_agent_ref_uses_referenced_config_system_prompt() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), faq_bot_agent_config());
+
+            let mut req = agent_turn_request("s", "inline prompt, should NOT be used");
+            req.agent_ref = Some("faq".to_string());
+
+            let llm = recording_llm("all good [[RESOLVED]]");
+
+            let result = run_one_agent_turn(
+                req,
+                state_store,
+                ext_runtime,
+                llm.clone(),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(merged),
+                None,
+                &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
+            )
+            .await
+            .expect("turn should succeed");
+
+            assert!(result.resolved);
+            assert_eq!(result.reply, "all good");
+
+            let seen = llm.seen_system_prompts.lock().expect("lock poisoned");
+            assert_eq!(seen.len(), 1);
+            assert!(
+                seen[0].contains("FAQ-BOT"),
+                "expected the referenced agent's system prompt, got: {}",
+                seen[0]
+            );
+            assert!(
+                !seen[0].contains("should NOT be used"),
+                "the node's inline system prompt must not be used when agent_ref is set"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_one_agent_turn_without_agent_ref_uses_inline_system_prompt() {
+            // Regression: agent_ref = None stays byte-unchanged — the node's
+            // own inline system_prompt is what the LLM sees, not any entry
+            // from `merged_agents` (even when one happens to exist).
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), faq_bot_agent_config());
+
+            let req = agent_turn_request("s", "You triage inline.");
+            let llm = recording_llm("all good [[RESOLVED]]");
+
+            let result = run_one_agent_turn(
+                req,
+                state_store,
+                ext_runtime,
+                llm.clone(),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(merged),
+                None,
+                &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
+            )
+            .await
+            .expect("turn should succeed");
+
+            assert!(result.resolved);
+
+            let seen = llm.seen_system_prompts.lock().expect("lock poisoned");
+            assert_eq!(seen.len(), 1);
+            assert!(seen[0].contains("You triage inline."));
+            assert!(!seen[0].contains("FAQ-BOT"));
+        }
+
+        #[tokio::test]
+        async fn run_one_agent_turn_with_missing_agent_ref_errors() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let mut req = agent_turn_request("s", "inline prompt");
+            req.agent_ref = Some("missing".to_string());
+
+            let err = run_one_agent_turn(
+                req,
+                state_store,
+                ext_runtime,
+                plain_reply_llm("unused"),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(HashMap::new()),
+                None,
+                &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
+            )
+            .await
+            .expect_err("must error when agent_ref doesn't resolve");
+
+            assert!(
+                err.to_string()
+                    .contains("referenced agent 'missing' not found"),
+                "unexpected error message: {err}"
+            );
+        }
+
+        /// The specialist case: `inherit_from` adopts the worker's capability
+        /// surface WITHOUT overwriting the node's own prompt. If this ever
+        /// regressed to `agent_ref` semantics, every specialist in a generated
+        /// graph would collapse into an identical copy of its parent.
+        #[test]
+        fn inherit_from_keeps_the_node_prompt_and_adopts_the_capability_surface() {
+            use greentic_aw_runtime::config::GuardrailRef;
+
+            let mut parent = faq_bot_agent_config();
+            parent.guardrails = vec![GuardrailRef {
+                cap_id: "greentic:guardrail/pii".to_string(),
+                offer_id: None,
+                config: serde_json::json!({}),
+                mode: Default::default(),
+            }];
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), parent);
+
+            let mut req = agent_turn_request("spec-billing", "You handle billing only.");
+            req.inherit_from = Some("faq".to_string());
+
+            let cfg = resolve_turn_config(&req, &merged, "graph.spec-billing")
+                .expect("a resolvable inherit_from must succeed");
+
+            assert_eq!(
+                cfg.system_prompt, "You handle billing only.",
+                "the specialist keeps its OWN prompt — this is the whole point"
+            );
+            assert_eq!(cfg.guardrails.len(), 1, "guardrails are inherited");
+            assert!(cfg.memory.is_some(), "memory is inherited");
+            assert!(cfg.knowledge.is_some(), "knowledge is inherited");
+        }
+
+        /// An unresolvable `inherit_from` fails rather than running stripped.
+        #[test]
+        fn inherit_from_unresolvable_fails_rather_than_running_stripped() {
+            let merged = HashMap::new();
+            let mut req = agent_turn_request("spec", "Specialist prompt.");
+            req.inherit_from = Some("ghost".to_string());
+
+            let err = resolve_turn_config(&req, &merged, "graph.spec")
+                .expect_err("an unknown inherit_from must not silently succeed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ghost") && msg.contains("refusing to run"),
+                "error should name the id and say it refused: {msg}"
+            );
+        }
+
+        /// `agent_ref` still wins when both are set — it already takes
+        /// everything, including the prompt.
+        #[test]
+        fn agent_ref_takes_precedence_over_inherit_from() {
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), faq_bot_agent_config());
+
+            let mut req = agent_turn_request("spec", "Specialist prompt.");
+            req.agent_ref = Some("faq".to_string());
+            req.inherit_from = Some("faq".to_string());
+
+            let cfg = resolve_turn_config(&req, &merged, "graph.spec").expect("resolvable");
+            assert_eq!(
+                cfg.system_prompt, "You are FAQ-BOT. Answer only from the knowledge base.",
+                "agent_ref adopts the referenced prompt wholesale"
+            );
+        }
+
+        /// A supervisor with no `agent_ref` keeps today's behaviour: no
+        /// guardrails, and nothing fails.
+        #[test]
+        fn supervisor_without_agent_ref_resolves_no_guardrails() {
+            let merged = HashMap::new();
+            let got = resolve_supervisor_guardrails(None, &merged, "router")
+                .expect("absent agent_ref is not an error");
+            assert!(got.is_empty());
+        }
+
+        /// The point of the whole change: a supervisor pointed at its worker
+        /// runs under that worker's guardrails.
+        #[test]
+        fn supervisor_with_agent_ref_inherits_the_parent_guardrails() {
+            use greentic_aw_runtime::config::GuardrailRef;
+
+            let mut parent = faq_bot_agent_config();
+            parent.guardrails = vec![GuardrailRef {
+                cap_id: "greentic:guardrail/pii".to_string(),
+                offer_id: None,
+                config: serde_json::json!({}),
+                mode: Default::default(),
+            }];
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), parent);
+
+            let got = resolve_supervisor_guardrails(Some("faq"), &merged, "router")
+                .expect("a resolvable agent_ref must succeed");
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].cap_id, "greentic:guardrail/pii");
+        }
+
+        /// An unresolvable `agent_ref` FAILS rather than routing unguarded — a
+        /// supervisor believed to be protected but running bare is exactly what
+        /// this inheritance exists to prevent.
+        #[test]
+        fn supervisor_with_unresolvable_agent_ref_fails_rather_than_routing_bare() {
+            let merged = HashMap::new();
+            let err = resolve_supervisor_guardrails(Some("ghost"), &merged, "router")
+                .expect_err("an unknown agent_ref must not silently succeed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ghost") && msg.contains("refusing to route"),
+                "error should name the id and say it refused: {msg}"
+            );
+        }
+
+        /// A supervisor inherits guardrails ONLY — the referenced worker's
+        /// memory and knowledge are deliberately left behind. It routes, it
+        /// does not work.
+        #[test]
+        fn supervisor_inherits_guardrails_but_not_memory_or_knowledge() {
+            use greentic_aw_runtime::config::GuardrailRef;
+
+            let mut parent = faq_bot_agent_config();
+            parent.guardrails = vec![GuardrailRef {
+                cap_id: "greentic:guardrail/pii".to_string(),
+                offer_id: None,
+                config: serde_json::json!({}),
+                mode: Default::default(),
+            }];
+            assert!(parent.memory.is_some(), "fixture should carry memory");
+            assert!(parent.knowledge.is_some(), "fixture should carry knowledge");
+
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), parent);
+
+            let got =
+                resolve_supervisor_guardrails(Some("faq"), &merged, "router").expect("resolvable");
+            assert_eq!(got.len(), 1, "guardrails come across");
         }
 
         #[tokio::test]
@@ -2632,6 +3569,7 @@ mod aw {
                 routes,
                 state: GraphRunState::default(),
                 provider: None,
+                agent_ref: None,
             };
 
             // No [[ROUTE:..]] sentinel in the reply -> falls back to the
@@ -2644,8 +3582,10 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                Arc::new(HashMap::new()),
                 None,
                 &real_tenant,
+                &TurnBilling::default(),
             )
             .await
             .expect("supervisor turn should succeed");
@@ -2676,6 +3616,7 @@ mod aw {
                 routes,
                 state: GraphRunState::default(),
                 provider: None,
+                agent_ref: None,
             };
 
             let result = run_one_supervisor_turn(
@@ -2686,8 +3627,10 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                Arc::new(HashMap::new()),
                 Some(&sink),
                 &real_tenant,
+                &TurnBilling::default(),
             )
             .await
             .expect("supervisor turn should succeed");
@@ -2698,6 +3641,572 @@ mod aw {
                 "no tool call happens on this path, so no audit event is expected"
             );
         }
+
+        // -------------------------------------------------------------------
+        // Billing of graph turns
+        // -------------------------------------------------------------------
+
+        /// (tenant_id, env_id, project_id, agent_id, model) per `emit`.
+        type GraphEmit = (String, String, Option<String>, String, String);
+
+        #[derive(Default)]
+        struct RecordingGraphMeter {
+            calls: std::sync::Mutex<Vec<GraphEmit>>,
+        }
+
+        impl greentic_aw_runtime::billing::BillingMeter for RecordingGraphMeter {
+            fn emit<'a>(
+                &'a self,
+                tenant: &'a TenantContext,
+                _input_tokens: u64,
+                _output_tokens: u64,
+                agent_id: &'a str,
+                model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(), greentic_aw_runtime::billing::BillingError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                self.calls.lock().expect("lock").push((
+                    tenant.tenant_id.clone(),
+                    tenant.env_id.clone(),
+                    tenant.project_id.clone(),
+                    agent_id.to_string(),
+                    model.to_string(),
+                ));
+                Box::pin(async { Ok(()) })
+            }
+
+            fn over_budget<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                Box::pin(std::future::ready(false))
+            }
+        }
+
+        fn unit_billing(meter: &Arc<RecordingGraphMeter>) -> TurnBilling {
+            TurnBilling {
+                meter: Some(
+                    Arc::clone(meter) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>
+                ),
+                project_id: Some("support-bot".to_string()),
+            }
+        }
+
+        /// An agent-graph turn bills through the unit's installed sink, under
+        /// the REAL tenant/env the node was dispatched with and the deployed
+        /// unit — not the synthetic `("graph", "run")` tenant every graph turn
+        /// used to run under, which also meant no sink at all.
+        #[tokio::test]
+        async fn a_graph_agent_turn_bills_the_real_tenant_and_the_unit() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+            let meter = Arc::new(RecordingGraphMeter::default());
+
+            run_one_agent_turn(
+                agent_turn_request("triage", "You triage."),
+                state_store,
+                ext_runtime,
+                plain_reply_llm("routed [[RESOLVED]]"),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(HashMap::new()),
+                None,
+                &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &unit_billing(&meter),
+            )
+            .await
+            .expect("turn succeeds");
+
+            let calls = meter.calls.lock().expect("lock");
+            assert_eq!(calls.len(), 1, "one LLM iteration → one billing emit");
+            assert_eq!(
+                calls[0],
+                (
+                    "acme".to_string(),
+                    "prod".to_string(),
+                    Some("support-bot".to_string()),
+                    "graph.triage".to_string(),
+                    "gpt-4o-mini".to_string(),
+                )
+            );
+        }
+
+        /// Supervisor routing is an LLM call too, and bills the same way.
+        #[tokio::test]
+        async fn a_supervisor_routing_turn_is_billed() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+            let meter = Arc::new(RecordingGraphMeter::default());
+            let req = SupervisorRequest {
+                node_id: "router".to_string(),
+                system_prompt: "Route the user.".to_string(),
+                model: "claude-3-haiku".to_string(),
+                routes: vec![SupervisorRoute {
+                    branch: "billing".into(),
+                    description: "Billing questions".into(),
+                }],
+                state: GraphRunState::default(),
+                provider: None,
+                agent_ref: None,
+            };
+
+            run_one_supervisor_turn(
+                req,
+                state_store,
+                ext_runtime,
+                plain_reply_llm("[[ROUTE:billing]]"),
+                telemetry,
+                token_meter,
+                ledger,
+                Arc::new(HashMap::new()),
+                None,
+                &real_tenant,
+                &unit_billing(&meter),
+            )
+            .await
+            .expect("supervisor turn succeeds");
+
+            let calls = meter.calls.lock().expect("lock");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, "acme");
+            assert_eq!(calls[0].1, "prod");
+            assert_eq!(calls[0].2.as_deref(), Some("support-bot"));
+            assert_eq!(calls[0].3, "graph.router.supervisor");
+            assert_eq!(calls[0].4, "claude-3-haiku");
+        }
+
+        /// No installed sink leaves the turn exactly as unbilled as before —
+        /// and it still runs.
+        #[tokio::test]
+        async fn a_graph_turn_without_a_sink_still_runs() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+            let result = run_one_agent_turn(
+                agent_turn_request("triage", "You triage."),
+                state_store,
+                ext_runtime,
+                plain_reply_llm("hello"),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                None,
+                Arc::new(vec![]),
+                Arc::new(HashMap::new()),
+                None,
+                &real_tenant,
+                &crate::runner::knowledge_index::IndexMount::default(),
+                &TurnBilling::default(),
+            )
+            .await
+            .expect("turn succeeds with no sink");
+            assert_eq!(result.reply, "hello");
+        }
+
+        #[test]
+        fn with_billing_sets_the_sink_and_unit_on_the_handler() {
+            let handler = handler_with(
+                Arc::new(InMemoryGraphProvider::new(HashMap::new())),
+                agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1),
+                tool_fn_ok(),
+            );
+            assert!(handler.billing.meter.is_none());
+            let meter = Arc::new(RecordingGraphMeter::default());
+            let handler = handler.with_billing(
+                Some(meter as Arc<dyn greentic_aw_runtime::billing::BillingMeter>),
+                Some("support-bot".to_string()),
+            );
+            assert!(handler.billing.meter.is_some());
+            assert_eq!(handler.billing.project_id.as_deref(), Some("support-bot"));
+        }
+    }
+
+    /// Graph turns and graph Tool nodes resolve `a2a:` tools from the same
+    /// pack-carried source a single-turn `dw.agent` does
+    /// ([`graph_a2a_source`]). Env-mutating, so every test is `#[serial]`
+    /// (crate convention, as in `a2a_pack_source`'s tests).
+    #[cfg(all(test, feature = "agentic-worker"))]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod a2a_tests {
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
+
+        use greentic_aw_runtime::cost::MockTokenMeter;
+        use greentic_aw_runtime::error::LlmError;
+        use greentic_aw_runtime::graph::{AgentTurnRequest, GraphRunState, ToolCallRequest};
+        use greentic_aw_runtime::llm::{LlmBackend, LlmRequest, LlmResponse};
+        use greentic_aw_runtime::mock::{MockAgentStateStore, MockTelemetry, NoopToolLedger};
+        use greentic_aw_runtime::state::ToolCallRecord;
+        use greentic_aw_runtime::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
+        use greentic_ext_runtime::ExtensionRuntime;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::{RuntimeTurnSource, TurnEffectSource, build_tool, graph_a2a_source};
+
+        /// A hyphenated id, as the admin mints them.
+        const AGENT_ID: &str = "8d2f0c1e-recipe";
+        const TENANT: &str = "acme";
+        const UNIT: &str = "unit-1";
+
+        async fn serve_agent(server: &MockServer, reply: &str) {
+            let card = json!({
+                "name": "Recipe Agent",
+                "description": "Suggests dishes.",
+                "version": "1.0.0",
+                "supportedInterfaces": [{
+                    "url": format!("{}/a2a", server.uri()),
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": "1.0"
+                }],
+                "capabilities": {"streaming": false, "pushNotifications": false},
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": []
+            });
+            Mock::given(method("GET"))
+                .and(path("/.well-known/agent-card.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(card))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/a2a"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {"message": {"messageId": "m-2", "role": "ROLE_AGENT",
+                                           "parts": [{"text": reply}]}}
+                })))
+                .mount(server)
+                .await;
+        }
+
+        /// A pack whose `assets/a2a-routes.json` names one team-scoped agent at
+        /// `server`.
+        fn pack_for(server: &MockServer) -> (tempfile::TempDir, Arc<crate::pack::PackRuntime>) {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+            let sidecar = json!([{
+                "agent_id": AGENT_ID,
+                "name": "Recipe agent",
+                "base_url": server.uri(),
+                "auth_header_name": null,
+                "auth_team": "sales",
+                "requires_auth": true
+            }]);
+            std::fs::write(
+                dir.path().join("assets/a2a-routes.json"),
+                sidecar.to_string(),
+            )
+            .unwrap();
+            let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(dir.path()));
+            (dir, pack)
+        }
+
+        struct MapSecrets(HashMap<String, Vec<u8>>);
+
+        #[async_trait::async_trait]
+        impl greentic_secrets_lib::SecretsManager for MapSecrets {
+            async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                self.0
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+            }
+            async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A store holding the token ONLY at the unit-scoped URI, so a call
+        /// that authenticates proves the tenant, the team and the unit all
+        /// reached the source.
+        fn unit_scoped_store() -> crate::secrets::DynSecretsManager {
+            let uri = greentic_aw_runtime::scoped_secrets::secret_uri_candidates(
+                "a2a",
+                TENANT,
+                Some("sales"),
+                Some(UNIT),
+                AGENT_ID,
+            )
+            .unwrap()
+            .remove(0);
+            assert!(uri.contains(".unit-"), "first candidate is the unit scope");
+            Arc::new(MapSecrets(HashMap::from([(uri, b"tok-1".to_vec())])))
+        }
+
+        #[allow(unsafe_code)]
+        fn set_gate(value: Option<&str>) {
+            // SAFETY: every caller is #[serial] (crate convention).
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("GREENTIC_AW_A2A", v),
+                    None => std::env::remove_var("GREENTIC_AW_A2A"),
+                }
+            }
+        }
+
+        /// LLM backend recording the tools offered on each call, then
+        /// replaying a script.
+        struct RecordingLlm {
+            responses: Mutex<Vec<LlmResponse>>,
+            offered: Mutex<Vec<Vec<(String, String)>>>,
+        }
+
+        impl LlmBackend for RecordingLlm {
+            fn complete<'a>(
+                &'a self,
+                req: LlmRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>>
+            {
+                self.offered.lock().unwrap().push(
+                    req.tools
+                        .iter()
+                        .map(|t| (t.extension_id.clone(), t.tool_name.clone()))
+                        .collect(),
+                );
+                let next = {
+                    let mut queue = self.responses.lock().unwrap();
+                    if queue.is_empty() {
+                        Err(LlmError::Transport("script exhausted".into()))
+                    } else {
+                        Ok(queue.remove(0))
+                    }
+                };
+                Box::pin(async move { next })
+            }
+        }
+
+        fn tool_ref() -> String {
+            format!("a2a:{AGENT_ID}")
+        }
+
+        /// The worker a specialist inherits from: it binds the `a2a:` tool
+        /// with the author contract the designer ships.
+        fn worker_with_a2a_tool() -> AgentConfig {
+            AgentConfig {
+                agent_id: "worker".into(),
+                system_prompt: "sys".into(),
+                tools: vec![ToolRef {
+                    extension_id: tool_ref(),
+                    tool_name: "ask".into(),
+                    description: Some("Ask the Recipe agent agent.".into()),
+                    input_schema: Some(json!({
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"]
+                    })),
+                    usage_note: None,
+                }],
+                llm: LlmProviderRef {
+                    provider: "mock".into(),
+                    model: "m".into(),
+                    credential_ref: None,
+                },
+                limits: AgentLimits::default(),
+                memory: None,
+                knowledge: None,
+                guardrails: vec![],
+                conversational: false,
+                opening_message: None,
+                on_text_while_parked: Default::default(),
+            }
+        }
+
+        /// Drive one graph agent turn through the PRODUCTION turn source (the
+        /// same `RuntimeTurnSource` `from_parts` builds), for a specialist that
+        /// inherits the worker's tools. Returns the reply and the tools offered
+        /// on the first LLM call.
+        async fn run_specialist_turn(
+            a2a_source: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+            calls_tool: bool,
+        ) -> (String, Vec<(String, String)>) {
+            let mut script = Vec::new();
+            if calls_tool {
+                script.push(LlmResponse {
+                    content: None,
+                    tool_calls: vec![ToolCallRecord {
+                        call_id: "c1".into(),
+                        extension_id: tool_ref(),
+                        tool_name: "ask".into(),
+                        args: json!({"message": "eggs?"}),
+                    }],
+                    tokens_in: 5,
+                    tokens_out: 5,
+                });
+            }
+            script.push(LlmResponse {
+                content: Some("Try an omelette. [[RESOLVED]]".into()),
+                tool_calls: vec![],
+                tokens_in: 5,
+                tokens_out: 5,
+            });
+            let llm = Arc::new(RecordingLlm {
+                responses: Mutex::new(script),
+                offered: Mutex::new(Vec::new()),
+            });
+            let source = RuntimeTurnSource {
+                state_store: Arc::new(MockAgentStateStore::new()),
+                ext_runtime: Arc::new(ExtensionRuntime::for_test().unwrap()),
+                llm: llm.clone(),
+                telemetry: Arc::new(MockTelemetry::new()),
+                token_meter: Arc::new(MockTokenMeter::new(0)),
+                ledger: Arc::new(NoopToolLedger),
+                mcp_source: None,
+                a2a_source,
+                packs: Arc::new(vec![]),
+                merged_agents: Arc::new(HashMap::from([(
+                    "worker".to_string(),
+                    worker_with_a2a_tool(),
+                )])),
+                index_mount: crate::runner::knowledge_index::IndexMount::default(),
+            };
+            let real_tenant = greentic_types::TenantCtx::new(
+                greentic_types::EnvId::try_from("prod").unwrap(),
+                greentic_types::TenantId::try_from(TENANT).unwrap(),
+            );
+            let turn = source.agent_turn(None, real_tenant, super::TurnBilling::default());
+            let result = turn(AgentTurnRequest {
+                node_id: "specialist".into(),
+                system_prompt: "You suggest recipes.".into(),
+                model: "m".into(),
+                state: GraphRunState::default(),
+                provider: Some("mock".into()),
+                tools: vec![],
+                agent_ref: None,
+                inherit_from: Some("worker".into()),
+            })
+            .await
+            .expect("the turn completes");
+            let offered = llm
+                .offered
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            (result.reply, offered)
+        }
+
+        /// (a) A graph agent turn is offered the `a2a:` tool from a pack
+        /// carrying `assets/a2a-routes.json`, and calling it reaches the agent
+        /// with the unit-scoped credential.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_graph_agent_turn_is_offered_and_calls_a_pack_carried_a2a_tool() {
+            set_gate(None);
+            let server = MockServer::start().await;
+            serve_agent(&server, "an omelette").await;
+            let (_dir, pack) = pack_for(&server);
+            let source = graph_a2a_source(&[pack], TENANT, &unit_scoped_store(), Some(UNIT));
+            assert!(source.is_some(), "the sidecar must yield a source");
+
+            let (reply, offered) = run_specialist_turn(source, true).await;
+
+            assert!(
+                offered.contains(&(tool_ref(), "ask".to_string())),
+                "the a2a tool must be offered to a graph agent turn; offered: {offered:?}"
+            );
+            assert_eq!(reply, "Try an omelette.");
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .expect("the agent must have been called");
+            assert_eq!(
+                post.headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer tok-1"),
+                "the credential is read at the unit scope the handler was built for"
+            );
+        }
+
+        /// (b) `GREENTIC_AW_A2A=0` disables the graph path too: no source is
+        /// built, so the turn is offered no `a2a:` tool.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn the_env_gate_disables_a2a_for_graph_turns() {
+            let server = MockServer::start().await;
+            serve_agent(&server, "unused").await;
+            let (_dir, pack) = pack_for(&server);
+            set_gate(Some("0"));
+            let gated = graph_a2a_source(
+                std::slice::from_ref(&pack),
+                TENANT,
+                &unit_scoped_store(),
+                Some(UNIT),
+            );
+            set_gate(None);
+            assert!(gated.is_none(), "the operator's kill switch must hold");
+
+            let (_, offered) = run_specialist_turn(gated, false).await;
+            assert!(
+                !offered.iter().any(|(ext, _)| ext.starts_with("a2a:")),
+                "a disabled A2A source must offer no a2a: tool; offered: {offered:?}"
+            );
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "a disabled source must never dial the agent"
+            );
+            assert!(
+                graph_a2a_source(&[pack], TENANT, &unit_scoped_store(), Some(UNIT)).is_some(),
+                "control: the same pack builds a source with the gate unset"
+            );
+        }
+
+        /// (c) A graph Tool node naming `a2a:<agent_id>/ask` dispatches through
+        /// the handler's A2A catalog rather than the extension runtime.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_graph_tool_node_dispatches_an_a2a_ref() {
+            set_gate(None);
+            let server = MockServer::start().await;
+            serve_agent(&server, "an omelette").await;
+            let (_dir, pack) = pack_for(&server);
+            let source = graph_a2a_source(&[pack], TENANT, &unit_scoped_store(), Some(UNIT));
+            let tool = build_tool(Arc::new(ExtensionRuntime::for_test().unwrap()), source);
+
+            let value = tool(ToolCallRequest {
+                node_id: "lookup".into(),
+                tool_name: format!("{}/ask", tool_ref()),
+                state: GraphRunState::default(),
+            })
+            .await
+            .expect("dispatch succeeds");
+
+            assert_eq!(
+                value,
+                json!({"status": "completed", "agent": AGENT_ID, "reply": "an omelette"})
+            );
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .expect("the agent must have been called");
+            assert_eq!(
+                post.headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer tok-1")
+            );
+        }
     }
 }
 
@@ -2706,3 +4215,6 @@ pub use aw::{
     GraphConfigSource, InMemoryGraphProvider, LayeredGraphProvider, RuntimeGraphNodeHandler,
     build_graph_node_handler, graph_config_from_sidecar,
 };
+
+#[cfg(feature = "agentic-worker")]
+pub(crate) use aw::build_graph_node_handler_metered;

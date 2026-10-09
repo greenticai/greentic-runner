@@ -61,9 +61,21 @@ static RUNTIME: Lazy<&'static tokio::runtime::Runtime> = Lazy::new(|| {
 /// Records the full [`RemoteDispatch`] including the `runtime` field so tests
 /// can assert that `operala.call` / `agentic.call` route to the correct runtime
 /// name without requiring a live NATS broker.
+///
+/// `all` keeps every captured dispatch (not just the most recent) so
+/// resume/re-park tests can assert on the *count* of dispatches — e.g. that a
+/// stray inbound while parked re-parks WITHOUT re-dispatching a duplicate
+/// approval request.
 #[derive(Default)]
 struct RuntimeCapturingStub {
     last: Mutex<Option<CapturedDispatch>>,
+    all: Mutex<Vec<CapturedDispatch>>,
+}
+
+impl RuntimeCapturingStub {
+    fn dispatch_count(&self) -> usize {
+        self.all.lock().unwrap().len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +85,7 @@ struct CapturedDispatch {
     operation: String,
     mode: DispatchMode,
     correlation_id: String,
+    decision_token: Option<String>,
 }
 
 #[async_trait]
@@ -84,13 +97,16 @@ impl RemoteDispatchHandler for RuntimeCapturingStub {
             },
             DispatchMode::FireAndForget => RemoteDispatchAction::Dispatched,
         };
-        *self.last.lock().unwrap() = Some(CapturedDispatch {
+        let captured = CapturedDispatch {
             runtime: request.runtime,
             target: request.target,
             operation: request.operation,
             mode: request.mode,
             correlation_id: request.correlation_id,
-        });
+            decision_token: request.decision_token,
+        };
+        *self.last.lock().unwrap() = Some(captured.clone());
+        self.all.lock().unwrap().push(captured);
         Ok(action)
     }
 }
@@ -296,6 +312,7 @@ fn flow_ctx<'a>(config: &'a HostConfig, pack_id: &'a str) -> FlowContext<'a> {
         attempt: 1,
         observer: None,
         mocks: None,
+        caller: None,
     }
 }
 
@@ -554,6 +571,276 @@ fn agentic_call_await_pauses_with_session_hint_correlation() -> Result<()> {
         recorded
             .correlation_id
             .contains(&format!("::flow={FLOW_ID}"))
+    );
+    Ok(())
+}
+
+// ── approval.call tests ───────────────────────────────────────────────────────
+
+#[test]
+fn approval_call_await_parks_at_self_not_the_successor() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-await.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    // `mode: always` → approval_requires_human → dispatch and park for a human.
+    build_dispatch_pack(
+        &pack_path,
+        "approval.call",
+        json!({ "await": true, "operation": "create", "input": { "mode": "always" } }),
+        true,
+    )?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(RuntimeCapturingStub::default());
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+
+    let ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let execution = rt
+        .block_on(engine.execute(ctx, Value::Null))
+        .context("await approval.call run")?;
+
+    let wait = match execution.status {
+        FlowStatus::Waiting(wait) => wait,
+        FlowStatus::Completed => {
+            anyhow::bail!("flow completed but should have paused awaiting the approval decision")
+        }
+    };
+
+    // THE contract this feature exists for. Every sibling dispatch node
+    // (sorla/operala/agentic/telco-x, resume_at_self = false) parks at the
+    // routing successor — here that would be "done". approval.call re-enters
+    // ITSELF so its own routing can see the decision.
+    assert_eq!(
+        wait.snapshot.next_node, "call",
+        "approval.call must park at self, not at the successor"
+    );
+
+    let recorded = handler
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler should have recorded a dispatch");
+    assert_eq!(
+        recorded.runtime, "approval",
+        "runtime name must be 'approval', got '{}'",
+        recorded.runtime
+    );
+    assert_eq!(recorded.mode, DispatchMode::Await);
+    assert_eq!(recorded.target, "dep-1");
+    Ok(())
+}
+
+/// Covers the decide half of the state machine: `take_approval_await` ->
+/// `entry_is_approval_response` -> `approval_outcome_from_entry` -> complete.
+/// A resume carrying a decision envelope must finish the flow WITHOUT
+/// re-dispatching a second approval request.
+#[test]
+fn approval_call_resume_with_decision_completes_without_redispatch() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-resume-decision.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    // `mode: always` → approval_requires_human → dispatch and park for a human.
+    build_dispatch_pack(
+        &pack_path,
+        "approval.call",
+        json!({ "await": true, "operation": "create", "input": { "mode": "always" } }),
+        true,
+    )?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(RuntimeCapturingStub::default());
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+
+    let ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let execution = rt
+        .block_on(engine.execute(ctx, Value::Null))
+        .context("await approval.call run")?;
+
+    let wait = match execution.status {
+        FlowStatus::Waiting(wait) => wait,
+        FlowStatus::Completed => {
+            anyhow::bail!("flow completed but should have paused awaiting the approval decision")
+        }
+    };
+    assert_eq!(wait.snapshot.next_node, "call");
+    assert_eq!(
+        handler.dispatch_count(),
+        1,
+        "exactly one dispatch to reach the park"
+    );
+
+    let token = handler
+        .last
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|d| d.decision_token.clone())
+        .expect("an approval dispatch is issued a decision_token");
+    let resume_ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let resumed = rt
+        .block_on(engine.resume(
+            resume_ctx,
+            wait.snapshot.clone(),
+            json!({ "ok": true, "output": { "decision": "denied", "decision_token": token } }),
+        ))
+        .context("resume with a decision should advance the flow")?;
+
+    match resumed.status {
+        FlowStatus::Completed => {}
+        FlowStatus::Waiting(w) => {
+            anyhow::bail!(
+                "resume with a decision should complete the flow, not re-park: {:?}",
+                w.reason
+            )
+        }
+    }
+    assert_eq!(
+        handler.dispatch_count(),
+        1,
+        "resume with a decision must NOT re-dispatch a duplicate approval request"
+    );
+    Ok(())
+}
+
+/// greentic-runner#794: the gate itself refuses a decision that does not carry
+/// the token it was issued — missing or wrong — and stays parked, whatever
+/// routed the response to it. Neither refusal re-dispatches.
+#[test]
+fn approval_call_refuses_a_decision_without_its_token() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-token.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_dispatch_pack(
+        &pack_path,
+        "approval.call",
+        json!({ "await": true, "operation": "create", "input": { "mode": "always" } }),
+        true,
+    )?;
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(RuntimeCapturingStub::default());
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+    let pack_id = pack.metadata().pack_id.clone();
+
+    let execution =
+        rt.block_on(engine.execute(flow_ctx(&config, pack_id.as_str()), Value::Null))?;
+    let FlowStatus::Waiting(wait) = execution.status else {
+        anyhow::bail!("approval.call must park");
+    };
+    let token = handler
+        .last
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|d| d.decision_token.clone())
+        .expect("an approval dispatch is issued a decision_token");
+    assert_eq!(token.len(), 43, "32 bytes, base64url without padding");
+
+    for (label, response) in [
+        (
+            "missing",
+            json!({ "ok": true, "output": { "decision": "approved" } }),
+        ),
+        (
+            "wrong",
+            json!({ "ok": true, "output": { "decision": "approved", "decision_token": "not-the-token" } }),
+        ),
+    ] {
+        let resumed = rt.block_on(engine.resume(
+            flow_ctx(&config, pack_id.as_str()),
+            wait.snapshot.clone(),
+            response,
+        ))?;
+        match resumed.status {
+            FlowStatus::Waiting(w) => assert_eq!(
+                w.snapshot.next_node, "call",
+                "a {label} token must leave the gate parked at itself"
+            ),
+            FlowStatus::Completed => anyhow::bail!("a {label} token must not decide the gate"),
+        }
+    }
+    assert_eq!(handler.dispatch_count(), 1, "a refusal never re-dispatches");
+
+    let resumed = rt.block_on(engine.resume(
+        flow_ctx(&config, pack_id.as_str()),
+        wait.snapshot.clone(),
+        json!({ "ok": true, "output": { "decision": "approved", "decision_token": token } }),
+    ))?;
+    assert!(
+        matches!(resumed.status, FlowStatus::Completed),
+        "the issued token decides the gate"
+    );
+    Ok(())
+}
+
+/// Regression test for the "mark only once the dispatch actually parked" fix:
+/// a stray inbound activity arriving while the node is parked must re-park at
+/// self WITHOUT re-dispatching — a re-dispatch here would send a duplicate
+/// approval request to a human operator (load-bearing, not defensive padding).
+#[test]
+fn approval_call_stray_inbound_reparks_without_redispatch() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-resume-stray.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    build_dispatch_pack(
+        &pack_path,
+        "approval.call",
+        json!({ "await": true, "operation": "create", "input": { "mode": "always" } }),
+        true,
+    )?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(RuntimeCapturingStub::default());
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+
+    let ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let execution = rt
+        .block_on(engine.execute(ctx, Value::Null))
+        .context("await approval.call run")?;
+
+    let wait = match execution.status {
+        FlowStatus::Waiting(wait) => wait,
+        FlowStatus::Completed => {
+            anyhow::bail!("flow completed but should have paused awaiting the approval decision")
+        }
+    };
+    assert_eq!(wait.snapshot.next_node, "call");
+    assert_eq!(
+        handler.dispatch_count(),
+        1,
+        "exactly one dispatch to reach the park"
+    );
+
+    let resume_ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let resumed = rt
+        .block_on(engine.resume(resume_ctx, wait.snapshot.clone(), json!({ "text": "hi" })))
+        .context("resume with a stray inbound should re-park")?;
+
+    let wait2 = match resumed.status {
+        FlowStatus::Waiting(w) => w,
+        FlowStatus::Completed => {
+            anyhow::bail!("a stray inbound must re-park, not complete the flow")
+        }
+    };
+    assert_eq!(
+        wait2.snapshot.next_node, "call",
+        "a stray inbound must re-park at self, not the successor"
+    );
+    assert_eq!(
+        handler.dispatch_count(),
+        1,
+        "a stray inbound must NOT re-dispatch a duplicate approval request"
     );
     Ok(())
 }

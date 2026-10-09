@@ -70,6 +70,9 @@ pub fn manifest_to_tool_refs(manifest: &DigitalWorkerManifest) -> Vec<ToolRef> {
         tool_refs.push(ToolRef {
             extension_id: extension_tool.extension_id.clone(),
             tool_name: extension_tool.tool_name.clone(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         });
     }
 

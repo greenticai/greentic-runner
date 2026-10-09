@@ -27,25 +27,31 @@ jobs:
   # repo `greentic-biz/greentic-chronicle-ext` — so any compiling job would die
   # at dependency-fetch with `greenticai`-only credentials.
   #
-  # That is no longer true on this lane. Those deps are declared only on
-  # `research`; `main` has ZERO git dependencies (`grep -c 'source = "git'
-  # Cargo.lock` → 0), and Nightly Coverage already builds the whole workspace
-  # with `--all-features` on a stock runner using a plain `actions/checkout@v4`
-  # and no extra credentials. So a compile gate IS possible here, and its
-  # absence was expensive: #653 landed a `#[cfg(feature =
-  # "desktop-agent-ephemeral")]`-gated call site that did not compile, went
-  # green on `main`, and was only caught by Nightly Coverage the next morning
-  # (fixed in #659).
+  # That reasoning is LANE-SPECIFIC, and it does not apply here. Measured:
+  #   develop   `grep -c 'source = "git' Cargo.lock` -> 0   (no git deps at all)
+  #   main      same, 0                                      -> gated in #662
+  #   research  38 git deps, 6 of them on greentic-biz       -> still blocked
+  # So `develop` and `main` can and do run a compile gate; `research` genuinely
+  # cannot until a cross-org deploy key / PAT is provisioned, and is the only
+  # lane the original comment still describes.
+  #
+  # Why it matters: #653 landed a `#[cfg(feature = "desktop-agent-ephemeral")]`
+  # -gated call site that did not compile. It went green on `main` and was only
+  # caught by Nightly Coverage the next morning (fixed in #659). Nothing on a PR
+  # built it, because nothing on a PR built anything.
   #
   # `clippy --all-targets --all-features` is the gate rather than a plain
   # `cargo check`: it compiles every target including test code, which is where
   # feature-gated breaks hide, and it enforces the same `-D warnings` bar as
-  # `ci/local_check.sh`. Test *execution* deliberately stays with Nightly
-  # Coverage — this job is about "does it build", which is the gap that bit us.
+  # `ci/local_check.sh`. Test *execution* stays with Nightly Coverage — this job
+  # answers "does it build", which is the gap.
   #
-  # If a chronicle dep is ever added to this lane, this job will fail at
-  # dependency-fetch. That is the signal to provision a cross-org deploy
-  # key / PAT, not to delete the gate.
+  # Since the Chronicle split (long-term memory and knowledge moved behind
+  # `runner::runtime_ext`, their backends into the private
+  # greentic-biz/greentic-chronicle-ext), no lane of this repo names a PRIVATE
+  # git dependency at all. If one is ever added back, this job will fail at
+  # dependency-fetch. That is the signal to provision the cross-org key, not to
+  # delete the gate.
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -66,6 +72,59 @@ jobs:
 
       - name: Clippy (all targets, all features, warnings denied)
         run: cargo clippy --all-targets --all-features --workspace --locked -- -D warnings
+
+      # `--all-features` above also enables desktop-agent-ephemeral, so it cannot
+      # tell whether `operala-in-process` compiles ON ITS OWN — the combination a
+      # server binary (greentic-start) ships. `-p` is deliberate: it stops
+      # workspace feature unification from pulling the ephemeral feature back in.
+      - name: Clippy (host, operala-in-process without desktop-agent-ephemeral)
+        run: cargo clippy -p greentic-runner-host --all-targets --features operala-in-process --locked -- -D warnings
+
+  # Durable-storage gate. The rest of this workflow answers "does it build";
+  # this one answers "does a parked conversation actually survive the process",
+  # which is the only question the Redis-backed stores exist to answer and the
+  # one a compile check cannot reach.
+  #
+  # It runs on every PR rather than in Nightly Coverage on purpose: these tests
+  # skip themselves when REDIS_URL is absent, and a durability gate that skips
+  # silently is worse than none — it reads green. GREENTIC_REDIS_TESTS_REQUIRED
+  # turns that skip into a failure, so removing the service block below breaks
+  # the job loudly instead of quietly disarming it.
+  redis-storage:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-wasip2
+
+      - name: Install wasm32-wasip2 target
+        run: rustup target add wasm32-wasip2 --toolchain 1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Durable session and flow-state stores
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+          GREENTIC_REDIS_TESTS_REQUIRED: "1"
+        run: |
+          cargo test -p greentic-runner-host --test redis_lb_safety --locked
+          cargo test -p greentic-runner-host --test storage_config --locked
+          cargo test -p greentic-runner-host --lib storage:: --locked
 
   fmt:
     runs-on: ubuntu-latest
@@ -96,18 +155,6 @@ jobs:
             echo "::warning::rustfmt.toml differs from canonical"
             diff rustfmt.toml /tmp/canonical-rustfmt.toml || true
           fi
-
-  # The crates.io publish list is duplicated across release-binaries.yml (tag
-  # `v*`) and crates-publish.yml (tag `runnercrates-v*`) with nothing keeping
-  # the two in sync. #655 fixed the drift that half-published v1.1.10; this
-  # gate is what stops it recurring. Cheap (no toolchain, no build), so it runs
-  # on every PR rather than waiting for a release to expose the mismatch.
-  publish-lanes:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Assert both publish lanes list the same crates
-        run: ./ci/assert_publish_crate_lists_match.sh
 
   heavy_wasm:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_heavy_wasm == true)

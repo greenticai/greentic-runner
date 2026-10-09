@@ -36,7 +36,9 @@ use greentic_runner_host::runner::engine::FlowEngine;
 use greentic_runner_host::runner::remote_dispatch::{
     RemoteDispatch, RemoteDispatchAction, RemoteDispatchHandler,
 };
-use greentic_runner_host::runner::runtime_session_resumer::RuntimeSessionResumer;
+use greentic_runner_host::runner::runtime_session_resumer::{
+    RuntimeSessionResumer, split_dispatch_nonce,
+};
 use greentic_runner_host::storage::new_session_store;
 use greentic_runner_host::storage::session::session_host_from;
 use greentic_runner_host::storage::state::new_state_store;
@@ -219,6 +221,7 @@ fn inbound_envelope() -> IngressEnvelope {
         channel: Some("chan".into()),
         conversation: Some("conv".into()),
         user: Some("user".into()),
+        entry_node: None,
         activity_id: Some("activity-1".into()),
         timestamp: None,
         messaging_endpoint_id: None,
@@ -349,12 +352,24 @@ const SORLA_FLOW_ID: &str = "sorla.wait.flow";
 #[derive(Default)]
 struct CapturingDispatchHandler {
     last_correlation: Mutex<Option<String>>,
+    /// Every dispatch in order, so a test can count them.
+    all: Mutex<Vec<String>>,
+    /// The `decision_token` each dispatch in `all` was issued, same order.
+    tokens: Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
 impl RemoteDispatchHandler for CapturingDispatchHandler {
     async fn dispatch(&self, request: RemoteDispatch) -> Result<RemoteDispatchAction> {
         *self.last_correlation.lock().unwrap() = Some(request.correlation_id.clone());
+        self.all
+            .lock()
+            .unwrap()
+            .push(request.correlation_id.clone());
+        self.tokens
+            .lock()
+            .unwrap()
+            .push(request.decision_token.clone());
         match request.mode {
             DispatchMode::Await => Ok(RemoteDispatchAction::AwaitingResponse {
                 correlation_id: request.correlation_id,
@@ -368,24 +383,31 @@ impl RemoteDispatchHandler for CapturingDispatchHandler {
 /// The await node routes forward to `done` so the resume has a node to advance
 /// into, exactly like the existing await test in `tests/sorla_node.rs`.
 fn build_sorla_wait_pack(pack_path: &Path) -> Result<()> {
-    let runtime_flow = json!({
-        "id": SORLA_FLOW_ID,
-        "flow_type": "messaging",
-        "start": "call",
-        "nodes": {
-            "call": {
-                "component": "sorla.call",
-                "operation": "dep-1",
-                "input": { "await": true, "operation": "create", "input": {} },
-                "routing": { "next": { "node_id": "done" } }
-            },
-            "done": {
-                "component": "emit.response",
-                "input": { "text": "resumed and completed" },
-                "routing": "end"
+    build_flow_pack(
+        pack_path,
+        json!({
+            "id": SORLA_FLOW_ID,
+            "flow_type": "messaging",
+            "start": "call",
+            "nodes": {
+                "call": {
+                    "component": "sorla.call",
+                    "operation": "dep-1",
+                    "input": { "await": true, "operation": "create", "input": {} },
+                    "routing": { "next": { "node_id": "done" } }
+                },
+                "done": {
+                    "component": "emit.response",
+                    "input": { "text": "resumed and completed" },
+                    "routing": "end"
+                }
             }
-        }
-    });
+        }),
+    )
+}
+
+/// Write a `.gtpack` carrying `runtime_flow` as its only flow.
+fn build_flow_pack(pack_path: &Path, runtime_flow: serde_json::Value) -> Result<()> {
     let runtime_extension = json!({ "flows": [runtime_flow] });
 
     let mut extensions = BTreeMap::new();
@@ -734,4 +756,233 @@ fn payload_has_pending(value: &serde_json::Value) -> bool {
         serde_json::Value::Array(items) => items.iter().any(payload_has_pending),
         _ => false,
     }
+}
+
+const APPROVAL_FLOW_ID: &str = "approval.twice.flow";
+
+/// Two `approval.call` gates in ONE flow, so one conversation raises two
+/// approvals in sequence: `gate1` -> `gate2` -> `done`.
+fn build_two_approval_pack(pack_path: &Path) -> Result<()> {
+    let gate = |next: &str| {
+        json!({
+            "component": "approval.call",
+            "operation": "approvals",
+            "input": { "await": true, "operation": "request", "input": { "mode": "always" } },
+            "routing": { "next": { "node_id": next } }
+        })
+    };
+    build_flow_pack(
+        pack_path,
+        json!({
+            "id": APPROVAL_FLOW_ID,
+            "flow_type": "messaging",
+            "start": "gate1",
+            "nodes": {
+                "gate1": gate("gate2"),
+                "gate2": gate("done"),
+                "done": {
+                    "component": "emit.response",
+                    "input": { "text": "both approved" },
+                    "routing": "end"
+                }
+            }
+        }),
+    )
+}
+
+fn demo_tenant() -> TenantCtx {
+    TenantCtx::new(
+        EnvId::from_str("local").unwrap(),
+        TenantId::from_str("demo").unwrap(),
+    )
+}
+
+/// greentic-runner#793: a second approval in one conversation must be a
+/// DIFFERENT correlation id (the responder UNIQUE-indexes it), each id must
+/// resume its own gate, and a stale response for the first gate must not
+/// resume the second.
+#[test]
+fn two_approvals_in_one_conversation_get_distinct_ids_and_resume_their_own_gate() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-twice.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_two_approval_pack(&pack_path)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(CapturingDispatchHandler::default());
+    let runtime =
+        build_runtime_with_dispatch(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+    let resumer = RuntimeSessionResumer::new(Arc::clone(&runtime));
+    let dispatched = || handler.all.lock().unwrap().clone();
+    let token = |i: usize| {
+        handler.tokens.lock().unwrap()[i]
+            .clone()
+            .expect("token issued")
+    };
+    let approve = |token: String| json!({ "ok": true, "output": { "decision": "approved", "decision_token": token } });
+
+    // ---- Turn 1: parks on gate1. ----
+    let inbound = IngressEnvelope {
+        flow_id: APPROVAL_FLOW_ID.into(),
+        ..inbound_envelope()
+    };
+    let paused = rt.block_on(runtime.handle(inbound))?;
+    assert!(
+        payload_has_pending(&paused),
+        "gate1 must park, got {paused:?}"
+    );
+    let first = dispatched();
+    assert_eq!(first.len(), 1, "exactly one approval dispatched: {first:?}");
+    let id1 = first[0].clone();
+
+    // Every existing segment is still there, in order, and the nonce is last.
+    let (without_nonce, nonce1) = split_dispatch_nonce(&id1);
+    assert_eq!(
+        without_nonce,
+        format!("{BARE_HINT}::pack={PACK_ID}::flow={APPROVAL_FLOW_ID}"),
+        "the nonce is appended after every existing segment"
+    );
+    let nonce1 = nonce1.expect("an approval correlation id carries a nonce");
+    assert_eq!(nonce1.len(), 32);
+
+    // ---- Turn 2: approve gate1 -> gate2 dispatches and parks. ----
+    rt.block_on(resumer.resume(demo_tenant(), &id1, approve(token(0))))?;
+    let second = dispatched();
+    assert_eq!(
+        second.len(),
+        2,
+        "gate2 must dispatch its own approval: {second:?}"
+    );
+    let id2 = second[1].clone();
+    assert_ne!(
+        id1, id2,
+        "two approvals in one conversation must not share an id"
+    );
+    assert_eq!(
+        split_dispatch_nonce(&id2).0,
+        without_nonce,
+        "the ids differ ONLY in the nonce"
+    );
+
+    // ---- A stale response for gate1 (e.g. its watchdog `timeout`) arrives. ----
+    // It must NOT resume gate2. Were it accepted, gate2 would complete on it,
+    // and the real gate2 decision below would find no park and start a fresh
+    // run — a third dispatch.
+    rt.block_on(resumer.resume(
+        demo_tenant(),
+        &id1,
+        json!({ "ok": false, "output": { "decision_token": token(0) }, "error": { "code": "timeout" } }),
+    ))?;
+    assert_eq!(dispatched().len(), 2, "a stale response dispatches nothing");
+
+    // ---- gate2's own decision resumes gate2 and completes the flow. ----
+    rt.block_on(resumer.resume(demo_tenant(), &id2, approve(token(1))))?;
+    assert_eq!(
+        dispatched().len(),
+        2,
+        "gate2's decision must land on gate2's park (no fresh run, no third dispatch)"
+    );
+
+    // ---- And the park really was consumed: a repeat of gate2's decision now
+    // finds nothing parked and (unchanged behaviour) starts a fresh run, which
+    // raises a NEW approval with a new id. ----
+    rt.block_on(resumer.resume(demo_tenant(), &id2, approve(token(1))))?;
+    let after = dispatched();
+    assert_eq!(after.len(), 3, "no park left -> fresh run -> gate1 again");
+    assert!(
+        !after[..2].contains(&after[2]),
+        "the fresh gate1 gets a fresh id"
+    );
+    Ok(())
+}
+
+/// greentic-runner#794: a parked approval resumes only on the token it was
+/// issued. A missing or wrong token — or the guessable id with its nonce
+/// dropped — is refused at the resumer and leaves the gate parked; the right
+/// token then resumes it, once.
+#[test]
+fn an_approval_resumes_only_on_the_token_it_was_issued() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-token.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_two_approval_pack(&pack_path)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(CapturingDispatchHandler::default());
+    let runtime =
+        build_runtime_with_dispatch(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+    let resumer = RuntimeSessionResumer::new(Arc::clone(&runtime));
+    let dispatched = || handler.all.lock().unwrap().len();
+
+    rt.block_on(runtime.handle(IngressEnvelope {
+        flow_id: APPROVAL_FLOW_ID.into(),
+        ..inbound_envelope()
+    }))?;
+    assert_eq!(dispatched(), 1);
+    let id1 = handler.all.lock().unwrap()[0].clone();
+    let token1 = handler.tokens.lock().unwrap()[0]
+        .clone()
+        .expect("gate1 is issued a token");
+    let guessed = split_dispatch_nonce(&id1).0.to_string();
+
+    for (id, output) in [
+        (id1.as_str(), json!({ "decision": "approved" })),
+        (
+            id1.as_str(),
+            json!({ "decision": "approved", "decision_token": "forged" }),
+        ),
+        (guessed.as_str(), json!({ "decision": "approved" })),
+    ] {
+        rt.block_on(resumer.resume(demo_tenant(), id, json!({ "ok": true, "output": output })))?;
+        assert_eq!(
+            dispatched(),
+            1,
+            "a refused response must not resume gate1 (which would dispatch gate2)"
+        );
+    }
+
+    let approve =
+        json!({ "ok": true, "output": { "decision": "approved", "decision_token": token1 } });
+    rt.block_on(resumer.resume(demo_tenant(), &id1, approve.clone()))?;
+    assert_eq!(
+        dispatched(),
+        2,
+        "the issued token resumes gate1 -> gate2 dispatches"
+    );
+
+    // Replay: gate1's token is spent. The conversation is now parked on gate2,
+    // so the replay is dropped and nothing moves.
+    rt.block_on(resumer.resume(demo_tenant(), &id1, approve))?;
+    assert_eq!(dispatched(), 2, "a spent token resumes nothing");
+    Ok(())
+}
+
+/// Only the approval runtime is nonced: `sorla.call` (like `agentic.call`,
+/// whose bridge reuses the id as the agent's SESSION id) keeps its
+/// deterministic per-conversation correlation.
+#[test]
+fn non_approval_dispatches_carry_no_nonce() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("sorla-no-nonce.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_sorla_wait_pack(&pack_path)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(CapturingDispatchHandler::default());
+    let runtime =
+        build_runtime_with_dispatch(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+    rt.block_on(runtime.handle(sorla_inbound_envelope()))?;
+    let correlation = handler.last_correlation.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        correlation,
+        format!("{BARE_HINT}::pack={PACK_ID}::flow={SORLA_FLOW_ID}")
+    );
+    assert!(split_dispatch_nonce(&correlation).1.is_none());
+    Ok(())
 }

@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 use greentic_runner_desktop::{RunOptions, run_pack_with_options, run_pack_with_options_async};
 use serde_json::json;
 

@@ -7,7 +7,8 @@ mod inner {
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use crate::config::AgentConfig;
@@ -205,16 +206,24 @@ mod inner {
         }
     }
 
-    /// In-memory state store; lock is a no-op semaphore.
+    /// In-memory state store; lock is a no-op semaphore that counts its
+    /// refreshes (`lock_refreshes`), so a test can see a held lock kept alive.
     pub struct MockAgentStateStore {
         entries: Mutex<HashMap<String, ConversationState>>,
+        lock_refreshes: Arc<AtomicUsize>,
     }
 
     impl MockAgentStateStore {
         pub fn new() -> Self {
             Self {
                 entries: Mutex::new(HashMap::new()),
+                lock_refreshes: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        /// How many times any lock this store handed out was refreshed.
+        pub fn lock_refreshes(&self) -> usize {
+            self.lock_refreshes.load(Ordering::SeqCst)
         }
 
         fn build_key(tenant: &TenantContext, session_id: &str) -> String {
@@ -269,16 +278,20 @@ mod inner {
             _session_id: &'a str,
             _wait: Duration,
         ) -> Pin<Box<dyn Future<Output = Result<SessionLock, StateError>> + Send + 'a>> {
-            Box::pin(async move { Ok(SessionLock::new(Box::new(NoopLockInner))) })
+            let refreshes = self.lock_refreshes.clone();
+            Box::pin(async move { Ok(SessionLock::new(Box::new(NoopLockInner { refreshes }))) })
         }
     }
 
-    struct NoopLockInner;
+    struct NoopLockInner {
+        refreshes: Arc<AtomicUsize>,
+    }
 
     impl SessionLockInner for NoopLockInner {
         fn refresh<'a>(
             &'a self,
         ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
 
@@ -382,6 +395,40 @@ mod inner {
         }
     }
 
+    /// Billing meter with a fixed `over_budget` verdict, for exercising the credit
+    /// gate without HTTP. `emit` records nothing — the gate is what is under test.
+    pub struct MockBillingMeter {
+        over: bool,
+    }
+
+    impl MockBillingMeter {
+        #[must_use]
+        pub fn new(over: bool) -> Self {
+            Self { over }
+        }
+    }
+
+    impl crate::billing::BillingMeter for MockBillingMeter {
+        fn emit<'a>(
+            &'a self,
+            _tenant: &'a TenantContext,
+            _input_tokens: u64,
+            _output_tokens: u64,
+            _agent_id: &'a str,
+            _model: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::billing::BillingError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn over_budget<'a>(
+            &'a self,
+            _tenant: &'a TenantContext,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            Box::pin(std::future::ready(self.over))
+        }
+    }
+
     /// Convenience: assert a [`TerminationReason`] matches the expected value.
     pub fn assert_terminated_by(actual: &TerminationReason, expected: &TerminationReason) {
         assert_eq!(actual, expected, "expected {expected:?}, got {actual:?}");
@@ -389,6 +436,6 @@ mod inner {
 }
 
 pub use inner::{
-    MockAgentStateStore, MockConfigProvider, MockKnowledge, MockLlmBackend, MockLongTermMemory,
-    MockTelemetry, NoopToolLedger, assert_terminated_by,
+    MockAgentStateStore, MockBillingMeter, MockConfigProvider, MockKnowledge, MockLlmBackend,
+    MockLongTermMemory, MockTelemetry, NoopToolLedger, assert_terminated_by,
 };
