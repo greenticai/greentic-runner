@@ -33,8 +33,12 @@ struct StubLedger {
 }
 
 impl UserLedger for StubLedger {
-    fn read<'a>(&'a self, subject: &'a str, _limit: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
-        self.reads.lock().unwrap().push(subject.to_string());
+    fn read<'a>(
+        &'a self,
+        subject: &'a greentic_aw_runtime::user_ledger::LedgerSubject,
+        _limit: u32,
+    ) -> LedgerFuture<'a, Vec<LedgerEvent>> {
+        self.reads.lock().unwrap().push(subject.sub().to_string());
         Box::pin(async {
             Ok(vec![LedgerEvent::new(
                 "unit-1",
@@ -46,14 +50,14 @@ impl UserLedger for StubLedger {
     }
     fn append<'a>(
         &'a self,
-        subject: &'a str,
+        subject: &'a greentic_aw_runtime::user_ledger::LedgerSubject,
         kind: &'a str,
         summary: &'a str,
     ) -> LedgerFuture<'a, ()> {
         self.appends
             .lock()
             .unwrap()
-            .push((subject.into(), kind.into(), summary.into()));
+            .push((subject.sub().into(), kind.into(), summary.into()));
         Box::pin(async { Ok(()) })
     }
 }

@@ -28,7 +28,11 @@ struct CountingLedger {
 }
 
 impl UserLedger for CountingLedger {
-    fn read<'a>(&'a self, _s: &'a str, _l: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
+    fn read<'a>(
+        &'a self,
+        _s: &'a greentic_aw_runtime::user_ledger::LedgerSubject,
+        _l: u32,
+    ) -> LedgerFuture<'a, Vec<LedgerEvent>> {
         *self.calls.lock().unwrap() += 1;
         Box::pin(async {
             Ok(vec![LedgerEvent::new(
@@ -39,7 +43,12 @@ impl UserLedger for CountingLedger {
             )])
         })
     }
-    fn append<'a>(&'a self, _s: &'a str, _k: &'a str, _m: &'a str) -> LedgerFuture<'a, ()> {
+    fn append<'a>(
+        &'a self,
+        _s: &'a greentic_aw_runtime::user_ledger::LedgerSubject,
+        _k: &'a str,
+        _m: &'a str,
+    ) -> LedgerFuture<'a, ()> {
         *self.calls.lock().unwrap() += 1;
         Box::pin(async { Ok(()) })
     }

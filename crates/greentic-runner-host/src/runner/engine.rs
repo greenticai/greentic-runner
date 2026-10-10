@@ -2424,7 +2424,15 @@ impl FlowEngine {
         // `message` must be configured. Refused as a value rather than as a
         // node abort, so a flow with an error route handles it like every
         // other a2a failure and one without still completes.
-        let Some(message) = payload.get("message").filter(|value| !is_blank(value)) else {
+        let answer = crate::runner::a2a_node::answer_from_payload(&payload);
+        // A card submit carries fields and no sentence, so `message` may be
+        // blank when there is an answer to forward.
+        let blank_message = Value::String(String::new());
+        let message = payload
+            .get("message")
+            .filter(|value| !is_blank(value))
+            .or_else(|| answer.as_ref().map(|_| &blank_message));
+        let Some(message) = message else {
             let result = greentic_aw_runtime::a2a_source::call_error_value(
                 agent_id,
                 "a2a node has no `message` to send (expected a non-empty `message` field \
@@ -2438,6 +2446,7 @@ impl FlowEngine {
             ));
         };
 
+        let card_submit_to = crate::runner::a2a_node::card_submit_target(&payload);
         let source = self.a2a_source_for(ctx.tenant, pack);
         let store = pack.state_store_handle();
         // A scope we cannot build only costs the continuation, so it degrades
@@ -2458,6 +2467,9 @@ impl FlowEngine {
                 tenant: ctx.tenant,
                 env: &self.default_env,
                 pack_id: &pack_id,
+                want_card: crate::runner::a2a_node::wants_card(&payload),
+                answer,
+                card_submit_to: card_submit_to.as_deref(),
             },
             agent_id,
             message,

@@ -516,3 +516,57 @@ async fn without_the_host_option_a_verified_turn_makes_no_ledger_call() -> Resul
     assert_eq!((now.reads, now.appends), (0, 0), "{now:?}");
     Ok(())
 }
+
+/// The issuer a provider stamps on the caller block (`extensions.caller.iss`)
+/// reaches both door bodies verbatim, beside the subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_callers_issuer_reaches_the_read_and_append_bodies() -> Result<()> {
+    let _lock = ENV_LOCK.lock().await;
+    let server = door_and_llm().await;
+    let _env = EnvGuard::set(&[("GREENTIC_LLM_BASE_URL", server.uri())]);
+    let temp = TempDir::new()?;
+    let runtime = load(
+        &temp,
+        RevisionHostOptions::default().with_user_ledger(target(&server)),
+    )
+    .await?;
+    let block = json!({ "user_verified": true, "sub": "alice", "iss": "https://idp.a.example/" });
+    let output = outer_turn(&runtime, &block).await?;
+    assert!(output.to_string().contains(REPLY), "{output}");
+    assert!(appends_settled(SETTLE).await, "appends did not settle");
+    let now = settle(&server, |c| c.appends >= 1).await;
+    assert_eq!((now.reads, now.appends), (1, 1), "{now:?}");
+    for request in server.received_requests().await.unwrap_or_default() {
+        let p = request.url.path();
+        if p.ends_with("/read") || p.ends_with("/append") {
+            let body: Value = serde_json::from_slice(&request.body)?;
+            assert_eq!(body["subject"], "alice", "{body}");
+            assert_eq!(body["issuer"], "https://idp.a.example/", "{body}");
+        }
+    }
+    Ok(())
+}
+
+/// An asserted but malformed issuer is never collapsed onto the issuer-less
+/// key: the turn runs, and the ledger is not touched at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_issuer_makes_no_ledger_call() -> Result<()> {
+    let _lock = ENV_LOCK.lock().await;
+    let server = door_and_llm().await;
+    let _env = EnvGuard::set(&[("GREENTIC_LLM_BASE_URL", server.uri())]);
+    let temp = TempDir::new()?;
+    let runtime = load(
+        &temp,
+        RevisionHostOptions::default().with_user_ledger(target(&server)),
+    )
+    .await?;
+    let block = json!({ "user_verified": true, "sub": "alice", "iss": " https://idp.a" });
+    let output = outer_turn(&runtime, &block).await?;
+    assert!(output.to_string().contains(REPLY), "{output}");
+    assert!(appends_settled(SETTLE).await, "appends did not settle");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let now = calls(&server).await;
+    assert!(now.llm >= 1, "{now:?}");
+    assert_eq!((now.reads, now.appends), (0, 0), "{now:?}");
+    Ok(())
+}

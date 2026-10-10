@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use tracing::warn;
 use url::Url;
 
-use super::{LedgerError, LedgerEvent, LedgerFuture, UserLedger};
+use super::{LedgerError, LedgerEvent, LedgerFuture, LedgerSubject, UserLedger};
 
 /// Per-request ceiling, just UNDER the turn's read budget (`READ_TIMEOUT`,
 /// 1.5 s) so the client sees its own timeout, and counts it for the breaker,
@@ -265,13 +265,33 @@ async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, BodyError> 
     }
 }
 
+/// The door body for `subject`: `subject` always, `issuer` ONLY when the
+/// provider stamped one. An absent key is the legacy (issuer-less) key, which
+/// an admin that predates the field reads the same way.
+fn subject_body(
+    tenant_slug: &str,
+    subject: &LedgerSubject,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut body = serde_json::Map::new();
+    body.insert("tenant_slug".into(), json!(tenant_slug));
+    body.insert("subject".into(), json!(subject.sub()));
+    if let Some(issuer) = subject.issuer() {
+        body.insert("issuer".into(), json!(issuer));
+    }
+    body
+}
+
 impl UserLedger for HttpUserLedger {
-    fn read<'a>(&'a self, subject: &'a str, limit: u32) -> LedgerFuture<'a, Vec<LedgerEvent>> {
+    fn read<'a>(
+        &'a self,
+        subject: &'a LedgerSubject,
+        limit: u32,
+    ) -> LedgerFuture<'a, Vec<LedgerEvent>> {
         Box::pin(async move {
             let limit = limit.clamp(MIN_LIMIT, MAX_LIMIT);
-            let body =
-                json!({ "tenant_slug": self.tenant_slug, "subject": subject, "limit": limit });
-            let resp = self.post("read", body).await?;
+            let mut body = subject_body(&self.tenant_slug, subject);
+            body.insert("limit".into(), json!(limit));
+            let resp = self.post("read", body.into()).await?;
             let bytes = match read_capped(resp).await {
                 Ok(bytes) => bytes,
                 Err(BodyError::TooLarge) => {
@@ -291,14 +311,15 @@ impl UserLedger for HttpUserLedger {
 
     fn append<'a>(
         &'a self,
-        subject: &'a str,
+        subject: &'a LedgerSubject,
         kind: &'a str,
         summary: &'a str,
     ) -> LedgerFuture<'a, ()> {
         Box::pin(async move {
-            let body = json!({ "tenant_slug": self.tenant_slug, "subject": subject,
-                               "kind": kind, "summary": summary });
-            self.post("append", body).await?;
+            let mut body = subject_body(&self.tenant_slug, subject);
+            body.insert("kind".into(), json!(kind));
+            body.insert("summary".into(), json!(summary));
+            self.post("append", body.into()).await?;
             self.breaker.record_success();
             Ok(())
         })
@@ -367,6 +388,10 @@ mod tests {
         }
     }
 
+    fn subj(sub: &str) -> LedgerSubject {
+        LedgerSubject::new(sub, None)
+    }
+
     fn ledger(server: &MockServer) -> HttpUserLedger {
         HttpUserLedger::new(target(&format!("{}/api/v1/ingest/ledger", server.uri()))).unwrap()
     }
@@ -430,7 +455,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let events = ledger(&server).read("sub-1", 20).await.unwrap();
+        let events = ledger(&server).read(&subj("sub-1"), 20).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].unit, "unit-1");
         assert_eq!(events[0].summary, "booked");
@@ -448,14 +473,14 @@ mod tests {
             .await;
         let with_query = format!("{}/api/v1/ingest/ledger?v=1", server.uri());
         let l = HttpUserLedger::new(target(&with_query)).unwrap();
-        assert!(l.read("sub-1", 20).await.unwrap().is_empty());
+        assert!(l.read(&subj("sub-1"), 20).await.unwrap().is_empty());
         // A trailing slash is absorbed too.
         let l = HttpUserLedger::new(target(&format!(
             "{}/api/v1/ingest/ledger/?v=1",
             server.uri()
         )))
         .unwrap();
-        assert!(l.read("sub-1", 20).await.unwrap().is_empty());
+        assert!(l.read(&subj("sub-1"), 20).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -474,9 +499,90 @@ mod tests {
             .mount(&server)
             .await;
         ledger(&server)
-            .append("sub-1", "reply", "done")
+            .append(&subj("sub-1"), "reply", "done")
             .await
             .unwrap();
+    }
+
+    fn issued(sub: &str, iss: &str) -> LedgerSubject {
+        LedgerSubject::new(sub, Some(iss.into()))
+    }
+
+    /// The body a mock received for `verb`, exactly once.
+    async fn only_body(server: &MockServer, verb: &str) -> serde_json::Value {
+        let reqs: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().ends_with(verb))
+            .collect();
+        assert_eq!(reqs.len(), 1, "{verb}");
+        serde_json::from_slice(&reqs[0].body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_sends_the_issuer_when_the_subject_has_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingest/ledger/read"))
+            .and(body_json(
+                json!({ "tenant_slug": "alpha", "subject": "sub-1",
+                                   "issuer": "https://idp.a", "limit": 20 }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "events": [] })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        ledger(&server)
+            .read(&issued("sub-1", "https://idp.a"), 20)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_sends_the_issuer_when_the_subject_has_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingest/ledger/append"))
+            .and(body_json(
+                json!({ "tenant_slug": "alpha", "subject": "sub-1",
+                                   "issuer": "https://idp.a",
+                                   "kind": "reply", "summary": "done" }),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        ledger(&server)
+            .append(&issued("sub-1", "https://idp.a"), "reply", "done")
+            .await
+            .unwrap();
+    }
+
+    /// No issuer: the key is OMITTED, never `null` or `""` (an old admin and
+    /// a new one both read an absent key as the legacy subject).
+    #[tokio::test]
+    async fn no_issuer_key_is_sent_when_the_subject_has_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingest/ledger/read"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "events": [] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingest/ledger/append"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let l = ledger(&server);
+        l.read(&subj("sub-1"), 20).await.unwrap();
+        l.append(&subj("sub-1"), "reply", "done").await.unwrap();
+        for verb in ["/read", "/append"] {
+            let body = only_body(&server, verb).await;
+            assert!(body.get("issuer").is_none(), "{verb}: {body}");
+            assert_eq!(body["subject"], "sub-1");
+        }
     }
 
     #[tokio::test]
@@ -491,11 +597,11 @@ mod tests {
                 .await;
             let l = ledger(&server);
             assert!(
-                matches!(l.read("sub-1", 20).await, Err(LedgerError::Refused(s)) if s == status)
+                matches!(l.read(&subj("sub-1"), 20).await, Err(LedgerError::Refused(s)) if s == status)
             );
             // Suspended: the second call sends nothing (`.expect(1)` above).
             assert!(matches!(
-                l.append("sub-1", "reply", "x").await,
+                l.append(&subj("sub-1"), "reply", "x").await,
                 Err(LedgerError::Suspended)
             ));
         }
@@ -516,10 +622,13 @@ mod tests {
             .await;
         let l = ledger(&server);
         assert!(matches!(
-            l.read("s", 20).await,
+            l.read(&subj("s"), 20).await,
             Err(LedgerError::Refused(429))
         ));
-        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        assert!(matches!(
+            l.read(&subj("s"), 20).await,
+            Err(LedgerError::Suspended)
+        ));
         tokio::time::pause();
         l
     }
@@ -567,17 +676,23 @@ mod tests {
             .await;
         let l = ledger(&server);
         assert!(matches!(
-            l.read("s", 20).await,
+            l.read(&subj("s"), 20).await,
             Err(LedgerError::Refused(401))
         ));
-        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        assert!(matches!(
+            l.read(&subj("s"), 20).await,
+            Err(LedgerError::Suspended)
+        ));
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(299)).await;
-        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        assert!(matches!(
+            l.read(&subj("s"), 20).await,
+            Err(LedgerError::Suspended)
+        ));
         tokio::time::advance(Duration::from_secs(2)).await;
         // Real clock again for the socket: the window already expired.
         tokio::time::resume();
-        assert!(l.read("s", 20).await.unwrap().is_empty());
+        assert!(l.read(&subj("s"), 20).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -597,17 +712,23 @@ mod tests {
         let l = ledger(&server);
         for _ in 0..3 {
             assert!(matches!(
-                l.read("s", 20).await,
+                l.read(&subj("s"), 20).await,
                 Err(LedgerError::Refused(503))
             ));
         }
-        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        assert!(matches!(
+            l.read(&subj("s"), 20).await,
+            Err(LedgerError::Suspended)
+        ));
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(29)).await;
-        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        assert!(matches!(
+            l.read(&subj("s"), 20).await,
+            Err(LedgerError::Suspended)
+        ));
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::time::resume();
-        assert!(l.read("s", 20).await.unwrap().is_empty());
+        assert!(l.read(&subj("s"), 20).await.unwrap().is_empty());
     }
 
     /// 5xx, 5xx, 2xx, 5xx: the success breaks the run, so no suspension.
@@ -629,16 +750,16 @@ mod tests {
         }
         let l = ledger(&server);
         assert!(matches!(
-            l.read("s", 20).await,
+            l.read(&subj("s"), 20).await,
             Err(LedgerError::Refused(503))
         ));
         assert!(matches!(
-            l.read("s", 20).await,
+            l.read(&subj("s"), 20).await,
             Err(LedgerError::Refused(503))
         ));
-        assert!(l.read("s", 20).await.unwrap().is_empty());
+        assert!(l.read(&subj("s"), 20).await.unwrap().is_empty());
         assert!(matches!(
-            l.read("s", 20).await,
+            l.read(&subj("s"), 20).await,
             Err(LedgerError::Refused(503))
         ));
         assert!(!l.breaker.suspended(Instant::now()));
@@ -669,12 +790,15 @@ mod tests {
         let l =
             HttpUserLedger::new(target(&format!("http://{addr}/api/v1/ingest/ledger"))).unwrap();
         for _ in 0..3 {
-            match l.read("s", 20).await {
+            match l.read(&subj("s"), 20).await {
                 Err(LedgerError::Unavailable(m)) => assert_eq!(m, "response body unreadable"),
                 other => panic!("{other:?}"),
             }
         }
-        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        assert!(matches!(
+            l.read(&subj("s"), 20).await,
+            Err(LedgerError::Suspended)
+        ));
     }
 
     #[tokio::test]
@@ -689,7 +813,7 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            ledger(&server).read("s", asked).await.unwrap();
+            ledger(&server).read(&subj("s"), asked).await.unwrap();
         }
     }
 
@@ -723,11 +847,11 @@ mod tests {
             .await;
         let l = ledger(&server);
         assert!(matches!(
-            l.read("s", 20).await,
+            l.read(&subj("s"), 20).await,
             Err(LedgerError::Refused(500))
         ));
         assert!(matches!(
-            l.read("s", 20).await,
+            l.read(&subj("s"), 20).await,
             Err(LedgerError::Refused(500))
         ));
     }
@@ -745,13 +869,16 @@ mod tests {
         let l = ledger(&server);
         for _ in 0..3 {
             assert!(matches!(
-                l.read("s", 20).await,
+                l.read(&subj("s"), 20).await,
                 Err(LedgerError::Refused(503))
             ));
         }
-        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
         assert!(matches!(
-            l.append("s", "reply", "x").await,
+            l.read(&subj("s"), 20).await,
+            Err(LedgerError::Suspended)
+        ));
+        assert!(matches!(
+            l.append(&subj("s"), "reply", "x").await,
             Err(LedgerError::Suspended)
         ));
     }
@@ -767,12 +894,15 @@ mod tests {
             .await;
         let l = ledger(&server);
         for _ in 0..3 {
-            match l.read("s", 20).await {
+            match l.read(&subj("s"), 20).await {
                 Err(LedgerError::Unavailable(m)) => assert_eq!(m, "request timed out"),
                 other => panic!("{other:?}"),
             }
         }
-        assert!(matches!(l.read("s", 20).await, Err(LedgerError::Suspended)));
+        assert!(matches!(
+            l.read(&subj("s"), 20).await,
+            Err(LedgerError::Suspended)
+        ));
     }
 
     /// Other 4xx (the extractor's plain-text 400/413/415/422): refused, never
@@ -788,7 +918,7 @@ mod tests {
                 .await;
             let l = ledger(&server);
             for _ in 0..2 {
-                let e = l.read("sub-1", 20).await.unwrap_err();
+                let e = l.read(&subj("sub-1"), 20).await.unwrap_err();
                 assert!(matches!(e, LedgerError::Refused(s) if s == status));
                 assert!(!format!("{e} {e:?}").contains("LEAK"));
             }
@@ -817,11 +947,11 @@ mod tests {
             .await;
         let l = ledger(&server);
         assert!(matches!(
-            l.read("s", 20).await,
+            l.read(&subj("s"), 20).await,
             Err(LedgerError::Refused(307))
         ));
         assert!(matches!(
-            l.append("s", "reply", "x").await,
+            l.append(&subj("s"), "reply", "x").await,
             Err(LedgerError::Refused(307))
         ));
     }
@@ -835,7 +965,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(big.clone()))
             .mount(&server)
             .await;
-        match ledger(&server).read("s", 20).await {
+        match ledger(&server).read(&subj("s"), 20).await {
             Err(LedgerError::Unavailable(m)) => assert_eq!(m, "response too large"),
             other => panic!("{other:?}"),
         }
@@ -848,7 +978,13 @@ mod tests {
             )
             .mount(&server)
             .await;
-        assert!(ledger(&server).read("s", 20).await.unwrap().is_empty());
+        assert!(
+            ledger(&server)
+                .read(&subj("s"), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// No `content-length`: a chunked body past the cap is cut off while
@@ -879,7 +1015,7 @@ mod tests {
         });
         let l =
             HttpUserLedger::new(target(&format!("http://{addr}/api/v1/ingest/ledger"))).unwrap();
-        match l.read("s", 20).await {
+        match l.read(&subj("s"), 20).await {
             Err(LedgerError::Unavailable(m)) => assert_eq!(m, "response too large"),
             other => panic!("{other:?}"),
         }
@@ -892,7 +1028,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("LEAK not json"))
             .mount(&server)
             .await;
-        let e = ledger(&server).read("s", 20).await.unwrap_err();
+        let e = ledger(&server).read(&subj("s"), 20).await.unwrap_err();
         assert!(!format!("{e}").contains("LEAK"));
     }
 

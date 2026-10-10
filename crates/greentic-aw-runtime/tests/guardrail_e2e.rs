@@ -715,7 +715,7 @@ struct RecordingLedger {
 impl greentic_aw_runtime::user_ledger::UserLedger for RecordingLedger {
     fn read<'a>(
         &'a self,
-        _s: &'a str,
+        _s: &'a greentic_aw_runtime::user_ledger::LedgerSubject,
         _l: u32,
     ) -> greentic_aw_runtime::user_ledger::LedgerFuture<
         'a,
@@ -725,7 +725,7 @@ impl greentic_aw_runtime::user_ledger::UserLedger for RecordingLedger {
     }
     fn append<'a>(
         &'a self,
-        _s: &'a str,
+        _s: &'a greentic_aw_runtime::user_ledger::LedgerSubject,
         _k: &'a str,
         summary: &'a str,
     ) -> greentic_aw_runtime::user_ledger::LedgerFuture<'a, ()> {
