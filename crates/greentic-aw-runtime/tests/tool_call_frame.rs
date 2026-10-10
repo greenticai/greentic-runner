@@ -182,6 +182,7 @@ async fn a_flow_call_and_its_resume_carry_the_same_frame() {
             text: String::new(),
             conversational: false,
             resume_payload: Some(json!({ "room": "101" })),
+            ..Default::default()
         },
     )
     .await
@@ -272,6 +273,7 @@ async fn the_frame_carries_the_outer_steps_verified_caller_never_model_text() {
             text: String::new(),
             conversational: false,
             resume_payload: Some(json!({})),
+            ..Default::default()
         },
     )
     .await

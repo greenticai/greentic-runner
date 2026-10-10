@@ -120,6 +120,7 @@ async fn loop_emits_billing_with_the_configured_model() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -163,6 +164,7 @@ async fn record_one_emit(tenant: TenantContext) -> EmitCall {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -247,6 +249,7 @@ async fn an_installed_worker_usage_meter_posts_one_turn_event_per_iteration() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await

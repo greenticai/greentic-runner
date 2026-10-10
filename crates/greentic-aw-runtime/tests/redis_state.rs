@@ -33,12 +33,13 @@ async fn save_then_load_roundtrips_state() {
     let mut state = ConversationState::empty(&tc, &session);
     state.messages.push(ChatMessage::User {
         content: "hello".into(),
+        attachments: Vec::new(),
     });
     store.save(&tc, &session, &state).await.unwrap();
 
     let loaded = store.load(&tc, &session).await.unwrap();
     assert_eq!(loaded.messages.len(), 1);
-    if let ChatMessage::User { content } = &loaded.messages[0] {
+    if let ChatMessage::User { content, .. } = &loaded.messages[0] {
         assert_eq!(content, "hello");
     } else {
         panic!("expected User message");
@@ -63,6 +64,7 @@ async fn state_survives_store_drop_and_rebuild() {
         let mut state = ConversationState::empty(&tenant, &session);
         state.messages.push(ChatMessage::User {
             content: "remember me".into(),
+            attachments: Vec::new(),
         });
         store.save(&tenant, &session, &state).await.unwrap();
     } // store dropped — simulates a runner restart
@@ -73,7 +75,7 @@ async fn state_survives_store_drop_and_rebuild() {
     let has_msg = loaded.messages.iter().any(|m| {
         matches!(
             m,
-            ChatMessage::User { content } if content == "remember me"
+            ChatMessage::User { content, .. } if content == "remember me"
         )
     });
     assert!(
@@ -218,18 +220,20 @@ async fn two_tenants_share_redis_without_cross_talk() {
     let mut state_a = ConversationState::empty(&a, &session);
     state_a.messages.push(ChatMessage::User {
         content: "from-acme".into(),
+        attachments: Vec::new(),
     });
     store.save(&a, &session, &state_a).await.unwrap();
 
     let mut state_b = ConversationState::empty(&b, &session);
     state_b.messages.push(ChatMessage::User {
         content: "from-beta".into(),
+        attachments: Vec::new(),
     });
     store.save(&b, &session, &state_b).await.unwrap();
 
     let loaded_a = store.load(&a, &session).await.unwrap();
     let loaded_b = store.load(&b, &session).await.unwrap();
-    if let (ChatMessage::User { content: ca }, ChatMessage::User { content: cb }) =
+    if let (ChatMessage::User { content: ca, .. }, ChatMessage::User { content: cb, .. }) =
         (&loaded_a.messages[0], &loaded_b.messages[0])
     {
         assert_eq!(ca, "from-acme");

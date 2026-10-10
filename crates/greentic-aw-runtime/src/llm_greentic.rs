@@ -14,11 +14,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use greentic_llm::{
-    ChatMessage as GChatMessage, ChatRequest as GChatRequest, ChatResponse as GChatResponse,
-    Credential, LlmProvider, MessageRole, ProviderKind, RigBackend, ToolCall as GToolCall,
-    ToolDef as GToolDef,
+    ChatImage as GChatImage, ChatMessage as GChatMessage, ChatRequest as GChatRequest,
+    ChatResponse as GChatResponse, Credential, LlmProvider, MessageRole, ProviderKind, RigBackend,
+    ToolCall as GToolCall, ToolDef as GToolDef,
 };
 
+use crate::artifact_reader::ArtifactReader;
+use crate::attachment_guard::AttachmentTextGuard;
+use crate::attachments_materialize::{TurnAttachments, TurnKey, materialize};
 use crate::error::LlmError;
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
 use crate::state::{ChatMessage, ToolCallRecord};
@@ -34,6 +37,17 @@ pub struct GreenticLlmBackend {
     api_key: String,
     base_url: Option<String>,
     cache: Mutex<HashMap<(String, String), Arc<dyn LlmProvider>>>,
+    /// Resolves attachment bytes for the current turn. `None`: attachments
+    /// are not materialised and the agent is told so (the turn still runs).
+    artifacts: Option<Arc<dyn ArtifactReader>>,
+    /// Makes the per-turn nonce of document-block markers. Injected only in
+    /// tests, to make the markers deterministic.
+    nonce_source: fn() -> String,
+}
+
+/// 122 random bits (a v4 UUID), as 32 lowercase hex characters.
+fn random_nonce() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 impl GreenticLlmBackend {
@@ -45,7 +59,38 @@ impl GreenticLlmBackend {
             api_key: api_key.into(),
             base_url: base_url.filter(|s| !s.trim().is_empty()),
             cache: Mutex::new(HashMap::new()),
+            artifacts: None,
+            nonce_source: random_nonce,
         }
+    }
+
+    /// Inject the reader used to resolve attachment bytes for the current turn.
+    pub fn with_artifact_reader(mut self, reader: Arc<dyn ArtifactReader>) -> Self {
+        self.artifacts = Some(reader);
+        self
+    }
+
+    /// Test seam: make document-block nonces deterministic.
+    #[cfg(any(test, feature = "test-mock"))]
+    pub fn with_nonce_source(mut self, source: fn() -> String) -> Self {
+        self.nonce_source = source;
+        self
+    }
+
+    /// Test seam: serve `(provider, model)` from `p` instead of building a
+    /// `RigBackend`.
+    #[cfg(any(test, feature = "test-mock"))]
+    pub fn with_cached_provider(
+        self,
+        provider: &str,
+        model: &str,
+        p: Arc<dyn LlmProvider>,
+    ) -> Self {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((provider.to_string(), model.to_string()), p);
+        self
     }
 
     /// Resolve (or build + cache) the greentic-llm provider for an agent's
@@ -92,28 +137,160 @@ impl LlmBackend for GreenticLlmBackend {
         Box::pin(async move {
             let provider =
                 self.provider_for(&request.provider.provider, &request.provider.model)?;
-            let chat_request = build_chat_request(&request);
+            // The vision gate runs BEFORE chat(): a provider without vision
+            // refuses any image with a hard error, so an image it cannot take
+            // is never sent and the agent is told instead.
+            let vision = provider.capabilities().vision;
+            let mut request = request;
+            let memo = request.turn_attachments.clone();
+            let guard = request.attachment_text_guard.clone();
+            let images = self
+                .apply_attachments(&mut request.history, vision, &memo, guard.as_deref())
+                .await;
+            let image_count = images.len();
+            let chat_request = build_chat_request(&request, images);
             // Built from the list the model is shown: a sanitised wire name
             // cannot be split back apart by string surgery.
             let codec = ToolNameCodec::for_tools(&request.tools);
-            let response = provider
-                .chat(chat_request)
-                .await
-                // greentic-llm errors are auth/config/transport-class; surface as
-                // BadRequest so `RetryingLlmBackend` does not loop on a
-                // deterministic failure.
-                .map_err(|e| LlmError::BadRequest(e.to_string()))?;
+            // greentic-llm errors are auth/config/transport-class; surface as
+            // BadRequest so `RetryingLlmBackend` does not loop on a
+            // deterministic failure.
+            let response = match provider.chat(chat_request).await {
+                Ok(response) => response,
+                Err(first) if image_count > 0 && refuses_images(&first) => {
+                    // Vision is advertised per PROVIDER, not per model: a model
+                    // that takes no images fails the call. Retry ONCE without
+                    // them, telling the agent; if that fails too, the original
+                    // error is what the caller sees. Only an error that reads
+                    // as the request being refused is retried: a rate limit,
+                    // an auth failure, a timeout or a server error would only
+                    // repeat (and a rate limit would be spent twice).
+                    tracing::warn!(
+                        code = "images_refused_retry",
+                        images = image_count,
+                        "provider refused a request carrying images; retrying without them"
+                    );
+                    append_to_last_user(
+                        &mut request.history,
+                        &crate::attachments_materialize::images_unseen_note(image_count),
+                    );
+                    provider
+                        .chat(build_chat_request(&request, Vec::new()))
+                        .await
+                        .map_err(|_| LlmError::BadRequest(first.to_string()))?
+                }
+                Err(e) => return Err(LlmError::BadRequest(e.to_string())),
+            };
             Ok(map_response(response, &codec))
         })
     }
 }
 
+impl GreenticLlmBackend {
+    /// Materialise the attachments of the LAST user message only; an earlier
+    /// user message keeps a fixed marker so a long conversation never fetches
+    /// old files again. Mutates the REQUEST's copy of the history, never the
+    /// conversation state (the loop hands over a clone), so state keeps
+    /// references only. Returns the images for the last user message.
+    async fn apply_attachments(
+        &self,
+        history: &mut [ChatMessage],
+        vision: bool,
+        memo: &TurnAttachments,
+        guard: Option<&dyn AttachmentTextGuard>,
+    ) -> Vec<GChatImage> {
+        let last_user = history
+            .iter()
+            .rposition(|m| matches!(m, ChatMessage::User { .. }));
+        let mut images = Vec::new();
+        for (idx, msg) in history.iter_mut().enumerate() {
+            let ChatMessage::User {
+                content,
+                attachments,
+            } = msg
+            else {
+                continue;
+            };
+            if attachments.is_empty() {
+                continue;
+            }
+            if Some(idx) == last_user {
+                let key = TurnKey {
+                    last_user_index: idx,
+                    vision,
+                };
+                let refs: &[_] = attachments;
+                let m = memo
+                    .get_or_materialize(key, || {
+                        let nonce = (self.nonce_source)();
+                        async move {
+                            materialize(self.artifacts.as_deref(), refs, vision, &nonce, guard)
+                                .await
+                        }
+                    })
+                    .await;
+                content.push_str(&m.text);
+                images = m
+                    .images
+                    .into_iter()
+                    .map(|i| GChatImage {
+                        data_base64: i.data_base64,
+                        media_type: i.media_type,
+                    })
+                    .collect();
+            } else {
+                content.push_str(&format!(
+                    "\n[This message had {} attachment(s), handled in an earlier turn; they \
+                     are not repeated here.]",
+                    attachments.len()
+                ));
+            }
+            attachments.clear();
+        }
+        images
+    }
+}
+
+/// Whether `e` can be the model refusing the images it was sent: a provider
+/// status of 400, 415 or 422 (rig maps an HTTP status onto
+/// [`greentic_llm::LlmError::Status`]), or the provider refusing vision. Never
+/// a transport failure or timeout, 401/403/408/429, or a 5xx.
+fn refuses_images(e: &greentic_llm::LlmError) -> bool {
+    matches!(
+        e,
+        greentic_llm::LlmError::Status {
+            status: 400 | 415 | 422,
+            ..
+        } | greentic_llm::LlmError::UnsupportedCapability("vision")
+    )
+}
+
+/// Append `text` to the last user message of `history` (the current turn's).
+fn append_to_last_user(history: &mut [ChatMessage], text: &str) {
+    if let Some(ChatMessage::User { content, .. }) = history
+        .iter_mut()
+        .rev()
+        .find(|m| matches!(m, ChatMessage::User { .. }))
+    {
+        content.push_str(text);
+    }
+}
+
 /// AW [`LlmRequest`] → greentic-llm [`ChatRequest`](greentic_llm::ChatRequest).
-fn build_chat_request(req: &LlmRequest) -> GChatRequest {
+/// `images` ride on the last user message (the current turn's).
+fn build_chat_request(req: &LlmRequest, images: Vec<GChatImage>) -> GChatRequest {
     let mut messages: Vec<GChatMessage> = Vec::with_capacity(req.history.len() + 1);
     messages.push(text_message(MessageRole::System, req.system_prompt.clone()));
     for msg in &req.history {
         messages.push(map_message(msg));
+    }
+    if !images.is_empty()
+        && let Some(m) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == MessageRole::User)
+    {
+        m.images = images;
     }
     let tools: Vec<GToolDef> = req
         .tools
@@ -147,7 +324,7 @@ fn text_message(role: MessageRole, content: String) -> GChatMessage {
 fn map_message(msg: &ChatMessage) -> GChatMessage {
     match msg {
         ChatMessage::System { content } => text_message(MessageRole::System, content.clone()),
-        ChatMessage::User { content } => text_message(MessageRole::User, content.clone()),
+        ChatMessage::User { content, .. } => text_message(MessageRole::User, content.clone()),
         ChatMessage::Assistant {
             content,
             tool_calls,
@@ -223,6 +400,8 @@ mod tests {
                 model: "deepseek-chat".into(),
                 credential_ref: None,
             },
+            turn_attachments: Default::default(),
+            attachment_text_guard: None,
         }
     }
 
@@ -231,6 +410,7 @@ mod tests {
         let request = req(
             vec![ChatMessage::User {
                 content: "hi".into(),
+                attachments: Vec::new(),
             }],
             vec![LlmToolSchema {
                 extension_id: "greentic.tavily".into(),
@@ -239,7 +419,7 @@ mod tests {
                 parameters: json!({"type": "object"}),
             }],
         );
-        let chat = build_chat_request(&request);
+        let chat = build_chat_request(&request, Vec::new());
         assert_eq!(chat.messages.len(), 2);
         assert!(matches!(chat.messages[0].role, MessageRole::System));
         assert_eq!(chat.messages[0].content, "be helpful");
@@ -252,7 +432,7 @@ mod tests {
 
     #[test]
     fn build_chat_request_omits_tool_choice_without_tools() {
-        let chat = build_chat_request(&req(vec![], vec![]));
+        let chat = build_chat_request(&req(vec![], vec![]), Vec::new());
         assert!(chat.tools.is_empty());
         assert!(chat.tool_choice.is_none());
     }
@@ -297,6 +477,7 @@ mod tests {
         let request = req(
             vec![ChatMessage::User {
                 content: "What is the latest stable Rust version? Use tavily_search.".into(),
+                attachments: Vec::new(),
             }],
             vec![LlmToolSchema {
                 extension_id: "greentic.tavily".into(),
@@ -362,3 +543,7 @@ mod tests {
         assert_eq!(resp.tokens_out, 17);
     }
 }
+
+#[cfg(test)]
+#[path = "llm_greentic_attachment_tests.rs"]
+mod attachment_tests;

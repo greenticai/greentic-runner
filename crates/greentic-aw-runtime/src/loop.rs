@@ -277,6 +277,14 @@ async fn run_step_scoped(
     // --- Inbound guardrail hook ---
     // Skipped when resuming a parked flow tool: the user's answer goes to the
     // flow, not the LLM, and returns as a tool result like any other tool's.
+    let attachments = message.attachments;
+    // The answer to a parked flow goes to the flow, which takes no files: the
+    // count is kept so the agent is told after the resume, never silently.
+    let resume_attachment_count = if resuming.is_some() {
+        attachments.len()
+    } else {
+        0
+    };
     let user_message = if resuming.is_some() {
         crate::flow_suspend::last_user_text(&state)
     } else {
@@ -312,11 +320,26 @@ async fn run_step_scoped(
         };
         // Keep user_message for long-term memory recall query below.
         let user_message = user_text.clone();
-        state
-            .messages
-            .push(ChatMessage::User { content: user_text });
+        state.messages.push(ChatMessage::User {
+            content: user_text,
+            attachments,
+        });
         user_message
     };
+
+    // The SAME inbound chain that checked the message text checks every
+    // attachment document's text, inside the backend, before it reaches the
+    // prompt (once per turn: it runs within the per-turn attachment memo).
+    // ALSO on a resume: no new user message is pushed then, but the last user
+    // message still carries its attachments, and the backend materialises
+    // them again for this turn, so they must pass the chain again. Only the
+    // message-text chain is skipped on a resume (the answer goes to the flow).
+    let attachment_text_guard = crate::attachment_guard::InboundChainGuard::for_turn(
+        &guardrail_chain,
+        &guardrail_ctx,
+        runtime.guardrail_evaluator.clone(),
+        observer.clone(),
+    );
 
     // Whether long-term memory is active for this turn (provider wired + the
     // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,
@@ -510,6 +533,8 @@ async fn run_step_scoped(
     if let Some(resume) = resuming {
         first_iter = resume.pending.iterations_used;
         iterations = first_iter;
+        let resumed_call_id = resume.pending.call_id.clone();
+        let carried_attachments = resume.pending.unannounced_attachments as usize;
         suspension = crate::flow_suspend::resume_pending(
             runtime,
             &lock,
@@ -525,7 +550,29 @@ async fn run_step_scoped(
         if suspension.is_some() {
             terminated_by = TerminationReason::AwaitingToolInput;
         }
+        // Files sent with the answer go nowhere (the flow takes none): the
+        // agent is told IN the resumed call's result (fixed text, a count
+        // only), so truncation removes the note with its group. On a re-park
+        // the model is not called: the count waits on the pending call.
+        match state.pending_tool.as_mut() {
+            Some(pending) if suspension.is_some() => {
+                pending.unannounced_attachments = pending
+                    .unannounced_attachments
+                    .saturating_add(u32::try_from(resume_attachment_count).unwrap_or(u32::MAX));
+            }
+            _ => crate::flow_suspend::announce_unread_attachments(
+                &mut state,
+                &resumed_call_id,
+                carried_attachments.saturating_add(resume_attachment_count),
+            ),
+        }
     }
+    // One memo per TURN, shared by every iteration's request (and by a
+    // retrying backend's re-sends): the current message's attachments are
+    // fetched once, and the memo is dropped when the turn ends. Never shared
+    // across turns or conversations (it holds bytes fetched under this turn's
+    // authorisation).
+    let turn_attachments = crate::attachments_materialize::TurnAttachments::for_turn();
     let iter_range = if suspension.is_some() {
         0..0
     } else {
@@ -568,6 +615,8 @@ async fn run_step_scoped(
             history: state.messages.clone(),
             tools: tools_schema,
             provider: config.llm.clone(),
+            turn_attachments: turn_attachments.clone(),
+            attachment_text_guard: attachment_text_guard.clone(),
         };
 
         // Stream only when the observer actually consumes deltas. A
@@ -863,6 +912,7 @@ async fn run_step_scoped(
                                 presentation: Some(presentation.clone()),
                                 parked_at: Some(chrono::Utc::now()),
                                 side_turns: 0,
+                                unannounced_attachments: 0,
                             });
                             if config.on_text_while_parked
                                 == crate::config::ParkedTextPolicy::SideTurn
@@ -1610,6 +1660,7 @@ mod tests {
                     text: "hi".into(),
                     conversational: true,
                     resume_payload: None,
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -1649,6 +1700,7 @@ mod tests {
                     text: "hi".into(),
                     conversational: false,
                     resume_payload: None,
+                    attachments: Vec::new(),
                 },
             )
             .await

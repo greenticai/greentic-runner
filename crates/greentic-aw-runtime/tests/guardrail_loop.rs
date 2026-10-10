@@ -108,6 +108,7 @@ async fn fail_closed_mandatory_unresolved_returns_guardrail_denied() {
                 text: "hello — please process this".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await;
@@ -195,6 +196,7 @@ async fn no_mandatory_guardrails_passes_through() {
                 text: "hi".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -229,6 +231,7 @@ async fn mandatory_ref_with_empty_registry_fails_closed() {
                 text: "sensitive input".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await;
@@ -350,6 +353,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await;

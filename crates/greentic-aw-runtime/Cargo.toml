@@ -54,7 +54,7 @@ greentic-dw-manifest = ">=1.2.0-dev, <1.3.0-0"
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
 greentic-dw-memory-long-term = ">=1.2.0-dev, <1.3.0-0"
-greentic-ext-runtime = ">=1.2.0, <1.3.0"
+greentic-ext-runtime = ">=1.2.38027318243, <1.3.0"
 greentic-extension-sdk-contract = ">=1.2.24-dev, <1.2.25"
 # Multi-provider LLM door (rig-core under the hood). Optional — see the
 # `greentic-llm-backend` feature.
@@ -107,6 +107,9 @@ thiserror           = { workspace = true }
 tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing             = { workspace = true }
 unicode-normalization = "0.1"
+# Unicode general categories (Cc/Cf/Zl/Zp) for sanitising attachment names
+# and document text. Already in the lock via jsonschema; no dependencies.
+unicode-general-category = "1"
 url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
 # ULID event ids for the worker-usage ingest door (the admin keys a

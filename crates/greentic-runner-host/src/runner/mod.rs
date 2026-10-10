@@ -7,6 +7,9 @@ pub mod adapt_timer;
 pub mod agent_node;
 pub mod approval_http;
 pub(crate) mod approval_token;
+// Uses `GreenticLlmBackend`, which exists only with `greentic-llm-backend`.
+#[cfg(all(feature = "agentic-worker", feature = "greentic-llm-backend"))]
+pub(crate) mod artifact_reader_wiring;
 #[cfg(feature = "agentic-worker")]
 pub(crate) mod aw_backends;
 pub mod card_nav;
@@ -27,6 +30,10 @@ pub mod user_ledger_routes;
 // `agent_node::EnvLlmPort`, which this module wraps as tier 2.
 #[cfg(all(feature = "agentic-worker", feature = "greentic-llm-backend"))]
 pub(crate) mod ext_llm_port;
+// Stores files an extension creates (`host.artifact.put`); public because
+// greentic-start may construct `HttpArtifactPort` for a unit.
+#[cfg(feature = "agentic-worker")]
+pub mod ext_artifact_port;
 pub mod flow_adapter;
 #[cfg(feature = "agentic-worker")]
 pub mod flow_invoker;
@@ -153,6 +160,8 @@ impl HostServer {
             ext_runtime: crate::runner::agent_node::build_ext_runtime(
                 std::sync::Arc::new(crate::runner::agent_node::EnvSecretsBackend),
                 None,
+                None,
+                // Process-level path: no embedding host, so no artifact port.
                 None,
                 &[],
             ),

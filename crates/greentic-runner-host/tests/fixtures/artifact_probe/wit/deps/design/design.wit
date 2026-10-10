@@ -1,0 +1,13 @@
+package greentic:extension-design@0.2.0;
+
+// Only `invoke-tool`, the export the runtime resolves for a tool call; the
+// error variant is structurally the 0.1.0 base `extension-error`.
+interface tools {
+  variant extension-error {
+    invalid-input(string),
+    missing-capability(string),
+    permission-denied(string),
+    internal(string),
+  }
+  invoke-tool: func(name: string, args-json: string) -> result<string, extension-error>;
+}

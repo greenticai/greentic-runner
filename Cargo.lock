@@ -2461,6 +2461,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "unicode-general-category",
  "unicode-normalization",
  "url",
  "uuid",
@@ -2878,9 +2879,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-ext-runtime"
-version = "1.2.37753059137"
+version = "1.2.38027318243"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d20d33e2f624305ec4fc7d044cc783d64e056578c3b0b810bbe8793c0256559e"
+checksum = "dd0d9cce3762008fc448bd19a9987332c1c5342ed490e5cc36742c10ccba89bd"
 dependencies = [
  "anyhow",
  "arc-swap",

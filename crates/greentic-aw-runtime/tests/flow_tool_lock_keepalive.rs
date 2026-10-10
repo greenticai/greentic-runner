@@ -202,6 +202,7 @@ async fn the_lock_is_refreshed_while_a_slow_resume_is_pending() {
             text: String::new(),
             conversational: false,
             resume_payload: Some(json!({ "room": "101" })),
+            ..Default::default()
         },
     )
     .await

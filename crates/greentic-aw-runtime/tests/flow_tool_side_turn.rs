@@ -266,6 +266,7 @@ impl Harness {
                     text: text.into(),
                     conversational: false,
                     resume_payload,
+                    ..Default::default()
                 },
             )
             .await
@@ -584,6 +585,7 @@ async fn an_llm_error_during_a_side_turn_keeps_the_park_and_a_valid_transcript()
                 text: "q".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await;
@@ -685,6 +687,7 @@ async fn a_denied_side_message_keeps_the_park_untouched() {
                 text: "q".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await;

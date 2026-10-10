@@ -1,0 +1,15 @@
+package greentic:extension-host@0.1.0;
+
+// The `artifact` interface exactly as greentic-ext-runtime declares it.
+interface artifact {
+  variant artifact-error {
+    unsupported,
+    tenant-required,
+    invalid-size,
+    invalid-input(string),
+    unsupported-media-type,
+    quota-exceeded,
+    unavailable,
+  }
+  put: func(bytes: list<u8>, mime-type: string, name: string) -> result<string, artifact-error>;
+}

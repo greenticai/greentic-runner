@@ -14,6 +14,11 @@
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod a2a_source;
+pub mod artifact_door;
+pub mod artifact_reader;
+pub mod attachment_guard;
+pub mod attachments;
+pub mod attachments_materialize;
 pub mod billing;
 pub mod component_source;
 pub mod config;
@@ -73,6 +78,11 @@ pub mod mock;
 pub mod serve;
 
 pub use a2a_source::{A2aRoute, A2aToolCatalog, A2aToolEntry, A2aToolSource};
+pub use artifact_door::{DOOR_ATTEMPTS, DOOR_CONCURRENCY, DoorReply, DoorRetry, DoorSendError};
+pub use artifact_reader::{
+    ArtifactBytes, ArtifactClientError, ArtifactError, ArtifactReader, HttpArtifactReader, door_url,
+};
+pub use attachments::{AttachmentKind, AttachmentRef, is_artifact_ref};
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
@@ -118,6 +128,10 @@ pub use playbook_source::{
     PlaybookSource, PlaybookToolCatalog, PlaybookToolEntry, PlaybookToolSource, PlaybookTurnFn,
     PlaybookTurnRequest, PlaybookTurnResult,
 };
+/// The `reqwest` the door helpers ([`DoorRetry`]) speak. A door client in
+/// another crate builds its `reqwest::Client` from this one, so the two never
+/// disagree on the version.
+pub use reqwest as door_reqwest;
 pub use run_trace::{RunContext, RunTrace, StepId, ToolOutcome};
 pub use share_policy::{BindingModes, ShareMode, SharePolicy};
 pub use sorla_source::{
@@ -623,6 +637,13 @@ pub struct AgentInput {
     /// [`TerminationReason::AwaitingToolInput`]: crate::error::TerminationReason::AwaitingToolInput
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_payload: Option<serde_json::Value>,
+    /// Attachments of THIS message (references only; see [`attachments`]).
+    ///
+    /// Adding this field made `AgentInput { .. }` literals without a base fail
+    /// to compile; downstream constructors use `..Default::default()` rather
+    /// than the struct being `#[non_exhaustive]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
 }
 
 /// Token + iteration accounting for one [`AgentRuntime::step`]. Surfaced on
