@@ -112,17 +112,19 @@ pub(crate) mod test_support {
             .expect("fixture pack path")
     }
 
-    fn minimal_config(workspace: &std::path::Path) -> Result<Arc<HostConfig>> {
+    fn minimal_config(workspace: &std::path::Path, timers: &str) -> Result<Arc<HostConfig>> {
         let bindings_path = workspace.join("bindings.yaml");
         std::fs::write(
             &bindings_path,
-            r#"
+            format!(
+                r#"
 tenant: demo
-flow_type_bindings: {}
-rate_limits: {}
-retry: {}
-timers: []
-"#,
+flow_type_bindings: {{}}
+rate_limits: {{}}
+retry: {{}}
+timers: {timers}
+"#
+            ),
         )?;
         let mut config =
             HostConfig::load_from_path(&bindings_path).context("load minimal host bindings")?;
@@ -134,8 +136,15 @@ timers: []
     }
 
     pub(crate) async fn build_test_runtime() -> Result<(TempDir, Arc<TenantRuntime>)> {
+        build_test_runtime_with_timers("[]").await
+    }
+
+    /// Same runtime, with `timers` (a YAML flow sequence) as its timer bindings.
+    pub(crate) async fn build_test_runtime_with_timers(
+        timers: &str,
+    ) -> Result<(TempDir, Arc<TenantRuntime>)> {
         let workspace = TempDir::new().context("temp workspace")?;
-        let config = minimal_config(workspace.path())?;
+        let config = minimal_config(workspace.path(), timers)?;
         let session_store = new_session_store();
         let session_host = session_host_from(Arc::clone(&session_store));
         let state_store = new_state_store();
