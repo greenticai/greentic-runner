@@ -12,10 +12,15 @@ pub const WELL_KNOWN_PATH: &str = "/.well-known/agent-card.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum A2aError {
-    #[error("agent URL must be https (plaintext is allowed only on loopback), got {base}")]
+    #[error(
+        "agent URL must be https (plaintext is allowed only on loopback, or on a Kubernetes \
+         cluster-internal service name when running in a pod), got {base}"
+    )]
     InsecureBase { base: String },
     #[error("an agent reached at a remote base may not name a loopback interface: {url}")]
     LoopbackFromRemote { url: String },
+    #[error("an agent reached at a remote base may not name a cluster-internal host: {url}")]
+    ClusterFromRemote { url: String },
     #[error("agent base URL is not a URL: {base}")]
     BadBase { base: String },
     #[error("fetching the agent card failed: {0}")]
@@ -65,7 +70,9 @@ fn card_url_under_path(base: &str) -> Result<Option<String>, A2aError> {
     Ok(Some(parsed.to_string()))
 }
 
-/// Parse `url` and refuse it unless it is `https`, or plaintext on loopback.
+/// Parse `url` and refuse it unless it is `https`, or plaintext on loopback, or plaintext
+/// on a Kubernetes cluster-internal service name while running in a pod (see
+/// [`CLUSTER_PLAINTEXT_ENV`]).
 ///
 /// The rule [`card_url`] applies to a base, exposed so a caller can apply the
 /// SAME rule to every other address it will send to — above all the interface
@@ -73,10 +80,15 @@ fn card_url_under_path(base: &str) -> Result<Option<String>, A2aError> {
 /// enough: an https card may still name a plaintext interface, and the message
 /// (and any credential with it) would then leave in the clear.
 pub fn require_secure(url: &str) -> Result<url::Url, A2aError> {
+    require_secure_with(url, cluster_plaintext_enabled())
+}
+
+fn require_secure_with(url: &str, cluster_plaintext: bool) -> Result<url::Url, A2aError> {
     let parsed = url::Url::parse(url).map_err(|_| A2aError::BadBase {
         base: url.to_string(),
     })?;
-    if parsed.scheme() != "https" && !is_loopback(&parsed) {
+    let plaintext_ok = is_loopback(&parsed) || (cluster_plaintext && is_cluster_internal(&parsed));
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && plaintext_ok) {
         return Err(A2aError::InsecureBase {
             base: url.to_string(),
         });
@@ -92,9 +104,20 @@ pub fn require_secure(url: &str) -> Result<url::Url, A2aError> {
 /// inside a card the agent controls, so a remote agent naming
 /// `http://127.0.0.1:<port>/` would otherwise turn this client into a way to
 /// reach services on the runner's own host. A loopback interface is therefore
-/// accepted only when the configured base is itself loopback.
+/// accepted only when the configured base is itself loopback. The same holds
+/// for a cluster-internal interface: it is accepted only when the configured
+/// base is itself cluster-internal, so a public agent cannot aim this client
+/// at services inside the cluster.
 pub fn require_secure_interface(base: &str, interface: &str) -> Result<url::Url, A2aError> {
-    let target = require_secure(interface)?;
+    require_secure_interface_with(base, interface, cluster_plaintext_enabled())
+}
+
+fn require_secure_interface_with(
+    base: &str,
+    interface: &str,
+    cluster_plaintext: bool,
+) -> Result<url::Url, A2aError> {
+    let target = require_secure_with(interface, cluster_plaintext)?;
     let base = url::Url::parse(base).map_err(|_| A2aError::BadBase {
         base: base.to_string(),
     })?;
@@ -103,7 +126,69 @@ pub fn require_secure_interface(base: &str, interface: &str) -> Result<url::Url,
             url: interface.to_string(),
         });
     }
+    if is_cluster_internal(&target) && !is_cluster_internal(&base) {
+        return Err(A2aError::ClusterFromRemote {
+            url: interface.to_string(),
+        });
+    }
     Ok(target)
+}
+
+/// Environment variable that overrides the in-pod default: `1`/`true` enables
+/// cluster plaintext even outside a pod, `0`/`false` disables it inside one.
+pub const CLUSTER_PLAINTEXT_ENV: &str = "GREENTIC_A2A_ALLOW_CLUSTER_PLAINTEXT";
+
+/// Whether plaintext to a cluster-internal service name is permitted.
+///
+/// On by default only inside a Kubernetes pod (`KUBERNETES_SERVICE_HOST` is set
+/// by the kubelet, and a deployed worker receives no other environment from the
+/// designer, so an opt-in that required one would be unusable there). An
+/// explicit [`CLUSTER_PLAINTEXT_ENV`] always wins in either direction.
+fn cluster_plaintext_enabled() -> bool {
+    decide_cluster_plaintext(
+        std::env::var(CLUSTER_PLAINTEXT_ENV).ok().as_deref(),
+        std::env::var("KUBERNETES_SERVICE_HOST").ok().as_deref(),
+    )
+}
+
+fn decide_cluster_plaintext(explicit: Option<&str>, kube_host: Option<&str>) -> bool {
+    match explicit.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => kube_host.is_some_and(|h| !h.trim().is_empty()),
+    }
+}
+
+/// Whether a URL names a Kubernetes service by its cluster DNS name.
+///
+/// Exactly `<service>.<namespace>.svc` or
+/// `<service>.<namespace>.svc.cluster.local`: a DNS NAME (never an IP literal,
+/// so no public or private address qualifies), each of the two leading labels
+/// a valid DNS-1123 label, and nothing before, between or after. Matched on
+/// the parsed host, so `evil.svc.attacker.com` and `x.svc.cluster.local.evil.com`
+/// fail, as does a userinfo trick such as `http://a.b.svc@evil.com/`.
+fn is_cluster_internal(url: &url::Url) -> bool {
+    let Some(url::Host::Domain(name)) = url.host() else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    let labels: Vec<&str> = name.split('.').collect();
+    let ok = match labels.as_slice() {
+        [svc, ns, "svc"] => (svc, ns),
+        [svc, ns, "svc", "cluster", "local"] => (svc, ns),
+        _ => return false,
+    };
+    is_dns_label(ok.0) && is_dns_label(ok.1)
+}
+
+fn is_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Whether a base names this host, and so cannot be observed on the wire.
@@ -408,6 +493,135 @@ mod tests {
             1,
             "the second get must not reach the network"
         );
+    }
+
+    // --- cluster-internal plaintext ----------------------------------------
+
+    #[test]
+    fn cluster_service_names_may_use_plaintext_when_enabled() {
+        for base in [
+            "http://gtc-worker-01abc.myns.svc:8080",
+            "http://gtc-worker-01abc.myns.svc.cluster.local:8080",
+            "http://a.b.svc",
+            "http://GTC-Worker.MyNs.svc:8080",
+        ] {
+            assert!(require_secure_with(base, true).is_ok(), "{base}");
+            assert!(
+                matches!(
+                    require_secure_with(base, false),
+                    Err(A2aError::InsecureBase { .. })
+                ),
+                "{base} must be refused when the switch is off"
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_is_refused_for_everything_that_only_resembles_a_cluster_name() {
+        for base in [
+            "http://api.example.com",
+            "http://evil.svc.attacker.com",
+            "http://a.b.svc.attacker.com:8080",
+            "http://a.b.svc.cluster.local.evil.com",
+            "http://svc.cluster.local",
+            "http://b.svc",
+            "http://x.a.b.svc",
+            "http://a.b.svc.cluster",
+            "http://a.b.svc.cluster.local.extra",
+            "http://a_b.ns.svc",
+            "http://-a.ns.svc",
+            "http://10.0.0.1:8080",
+            "http://8.8.8.8",
+            "http://[2001:db8::1]",
+            "http://a.b.svc@evil.example.com/",
+            "http://evil.example.com/@a.b.svc",
+        ] {
+            assert!(
+                matches!(
+                    require_secure_with(base, true),
+                    Err(A2aError::InsecureBase { .. })
+                ),
+                "{base} must be refused even with cluster plaintext enabled"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_agent_may_not_name_a_cluster_interface() {
+        let err = require_secure_interface_with(
+            "https://agent.example.com",
+            "http://victim.prod.svc:8080/a2a",
+            true,
+        );
+        assert!(matches!(err, Err(A2aError::ClusterFromRemote { .. })));
+        // An https cluster name is also refused: the base is not in the cluster.
+        assert!(matches!(
+            require_secure_interface_with(
+                "https://agent.example.com",
+                "https://victim.prod.svc/a2a",
+                true
+            ),
+            Err(A2aError::ClusterFromRemote { .. })
+        ));
+        // A loopback base does not vouch for a cluster interface either.
+        assert!(matches!(
+            require_secure_interface_with(
+                "http://127.0.0.1:9000",
+                "http://victim.prod.svc/a2a",
+                true
+            ),
+            Err(A2aError::ClusterFromRemote { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cluster_agent_may_name_a_cluster_interface_but_not_a_public_plaintext_one() {
+        let base = "http://w.ns.svc:8080";
+        assert!(require_secure_interface_with(base, "http://w.ns.svc:8080/a2a", true).is_ok());
+        assert!(matches!(
+            require_secure_interface_with(base, "http://api.example.com/a2a", true),
+            Err(A2aError::InsecureBase { .. })
+        ));
+        assert!(require_secure_interface_with(base, "https://api.example.com/a2a", true).is_ok());
+        assert!(matches!(
+            require_secure_interface_with(base, "http://127.0.0.1/a2a", true),
+            Err(A2aError::LoopbackFromRemote { .. })
+        ));
+    }
+
+    #[test]
+    fn the_switch_is_on_in_a_pod_and_an_explicit_value_wins() {
+        assert!(!decide_cluster_plaintext(None, None));
+        assert!(!decide_cluster_plaintext(None, Some("")));
+        assert!(decide_cluster_plaintext(None, Some("10.96.0.1")));
+        assert!(decide_cluster_plaintext(Some("1"), None));
+        assert!(decide_cluster_plaintext(Some("true"), None));
+        assert!(!decide_cluster_plaintext(Some("0"), Some("10.96.0.1")));
+        assert!(!decide_cluster_plaintext(Some("off"), Some("10.96.0.1")));
+        assert!(decide_cluster_plaintext(Some("garbage"), Some("10.96.0.1")));
+        assert!(!decide_cluster_plaintext(Some("garbage"), None));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_even_to_a_loopback_host() {
+        let target = spawn_card_server(Arc::new(AtomicUsize::new(0)));
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind loopback");
+        let port = server.server_addr().to_ip().expect("an ip addr").port();
+        let location = format!("{target}{WELL_KNOWN_PATH}");
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let header = tiny_http::Header::from_bytes(&b"Location"[..], location.as_bytes())
+                    .expect("a valid header");
+                let _ = request.respond(
+                    tiny_http::Response::from_string("")
+                        .with_status_code(302)
+                        .with_header(header),
+                );
+            }
+        });
+        let cache = CardCache::new(Duration::from_secs(300)).expect("client builds");
+        let result = cache.get(&format!("http://127.0.0.1:{port}")).await;
+        assert!(matches!(result, Err(A2aError::Transport(_))), "{result:?}");
     }
 
     // --- test server -------------------------------------------------------
