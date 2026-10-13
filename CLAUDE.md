@@ -508,6 +508,51 @@ packs that carry a WORKER binding an `a2a:` tool. A flow-only pack gets no
 sidecar, so every `a2a` node in it refuses with the "declares no agents"
 message. That is the designer half, and it is a separate change.
 
+### A plain flow can create a file (`component == "media.create"`)
+
+A flow with no agentic worker can render a `txt`, `md`, `csv` or `pdf` file and
+store it as an artifact. **LOCKED ENCODING v1**, `component == "media.create"`,
+payload/config (already template-rendered when the node runs):
+
+```yaml
+make_pdf:
+  media.create:
+    format: pdf              # txt | md | csv | pdf (required)
+    name: "Claim Summary"    # file stem, sanitised (`[A-Za-z0-9._-]`, 64 chars)
+    text: "{{vars.summary}}" # txt / md / pdf; blank is an `invalid_input` value
+    rows: [["a", "b"]]       # csv only: array of arrays of scalars
+    output: file             # optional state key to bind the result under
+  routing: end
+```
+
+The result is the C5 value of `docs/media-contract-v1.md` in the designer repo:
+`{ok:true, artifact:{id,mime_type,name}, artifacts:[..], warnings:[..]}` or
+`{ok:false, error:{code,message}}`, codes `invalid_input`, `unsupported_format`,
+`too_large`, `artifact_unavailable`, `artifact_rejected`, `unauthorized`.
+Without `output:` the result IS the node output, so greentic-start's outbound
+collector finds a top-level `artifact`; bound under `output:` it is delivered
+only if a later node forwards it.
+
+Rules, each silent if broken:
+
+- **A failure is a value.** The node is marked failed (errors envelope via
+  `normalize_mcp_tool_error`) only when it has an `on_error` edge; otherwise it
+  completes with the failure value, exactly like `a2a`.
+- **The port is the agent runtime's.** `FlowEngine::set_ext_artifact_port` is
+  called in `runtime.rs` with the same `ext_artifact_port` the agent runtime
+  gets as `host.artifact.put`. No port gives an `artifact_unavailable` value.
+  `ArtifactPort::put` is synchronous, so it runs on `spawn_blocking`; the real
+  `HttpArtifactPort` refuses a current-thread runtime. Nested flow-tool
+  engines get no port yet.
+- **The renderer is ported, not shared.** `runner/media_render/` is a copy of
+  `component-media-ext` (`document.rs`, `pdf.rs`, `input.rs`, `names.rs`,
+  `limits.rs`, `output.rs`); limits are identical (10 MB, text 2,000,000
+  characters, PDF over 2000 pages is `too_large`, CSV formula escaping, Latin-1
+  replacement warning). Recorded debt: change both or neither.
+- Registered like `a2a`: `NATIVE_OP_KEYS`, the `is_builtin` prefix (`media.`),
+  `NodeKind::MediaCreate`, the dispatch arm. The loader additionally needs
+  greentic-flow's `RUNTIME_NATIVE_CALL_KINDS` to carry `media.create`.
+
 ### Async runtime dispatch (`sorla.call` node)
 
 **A route document is the primary transport, and NATS is now the fallback (amendment

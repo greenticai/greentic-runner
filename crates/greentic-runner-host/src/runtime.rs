@@ -1301,6 +1301,10 @@ impl TenantRuntime {
             // Operator config overrides pack-provided agents on collision.
             let merged_agents = merge_agent_sources(pack_agents, config.agents.clone());
 
+            // `media.create` flow nodes store through the SAME artifact port the
+            // agent runtime hands extensions as `host.artifact.put`.
+            engine.set_ext_artifact_port(ext_artifact_port.clone());
+
             // First-boot ingest of any pack-baked knowledge corpus (W4 4c), handed
             // to every registered agent-runtime extension. Runs BEFORE the agent
             // runtime mounts its serving knowledge connection: embedded SurrealDB

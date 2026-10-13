@@ -134,6 +134,11 @@ pub struct FlowEngine {
     /// the process.
     #[cfg(feature = "agentic-worker")]
     a2a_sources: RwLock<HashMap<(String, String), Arc<greentic_aw_runtime::A2aToolSource>>>,
+    /// The port `media.create` stores its file through: the SAME port the agent
+    /// runtime hands extensions as `host.artifact.put`. `None` makes the node
+    /// answer an `artifact_unavailable` value.
+    #[cfg(feature = "agentic-worker")]
+    ext_artifact_port: Option<crate::host::ExtArtifactPort>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -432,6 +437,11 @@ enum NodeKind {
     A2a {
         agent_id: String,
     },
+    /// Flow-execution media node (LOCKED ENCODING v1): `component ==
+    /// "media.create"` with `format`/`name`/`text`/`rows`/`output` in the node
+    /// payload. Renders a `txt`/`md`/`csv`/`pdf` file and stores it through the
+    /// engine's artifact port. See [`crate::runner::media_node`].
+    MediaCreate,
 }
 
 #[derive(Clone, Debug)]
@@ -728,6 +738,8 @@ impl FlowEngine {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
         })
     }
 
@@ -890,6 +902,14 @@ impl FlowEngine {
         handler: Arc<dyn crate::runner::agent_node::AgentNodeHandler>,
     ) {
         self.agent_node_handler = Some(handler);
+    }
+
+    /// Set the artifact port `media.create` nodes store their file through.
+    /// Pass the same port the agent runtime receives, so a flow's file and a
+    /// worker's file land in the same store.
+    #[cfg(feature = "agentic-worker")]
+    pub fn set_ext_artifact_port(&mut self, port: Option<crate::host::ExtArtifactPort>) {
+        self.ext_artifact_port = port;
     }
 
     /// Set the handler that bridges `DwAgentGraph` flow nodes into the durable
@@ -1918,7 +1938,55 @@ impl FlowEngine {
                 .execute_a2a(ctx, agent_id, payload, node_has_error_route(&node.routing))
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::MediaCreate => self
+                .execute_media_create(ctx, payload, node_has_error_route(&node.routing))
+                .await
+                .map(DispatchOutcome::complete),
         }
+    }
+
+    /// Execute a `component == "media.create"` flow node (LOCKED ENCODING v1).
+    ///
+    /// `payload` is the already-rendered node input mapping, shaped
+    /// `{ format, name?, text?, rows?, output? }`. A failure is a C5 value
+    /// (`{ok:false, error:{code,message}}`), never an aborted run; the node is
+    /// marked failed only when it has an `on_error` edge, like `a2a`.
+    #[cfg(feature = "agentic-worker")]
+    async fn execute_media_create(
+        &self,
+        ctx: &FlowContext<'_>,
+        payload: Value,
+        has_error_route: bool,
+    ) -> Result<NodeOutput> {
+        let result = crate::runner::media_node::create(
+            &payload,
+            ctx.tenant,
+            self.ext_artifact_port.as_ref(),
+        )
+        .await;
+        Ok(media_node_output(
+            bind_node_result(&payload, result.clone()),
+            &result,
+            has_error_route,
+        ))
+    }
+
+    /// Compile-time stub when the agentic-worker feature (which carries the
+    /// artifact port) is disabled: the node degrades to an error value.
+    #[cfg(not(feature = "agentic-worker"))]
+    async fn execute_media_create(
+        &self,
+        _ctx: &FlowContext<'_>,
+        _payload: Value,
+        _has_error_route: bool,
+    ) -> Result<NodeOutput> {
+        Ok(NodeOutput::new(json!({
+            "ok": false,
+            "error": {
+                "code": "artifact_unavailable",
+                "message": "media.create requires the agentic-worker feature"
+            }
+        })))
     }
 
     #[cfg(feature = "agentic-worker")]
@@ -4760,6 +4828,21 @@ fn a2a_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeO
     NodeOutput::errored(normalize_mcp_tool_error(&bound, code, error))
 }
 
+/// Build a `media.create` node's output. A C5 failure is a value; only a node
+/// with an `on_error` edge is marked failed (the same gate `a2a` uses, for the
+/// same reason: a failed node without a route would park the run).
+#[cfg(feature = "agentic-worker")]
+fn media_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeOutput {
+    if !has_error_route || !crate::runner::media_node::is_failure(result) {
+        return NodeOutput::new(bound);
+    }
+    NodeOutput::errored(normalize_mcp_tool_error(
+        &bound,
+        &crate::runner::media_node::failure_code(result),
+        &crate::runner::media_node::failure_message(result),
+    ))
+}
+
 /// Turn a `sorla.call` HTTP failure (a malformed route document, an unknown
 /// action, or the SoR request itself failing) into a `DispatchOutcome`: a
 /// structured `{"error": msg}` node output when the node has an error route
@@ -5140,6 +5223,7 @@ impl From<Node> for HostNode {
             // pack that is perfectly well-formed, so rebuilding never helps.
             || full_ref.starts_with("approval.")
             || full_ref.starts_with("var.")
+            || full_ref.starts_with("media.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
             || full_ref.starts_with("mcp:")
@@ -5272,6 +5356,9 @@ impl From<Node> for HostNode {
                 // fallback, mirroring the `mcp` node's two encodings.
                 "a2a" => a2a_node_kind(&node.input.mapping, raw_operation.as_deref()),
                 comp if comp.starts_with("a2a:") => a2a_node_kind(&node.input.mapping, Some(comp)),
+                // LOCKED ENCODING v1: `component == "media.create"` with
+                // `format`/`name`/`text`/`rows`/`output` in the node payload.
+                "media.create" => NodeKind::MediaCreate,
                 other => NodeKind::PackComponent {
                     component_ref: other.to_string(),
                 },
@@ -5297,6 +5384,7 @@ impl From<Node> for HostNode {
             NodeKind::ApprovalCall { .. } => "approval.call".to_string(),
             NodeKind::Mcp { server_id, tool } => format!("mcp:{server_id}/{tool}"),
             NodeKind::A2a { agent_id } => format!("a2a:{agent_id}"),
+            NodeKind::MediaCreate => "media.create".to_string(),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
@@ -6628,6 +6716,7 @@ mod tests {
             NodeKind::BuiltinStateGet => Some("state.get"),
             NodeKind::BuiltinStateSet => Some("state.set"),
             NodeKind::VarSet { .. } => Some("var.set"),
+            NodeKind::MediaCreate => Some("media.create"),
             NodeKind::Wait => Some("session.wait"),
             NodeKind::DwAgent { .. } => Some("dw.agent"),
             NodeKind::DwAgentGraph { .. } => Some("dw.agent_graph"),
@@ -6659,6 +6748,7 @@ mod tests {
             "agentic.call",
             "telco-x.call",
             "approval.call",
+            "media.create",
         ] {
             assert!(
                 crate::runner::flow_adapter::is_native_op_key(key),
@@ -6699,6 +6789,42 @@ mod tests {
     #[test]
     fn the_a2a_component_ref_is_a_valid_component_id() {
         assert!(greentic_types::ComponentId::from_str("a2a").is_ok());
+    }
+
+    /// `media.create` is dispatched on its dotted component id, which must be a
+    /// valid `ComponentId` and be classified (not split into
+    /// `media` + `create`) by the loader.
+    #[test]
+    fn the_media_create_component_ref_is_a_valid_component_id() {
+        assert!(greentic_types::ComponentId::from_str("media.create").is_ok());
+        assert!(crate::runner::flow_adapter::is_native_op_key(
+            "media.create"
+        ));
+        assert_eq!(
+            native_op_key_for(&NodeKind::MediaCreate),
+            Some("media.create")
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_media_failure_is_an_errored_node_only_with_an_error_route() {
+        let result = json!({"ok": false, "error": {"code": "invalid_input", "message": "no text"}});
+        let payload = json!({ "format": "pdf", "output": "file" });
+        let quiet = media_node_output(bind_node_result(&payload, result.clone()), &result, false);
+        assert!(quiet.ok);
+        assert_eq!(quiet.payload["file"]["error"]["code"], "invalid_input");
+        let routed = media_node_output(bind_node_result(&payload, result.clone()), &result, true);
+        assert!(!routed.ok);
+        assert_eq!(routed.payload["error"]["code"], "invalid_input");
+        assert_eq!(routed.payload["error"]["message"], "no text");
+        assert!(
+            routed.payload["file"].is_object(),
+            "the output key survives"
+        );
+        let good = json!({"ok": true, "artifact": {"id": "artifact://x"}});
+        let out = media_node_output(good.clone(), &good, true);
+        assert!(out.ok);
     }
 
     #[test]
@@ -7223,6 +7349,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         }
     }
@@ -8282,6 +8410,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -8505,6 +8635,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
 
@@ -8674,6 +8806,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
         let ctx = FlowContext {
@@ -8824,6 +8958,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
         let ctx = FlowContext {
@@ -9005,6 +9141,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
 
@@ -9132,6 +9270,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         }
     }
@@ -9880,6 +10020,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
         }
     }
 
@@ -10514,6 +10656,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -11431,6 +11575,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
 
@@ -11838,6 +11984,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
 
@@ -11959,6 +12107,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
 
@@ -12110,6 +12260,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -12673,6 +12825,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
@@ -12870,6 +13024,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         }
     }
@@ -13572,6 +13728,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         }
     }
@@ -14134,6 +14292,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         }
     }
@@ -14281,6 +14441,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: handler,
         }
     }
@@ -14973,6 +15135,8 @@ mod tests {
             mcp_secrets: None,
             #[cfg(feature = "agentic-worker")]
             a2a_sources: RwLock::new(HashMap::new()),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
