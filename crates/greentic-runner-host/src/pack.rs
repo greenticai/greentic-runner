@@ -6922,7 +6922,7 @@ mod legacy_flow_normalize_tests {
     /// verbatim rather than being wrapped in `component.exec`.
     #[test]
     fn normalize_preserves_dw_agent_and_sorla_call_op_keys() {
-        for op_key in ["dw.agent", "sorla.call"] {
+        for op_key in ["dw.agent", "sorla.call", "media.create"] {
             let doc = single_node_doc(op_key, json!({ "input": { "x": 1 } }));
             let normalized = normalize_flow_doc(doc);
             let node = normalized.nodes.get("node").expect("node exists");

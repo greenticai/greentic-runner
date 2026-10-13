@@ -50,6 +50,10 @@ pub mod mcp_node;
 pub mod mcp_pack_routes;
 #[cfg(feature = "agentic-worker")]
 pub mod mcp_warm_listener;
+#[cfg(feature = "agentic-worker")]
+pub mod media_node;
+#[cfg(feature = "agentic-worker")]
+pub mod media_render;
 pub mod mocks;
 pub mod nested_flow;
 pub mod operala_node;
