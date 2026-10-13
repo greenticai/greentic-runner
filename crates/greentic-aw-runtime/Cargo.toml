@@ -104,7 +104,7 @@ serde_json          = { workspace = true }
 # MCP signature verify reconstructs the same bytes.
 serde_jcs           = "0.1"
 thiserror           = { workspace = true }
-tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 tracing             = { workspace = true }
 unicode-normalization = "0.1"
 # Unicode general categories (Cc/Cf/Zl/Zp) for sanitising attachment names
