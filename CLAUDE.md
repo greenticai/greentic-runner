@@ -529,12 +529,29 @@ The result is the C5 value of `docs/media-contract-v1.md` in the designer repo:
 `{ok:true, artifact:{id,mime_type,name}, artifacts:[..], warnings:[..]}` or
 `{ok:false, error:{code,message}}`, codes `invalid_input`, `unsupported_format`,
 `too_large`, `artifact_unavailable`, `artifact_rejected`, `unauthorized`.
-Without `output:` the result IS the node output, so greentic-start's outbound
-collector finds a top-level `artifact`; bound under `output:` it is delivered
-only if a later node forwards it.
+**Delivery does not depend on `output:` or on what follows the node.** Every
+successful `media.create` records its file(s) in the turn's created-files list
+(`ExecutionState.created_artifacts`, fed from `NodeOutput.created`), and
+`finalize_with` folds that list into the turn's FINAL reply as a reserved
+`created_artifacts: [{id, mime_type, name}]` key (`media_node::attach_created`;
+an object gets the key, an array of emitted payloads gets it on its LAST
+element, a string becomes `{text, created_artifacts}`, `null` becomes a
+file-only `{created_artifacts}`). greentic-start (>= the build after this
+change) delivers every listed id its own artifact port stored, in addition to
+the older top-level `artifact` / `response.artifact` rule. Without `output:`
+the result still IS the node output, so the old rule keeps working as before.
 
 Rules, each silent if broken:
 
+- **The list is the runner's word, never the flow's.** `attach_created` always
+  removes a `created_artifacts` key already present in a reply (a node, an HTTP
+  echo or a template cannot name files), and a failure value never lists a file.
+  The list is per TURN: it is `#[serde(skip)]` and cleared with the egress on
+  every snapshot, so a parked run does not deliver a file again when it
+  resumes. A turn that fails terminally (the metadata-only error reply) lists
+  nothing. A failed node elsewhere in the flow makes `lift_first_node_error_from_nodes`
+  wrap an ARRAY reply under `payload`, which hides the list from the host: known,
+  rare, and the file is not delivered then.
 - **A failure is a value.** The node is marked failed (errors envelope via
   `normalize_mcp_tool_error`) only when it has an `on_error` edge; otherwise it
   completes with the failure value, exactly like `a2a`.

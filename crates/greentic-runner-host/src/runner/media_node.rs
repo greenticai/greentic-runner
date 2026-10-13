@@ -144,6 +144,88 @@ pub async fn create(payload: &Value, tenant: &str, port: Option<&Arc<dyn Artifac
     }
 }
 
+/// Reserved key of a turn's final reply payload that lists the files the
+/// RUNNER created for the end user during that turn (`media.create`), as
+/// `[{id, mime_type, name}]`.
+///
+/// This is a runner-to-host contract: greentic-start delivers every listed
+/// file whose id this deployment's artifact port stored, in addition to a
+/// top-level `artifact`. Only [`attach_created`] writes it, and it removes any
+/// copy a flow's own data put there, so a node (or an HTTP echo) cannot
+/// forge the list. A failure result never lists a file.
+pub const CREATED_ARTIFACTS_KEY: &str = "created_artifacts";
+
+/// More files than this in one turn are not tracked (the host delivers at
+/// most 5 per reply anyway).
+pub const MAX_CREATED_PER_TURN: usize = 20;
+
+/// The files a successful `media.create` result created; empty for a failure.
+pub fn created_files(result: &Value) -> Vec<Value> {
+    if is_failure(result) || result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Vec::new();
+    }
+    let listed = result
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .cloned()
+        .or_else(|| result.get("artifact").map(|one| vec![one.clone()]))
+        .unwrap_or_default();
+    listed
+        .into_iter()
+        .filter(|file| file.get("id").and_then(Value::as_str).is_some())
+        .collect()
+}
+
+fn strip_reserved(value: &mut Value) {
+    if let Value::Object(map) = value {
+        map.remove(CREATED_ARTIFACTS_KEY);
+    }
+}
+
+/// Fold the turn's created files into its final reply `reply`.
+///
+/// Always removes a pre-existing [`CREATED_ARTIFACTS_KEY`] first (a flow must
+/// not be able to name files). With files: an object gets the key; an array
+/// (several emitted payloads) gets it on its LAST element, so the link goes
+/// with the final reply; a plain string becomes `{text, key}`; `null` becomes
+/// `{key}` (a file-only turn).
+pub fn attach_created(mut reply: Value, created: Vec<Value>) -> Value {
+    match &mut reply {
+        Value::Array(items) => items.iter_mut().for_each(strip_reserved),
+        other => strip_reserved(other),
+    }
+    if created.is_empty() {
+        return reply;
+    }
+    let list = Value::Array(created);
+    let key = CREATED_ARTIFACTS_KEY.to_string();
+    match reply {
+        Value::Object(mut map) => {
+            map.insert(key, list);
+            Value::Object(map)
+        }
+        Value::Null => serde_json::json!({ key: list }),
+        Value::String(text) => serde_json::json!({ "text": text, key: list }),
+        Value::Array(mut items) => {
+            match items.last_mut() {
+                Some(Value::Object(map)) => {
+                    map.insert(key, list);
+                }
+                Some(Value::String(text)) => {
+                    let text = std::mem::take(text);
+                    if let Some(last) = items.last_mut() {
+                        *last = serde_json::json!({ "text": text, key: list });
+                    }
+                }
+                _ => items.push(serde_json::json!({ key: list })),
+            }
+            Value::Array(items)
+        }
+        other => Value::Array(vec![other, serde_json::json!({ key: list })]),
+    }
+}
+
 /// Whether a node result is a C5 failure value.
 pub fn is_failure(result: &Value) -> bool {
     result.get("ok").and_then(Value::as_bool) == Some(false)
@@ -322,5 +404,56 @@ mod tests {
         )
         .await;
         assert_eq!(value["warnings"][0]["code"], "characters_replaced");
+    }
+}
+
+#[cfg(test)]
+mod created_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn file(n: u8) -> Value {
+        json!({"id": format!("artifact://{}", n.to_string().repeat(64)), "name": "n.txt"})
+    }
+
+    #[test]
+    fn only_a_success_lists_files() {
+        let ok = success(
+            &[Artifact {
+                id: "artifact://x".into(),
+                mime_type: "text/plain".into(),
+                name: "n.txt".into(),
+            }],
+            &[],
+        );
+        assert_eq!(created_files(&ok).len(), 1);
+        let bad = failure(&Failure::new(codes::INVALID_INPUT, "no"));
+        assert!(created_files(&bad).is_empty());
+        assert!(created_files(&json!({"artifact": {"id": "a"}})).is_empty());
+    }
+
+    #[test]
+    fn an_object_reply_gets_the_key_and_a_forged_one_is_replaced() {
+        let reply = json!({"text": "hi", "created_artifacts": [{"id": "forged"}]});
+        let out = attach_created(reply, vec![file(1)]);
+        assert_eq!(out["created_artifacts"], json!([file(1)]));
+        let none = attach_created(json!({"created_artifacts": [1]}), vec![]);
+        assert!(none.get("created_artifacts").is_none());
+    }
+
+    #[test]
+    fn shapes_other_than_an_object_are_wrapped_or_extended() {
+        let s = attach_created(json!("hello"), vec![file(1)]);
+        assert_eq!(s["text"], "hello");
+        let n = attach_created(Value::Null, vec![file(1)]);
+        assert_eq!(n["created_artifacts"][0], file(1));
+        let a = attach_created(json!([{"text": "a"}, "b"]), vec![file(1)]);
+        assert!(a[0].get("created_artifacts").is_none());
+        assert_eq!(a[1]["text"], "b");
+        assert_eq!(a[1]["created_artifacts"][0], file(1));
+        let e = attach_created(json!([]), vec![file(1)]);
+        assert_eq!(e[0]["created_artifacts"][0], file(1));
+        let unchanged = attach_created(json!("x"), vec![]);
+        assert_eq!(unchanged, json!("x"));
     }
 }
