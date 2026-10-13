@@ -230,6 +230,23 @@ impl McpToolSource {
             // fail every local-wasm pack route on a credential that is not
             // supposed to exist.
             let is_http = record.transport != "local-wasm";
+            // An unknown auth_mode refuses this server before its secret is
+            // even read, so the diagnostic names the real cause.
+            if is_http
+                && let Err(detail) = crate::oauth::parse_auth_mode(record.auth_mode.as_deref())
+            {
+                tracing::warn!(
+                    tenant = %tenant.tenant_id,
+                    server = %record.server_id,
+                    detail = %detail,
+                    "pack-carried mcp route refused; its tools will report the cause"
+                );
+                server_errors.insert(
+                    record.server_id.clone(),
+                    format!("mcp server '{}': {detail}", record.server_id),
+                );
+                continue;
+            }
             let secret = match self.secrets.as_ref().filter(|_| is_http) {
                 Some(manager) => {
                     match crate::mcp_secrets::read_mcp_secret_for_unit(

@@ -193,7 +193,7 @@ pub mod aw {
     ) -> Result<greentic_aw_runtime::McpRoute, String> {
         let is_http = route.transport != "local-wasm";
 
-        let token = match secrets.filter(|_| is_http) {
+        let secret = match secrets.filter(|_| is_http) {
             Some(manager) => match greentic_aw_runtime::mcp_secrets::read_mcp_secret_for_unit(
                 manager.as_ref(),
                 tenant,
@@ -211,16 +211,27 @@ pub mod aw {
             None => None,
         };
 
-        Ok(greentic_aw_runtime::McpRoute::from_parts(
+        // `auth_mode` decides how the secret is read: a bearer token, or the
+        // sealed OAuth client credentials. Any mismatch fails this route only.
+        greentic_aw_runtime::McpRoute::from_pack_parts(
             &route.server_id,
             route.transport_url.as_deref().unwrap_or_default(),
             route.auth_header_name.as_deref(),
-            token.as_deref(),
+            secret.as_deref(),
             &route.transport,
             route.component_ref.as_deref(),
             route.component_version.as_deref(),
             route.component_digest.as_deref(),
-        ))
+            &route.auth_spec(),
+            greentic_aw_runtime::oauth::route_token_key(
+                "mcp",
+                tenant,
+                team,
+                unit,
+                &route.server_id,
+            ),
+        )
+        .map_err(|detail| format!("mcp server '{}': {detail}", route.server_id))
     }
 
     /// The `(tenant, secrets)` pair a dispatch runs under. `local-wasm` tools

@@ -855,6 +855,10 @@ mod aw {
                     component_ref: route.component_ref.clone(),
                     component_version: route.component_version.clone(),
                     component_digest: route.component_digest.clone(),
+                    auth_mode: route.auth_mode.clone(),
+                    oauth_endpoint: route.oauth_endpoint.clone(),
+                    oauth_scope: route.oauth_scope.clone(),
+                    oauth_audience: route.oauth_audience.clone(),
                 });
             }
         }

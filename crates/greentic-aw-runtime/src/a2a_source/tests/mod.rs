@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod catalog;
 mod credentials;
 mod dispatch;
+mod oauth;
 
 /// A real-shaped agent card. `PLACEHOLDER` becomes the interface URL, so a
 /// dispatch test can post back to the same mock server that served the card.
