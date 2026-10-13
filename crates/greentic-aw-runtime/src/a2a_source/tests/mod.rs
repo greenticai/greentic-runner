@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod catalog;
 mod credentials;
 mod dispatch;
+mod oauth;
 
 /// A real-shaped agent card. `PLACEHOLDER` becomes the interface URL, so a
 /// dispatch test can post back to the same mock server that served the card.
@@ -135,6 +136,7 @@ fn route(
         auth_header_name: header.map(str::to_string),
         auth_team: team.map(str::to_string),
         requires_auth,
+        ..crate::a2a_source::A2aRoute::unauthenticated("", "")
     }
 }
 

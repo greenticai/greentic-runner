@@ -12,6 +12,8 @@ use greentic_secrets_lib::SecretsManager;
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
 use super::types::A2aRoute;
+use crate::oauth::{AuthMode, ClientCredentials, TokenProvider, parse_auth_mode, route_token_key};
+use secrecy::ExposeSecret;
 
 /// The secrets category A2A credentials are sealed under (contract §5/§6).
 pub(super) const A2A_CATEGORY: &str = "a2a";
@@ -22,6 +24,7 @@ pub(super) struct CredentialScope {
     secrets: Option<Arc<dyn SecretsManager>>,
     tenant: String,
     unit: Option<String>,
+    provider: Arc<TokenProvider>,
 }
 
 impl CredentialScope {
@@ -29,18 +32,20 @@ impl CredentialScope {
         secrets: Option<Arc<dyn SecretsManager>>,
         tenant: String,
         unit: Option<String>,
+        provider: Arc<TokenProvider>,
     ) -> Self {
         Self {
             secrets,
             tenant,
             unit,
+            provider,
         }
     }
 
     /// The scope of a source built with no credentials at all. Every route it
     /// holds has `requires_auth: false`, so it is never consulted.
     pub(super) fn none() -> Self {
-        Self::new(None, String::new(), None)
+        Self::new(None, String::new(), None, TokenProvider::shared())
     }
 
     /// The header to add to the `SendMessage` POST: `None` for a route that
@@ -51,10 +56,14 @@ impl CredentialScope {
         &self,
         route: &A2aRoute,
     ) -> Result<Option<(HeaderName, HeaderValue)>, String> {
-        if !route.requires_auth {
+        let agent_id = route.agent_id.as_str();
+        // An unknown auth_mode refuses this agent even when `requires_auth` is
+        // unset: the sidecar asked for something this runner cannot honour.
+        let mode = parse_auth_mode(route.auth_mode.as_deref())
+            .map_err(|detail| format!("a2a agent {agent_id}: {detail}"))?;
+        if !route.requires_auth && mode == AuthMode::Static {
             return Ok(None);
         }
-        let agent_id = route.agent_id.as_str();
         ensure_safe_agent_id(agent_id)?;
         let team = route.auth_team.as_deref();
         if let Some(team) = team.filter(|t| !t.is_empty() && *t != "_") {
@@ -86,6 +95,9 @@ impl CredentialScope {
         )
         .await
         .map_err(|miss| format!("a2a agent {agent_id}: {miss}"))?;
+        if mode == AuthMode::OAuthClientCredentials {
+            return self.oauth_header(route, &bytes).await.map(Some);
+        }
         let token = String::from_utf8(bytes).map_err(|_| {
             format!("a2a agent {agent_id}: the stored credential is not valid UTF-8")
         })?;
@@ -95,8 +107,86 @@ impl CredentialScope {
                 "a2a agent {agent_id}: the stored credential is empty"
             ));
         }
+        if looks_like_client_credentials(token) {
+            return Err(format!(
+                "a2a agent {agent_id}: the stored secret holds OAuth client credentials but the \
+                 route's auth_mode is not oauth_client_credentials; refusing to send it as a token"
+            ));
+        }
         auth_header(agent_id, route.auth_header_name.as_deref(), token).map(Some)
     }
+
+    /// `Authorization: Bearer <access token>` for an OAuth route. The token
+    /// endpoint is the sidecar's `oauth_endpoint`; nothing from the agent card
+    /// reaches it.
+    async fn oauth_header(
+        &self,
+        route: &A2aRoute,
+        secret: &[u8],
+    ) -> Result<(HeaderName, HeaderValue), String> {
+        let agent_id = route.agent_id.as_str();
+        let endpoint = route
+            .oauth_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| {
+                format!("a2a agent {agent_id}: oauth_client_credentials needs an oauth_endpoint")
+            })?;
+        let creds = ClientCredentials::from_secret_bytes(secret)
+            .map_err(|detail| format!("a2a agent {agent_id}: {detail}"))?;
+        let clean = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
+                .map(str::to_string)
+        };
+        let access = self
+            .provider
+            .token_for(
+                &self.token_key(route),
+                endpoint,
+                clean(&route.oauth_scope).as_deref(),
+                clean(&route.oauth_audience).as_deref(),
+                &creds.client_id,
+                &creds.client_secret,
+            )
+            .await
+            .map_err(|e| format!("a2a agent {agent_id}: {e}"))?;
+        auth_header(agent_id, None, access.expose_secret())
+    }
+
+    fn token_key(&self, route: &A2aRoute) -> String {
+        route_token_key(
+            A2A_CATEGORY,
+            &self.tenant,
+            route.auth_team.as_deref(),
+            self.unit.as_deref(),
+            &route.agent_id,
+        )
+    }
+
+    /// The resource answered 401 to the token: drop it so a retry fetches a
+    /// new one.
+    pub(super) async fn invalidate(&self, route: &A2aRoute) {
+        self.provider.invalidate(&self.token_key(route)).await;
+    }
+
+    /// Whether `route` authenticates with an OAuth grant.
+    pub(super) fn is_oauth(route: &A2aRoute) -> bool {
+        matches!(
+            parse_auth_mode(route.auth_mode.as_deref()),
+            Ok(AuthMode::OAuthClientCredentials)
+        )
+    }
+}
+
+fn looks_like_client_credentials(secret: &str) -> bool {
+    let trimmed = secret.trim();
+    trimmed.starts_with('{')
+        && serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .is_some_and(|v| v.get("client_secret").is_some())
 }
 
 /// The `(name, value)` pair for `token`, following greentic-mcp-client's

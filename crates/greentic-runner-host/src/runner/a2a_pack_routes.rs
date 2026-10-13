@@ -42,6 +42,30 @@ pub struct PackA2aRoute {
     /// A token is stored and must be sent. Absent means `false`.
     #[serde(default)]
     pub requires_auth: bool,
+    /// `bearer` / `header` / `oauth_client_credentials`; validated when the
+    /// credential is needed, so an unknown value refuses this agent only.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub auth_mode: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub oauth_endpoint: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub oauth_scope: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub oauth_audience: Option<String>,
+}
+
+/// A string field that tolerates any other JSON type; a non-string becomes
+/// `"<invalid>"` so it fails closed as an unknown mode (see the MCP twin).
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text),
+        Some(_) => Some("<invalid>".to_string()),
+    })
 }
 
 /// Every agent a pack declares, in declaration order, unique by `agent_id`.
@@ -136,6 +160,21 @@ mod tests {
         assert_eq!(route.auth_team, None);
         assert_eq!(route.name, None);
         assert!(!route.requires_auth);
+    }
+
+    #[test]
+    fn oauth_parameters_round_trip() {
+        let routes = PackA2aRoutes::from_sidecar_bytes(
+            br#"[{"agent_id":"a","base_url":"https://a.example","requires_auth":true,
+                  "auth_mode":"oauth_client_credentials","oauth_endpoint":"https://idp/token",
+                  "oauth_scope":"s","oauth_audience":"aud"}]"#,
+        )
+        .expect("parses");
+        let route = routes.get("a").unwrap();
+        assert_eq!(route.auth_mode.as_deref(), Some("oauth_client_credentials"));
+        assert_eq!(route.oauth_endpoint.as_deref(), Some("https://idp/token"));
+        assert_eq!(route.oauth_scope.as_deref(), Some("s"));
+        assert_eq!(route.oauth_audience.as_deref(), Some("aud"));
     }
 
     #[test]

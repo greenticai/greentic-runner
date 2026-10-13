@@ -54,6 +54,7 @@ pub mod mcp_secrets;
 pub mod mcp_source;
 pub mod mcp_store_pull;
 pub mod memory;
+pub mod oauth;
 pub mod playbook_source;
 pub mod run_trace;
 pub mod scoped_secrets;
