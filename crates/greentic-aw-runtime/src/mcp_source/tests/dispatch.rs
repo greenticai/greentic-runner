@@ -23,6 +23,7 @@ async fn route_debug_redacts_token() {
         component_ref: None,
         component_version: None,
         component_digest: None,
+        oauth: None,
     };
     let dbg = format!("{route:?}");
     assert!(!dbg.contains("tok-secret"), "got: {dbg}");
@@ -419,6 +420,7 @@ async fn dispatch_route_local_wasm_wrong_digest_returns_error_not_panic() {
         component_ref: Some("router_echo".to_string()),
         component_version: Some("1.0.0".to_string()),
         component_digest: Some(wrong_digest),
+        oauth: None,
     };
 
     let scope =

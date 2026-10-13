@@ -11,6 +11,8 @@ use greentic_secrets_lib::SecretsManager;
 use secrecy::SecretString;
 use serde::Deserialize;
 
+use crate::oauth::{ResolvedAuth, RouteAuthSpec, RouteOAuth, TokenProvider};
+
 /// How long a built catalog is reused before a refetch is considered.
 pub(super) const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 
@@ -148,6 +150,18 @@ pub(super) struct WireRow {
     /// For `local-wasm` rows: optional pinned component content digest (hex).
     #[serde(default)]
     pub(super) component_digest: Option<String>,
+    /// How `auth_token` is to be read: absent / `bearer` / `header` mean the
+    /// stored value is the token; `oauth_client_credentials` means it is the
+    /// sealed `{"client_id","client_secret"}` JSON. Kept as a string and
+    /// validated per row so one unknown mode cannot void the whole list.
+    #[serde(default)]
+    pub(super) auth_mode: Option<String>,
+    #[serde(default)]
+    pub(super) oauth_endpoint: Option<String>,
+    #[serde(default)]
+    pub(super) oauth_scope: Option<String>,
+    #[serde(default)]
+    pub(super) oauth_audience: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +181,12 @@ pub(super) struct ParsedServer {
     pub(super) component_ref: Option<String>,
     pub(super) component_version: Option<String>,
     pub(super) component_digest: Option<String>,
+    /// OAuth grant for this server, when its `auth_mode` selects one.
+    pub(super) oauth: Option<RouteOAuth>,
+    /// Why this server's credential cannot be used (unknown `auth_mode`,
+    /// unreadable client credentials). A server with this set is never probed
+    /// or called: it fails closed with this sentence.
+    pub(super) auth_error: Option<String>,
 }
 
 /// LLM-facing schema for one MCP tool: enough for Task 2 to build an
@@ -192,6 +212,9 @@ pub struct McpRoute {
     pub component_ref: Option<String>,
     pub component_version: Option<String>,
     pub component_digest: Option<String>,
+    /// Set instead of `auth_token` for an `oauth_client_credentials` route:
+    /// the access token is fetched (and cached) per call, never stored here.
+    pub(super) oauth: Option<RouteOAuth>,
 }
 
 impl McpRoute {
@@ -231,7 +254,79 @@ impl McpRoute {
             component_ref: component_ref.map(str::to_string),
             component_version: component_version.map(str::to_string),
             component_digest: component_digest.map(str::to_string),
+            oauth: None,
         }
+    }
+
+    /// [`Self::from_parts`] for a pack-carried record, honouring its
+    /// `auth_mode`. `secret` is the UTF-8 text read from the secrets store
+    /// (`None` for a route that reads none). `token_key` identifies the route
+    /// in the token cache (see [`crate::oauth::route_token_key`]).
+    ///
+    /// Fails closed with a sentence naming the cause: an unknown `auth_mode`,
+    /// OAuth client credentials on a route that is not in OAuth mode, or an
+    /// OAuth route whose credentials cannot be read. It never falls back to
+    /// sending the stored value as a bearer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_pack_parts(
+        server_id: &str,
+        transport_url: &str,
+        auth_header_name: Option<&str>,
+        secret: Option<&str>,
+        transport: &str,
+        component_ref: Option<&str>,
+        component_version: Option<&str>,
+        component_digest: Option<&str>,
+        auth: &RouteAuthSpec<'_>,
+        token_key: String,
+    ) -> Result<Self, String> {
+        // A local-wasm component reads its own secrets; auth_mode is moot.
+        if transport == "local-wasm" {
+            return Ok(Self::from_parts(
+                server_id,
+                transport_url,
+                auth_header_name,
+                None,
+                transport,
+                component_ref,
+                component_version,
+                component_digest,
+            ));
+        }
+        match crate::oauth::resolve_route_auth(auth, secret, token_key, TokenProvider::shared())? {
+            ResolvedAuth::Static { token } => Ok(Self::from_parts(
+                server_id,
+                transport_url,
+                auth_header_name,
+                token.as_deref(),
+                transport,
+                component_ref,
+                component_version,
+                component_digest,
+            )),
+            ResolvedAuth::OAuth(oauth) => {
+                let mut route = Self::from_parts(
+                    server_id,
+                    transport_url,
+                    None,
+                    None,
+                    transport,
+                    component_ref,
+                    component_version,
+                    component_digest,
+                );
+                route.oauth = Some(oauth);
+                Ok(route)
+            }
+        }
+    }
+
+    /// Serve this route's OAuth grant from `provider` (tests inject one that
+    /// may reach a loopback stub). No effect on a static-credential route.
+    #[must_use]
+    pub fn with_token_provider(mut self, provider: std::sync::Arc<TokenProvider>) -> Self {
+        self.oauth = self.oauth.map(|oauth| oauth.with_provider(provider));
+        self
     }
 
     /// Name the tool this route is about to call.
@@ -252,6 +347,7 @@ impl std::fmt::Debug for McpRoute {
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("oauth", &self.oauth)
             .field("raw_tool_name", &self.raw_tool_name)
             .field("transport", &self.transport)
             .field("component_ref", &self.component_ref)
@@ -281,6 +377,24 @@ pub struct McpPackRoute {
     pub component_ref: Option<String>,
     pub component_version: Option<String>,
     pub component_digest: Option<String>,
+    /// `bearer` / `header` / `oauth_client_credentials`; absent keeps the
+    /// pre-existing behaviour. Validated per route, never per file.
+    pub auth_mode: Option<String>,
+    pub oauth_endpoint: Option<String>,
+    pub oauth_scope: Option<String>,
+    pub oauth_audience: Option<String>,
+}
+
+impl McpPackRoute {
+    /// The non-secret OAuth parameters of this record.
+    pub fn auth_spec(&self) -> RouteAuthSpec<'_> {
+        RouteAuthSpec {
+            auth_mode: self.auth_mode.as_deref(),
+            oauth_endpoint: self.oauth_endpoint.as_deref(),
+            oauth_scope: self.oauth_scope.as_deref(),
+            oauth_audience: self.oauth_audience.as_deref(),
+        }
+    }
 }
 
 /// Immutable per-tenant view of the agentic-worker MCP tool surface.

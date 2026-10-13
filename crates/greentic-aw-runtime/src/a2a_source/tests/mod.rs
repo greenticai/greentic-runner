@@ -135,6 +135,7 @@ fn route(
         auth_header_name: header.map(str::to_string),
         auth_team: team.map(str::to_string),
         requires_auth,
+        ..crate::a2a_source::A2aRoute::unauthenticated("", "")
     }
 }
 

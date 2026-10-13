@@ -30,6 +30,15 @@ pub struct A2aRoute {
     /// A token is stored and must be sent. A route with this set and no
     /// resolvable token is refused, never called unauthenticated.
     pub requires_auth: bool,
+    /// `bearer` / `header` / `oauth_client_credentials`; absent keeps the
+    /// pre-existing behaviour. Validated when the credential is needed, so an
+    /// unknown value refuses this agent only.
+    pub auth_mode: Option<String>,
+    /// Where the OAuth token is fetched. Taken from the sidecar, never from the
+    /// agent card, so a card cannot redirect the client secret.
+    pub oauth_endpoint: Option<String>,
+    pub oauth_scope: Option<String>,
+    pub oauth_audience: Option<String>,
 }
 
 impl A2aRoute {
@@ -42,6 +51,10 @@ impl A2aRoute {
             auth_header_name: None,
             auth_team: None,
             requires_auth: false,
+            auth_mode: None,
+            oauth_endpoint: None,
+            oauth_scope: None,
+            oauth_audience: None,
         }
     }
 }

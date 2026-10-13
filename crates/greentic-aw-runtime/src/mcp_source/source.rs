@@ -8,7 +8,9 @@ use dashmap::DashMap;
 use secrecy::ExposeSecret;
 use serde_json::json;
 
-use greentic_mcp_client::{McpAuth, McpClientOptions, McpHttpClient, McpToolDef};
+use greentic_mcp_client::{McpAuth, McpClientOptions, McpError, McpHttpClient, McpToolDef};
+
+use crate::oauth::{ResolvedAuth, RouteAuthSpec, RouteOAuth, TokenProvider, route_token_key};
 
 use crate::mcp_scope::McpCallScope;
 use crate::tenant::TenantContext;
@@ -44,6 +46,9 @@ pub struct McpToolSource {
     /// try the unit-scoped secret before the team / `_` scopes; see
     /// [`McpToolSource::with_unit`].
     unit: Option<String>,
+    /// Serves `oauth_client_credentials` routes. The process-wide provider
+    /// unless a test injects its own.
+    token_provider: Arc<TokenProvider>,
 }
 
 impl McpToolSource {
@@ -65,7 +70,15 @@ impl McpToolSource {
             secrets: None,
             pack_routes: None,
             unit: None,
+            token_provider: TokenProvider::shared(),
         }
+    }
+
+    /// Serve OAuth routes from `provider` instead of the process-wide one.
+    #[must_use]
+    pub fn with_token_provider(mut self, provider: Arc<TokenProvider>) -> Self {
+        self.token_provider = provider;
+        self
     }
 
     /// Build a source backed by the route material a `.gtpack` carries in
@@ -217,7 +230,7 @@ impl McpToolSource {
             // fail every local-wasm pack route on a credential that is not
             // supposed to exist.
             let is_http = record.transport != "local-wasm";
-            let token = match self.secrets.as_ref().filter(|_| is_http) {
+            let secret = match self.secrets.as_ref().filter(|_| is_http) {
                 Some(manager) => {
                     match crate::mcp_secrets::read_mcp_secret_for_unit(
                         manager.as_ref(),
@@ -246,19 +259,44 @@ impl McpToolSource {
                 None => None,
             };
 
-            server_routes.insert(
-                record.server_id.clone(),
-                McpRoute::from_parts(
-                    &record.server_id,
-                    record.transport_url.as_deref().unwrap_or_default(),
-                    record.auth_header_name.as_deref(),
-                    token.as_deref(),
-                    &record.transport,
-                    record.component_ref.as_deref(),
-                    record.component_version.as_deref(),
-                    record.component_digest.as_deref(),
-                ),
+            let token_key = route_token_key(
+                "mcp",
+                &tenant.tenant_id,
+                record.auth_team.as_deref(),
+                self.unit.as_deref(),
+                &record.server_id,
             );
+            match McpRoute::from_pack_parts(
+                &record.server_id,
+                record.transport_url.as_deref().unwrap_or_default(),
+                record.auth_header_name.as_deref(),
+                secret.as_deref(),
+                &record.transport,
+                record.component_ref.as_deref(),
+                record.component_version.as_deref(),
+                record.component_digest.as_deref(),
+                &record.auth_spec(),
+                token_key,
+            ) {
+                Ok(route) => {
+                    server_routes.insert(
+                        record.server_id.clone(),
+                        route.with_token_provider(self.token_provider.clone()),
+                    );
+                }
+                Err(detail) => {
+                    tracing::warn!(
+                        tenant = %tenant.tenant_id,
+                        server = %record.server_id,
+                        detail = %detail,
+                        "pack-carried mcp route refused; its tools will report the cause"
+                    );
+                    server_errors.insert(
+                        record.server_id.clone(),
+                        format!("mcp server '{}': {detail}", record.server_id),
+                    );
+                }
+            }
         }
 
         tracing::debug!(
@@ -278,7 +316,7 @@ impl McpToolSource {
     /// Fetch the admin rows and probe each server carrying `role`. Always
     /// returns a catalog (possibly empty); never errors.
     async fn build_catalog(&self, tenant_key: &str, role: &str) -> McpToolCatalog {
-        let servers = match self.fetch_servers().await {
+        let servers = match self.fetch_servers(tenant_key).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -305,7 +343,7 @@ impl McpToolSource {
 
     /// GET the tenant's MCP servers from the admin. Returns an error string on
     /// any network failure or non-200 status (the caller degrades to empty).
-    async fn fetch_servers(&self) -> Result<Vec<ParsedServer>, String> {
+    async fn fetch_servers(&self, tenant_key: &str) -> Result<Vec<ParsedServer>, String> {
         let url = format!("{}/api/v1/designer/tenant/me/mcp-servers", self.base_url);
         let mut req = self.client.get(&url).bearer_auth(&self.token);
         if let Some(identity) = &self.identity {
@@ -330,7 +368,7 @@ impl McpToolSource {
             .json()
             .await
             .map_err(|e| format!("decode failed: {e}"))?;
-        parse_rows(body)
+        parse_rows_with(body, tenant_key, &self.token_provider)
     }
 
     /// Probe one server and ingest its (filtered) tools into `catalog`. A
@@ -361,26 +399,64 @@ impl McpToolSource {
 }
 
 /// Parse the `{servers:[...]}` wire body into [`ParsedServer`]s.
+#[cfg(test)]
 pub(crate) fn parse_rows(body: serde_json::Value) -> Result<Vec<ParsedServer>, String> {
+    parse_rows_with(body, "", &TokenProvider::shared())
+}
+
+/// [`parse_rows`] with the cache scope and provider an OAuth row needs.
+pub(crate) fn parse_rows_with(
+    body: serde_json::Value,
+    tenant_key: &str,
+    provider: &Arc<TokenProvider>,
+) -> Result<Vec<ParsedServer>, String> {
     use secrecy::SecretString;
 
     let wire: WireBody = serde_json::from_value(body).map_err(|e| e.to_string())?;
     Ok(wire
         .servers
         .into_iter()
-        .map(|w| ParsedServer {
-            id: w.id,
-            // `null`/absent (local-wasm) → ""; the local-wasm branch never reads
-            // it as a URL, and http rows always carry a real URL.
-            transport_url: w.transport_url.unwrap_or_default(),
-            auth_header_name: w.auth_header_name,
-            auth_token: w.auth_token.map(SecretString::from),
-            allowed_tools: w.allowed_tools,
-            roles: w.roles,
-            transport: w.transport,
-            component_ref: w.component_ref,
-            component_version: w.component_version,
-            component_digest: w.component_digest,
+        .map(|w| {
+            let spec = RouteAuthSpec {
+                auth_mode: w.auth_mode.as_deref(),
+                oauth_endpoint: w.oauth_endpoint.as_deref(),
+                oauth_scope: w.oauth_scope.as_deref(),
+                oauth_audience: w.oauth_audience.as_deref(),
+            };
+            // A local-wasm row has no HTTP credential; its auth_mode is moot.
+            let resolved = if w.transport == Transport::LocalWasm {
+                Ok(ResolvedAuth::Static {
+                    token: w.auth_token.clone(),
+                })
+            } else {
+                crate::oauth::resolve_route_auth(
+                    &spec,
+                    w.auth_token.as_deref(),
+                    route_token_key("mcp-admin", tenant_key, None, None, &w.id),
+                    provider.clone(),
+                )
+            };
+            let (auth_token, oauth, auth_error) = match resolved {
+                Ok(ResolvedAuth::Static { token }) => (token.map(SecretString::from), None, None),
+                Ok(ResolvedAuth::OAuth(oauth)) => (None, Some(oauth), None),
+                Err(detail) => (None, None, Some(format!("mcp server '{}': {detail}", w.id))),
+            };
+            ParsedServer {
+                id: w.id,
+                // `null`/absent (local-wasm) -> ""; the local-wasm branch never
+                // reads it as a URL, and http rows always carry a real URL.
+                transport_url: w.transport_url.unwrap_or_default(),
+                auth_header_name: w.auth_header_name,
+                auth_token,
+                allowed_tools: w.allowed_tools,
+                roles: w.roles,
+                transport: w.transport,
+                component_ref: w.component_ref,
+                component_version: w.component_version,
+                component_digest: w.component_digest,
+                oauth,
+                auth_error,
+            }
         })
         .collect())
 }
@@ -414,6 +490,7 @@ fn ingest_server_tools(catalog: &mut McpToolCatalog, server: &ParsedServer, defs
                 component_ref: server.component_ref.clone(),
                 component_version: server.component_version.clone(),
                 component_digest: server.component_digest.clone(),
+                oauth: server.oauth.clone(),
             },
         );
     }
@@ -427,6 +504,28 @@ fn build_auth(token: Option<&secrecy::SecretString>, header_name: Option<&str>) 
     })
 }
 
+/// The auth for one request. An OAuth route fetches (or reuses) its access
+/// token here and sends it as `Authorization: Bearer`, whatever header name the
+/// row carries; a failure to obtain one fails the request, never sends it bare.
+async fn request_auth(
+    token: Option<&secrecy::SecretString>,
+    header_name: Option<&str>,
+    oauth: Option<&RouteOAuth>,
+) -> Result<Option<McpAuth>, String> {
+    match oauth {
+        Some(oauth) => {
+            let access = oauth.token().await.map_err(|e| e.to_string())?;
+            Ok(Some(McpAuth::bearer(access.expose_secret().to_string())))
+        }
+        None => Ok(build_auth(token, header_name)),
+    }
+}
+
+/// The server rejected the credential (HTTP 401).
+fn is_unauthorized(error: &McpError) -> bool {
+    matches!(error, McpError::Transport(e) if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED))
+}
+
 fn client_opts(timeout: std::time::Duration) -> McpClientOptions {
     McpClientOptions {
         timeout,
@@ -435,23 +534,34 @@ fn client_opts(timeout: std::time::Duration) -> McpClientOptions {
     }
 }
 
-/// Construct a client for a parsed server row. Synchronous: `McpHttpClient::new`
-/// does no I/O (the network handshake happens in `initialize`/`list_tools`).
-fn connect(server: &ParsedServer) -> Result<McpHttpClient, String> {
+/// Construct a client for a parsed server row. No network I/O happens in
+/// `McpHttpClient::new` (the handshake is in `initialize`/`list_tools`), but an
+/// OAuth row fetches its token first.
+async fn connect(server: &ParsedServer) -> Result<McpHttpClient, String> {
+    if let Some(detail) = &server.auth_error {
+        return Err(detail.clone());
+    }
     let endpoint = url::Url::parse(&server.transport_url)
         .map_err(|e| format!("invalid transport_url '{}': {e}", server.transport_url))?;
-    let auth = build_auth(
+    let auth = request_auth(
         server.auth_token.as_ref(),
         server.auth_header_name.as_deref(),
-    );
+        server.oauth.as_ref(),
+    )
+    .await?;
     McpHttpClient::new(endpoint, auth, client_opts(PROBE_TIMEOUT)).map_err(|e| e.to_string())
 }
 
 /// Construct a client from a dispatch route.
-fn connect_route(route: &McpRoute) -> Result<McpHttpClient, String> {
+async fn connect_route(route: &McpRoute) -> Result<McpHttpClient, String> {
     let endpoint = url::Url::parse(&route.transport_url)
         .map_err(|e| format!("invalid transport_url '{}': {e}", route.transport_url))?;
-    let auth = build_auth(route.auth_token.as_ref(), route.auth_header_name.as_deref());
+    let auth = request_auth(
+        route.auth_token.as_ref(),
+        route.auth_header_name.as_deref(),
+        route.oauth.as_ref(),
+    )
+    .await?;
     // The CALL budget, not the probe budget: this client carries the tool's own
     // work, and reqwest would otherwise cut it off at the probe's 5s regardless
     // of the outer timeout.
@@ -465,9 +575,26 @@ fn connect_route(route: &McpRoute) -> Result<McpHttpClient, String> {
 async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, String> {
     match server.transport {
         Transport::Http => {
-            let mut client = connect(server)?;
-            client.initialize().await.map_err(|e| e.to_string())?;
-            client.list_tools().await.map_err(|e| e.to_string())
+            let mut attempt = 0;
+            loop {
+                let mut client = connect(server).await?;
+                let listed = async {
+                    client.initialize().await?;
+                    client.list_tools().await
+                }
+                .await;
+                match listed {
+                    Ok(defs) => return Ok(defs),
+                    Err(e) if attempt == 0 && is_unauthorized(&e) && server.oauth.is_some() => {
+                        // The cached token was refused: drop it and retry once.
+                        if let Some(oauth) = &server.oauth {
+                            oauth.invalidate().await;
+                        }
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
         }
         Transport::LocalWasm => {
             let component = server
@@ -555,13 +682,26 @@ async fn call_route(
 ) -> Result<serde_json::Value, String> {
     match route.transport {
         Transport::Http => {
-            let mut client = connect_route(route)?;
-            client.initialize().await.map_err(|e| e.to_string())?;
-            let out = client
-                .call_tool(&route.raw_tool_name, args)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(out.to_value())
+            let mut attempt = 0;
+            loop {
+                let mut client = connect_route(route).await?;
+                let called = async {
+                    client.initialize().await?;
+                    client.call_tool(&route.raw_tool_name, args).await
+                }
+                .await;
+                match called {
+                    Ok(out) => return Ok(out.to_value()),
+                    Err(e) if attempt == 0 && is_unauthorized(&e) && route.oauth.is_some() => {
+                        // The cached token was refused: drop it and retry once.
+                        if let Some(oauth) = &route.oauth {
+                            oauth.invalidate().await;
+                        }
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
         }
         Transport::LocalWasm => {
             let component = route

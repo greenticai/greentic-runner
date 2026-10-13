@@ -20,6 +20,7 @@ use super::auth::{CredentialScope, ensure_same_host};
 use super::continuation::A2aContinuation;
 use super::outcome::A2aOutcome;
 use super::types::{A2aRoute, A2aToolCatalog, A2aToolEntry};
+use crate::oauth::TokenProvider;
 
 /// How long a fetched agent card is trusted before a refetch is considered.
 /// Mirrors [`crate::mcp_source`]'s catalog TTL: a card changes rarely, so
@@ -132,7 +133,22 @@ impl A2aToolSource {
         tenant: impl Into<String>,
         unit: Option<String>,
     ) -> Result<Self, reqwest::Error> {
-        Self::build(routes, CredentialScope::new(secrets, tenant.into(), unit))
+        Self::from_routes_with_provider(routes, secrets, tenant, unit, TokenProvider::shared())
+    }
+
+    /// [`Self::from_routes`] serving OAuth routes from `provider` rather than
+    /// the process-wide one (tests inject one that may reach a loopback stub).
+    pub fn from_routes_with_provider(
+        routes: Vec<A2aRoute>,
+        secrets: Option<Arc<dyn SecretsManager>>,
+        tenant: impl Into<String>,
+        unit: Option<String>,
+        provider: Arc<TokenProvider>,
+    ) -> Result<Self, reqwest::Error> {
+        Self::build(
+            routes,
+            CredentialScope::new(secrets, tenant.into(), unit, provider),
+        )
     }
 
     fn build(routes: Vec<A2aRoute>, credentials: CredentialScope) -> Result<Self, reqwest::Error> {
@@ -338,10 +354,10 @@ impl Transport {
         // Checked before the secret is read, so a card naming another host
         // never causes a secrets lookup, and nothing is sent: there is no
         // unauthenticated retry.
-        if route.requires_auth {
+        let oauth = CredentialScope::is_oauth(route);
+        if route.requires_auth || oauth {
             ensure_same_host(agent_id, &route.base_url, &target)?;
         }
-        let auth = self.credentials.header_for(route).await?;
 
         // The two fields this whole slice exists to populate. An absent
         // `prior` is a first turn and correctly sends neither; a `prior`
@@ -372,14 +388,26 @@ impl Transport {
         };
         let request = JsonRpcRequest::new(1, METHOD_SEND_MESSAGE, params);
 
-        let mut post = self.client.post(target).json(&request);
-        if let Some((name, value)) = auth {
-            post = post.header(name, value);
-        }
-        let response = post
-            .send()
-            .await
-            .map_err(|err| format!("calling a2a agent {agent_id} failed: {err}"))?;
+        // An OAuth token the agent refuses (401) is dropped and fetched anew,
+        // exactly once.
+        let mut retried = false;
+        let response = loop {
+            let auth = self.credentials.header_for(route).await?;
+            let mut post = self.client.post(target.clone()).json(&request);
+            if let Some((name, value)) = auth {
+                post = post.header(name, value);
+            }
+            let response = post
+                .send()
+                .await
+                .map_err(|err| format!("calling a2a agent {agent_id} failed: {err}"))?;
+            if oauth && !retried && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                self.credentials.invalidate(route).await;
+                retried = true;
+                continue;
+            }
+            break response;
+        };
 
         // A JSON-RPC server reports method errors inside a 200 body, so a
         // non-success status is a transport-level failure (a proxy, a crash,
