@@ -1338,6 +1338,7 @@ impl FlowEngine {
 
             let owned_the_submit =
                 attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
+            state.note_created_artifacts(std::mem::take(&mut output.created));
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
@@ -3729,6 +3730,13 @@ pub struct ExecutionState {
     /// per-node, serde-defaulted, persisted-in-snapshot pattern.
     #[serde(default)]
     pending_agent_await: HashMap<String, ()>,
+    /// Files created for the end user during THIS turn (`media.create`),
+    /// folded into the turn's final reply by `finalize_with`
+    /// (see [`crate::runner::media_node::CREATED_ARTIFACTS_KEY`]). Never
+    /// serialised and cleared on every snapshot, so a parked run cannot
+    /// deliver a file again on its next turn.
+    #[serde(skip)]
+    created_artifacts: Vec<Value>,
     /// Nodes that dispatched an approval request and are parked awaiting the
     /// decision. Set on dispatch, cleared when the response re-enters the node.
     /// Without it a stray inbound arriving mid-await would look like a first
@@ -3785,6 +3793,7 @@ impl ExecutionState {
             vars: JsonMap::new(),
             park_turns: HashMap::new(),
             pending_agent_await: HashMap::new(),
+            created_artifacts: Vec::new(),
             pending_approval_await: HashMap::new(),
             pending_approval_token: HashMap::new(),
             pending_tool_await: HashMap::new(),
@@ -3840,8 +3849,30 @@ impl ExecutionState {
         self.input = input;
     }
 
+    /// Drop everything a snapshot must not carry into the next turn: the
+    /// emitted payloads and the files created this turn (both belong to the
+    /// reply being finalised now, not to the parked run).
     fn clear_egress(&mut self) {
         self.egress.clear();
+        self.created_artifacts.clear();
+    }
+
+    /// Record files a node created for the user this turn. Deduplicated by id
+    /// and bounded, so a looping flow cannot grow the list without limit.
+    fn note_created_artifacts(&mut self, created: Vec<Value>) {
+        for file in created {
+            if self.created_artifacts.len() >= crate::runner::media_node::MAX_CREATED_PER_TURN {
+                break;
+            }
+            let id = file.get("id").and_then(Value::as_str);
+            let known = self
+                .created_artifacts
+                .iter()
+                .any(|seen| seen.get("id").and_then(Value::as_str) == id);
+            if id.is_some() && !known {
+                self.created_artifacts.push(file);
+            }
+        }
     }
 
     fn redirect_count(&self) -> u32 {
@@ -3940,6 +3971,12 @@ impl ExecutionState {
     }
 
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
+        let created = std::mem::take(&mut self.created_artifacts);
+        let reply = self.finalize_reply(final_payload);
+        crate::runner::media_node::attach_created(reply, created)
+    }
+
+    fn finalize_reply(mut self, final_payload: Option<Value>) -> Value {
         if self.egress.is_empty() {
             return final_payload.unwrap_or(Value::Null);
         }
@@ -3968,6 +4005,12 @@ struct NodeOutput {
     ok: bool,
     payload: Value,
     meta: Value,
+    /// Files this node created for the end user of the CURRENT turn
+    /// (`media.create` only). Never serialised: the run loop moves it into
+    /// [`ExecutionState`]'s per-turn list right after dispatch, so it can
+    /// neither reach a snapshot nor a later turn.
+    #[serde(skip)]
+    created: Vec<Value>,
 }
 
 impl NodeOutput {
@@ -3976,6 +4019,7 @@ impl NodeOutput {
             ok: true,
             payload,
             meta: Value::Null,
+            created: Vec::new(),
         }
     }
 
@@ -3994,6 +4038,7 @@ impl NodeOutput {
                     "node_id": node_id,
                 }
             }),
+            created: Vec::new(),
         }
     }
 }
@@ -4101,6 +4146,7 @@ impl NodeOutput {
             ok: true,
             payload,
             meta,
+            created: Vec::new(),
         }
     }
 
@@ -4134,6 +4180,7 @@ impl NodeOutput {
             ok: false,
             payload,
             meta,
+            created: Vec::new(),
         }
     }
 }
@@ -4833,7 +4880,12 @@ fn a2a_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeO
 /// same reason: a failed node without a route would park the run).
 #[cfg(feature = "agentic-worker")]
 fn media_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeOutput {
-    if !has_error_route || !crate::runner::media_node::is_failure(result) {
+    if !crate::runner::media_node::is_failure(result) {
+        let mut output = NodeOutput::new(bound);
+        output.created = crate::runner::media_node::created_files(result);
+        return output;
+    }
+    if !has_error_route {
         return NodeOutput::new(bound);
     }
     NodeOutput::errored(normalize_mcp_tool_error(
@@ -11283,6 +11335,7 @@ mod tests {
             ok: false,
             payload: json!({}),
             meta: Value::Null,
+            created: Vec::new(),
         };
 
         // qa shape: failure port is `on_cancel`, no `on_error` edge.

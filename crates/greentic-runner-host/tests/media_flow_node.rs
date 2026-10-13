@@ -56,6 +56,8 @@ type Put = (String, String, Vec<u8>, Option<String>);
 #[derive(Default)]
 struct StubPort {
     puts: Mutex<Vec<Put>>,
+    /// Ids are `artifact://<64 hex>` with the put's ordinal in the low digits.
+    next: Mutex<u64>,
     refuse: Mutex<Option<ArtifactPortError>>,
 }
 
@@ -75,7 +77,9 @@ impl ArtifactPort for StubPort {
             request.bytes,
             ctx.tenant.clone(),
         ));
-        Ok(format!("artifact://{}", "b".repeat(64)))
+        let mut next = self.next.lock().unwrap();
+        *next += 1;
+        Ok(format!("artifact://{:0>64x}", 0xb000 + *next))
     }
 }
 
@@ -106,7 +110,10 @@ fn host_config(bindings_path: &Path) -> HostConfig {
 
 /// Build a `.gtpack` whose only flow is a `media.create` node `make`, routed
 /// to `ok` / `err` end nodes when `error_route` is set.
-fn build_pack(pack_path: &Path, node_input: Value, error_route: bool) -> Result<()> {
+fn single_node_flow(
+    node_input: Value,
+    error_route: bool,
+) -> (&'static str, serde_json::Map<String, Value>) {
     let routing = if error_route {
         json!({ "custom": [
             { "condition": "event == \"on_success\"", "to": "ok" },
@@ -132,10 +139,19 @@ fn build_pack(pack_path: &Path, node_input: Value, error_route: bool) -> Result<
             );
         }
     }
+    ("make", nodes)
+}
+
+/// Pack a flow made of `nodes`, starting at `start`.
+fn build_pack_nodes(
+    pack_path: &Path,
+    start: &str,
+    nodes: serde_json::Map<String, Value>,
+) -> Result<()> {
     let flows = vec![json!({
         "id": FLOW_ID,
         "flow_type": "messaging",
-        "start": "make",
+        "start": start,
         "nodes": Value::Object(nodes),
     })];
 
@@ -186,11 +202,20 @@ struct Harness {
 
 impl Harness {
     fn new(node_input: Value, error_route: bool, with_port: bool) -> Result<Self> {
+        let (start, nodes) = single_node_flow(node_input, error_route);
+        Self::with_nodes(start, nodes, with_port)
+    }
+
+    fn with_nodes(
+        start: &str,
+        nodes: serde_json::Map<String, Value>,
+        with_port: bool,
+    ) -> Result<Self> {
         let temp = TempDir::new()?;
         let pack_path = temp.path().join("media.gtpack");
         let bindings_path = temp.path().join("bindings.yaml");
         std::fs::write(&bindings_path, b"tenant: demo")?;
-        build_pack(&pack_path, node_input, error_route)?;
+        build_pack_nodes(&pack_path, start, nodes)?;
         let config = Arc::new(host_config(&bindings_path));
         let rt = *RUNTIME;
         let pack = Arc::new(rt.block_on(PackRuntime::load(
@@ -221,6 +246,15 @@ impl Harness {
             engine,
             port,
         })
+    }
+
+    /// Run the flow once and return the execution, parked or not.
+    fn run_any(&self) -> Result<greentic_runner_host::runner::engine::FlowExecution> {
+        let pack_id = self.pack.metadata().pack_id.to_string();
+        let ctx = flow_ctx(&self.config, &pack_id, FLOW_ID, Some("demo:p:c:u"));
+        RUNTIME
+            .block_on(self.engine.execute(ctx, json!({ "text": "hello" })))
+            .context("media flow run")
     }
 
     /// Run the flow once and return the whole execution.
@@ -435,4 +469,171 @@ fn flow_ctx<'a>(
         mocks: None,
         caller: None,
     }
+}
+
+// ── delivery of a file created mid-flow ──────────────────────────────────────
+
+/// Every `created_artifacts` list in a final reply, as the ids it names.
+fn created_ids(reply: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    collect_created(reply, &mut ids);
+    ids
+}
+
+fn collect_created(value: &Value, ids: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(files)) = map.get("created_artifacts") {
+                ids.extend(
+                    files
+                        .iter()
+                        .filter_map(|f| f["id"].as_str().map(str::to_string)),
+                );
+            }
+            map.values().for_each(|v| collect_created(v, ids));
+        }
+        Value::Array(items) => items.iter().for_each(|v| collect_created(v, ids)),
+        _ => {}
+    }
+}
+
+fn media(format: &str, text: &str, routing: Value, output: Option<&str>) -> Value {
+    let mut input = json!({ "format": format, "text": text });
+    if let Some(key) = output {
+        input["output"] = json!(key);
+    }
+    json!({ "component": "media.create", "input": input, "routing": routing })
+}
+
+fn say(text: &str, routing: Value) -> Value {
+    json!({ "component": "emit.response", "input": { "text": text }, "routing": routing })
+}
+
+fn to(node: &str) -> Value {
+    json!({ "next": { "node_id": node } })
+}
+
+#[test]
+fn an_output_bound_file_followed_by_another_node_is_still_listed() -> Result<()> {
+    let mut nodes = serde_json::Map::new();
+    nodes.insert(
+        "make".into(),
+        media("pdf", "summary", to("done"), Some("file")),
+    );
+    nodes.insert("done".into(), say("Here is your summary", json!("end")));
+    let harness = Harness::with_nodes("make", nodes, true)?;
+    let execution = harness.run()?;
+    let ids = created_ids(&execution.output);
+    assert_eq!(ids.len(), 1, "{}", execution.output);
+    assert!(ids[0].starts_with("artifact://"));
+    // The list rides with the final text reply, not on a separate payload.
+    let last = match &execution.output {
+        Value::Array(items) => items.last().context("last reply")?.clone(),
+        other => other.clone(),
+    };
+    assert_eq!(created_ids(&last), ids, "{}", execution.output);
+    assert!(last.to_string().contains("Here is your summary"));
+    Ok(())
+}
+
+#[test]
+fn two_files_in_one_turn_are_both_listed_in_order() -> Result<()> {
+    let mut nodes = serde_json::Map::new();
+    nodes.insert("one".into(), media("txt", "a", to("two"), Some("a")));
+    nodes.insert("two".into(), media("csv", "b", to("done"), None));
+    nodes.insert("done".into(), say("Both files are ready", json!("end")));
+    // `csv` needs rows, not text: give it some.
+    nodes["two"]["input"] = json!({ "format": "csv", "rows": [["a", "b"]] });
+    let harness = Harness::with_nodes("one", nodes, true)?;
+    let execution = harness.run()?;
+    let ids = created_ids(&execution.output);
+    assert_eq!(ids.len(), 2, "{}", execution.output);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(harness.port.puts.lock().unwrap().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_failed_node_lists_no_file() -> Result<()> {
+    let mut nodes = serde_json::Map::new();
+    nodes.insert("make".into(), media("docx", "x", to("done"), Some("file")));
+    nodes.insert("done".into(), say("done", json!("end")));
+    let harness = Harness::with_nodes("make", nodes, true)?;
+    let execution = harness.run()?;
+    assert!(
+        created_ids(&execution.output).is_empty(),
+        "{}",
+        execution.output
+    );
+    assert!(harness.port.puts.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_file_node_that_ends_the_flow_is_listed_too() -> Result<()> {
+    let harness = Harness::new(json!({"format":"txt","text":"hi"}), false, true)?;
+    let execution = harness.run()?;
+    assert_eq!(
+        created_ids(&execution.output).len(),
+        1,
+        "{}",
+        execution.output
+    );
+    // The top-level `artifact` contract is unchanged.
+    assert!(find_key(&execution.output, "artifact").is_some());
+    Ok(())
+}
+
+#[test]
+fn a_flow_cannot_forge_the_list() -> Result<()> {
+    let mut nodes = serde_json::Map::new();
+    nodes.insert(
+        "done".into(),
+        json!({
+            "component": "emit.response",
+            "input": { "text": "hi", "created_artifacts": [{ "id": format!("artifact://{}", "c".repeat(64)) }] },
+            "routing": "end",
+        }),
+    );
+    let harness = Harness::with_nodes("done", nodes, true)?;
+    let execution = harness.run()?;
+    assert!(
+        created_ids(&execution.output).is_empty(),
+        "{}",
+        execution.output
+    );
+    Ok(())
+}
+
+#[test]
+fn a_parked_turn_lists_its_file_and_the_resumed_turn_does_not() -> Result<()> {
+    let mut nodes = serde_json::Map::new();
+    nodes.insert("make".into(), media("txt", "hi", to("wait"), Some("file")));
+    nodes.insert(
+        "wait".into(),
+        json!({ "component": "session.wait", "input": { "reason": "ask" }, "routing": to("done") }),
+    );
+    nodes.insert("done".into(), say("all done", json!("end")));
+    let harness = Harness::with_nodes("make", nodes, true)?;
+    let parked = harness.run_any()?;
+    assert_eq!(created_ids(&parked.output).len(), 1, "{}", parked.output);
+    let FlowStatus::Waiting(wait) = parked.status else {
+        anyhow::bail!("the flow must park at session.wait");
+    };
+    let pack_id = harness.pack.metadata().pack_id.to_string();
+    let ctx = flow_ctx(&harness.config, &pack_id, FLOW_ID, Some("demo:p:c:u"));
+    let resumed = RUNTIME
+        .block_on(
+            harness
+                .engine
+                .resume(ctx, wait.snapshot, json!({ "text": "go on" })),
+        )
+        .context("resume")?;
+    assert!(
+        created_ids(&resumed.output).is_empty(),
+        "a file must be delivered on the turn that made it only: {}",
+        resumed.output
+    );
+    assert_eq!(harness.port.puts.lock().unwrap().len(), 1);
+    Ok(())
 }
