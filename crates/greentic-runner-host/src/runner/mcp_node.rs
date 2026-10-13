@@ -367,6 +367,134 @@ pub mod aw {
     }
 
     #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod oauth_tests {
+        use super::invoke_with_secrets;
+        use crate::runner::mcp_pack_routes::PackMcpRoutes;
+        use serde_json::json;
+        use std::sync::Arc;
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct OneSecret(String);
+
+        #[async_trait::async_trait]
+        impl greentic_secrets_lib::SecretsManager for OneSecret {
+            async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                if path == "secrets://default/acme/_/mcp/srv" {
+                    Ok(self.0.clone().into_bytes())
+                } else {
+                    Err(greentic_secrets_lib::SecretError::NotFound(
+                        path.to_string(),
+                    ))
+                }
+            }
+            async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        async fn mcp_server() -> MockServer {
+            let server = MockServer::start().await;
+            for (m, resp) in [
+                (
+                    "initialize",
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "result": {"protocolVersion": "2025-06-18",
+                                   "serverInfo": {"name": "f", "version": "1"}}
+                    })),
+                ),
+                ("notifications/initialized", ResponseTemplate::new(202)),
+                (
+                    "tools/call",
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0", "id": 3,
+                        "result": {"content": [{"type": "text", "text": "done"}]}
+                    })),
+                ),
+            ] {
+                Mock::given(method("POST"))
+                    .and(header("authorization", "Bearer access-1"))
+                    .and(body_partial_json(json!({"method": m})))
+                    .respond_with(resp)
+                    .mount(&server)
+                    .await;
+            }
+            server
+        }
+
+        async fn run(sidecar: serde_json::Value, secret: &str) -> serde_json::Value {
+            let routes = PackMcpRoutes::from_sidecar_bytes(sidecar.to_string().as_bytes()).unwrap();
+            let secrets: crate::secrets::DynSecretsManager = Arc::new(OneSecret(secret.into()));
+            invoke_with_secrets(
+                None,
+                Some(&routes),
+                Some(&secrets),
+                "acme",
+                "prod",
+                None,
+                None,
+                "srv",
+                "echo",
+                &json!({}),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_flow_mcp_node_uses_the_oauth_token_for_an_oauth_route() {
+            // Test hook: the stub IdP is plain http on loopback.
+            greentic_aw_runtime::oauth::TokenProvider::shared().allow_loopback_http_for_tests();
+            let mcp = mcp_server().await;
+            let idp = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"access_token": "access-1", "token_type": "Bearer", "expires_in": 3600}),
+                ))
+                .mount(&idp)
+                .await;
+            let out = run(
+                json!([{"server_id": "srv", "transport_url": mcp.uri(),
+                        "auth_mode": "oauth_client_credentials",
+                        "oauth_endpoint": format!("{}/token", idp.uri())}]),
+                r#"{"client_id":"cid","client_secret":"csecret-XYZ"}"#,
+            )
+            .await;
+            assert!(out.get("error").is_none(), "{out}");
+        }
+
+        #[tokio::test]
+        async fn unknown_mode_and_json_on_a_bearer_route_fail_closed() {
+            let mcp = mcp_server().await;
+            let unknown = run(
+                json!([{"server_id": "srv", "transport_url": mcp.uri(), "auth_mode": "mtls"}]),
+                "tok",
+            )
+            .await;
+            assert!(
+                unknown["error"].as_str().unwrap().contains("mtls"),
+                "{unknown}"
+            );
+            let bearer = run(
+                json!([{"server_id": "srv", "transport_url": mcp.uri()}]),
+                r#"{"client_id":"cid","client_secret":"csecret-XYZ"}"#,
+            )
+            .await;
+            let msg = bearer["error"].as_str().unwrap();
+            assert!(
+                msg.contains("client credentials") && !msg.contains("csecret-XYZ"),
+                "{msg}"
+            );
+            assert!(mcp.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[cfg(test)]
     mod precedence_tests {
         use super::choose_mcp_secrets;
         use std::sync::Arc;
