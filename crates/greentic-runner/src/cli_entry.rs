@@ -941,3 +941,7 @@ fn normalize_operation_id(value: &str) -> String {
         op.to_string()
     }
 }
+
+#[cfg(test)]
+#[path = "cli_entry_tests.rs"]
+mod tests;

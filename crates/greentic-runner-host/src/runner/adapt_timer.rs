@@ -173,4 +173,38 @@ mod tests {
         let timers = spawn_timers(Arc::clone(&runtime)).expect("spawn timers");
         assert!(timers.is_empty());
     }
+
+    #[tokio::test]
+    async fn spawn_timers_rejects_an_invalid_cron_expression() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime_with_timers(
+            r#"[{ flow_id: "flow.main", cron: "not a cron" }]"#,
+        )
+        .await
+        .expect("runtime");
+        let err = spawn_timers(runtime).expect_err("bad cron must be refused");
+        assert!(
+            err.to_string().contains("invalid cron expression"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timer_for_an_unknown_flow_keeps_running_instead_of_dying() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime_with_timers(
+            r#"[{ flow_id: "flow.does.not.exist", cron: "* * * * * *", schedule_id: "every-second" }]"#,
+        )
+        .await
+        .expect("runtime");
+        let handles = spawn_timers(runtime).expect("spawn timers");
+        assert_eq!(handles.len(), 1);
+        // Let at least one tick fire against the missing flow.
+        sleep(Duration::from_millis(2300)).await;
+        assert!(
+            !handles[0].is_finished(),
+            "an unresolvable flow must be logged and skipped, not end the schedule"
+        );
+        for handle in handles {
+            handle.abort();
+        }
+    }
 }
