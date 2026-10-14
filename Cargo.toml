@@ -24,7 +24,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.2.0"
+version = "1.2.1"
 
 # THE LANE. Every greentic dependency is a RANGE over the single `1.2.0-dev`
 # crates.io lane (`>=1.2.0-dev, <1.3.0-0`), because `dev-publish.yml` stamps

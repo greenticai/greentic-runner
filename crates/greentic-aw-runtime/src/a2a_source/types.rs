@@ -30,6 +30,15 @@ pub struct A2aRoute {
     /// A token is stored and must be sent. A route with this set and no
     /// resolvable token is refused, never called unauthenticated.
     pub requires_auth: bool,
+    /// `bearer` / `header` / `oauth_client_credentials`; absent keeps the
+    /// pre-existing behaviour. Validated when the credential is needed, so an
+    /// unknown value refuses this agent only.
+    pub auth_mode: Option<String>,
+    /// Where the OAuth token is fetched. Taken from the sidecar, never from the
+    /// agent card, so a card cannot redirect the client secret.
+    pub oauth_endpoint: Option<String>,
+    pub oauth_scope: Option<String>,
+    pub oauth_audience: Option<String>,
 }
 
 impl A2aRoute {
@@ -42,6 +51,10 @@ impl A2aRoute {
             auth_header_name: None,
             auth_team: None,
             requires_auth: false,
+            auth_mode: None,
+            oauth_endpoint: None,
+            oauth_scope: None,
+            oauth_audience: None,
         }
     }
 }
@@ -160,6 +173,31 @@ impl A2aToolCatalog {
         continuations: &mut A2aContinuations,
         now: DateTime<Utc>,
     ) -> Value {
+        self.dispatch_in_conversation_with(
+            agent_id,
+            args,
+            tenant,
+            continuations,
+            now,
+            A2aCallOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Self::dispatch_in_conversation`] with per-call options.
+    ///
+    /// `options.want_card` asks the agent for its Adaptive Card (interop
+    /// contract D10); the rendered value then carries it under `card`. Without
+    /// it nothing changes: no `configuration` is sent and no `card` key exists.
+    pub async fn dispatch_in_conversation_with(
+        &self,
+        agent_id: &str,
+        args: &Value,
+        tenant: &TenantContext,
+        continuations: &mut A2aContinuations,
+        now: DateTime<Utc>,
+        options: A2aCallOptions,
+    ) -> Value {
         let caller = self
             .caller
             .as_ref()
@@ -174,7 +212,13 @@ impl A2aToolCatalog {
 
         let prior = continuations.resume(tenant, agent_id, now);
         match caller
-            .send(agent_id, &args_to_text(args), prior.as_ref())
+            .send(
+                agent_id,
+                &args_to_text(args),
+                prior.as_ref(),
+                options.want_card,
+                options.answer.as_ref(),
+            )
             .await
         {
             Ok(reply) => {
@@ -208,6 +252,18 @@ impl A2aToolCatalog {
             }
         }
     }
+}
+
+/// Per-call options for [`A2aToolCatalog::dispatch_in_conversation_with`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct A2aCallOptions {
+    /// Ask the agent for its Adaptive Card as well as its text.
+    pub want_card: bool,
+    /// An answer to a question the agent asked with a card: the `{field id:
+    /// value}` object a card submit carries, sent as a `data` part beside the
+    /// message text. This is how a form the agent parked on is submitted
+    /// (interop contract section 9.4); text alone cannot carry it.
+    pub answer: Option<Value>,
 }
 
 /// The text an A2A agent receives for a tool call's `args`.

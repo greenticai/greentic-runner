@@ -57,6 +57,45 @@ pub struct PackMcpRoute {
     pub component_version: Option<String>,
     #[serde(default)]
     pub component_digest: Option<String>,
+    /// `bearer` / `header` / `oauth_client_credentials`. Absent keeps the
+    /// pre-existing behaviour. Read as a string and validated per route, so an
+    /// unknown (or mistyped) value refuses that one server and never the file.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub auth_mode: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub oauth_endpoint: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub oauth_scope: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub oauth_audience: Option<String>,
+}
+
+impl PackMcpRoute {
+    /// The non-secret OAuth parameters of this record.
+    pub fn auth_spec(&self) -> greentic_aw_runtime::oauth::RouteAuthSpec<'_> {
+        greentic_aw_runtime::oauth::RouteAuthSpec {
+            auth_mode: self.auth_mode.as_deref(),
+            oauth_endpoint: self.oauth_endpoint.as_deref(),
+            oauth_scope: self.oauth_scope.as_deref(),
+            oauth_audience: self.oauth_audience.as_deref(),
+        }
+    }
+}
+
+/// A string field that tolerates any other JSON type. A non-string value
+/// becomes the marker `"<invalid>"`, which no auth mode matches, so a record
+/// with a mistyped `auth_mode` fails closed instead of being dropped (which
+/// would hand the server to the admin catalog) or read as "no auth_mode".
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text),
+        Some(_) => Some("<invalid>".to_string()),
+    })
 }
 
 fn default_transport() -> String {
@@ -95,14 +134,22 @@ impl PackMcpRoutes {
     ///
     /// [`from_pack_bytes`]: PackMcpRoutes::from_pack_bytes
     pub fn from_sidecar_bytes(sidecar_bytes: &[u8]) -> Option<Self> {
-        let routes: Vec<PackMcpRoute> = serde_json::from_slice(sidecar_bytes)
+        let records: Vec<serde_json::Value> = serde_json::from_slice(sidecar_bytes)
             .inspect_err(|e| tracing::warn!(error = %e, "mcp-routes: malformed; ignoring sidecar"))
             .ok()?;
 
-        let by_server = routes
-            .into_iter()
-            .map(|route| (route.server_id.clone(), route))
-            .collect();
+        // Lenient per record: one unreadable record must not void the others.
+        let mut by_server = HashMap::new();
+        for (index, record) in records.into_iter().enumerate() {
+            match serde_json::from_value::<PackMcpRoute>(record) {
+                Ok(route) => {
+                    by_server.insert(route.server_id.clone(), route);
+                }
+                Err(e) => {
+                    tracing::warn!(index, error = %e, "mcp-routes: record unreadable; dropped");
+                }
+            }
+        }
         Some(Self { by_server })
     }
 
@@ -177,6 +224,50 @@ mod tests {
         // agent path branches on that string to decide whether to read a token.
         assert_eq!(routes.get("a").unwrap().transport, "http");
         assert_eq!(routes.get("b").unwrap().transport, "local-wasm");
+    }
+
+    #[test]
+    fn oauth_parameters_round_trip_and_old_sidecars_read_as_none() {
+        let routes = PackMcpRoutes::from_sidecar_bytes(
+            br#"[{"server_id":"a","transport_url":"https://a/","auth_mode":"oauth_client_credentials",
+                  "oauth_endpoint":"https://idp/token","oauth_scope":"s","oauth_audience":"aud"},
+                 {"server_id":"b","transport_url":"https://b/"}]"#,
+        )
+        .expect("parses");
+        let a = routes.get("a").unwrap();
+        assert_eq!(a.auth_mode.as_deref(), Some("oauth_client_credentials"));
+        assert_eq!(a.oauth_endpoint.as_deref(), Some("https://idp/token"));
+        assert_eq!(a.oauth_scope.as_deref(), Some("s"));
+        assert_eq!(a.oauth_audience.as_deref(), Some("aud"));
+        assert_eq!(routes.get("b").unwrap().auth_mode, None);
+    }
+
+    #[test]
+    fn one_bad_record_no_longer_voids_the_file() {
+        let routes = PackMcpRoutes::from_sidecar_bytes(
+            br#"[{"transport_url":"https://nameless/"},
+                 {"server_id":"ok","transport_url":"https://ok/"}]"#,
+        )
+        .expect("the file still parses");
+        assert!(routes.get("ok").is_some());
+    }
+
+    #[test]
+    fn a_mistyped_auth_mode_is_kept_as_an_unknown_mode_not_dropped() {
+        let routes = PackMcpRoutes::from_sidecar_bytes(
+            br#"[{"server_id":"a","transport_url":"https://a/","auth_mode":7}]"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            routes.get("a").unwrap().auth_mode.as_deref(),
+            Some("<invalid>")
+        );
+        assert!(
+            greentic_aw_runtime::oauth::parse_auth_mode(
+                routes.get("a").unwrap().auth_mode.as_deref()
+            )
+            .is_err()
+        );
     }
 
     #[test]

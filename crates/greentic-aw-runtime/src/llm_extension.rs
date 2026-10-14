@@ -148,9 +148,13 @@ impl LlmBackend for ExtensionLlmBackend {
                 CredentialSource::Static(c) => c,
                 CredentialSource::Resolver(r) => r.resolve(&request.provider).await?,
             };
+            // The bridge cannot open attachments: it gets the fixed notice and
+            // never a reference, id or name.
+            let mut history = request.history.clone();
+            crate::attachments_materialize::announce_unreadable(&mut history);
             let payload = BridgeRequest {
                 system_prompt: &request.system_prompt,
-                history: &request.history,
+                history: &history,
                 tools: &request.tools,
                 credential: &credential,
             };
@@ -191,8 +195,10 @@ mod tests {
     fn req() -> LlmRequest {
         LlmRequest {
             system_prompt: "be helpful".into(),
+            // attachments unsupported on this backend
             history: vec![ChatMessage::User {
                 content: "hi".into(),
+                attachments: Vec::new(),
             }],
             tools: vec![LlmToolSchema {
                 extension_id: "http".into(),
@@ -205,6 +211,8 @@ mod tests {
                 model: "gpt-4o".into(),
                 credential_ref: None,
             },
+            turn_attachments: Default::default(),
+            attachment_text_guard: None,
         }
     }
 
@@ -256,6 +264,46 @@ mod tests {
         assert_eq!(v["tools"][0]["tool_name"], "fetch");
         // base_url omitted when None.
         assert!(v["credential"].get("base_url").is_none());
+    }
+
+    /// The bridge extension cannot open attachments: it gets the fixed notice
+    /// in the message text and no attachment reference, id or name.
+    #[tokio::test]
+    async fn attachments_are_announced_with_the_fixed_notice_and_never_sent() {
+        use crate::attachments::{AttachmentKind, AttachmentRef};
+        let reply = serde_json::json!({
+            "content": "ok", "tool_calls": [], "tokens_in": 1, "tokens_out": 1
+        })
+        .to_string();
+        let inv = Arc::new(ScriptInvoker {
+            seen: Mutex::new(None),
+            reply: Ok(reply),
+        });
+        let backend = ExtensionLlmBackend::with_invoker(inv.clone(), "bridge", cred());
+        let mut request = req();
+        request.history = vec![ChatMessage::User {
+            content: "look".into(),
+            attachments: vec![AttachmentRef {
+                id: "artifact://a".into(),
+                mime_type: "text/plain".into(),
+                name: Some("secret-plan.txt".into()),
+                size_bytes: None,
+                kind: AttachmentKind::Document,
+                text_ref: None,
+            }],
+        }];
+        backend.complete(request).await.unwrap();
+        let (_, _, args) = inv.seen.lock().unwrap().clone().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        let content = v["history"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            content,
+            format!("look{}", crate::attachments_materialize::unreadable_note(1))
+        );
+        assert!(
+            !args.contains("secret-plan") && !args.contains("artifact://"),
+            "{args}"
+        );
     }
 
     #[tokio::test]

@@ -295,4 +295,110 @@ mod tests {
         .unwrap();
         assert_eq!(rendered, Value::String("https://x/42".to_string()));
     }
+
+    #[test]
+    fn entry_attachments_resolve_by_index_and_keep_json_types() {
+        let ctx = json!({
+            "entry": { "attachments": [
+                {"mime_type":"application/pdf","url":"artifact://d","name":"d.pdf","text":"hello world"},
+                {"mime_type":"image/png","url":"artifact://i","name":"i.png"}
+            ]},
+            "prev": {}, "node": {}, "state": {},
+        });
+        let text = render_template_value(
+            &Value::String("{{entry.attachments[0].text}}".into()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(text, json!("hello world"));
+        let all = render_template_value(
+            &Value::String("{{entry.attachments}}".into()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            all.as_array().map(Vec::len),
+            Some(2),
+            "exact expression keeps the array"
+        );
+        let second = render_template_value(
+            &Value::String("{{entry.attachments[1].url}}".into()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(second, json!("artifact://i"));
+    }
+
+    #[test]
+    fn extension_metadata_and_notes_resolve_through_the_in_alias() {
+        // These are the exact expressions greentic-dw-authoring maps (contract C4b).
+        let ctx = json!({
+            "entry": {
+                "attachments": [{"mime_type":"application/pdf","url":null,"name":"big.pdf"}],
+                "extensions": {
+                    "artifacts": [{"sha256":"aa","kind":"document","text_ref":null}],
+                    "attachment_notes": [{"code":"too_large","message":"over 10 MB"}]
+                }
+            },
+            "in": {
+                "extensions": {
+                    "artifacts": [{"sha256":"aa","kind":"document","text_ref":null}],
+                    "attachment_notes": [{"code":"too_large","message":"over 10 MB"}]
+                }
+            },
+            "prev": {}, "node": {}, "state": {},
+        });
+        let notes = render_template_value(
+            &Value::String("{{in.extensions.attachment_notes}}".into()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            notes[0]["code"],
+            json!("too_large"),
+            "exact expression keeps the array"
+        );
+        let meta = render_template_value(
+            &Value::String("{{in.extensions.artifacts}}".into()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(meta[0]["kind"], json!("document"));
+    }
+
+    #[test]
+    fn unresolved_extension_keys_render_empty_string_which_the_agent_node_treats_as_none() {
+        let ctx =
+            json!({"entry": {"attachments": []}, "in": {}, "prev": {}, "node": {}, "state": {}});
+        for expr in [
+            "{{in.extensions.artifacts}}",
+            "{{in.extensions.attachment_notes}}",
+            "{{in.attachments}}",
+        ] {
+            let out = render_template_value(
+                &Value::String(expr.into()),
+                &ctx,
+                TemplateOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(out, json!(""), "{expr}");
+        }
+    }
+
+    #[test]
+    fn missing_attachment_index_renders_empty_string_like_any_missing_path() {
+        let ctx = json!({"entry": {"attachments": []}, "prev": {}, "node": {}, "state": {}});
+        let out = render_template_value(
+            &Value::String("{{entry.attachments[0].text}}".into()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(out, json!(""));
+    }
 }

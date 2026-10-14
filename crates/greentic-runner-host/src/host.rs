@@ -51,6 +51,21 @@ pub type ExtLlmPort = Arc<dyn greentic_ext_runtime::host_ports::LlmPort>;
 #[cfg(feature = "agentic-worker")]
 pub type McpSource = Arc<greentic_aw_runtime::McpToolSource>;
 
+/// Reader for the bytes of a message's attachments (contract C3 `get` on the
+/// admin `artifacts` door), used by the in-process multi-provider LLM backend.
+/// See [`HostBuilder::with_artifact_reader`] and
+/// [`crate::runtime::RevisionHostOptions::with_artifact_reader`].
+#[cfg(feature = "agentic-worker")]
+pub type ArtifactReaderPort = Arc<dyn greentic_aw_runtime::ArtifactReader>;
+
+/// Port that stores the files an extension creates (`host.artifact.put`,
+/// contract C3 `put`), installed on the extension runtime `build_ext_runtime`
+/// builds. Without one, `put` answers `unsupported`. See
+/// [`HostBuilder::with_ext_artifact_port`] and
+/// [`crate::runtime::RevisionHostOptions::with_ext_artifact_port`].
+#[cfg(feature = "agentic-worker")]
+pub type ExtArtifactPort = Arc<dyn greentic_ext_runtime::host_ports::ArtifactPort>;
+
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
@@ -62,6 +77,12 @@ pub struct HostBuilder {
     ext_llm_port: Option<ExtLlmPort>,
     #[cfg(feature = "agentic-worker")]
     mcp_source: Option<McpSource>,
+    #[cfg(feature = "agentic-worker")]
+    artifact_reader: Option<ArtifactReaderPort>,
+    #[cfg(feature = "agentic-worker")]
+    ext_artifact_port: Option<ExtArtifactPort>,
+    #[cfg(feature = "agentic-worker")]
+    artifact_env_fallback: bool,
 }
 
 impl HostBuilder {
@@ -76,6 +97,12 @@ impl HostBuilder {
             ext_llm_port: None,
             #[cfg(feature = "agentic-worker")]
             mcp_source: None,
+            #[cfg(feature = "agentic-worker")]
+            artifact_reader: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            artifact_env_fallback: false,
         }
     }
 
@@ -156,11 +183,101 @@ impl HostBuilder {
         self
     }
 
+    /// Inject the reader `dw.agent` turns use to open a message's attachments.
+    ///
+    /// A reader holds ONE door token, and the door decides the tenant from the
+    /// token, so a host-wide reader is only accepted on a host with exactly
+    /// ONE tenant configuration (the designer's Run Demo host, a local run,
+    /// the Test chat sidecar). Decided once, in [`Self::build`]:
+    ///
+    /// - one tenant, a reader injected: that reader;
+    /// - one tenant, `None`: no reader, unless the host opted in with
+    ///   [`Self::with_artifact_env_fallback`]; then the env fallback,
+    ///   `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN` (both
+    ///   required), else no reader;
+    /// - several tenants: NO reader. An injected one is dropped with a warning
+    ///   and the env is not used in its place: one tenant's agents must never
+    ///   read through another tenant's token. A host serving many units
+    ///   injects per unit instead, with
+    ///   [`crate::runtime::RevisionHostOptions::with_artifact_reader`].
+    ///
+    /// Without a reader attachments are announced to the agent, never read.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_artifact_reader(mut self, reader: Option<ArtifactReaderPort>) -> Self {
+        self.artifact_reader = reader;
+        self
+    }
+
+    /// Inject the port that stores files this host's extensions create
+    /// (`host.artifact.put`). Same tenant rules as
+    /// [`Self::with_artifact_reader`], decided once in [`Self::build`]:
+    ///
+    /// - one tenant, a port injected: that port;
+    /// - one tenant, `None`: no port, unless the host opted in with
+    ///   [`Self::with_artifact_env_fallback`]; then the env fallback,
+    ///   `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN` (both
+    ///   required, and `build` must run inside a multi-thread tokio runtime),
+    ///   else no port;
+    /// - several tenants: NO port. An injected one is dropped with a warning
+    ///   and the env is not used in its place. A host serving many units
+    ///   injects per unit instead, with
+    ///   [`crate::runtime::RevisionHostOptions::with_ext_artifact_port`].
+    ///
+    /// Without a port an extension's `put` answers `unsupported`.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_ext_artifact_port(mut self, port: Option<ExtArtifactPort>) -> Self {
+        self.ext_artifact_port = port;
+        self
+    }
+
+    /// Opt in to the `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN`
+    /// fallback for the attachment reader AND the extension artifact port.
+    /// Default `false`: without it the env variables are never read.
+    ///
+    /// SINGLE-TENANT PROCESS ONLY. The variables hold one unit's token, so only
+    /// a process that serves one tenant may read them (the standalone runner,
+    /// `crate::run`, opts in). The designer must never enable it: it embeds a
+    /// host per session and owns per-tenant credentials. Even when enabled, a
+    /// host with several tenant configurations gets no env reader or port.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_artifact_env_fallback(mut self, enabled: bool) -> Self {
+        self.artifact_env_fallback = enabled;
+        self
+    }
+
+    #[cfg(all(test, feature = "agentic-worker"))]
+    pub(crate) fn artifact_env_fallback_for_tests(&self) -> bool {
+        self.artifact_env_fallback
+    }
+
     pub fn build(self) -> Result<RunnerHost> {
         if self.configs.is_empty() {
             bail!("at least one tenant configuration is required");
         }
         let wasi_policy = Arc::new(self.wasi_policy);
+        #[cfg(all(feature = "agentic-worker", feature = "greentic-llm-backend"))]
+        let artifact_reader = host_artifact_reader(
+            self.artifact_reader,
+            self.configs.len(),
+            self.artifact_env_fallback,
+            crate::runner::artifact_reader_wiring::artifact_reader_from_env,
+        );
+        // Without the multi-provider backend nothing reads attachments, so
+        // there is no env reader to fall back to.
+        #[cfg(all(feature = "agentic-worker", not(feature = "greentic-llm-backend")))]
+        let artifact_reader = host_artifact_reader(
+            self.artifact_reader,
+            self.configs.len(),
+            self.artifact_env_fallback,
+            || None,
+        );
+        #[cfg(feature = "agentic-worker")]
+        let ext_artifact_port = host_ext_artifact_port(
+            self.ext_artifact_port,
+            self.configs.len(),
+            self.artifact_env_fallback,
+            crate::runner::ext_artifact_port::artifact_port_from_env,
+        );
         let configs = self
             .configs
             .into_iter()
@@ -223,9 +340,67 @@ impl HostBuilder {
             #[cfg(feature = "agentic-worker")]
             mcp_source: self.mcp_source,
             #[cfg(feature = "agentic-worker")]
+            artifact_reader,
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port,
+            #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: self.telemetry,
         })
+    }
+}
+
+/// The reader a `HostBuilder` host hands its runtimes; see
+/// [`HostBuilder::with_artifact_reader`]. `env` is consulted ONLY for a
+/// single-tenant host with no injected reader that opted in
+/// ([`HostBuilder::with_artifact_env_fallback`]).
+#[cfg(feature = "agentic-worker")]
+pub(crate) fn host_artifact_reader(
+    injected: Option<ArtifactReaderPort>,
+    tenants: usize,
+    env_fallback: bool,
+    env: impl FnOnce() -> Option<ArtifactReaderPort>,
+) -> Option<ArtifactReaderPort> {
+    match (injected, tenants) {
+        (Some(reader), 1) => Some(reader),
+        (Some(_), _) => {
+            tracing::warn!(
+                code = "artifact_reader_multi_tenant_host",
+                tenants,
+                "host-wide artifact reader dropped: this host serves several tenants; \
+                 inject one per unit with RevisionHostOptions::with_artifact_reader"
+            );
+            None
+        }
+        (None, 1) if env_fallback => env(),
+        (None, _) => None,
+    }
+}
+
+/// The extension artifact port a `HostBuilder` host hands its runtimes; see
+/// [`HostBuilder::with_ext_artifact_port`]. `env` is consulted ONLY for a
+/// single-tenant host with no injected port that opted in
+/// ([`HostBuilder::with_artifact_env_fallback`]).
+#[cfg(feature = "agentic-worker")]
+pub(crate) fn host_ext_artifact_port(
+    injected: Option<ExtArtifactPort>,
+    tenants: usize,
+    env_fallback: bool,
+    env: impl FnOnce() -> Option<ExtArtifactPort>,
+) -> Option<ExtArtifactPort> {
+    match (injected, tenants) {
+        (Some(port), 1) => Some(port),
+        (Some(_), _) => {
+            tracing::warn!(
+                code = "artifact_port_multi_tenant_host",
+                tenants,
+                "host-wide extension artifact port dropped: this host serves several tenants; \
+                 inject one per unit with RevisionHostOptions::with_ext_artifact_port"
+            );
+            None
+        }
+        (None, 1) if env_fallback => env(),
+        (None, _) => None,
     }
 }
 
@@ -269,6 +444,13 @@ pub struct RunnerHost {
     /// flow engine derive one from `GREENTIC_AW_*` env (standalone runners).
     #[cfg(feature = "agentic-worker")]
     mcp_source: Option<McpSource>,
+    /// Attachment reader injected by a single-tenant embedding host, or `None`
+    /// (each runtime then falls back to the env reader, else to none).
+    #[cfg(feature = "agentic-worker")]
+    artifact_reader: Option<ArtifactReaderPort>,
+    /// Extension artifact port, decided at build (single-tenant hosts only).
+    #[cfg(feature = "agentic-worker")]
+    ext_artifact_port: Option<ExtArtifactPort>,
     /// Session-id → active streaming observer, shared by every `dw.agent`
     /// node handler this host builds (writer: the `POST /agent/chat/stream`
     /// SSE handler via `ServerState`; reader: `RuntimeAgentNodeHandler::execute`).
@@ -908,6 +1090,20 @@ impl RunnerHost {
         self.mcp_source.clone()
     }
 
+    /// The host-injected attachment reader, if any (single-tenant hosts only;
+    /// see [`HostBuilder::with_artifact_reader`]).
+    #[cfg(feature = "agentic-worker")]
+    pub fn artifact_reader(&self) -> Option<ArtifactReaderPort> {
+        self.artifact_reader.clone()
+    }
+
+    /// The extension artifact port decided for this host, if any (see
+    /// [`HostBuilder::with_ext_artifact_port`]).
+    #[cfg(feature = "agentic-worker")]
+    pub fn ext_artifact_port(&self) -> Option<ExtArtifactPort> {
+        self.ext_artifact_port.clone()
+    }
+
     /// The shared session-keyed streaming-observer registry (R2). Cloning
     /// this `Arc` and handing it to both `TenantRuntime` construction (so
     /// `RuntimeAgentNodeHandler::execute` can read it) and `ServerState` (so
@@ -978,6 +1174,10 @@ impl RunnerHost {
             #[cfg(feature = "agentic-worker")]
             mcp_source: None,
             #[cfg(feature = "agentic-worker")]
+            artifact_reader: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: None,
         })
@@ -1000,7 +1200,7 @@ impl RunnerHost {
                 config.tenant
             );
         }
-        let runtime = TenantRuntime::load(
+        let runtime = TenantRuntime::load_with_artifact_reader(
             pack_path,
             Arc::clone(&config),
             None,
@@ -1016,6 +1216,10 @@ impl RunnerHost {
             self.ext_llm_port(),
             #[cfg(feature = "agentic-worker")]
             self.mcp_source(),
+            #[cfg(feature = "agentic-worker")]
+            self.artifact_reader(),
+            #[cfg(feature = "agentic-worker")]
+            self.ext_artifact_port(),
             #[cfg(feature = "agentic-worker")]
             Some(self.stream_observers()),
         )
@@ -1747,6 +1951,10 @@ mod identify_endpoints_tests {
             ext_llm_port: None,
             #[cfg(feature = "agentic-worker")]
             mcp_source: None,
+            #[cfg(feature = "agentic-worker")]
+            artifact_reader: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port: None,
             #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             configs: HashMap::new(),

@@ -3,6 +3,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The media type of an Adaptive Card part, as a Greentic worker stamps it.
+pub const ADAPTIVE_CARD_MEDIA_TYPE: &str = "application/vnd.microsoft.card.adaptive+json";
+
+/// The bare spelling of [`ADAPTIVE_CARD_MEDIA_TYPE`] (no `+json` suffix), which
+/// the interop contract names and a server may stamp instead.
+pub const ADAPTIVE_CARD_MEDIA_TYPE_BARE: &str = "application/vnd.microsoft.card.adaptive";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     #[serde(rename = "ROLE_UNSPECIFIED")]
@@ -49,6 +56,17 @@ pub struct Part {
 }
 
 impl Part {
+    /// The Adaptive Card this part carries, when it is one.
+    ///
+    /// Matched on the media type (either spelling, case-insensitively) AND a
+    /// `data` payload: a part naming the card type with no data carries no card.
+    pub fn adaptive_card(&self) -> Option<&serde_json::Value> {
+        let media = self.media_type.as_deref()?.trim();
+        let is_card = media.eq_ignore_ascii_case(ADAPTIVE_CARD_MEDIA_TYPE)
+            || media.eq_ignore_ascii_case(ADAPTIVE_CARD_MEDIA_TYPE_BARE);
+        if is_card { self.data.as_ref() } else { None }
+    }
+
     /// A plain text part — the shape almost every reply uses.
     pub fn text(text: impl Into<String>) -> Self {
         Self {
@@ -337,5 +355,51 @@ mod tests {
             None,
             "a struct lost rename_all = \"camelCase\""
         );
+    }
+}
+
+#[cfg(test)]
+mod adaptive_card_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn part(media: Option<&str>, data: Option<serde_json::Value>) -> Part {
+        Part {
+            media_type: media.map(str::to_string),
+            data,
+            ..Part::default()
+        }
+    }
+
+    #[test]
+    fn a_card_part_is_found_under_either_spelling_of_its_media_type() {
+        let card = json!({"type": "AdaptiveCard"});
+        for media in [
+            ADAPTIVE_CARD_MEDIA_TYPE,
+            ADAPTIVE_CARD_MEDIA_TYPE_BARE,
+            "APPLICATION/VND.MICROSOFT.CARD.ADAPTIVE+JSON",
+        ] {
+            assert_eq!(
+                part(Some(media), Some(card.clone())).adaptive_card(),
+                Some(&card),
+                "{media}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_that_is_not_a_card_carries_none() {
+        let data = json!({"k": 1});
+        assert!(
+            part(Some("application/json"), Some(data))
+                .adaptive_card()
+                .is_none()
+        );
+        assert!(
+            part(Some(ADAPTIVE_CARD_MEDIA_TYPE), None)
+                .adaptive_card()
+                .is_none()
+        );
+        assert!(Part::text("hi").adaptive_card().is_none());
     }
 }

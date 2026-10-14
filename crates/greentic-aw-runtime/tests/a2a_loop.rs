@@ -225,6 +225,7 @@ async fn a2a_tool_offered_called_and_result_in_trail() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -288,6 +289,7 @@ async fn no_a2a_source_offers_no_a2a_tool() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -383,6 +385,7 @@ async fn a_second_turn_resumes_the_remote_task_the_first_turn_left_open() {
                 text: "book a hotel in Spain".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -407,6 +410,7 @@ async fn a_second_turn_resumes_the_remote_task_the_first_turn_left_open() {
                 text: "Barcelona".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -459,6 +463,7 @@ async fn a_different_session_never_inherits_the_first_ones_remote_context() {
                 text: "book a hotel".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -524,6 +529,7 @@ async fn another_tenant_on_the_same_session_id_gets_its_own_remote_context() {
                 text: "book a hotel".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -569,6 +575,7 @@ async fn a_failed_remote_task_reaches_the_model_as_a_failure_not_a_reply() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -642,6 +649,7 @@ async fn an_a2a_call_carries_nothing_from_the_run_context() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         ),
     )

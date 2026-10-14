@@ -67,6 +67,10 @@ pub async fn start_pack_watcher(
     #[cfg(feature = "agentic-worker")]
     let mcp_source = host.mcp_source();
     #[cfg(feature = "agentic-worker")]
+    let artifact_reader = host.artifact_reader();
+    #[cfg(feature = "agentic-worker")]
+    let ext_artifact_port = host.ext_artifact_port();
+    #[cfg(feature = "agentic-worker")]
     let stream_observers = host.stream_observers();
 
     reload_once(
@@ -86,6 +90,10 @@ pub async fn start_pack_watcher(
         #[cfg(feature = "agentic-worker")]
         mcp_source.clone(),
         #[cfg(feature = "agentic-worker")]
+        artifact_reader.clone(),
+        #[cfg(feature = "agentic-worker")]
+        ext_artifact_port.clone(),
+        #[cfg(feature = "agentic-worker")]
         stream_observers.clone(),
     )
     .await?;
@@ -103,6 +111,10 @@ pub async fn start_pack_watcher(
     let ext_llm_port_clone = ext_llm_port.clone();
     #[cfg(feature = "agentic-worker")]
     let mcp_source_clone = mcp_source.clone();
+    #[cfg(feature = "agentic-worker")]
+    let artifact_reader_clone = artifact_reader.clone();
+    #[cfg(feature = "agentic-worker")]
+    let ext_artifact_port_clone = ext_artifact_port.clone();
     #[cfg(feature = "agentic-worker")]
     let stream_observers_clone = stream_observers.clone();
     let handle = tokio::spawn(async move {
@@ -132,6 +144,10 @@ pub async fn start_pack_watcher(
                 ext_llm_port_clone.clone(),
                 #[cfg(feature = "agentic-worker")]
                 mcp_source_clone.clone(),
+                #[cfg(feature = "agentic-worker")]
+                artifact_reader_clone.clone(),
+                #[cfg(feature = "agentic-worker")]
+                ext_artifact_port_clone.clone(),
                 #[cfg(feature = "agentic-worker")]
                 stream_observers_clone.clone(),
             )
@@ -163,6 +179,8 @@ async fn reload_once(
     secrets_manager: DynSecretsManager,
     #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
     #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
+    #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
+    #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
     #[cfg(feature = "agentic-worker")]
     stream_observers: crate::http::agent_stream::StreamObserverRegistry,
 ) -> Result<()> {
@@ -221,7 +239,7 @@ async fn reload_once(
             packs.push((runtime, Some(overlay.digest.as_str().to_string())));
         }
 
-        let runtime = TenantRuntime::from_packs(
+        let runtime = TenantRuntime::from_packs_with_artifact_reader(
             Arc::clone(&config),
             packs,
             None,
@@ -234,6 +252,10 @@ async fn reload_once(
             ext_llm_port.clone(),
             #[cfg(feature = "agentic-worker")]
             mcp_source.clone(),
+            #[cfg(feature = "agentic-worker")]
+            artifact_reader.clone(),
+            #[cfg(feature = "agentic-worker")]
+            ext_artifact_port.clone(),
             #[cfg(feature = "agentic-worker")]
             Some(stream_observers.clone()),
         )

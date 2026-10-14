@@ -109,6 +109,7 @@ async fn happy_path_one_iteration() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -137,6 +138,7 @@ async fn max_iterations_terminates_loop() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -158,6 +160,7 @@ async fn timeout_terminates_loop() {
                 text: "x".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -184,6 +187,7 @@ async fn tool_not_allowed_becomes_observation_then_reply() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -223,6 +227,7 @@ async fn tool_dispatch_error_becomes_observation_then_reply() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -269,6 +274,7 @@ async fn tool_call_trail_carries_args_and_duration() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -309,6 +315,7 @@ async fn token_budget_exceeded_returns_error() {
                 text: "x".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -350,6 +357,7 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -394,6 +402,7 @@ async fn llm_provider_unavailable_after_retries_returns_error() {
                 text: "x".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -465,6 +474,7 @@ async fn long_term_facts_are_injected_into_system_prompt() {
             text: "what do I like?".into(),
             conversational: false,
             resume_payload: None,
+            ..Default::default()
         },
     )
     .await
@@ -491,6 +501,7 @@ async fn no_injection_when_long_term_disabled() {
             text: "hi".into(),
             conversational: false,
             resume_payload: None,
+            ..Default::default()
         },
     )
     .await
@@ -517,6 +528,7 @@ async fn turn_is_ingested_as_episode_in_background() {
                 text: "what do I like?".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -547,6 +559,7 @@ async fn no_ingest_when_long_term_disabled() {
             text: "hi".into(),
             conversational: false,
             resume_payload: None,
+            ..Default::default()
         },
     )
     .await
@@ -568,6 +581,7 @@ async fn recall_memory_tool_advertised_when_active() {
             text: "hi".into(),
             conversational: false,
             resume_payload: None,
+            ..Default::default()
         },
     )
     .await
@@ -592,6 +606,7 @@ async fn recall_memory_tool_absent_when_disabled() {
             text: "hi".into(),
             conversational: false,
             resume_payload: None,
+            ..Default::default()
         },
     )
     .await
@@ -623,6 +638,7 @@ async fn recall_memory_call_is_handled_host_side() {
                 text: "what do I like?".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -721,6 +737,7 @@ async fn remember_and_recall_tools_advertised_when_active() {
             text: "hi".into(),
             conversational: false,
             resume_payload: None,
+            ..Default::default()
         },
     )
     .await
@@ -754,6 +771,7 @@ async fn short_term_tools_absent_when_disabled() {
             text: "hi".into(),
             conversational: false,
             resume_payload: None,
+            ..Default::default()
         },
     )
     .await
@@ -804,6 +822,7 @@ async fn remember_then_recall_roundtrips_via_tools() {
                 text: "what is my fav color?".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -850,6 +869,7 @@ async fn recall_missing_key_returns_null() {
                 text: "do you know my name?".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -899,6 +919,7 @@ async fn conversational_agent_is_offered_end_conversation_tool() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -946,6 +967,7 @@ async fn non_conversational_agent_has_no_end_conversation_tool() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -1012,6 +1034,7 @@ async fn end_conversation_terminates_with_final_message() {
                 text: "bye".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -1038,6 +1061,7 @@ async fn end_conversation_falls_back_to_accompanying_content() {
                 text: "bye".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -1060,6 +1084,7 @@ async fn end_conversation_empty_reply_when_neither_present() {
                 text: "bye".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -1087,6 +1112,7 @@ async fn end_conversation_ignored_when_not_conversational() {
                 text: "hi".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -1140,6 +1166,7 @@ async fn a_tool_outcome_is_traced_and_shown_to_the_next_llm_request() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         ),
     )

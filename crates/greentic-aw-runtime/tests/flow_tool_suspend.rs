@@ -249,6 +249,7 @@ impl Harness {
                     text: text.into(),
                     conversational: false,
                     resume_payload,
+                    ..Default::default()
                 },
             )
             .await
@@ -402,7 +403,7 @@ async fn a_message_without_a_resume_payload_cancels_the_pending_tool() {
     let cancelled = tool_result(&seen, "c1").expect("cancelled result");
     assert_eq!(cancelled["status"], "cancelled");
     assert!(
-        matches!(seen.last(), Some(ChatMessage::User { content }) if content == "never mind"),
+        matches!(seen.last(), Some(ChatMessage::User { content, .. }) if content == "never mind"),
         "the user's text follows the cancelled tool result"
     );
     assert!(h.state().await.pending_tool.is_none());
@@ -437,4 +438,181 @@ async fn an_expired_pending_tool_is_cancelled_not_resumed() {
         cancelled["reason"].as_str().unwrap().contains("expired"),
         "got {cancelled}"
     );
+}
+
+/// The key under which the resumed tool result carries the attachment note.
+const NOTE_KEY: &str = "user_attachments_note";
+
+fn png() -> greentic_aw_runtime::AttachmentRef {
+    greentic_aw_runtime::AttachmentRef {
+        id: format!("artifact://{}", "a".repeat(64)),
+        mime_type: "image/png".into(),
+        name: Some("secret.png".into()),
+        size_bytes: None,
+        kind: greentic_aw_runtime::AttachmentKind::Image,
+        text_ref: None,
+    }
+}
+
+impl Harness {
+    async fn resume_with(
+        &self,
+        attachments: Vec<greentic_aw_runtime::AttachmentRef>,
+    ) -> AgentOutput {
+        self.rt
+            .step(
+                self.tc.clone(),
+                SESSION,
+                "a",
+                AgentInput {
+                    resume_payload: Some(json!({ "metadata": { "action": "submit" } })),
+                    attachments,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+}
+
+fn notes_in(messages: &[ChatMessage]) -> usize {
+    let note = greentic_aw_runtime::attachments_materialize::unreadable_note(1);
+    let note = note.trim();
+    messages
+        .iter()
+        .map(|m| match m {
+            ChatMessage::Tool { content, .. } => content.to_string().matches(note).count(),
+            other => format!("{other:?}").matches(note).count(),
+        })
+        .sum()
+}
+
+/// Files sent with the answer to a parked flow cannot go to the flow or the
+/// model: the agent is told with the fixed "not available" notice in the
+/// resumed tool's result, never silently and never as a system message.
+#[tokio::test]
+async fn attachments_sent_with_a_resume_are_announced_not_dropped() {
+    let llm = Arc::new(RecordingLlm::new(vec![
+        tool_calls(vec![call("c1", "form")]),
+        final_reply("booked"),
+    ]));
+    let flows = Arc::new(ScriptedFlows::new(
+        vec![waiting("A")],
+        vec![FlowInvokeOutcome::Completed(json!({ "room": "101" }))],
+    ));
+    let h = harness(llm.clone(), flows);
+    h.step("book me a room", None).await;
+
+    let out = h.resume_with(vec![png()]).await;
+    assert_eq!(out.reply, "booked");
+    let seen = llm.histories.lock().unwrap()[1].clone();
+    let note = greentic_aw_runtime::attachments_materialize::unreadable_note(1);
+    let result = tool_result(&seen, "c1").expect("resumed result");
+    assert_eq!(result["room"], "101", "the flow's own output is kept");
+    assert_eq!(result[NOTE_KEY], note.trim());
+    assert!(
+        !seen.iter().any(|m| matches!(m, ChatMessage::System { .. })),
+        "{seen:?}"
+    );
+    assert!(!format!("{seen:?}").contains("secret.png"));
+}
+
+/// Three resumes with attachments: each resumed result carries its note once,
+/// the model sees it once per resume, and nothing piles up as a system
+/// message that history truncation never removes.
+#[tokio::test]
+async fn repeated_resumes_with_attachments_do_not_pile_up_system_notes() {
+    let mut script = Vec::new();
+    for i in 1..=3 {
+        script.push(tool_calls(vec![call(&format!("c{i}"), "form")]));
+        script.push(final_reply("booked"));
+    }
+    let llm = Arc::new(RecordingLlm::new(script));
+    let flows = Arc::new(ScriptedFlows::new(
+        vec![waiting("A"), waiting("B"), waiting("C")],
+        vec![
+            FlowInvokeOutcome::Completed(json!({ "room": "101" })),
+            FlowInvokeOutcome::Completed(json!("plain")),
+            FlowInvokeOutcome::Completed(json!({ "room": "103" })),
+        ],
+    ));
+    let h = harness(llm.clone(), flows);
+    for i in 1..=3 {
+        h.step("book me a room", None).await;
+        h.resume_with(vec![png()]).await;
+        let seen = llm.histories.lock().unwrap().last().unwrap().clone();
+        let result = tool_result(&seen, &format!("c{i}")).expect("resumed result");
+        assert_eq!(
+            result
+                .to_string()
+                .matches("not available in this deployment")
+                .count(),
+            1,
+            "{result}"
+        );
+        assert_eq!(notes_in(&seen), i, "one note per resume so far: {seen:?}");
+    }
+    let state = h.state().await;
+    assert!(
+        !state
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::System { .. })),
+        "{:?}",
+        state.messages
+    );
+    assert_eq!(notes_in(&state.messages), 3, "{:?}", state.messages);
+    // A non-object result keeps its value under `result`.
+    assert_eq!(
+        tool_result(&state.messages, "c2").unwrap()["result"],
+        "plain"
+    );
+}
+
+/// A resume that parks AGAIN keeps the count, and the call's eventual result
+/// announces it: the model is not called on the re-park, so nothing is lost.
+#[tokio::test]
+async fn attachments_sent_with_a_resume_that_parks_again_are_announced_later() {
+    let llm = Arc::new(RecordingLlm::new(vec![
+        tool_calls(vec![call("c1", "form")]),
+        final_reply("booked"),
+    ]));
+    let flows = Arc::new(ScriptedFlows::new(
+        vec![waiting("A")],
+        vec![
+            waiting("A2"),
+            FlowInvokeOutcome::Completed(json!({ "room": "101" })),
+        ],
+    ));
+    let h = harness(llm.clone(), flows);
+    h.step("book me a room", None).await;
+    let out = h.resume_with(vec![png()]).await;
+    assert_eq!(out.terminated_by, TerminationReason::AwaitingToolInput);
+    h.resume_with(vec![]).await;
+    let seen = llm.histories.lock().unwrap().last().unwrap().clone();
+    let note = greentic_aw_runtime::attachments_materialize::unreadable_note(1);
+    assert_eq!(tool_result(&seen, "c1").unwrap()[NOTE_KEY], note.trim());
+    let state = h.state().await;
+    assert!(state.pending_tool.is_none());
+    assert_eq!(notes_in(&state.messages), 1);
+}
+
+/// A carried count is announced on a CANCELLED call too (the user typed a
+/// message instead of finishing the step).
+#[tokio::test]
+async fn carried_attachments_are_announced_when_the_park_is_cancelled() {
+    let llm = Arc::new(RecordingLlm::new(vec![
+        tool_calls(vec![call("c1", "form")]),
+        final_reply("ok"),
+    ]));
+    let flows = Arc::new(ScriptedFlows::new(vec![waiting("A")], vec![waiting("A2")]));
+    let h = harness(llm.clone(), flows);
+    h.step("book me a room", None).await;
+    h.resume_with(vec![png(), png()]).await;
+    h.step("never mind", None).await;
+    let seen = llm.histories.lock().unwrap().last().unwrap().clone();
+    let result = tool_result(&seen, "c1").unwrap();
+    assert_eq!(result["status"], "cancelled");
+    let note = greentic_aw_runtime::attachments_materialize::unreadable_note(2);
+    assert_eq!(result[NOTE_KEY], note.trim());
 }

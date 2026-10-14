@@ -403,6 +403,8 @@ mod aw {
             std::sync::Arc::new(super::super::agent_node::EnvSecretsBackend),
             None,
             None,
+            // Process-level path: no embedding host, so no artifact port.
+            None,
             &packs,
         )?;
         let llm = super::super::agent_node::build_llm_backend(&ext_runtime);
@@ -918,6 +920,24 @@ mod aw {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // A graph turn cannot open files: say so with the fixed notices
+            // (counts and codes only, no name) instead of dropping them
+            // silently. Parsed exactly like the `dw.agent` path: a file the
+            // host could not store (or a bad / duplicate / over-limit
+            // reference) gets its own skip notice, and only the files the
+            // runner would actually read are counted as "not available".
+            let parsed = crate::runner::agent_node::attachments_from_flow_input(flow_input);
+            let mut user_text = crate::runner::agent_node::text_with_skipped_notices(
+                user_text,
+                &parsed.skipped_codes,
+            );
+            if !parsed.refs.is_empty() {
+                user_text.push_str(
+                    &greentic_aw_runtime::attachments_materialize::unreadable_note(
+                        parsed.refs.len(),
+                    ),
+                );
+            }
 
             let tenant = TenantContext::new(tenant_id, env_id);
 
@@ -1080,6 +1100,7 @@ mod aw {
             match m.role {
                 GraphRole::User => seeded.messages.push(ChatMessage::User {
                     content: m.content.clone(),
+                    attachments: Vec::new(),
                 }),
                 GraphRole::Assistant => seeded.messages.push(ChatMessage::Assistant {
                     content: m.content.clone(),
@@ -1087,6 +1108,7 @@ mod aw {
                 }),
                 GraphRole::Tool => seeded.messages.push(ChatMessage::User {
                     content: format!("Tool result: {}", m.content),
+                    attachments: Vec::new(),
                 }),
             }
         }
@@ -2099,6 +2121,60 @@ mod aw {
                 "trail should be a non-empty array: {:?}",
                 out["trail"]
             );
+        }
+
+        /// A graph turn cannot open files: attachments on the flow node are
+        /// announced to the graph's agents with the fixed notice, never
+        /// dropped silently, and no name reaches them.
+        #[tokio::test]
+        async fn attachments_on_a_graph_turn_are_announced_with_the_fixed_notice() {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen_by_agent = seen.clone();
+            let agent: AgentTurnFn = Arc::new(move |req: AgentTurnRequest| {
+                seen_by_agent.lock().unwrap().extend(
+                    req.state
+                        .messages
+                        .iter()
+                        .map(|m| m.content.clone())
+                        .collect::<Vec<_>>(),
+                );
+                Box::pin(async move {
+                    Ok(AgentTurnResult {
+                        reply: "done".into(),
+                        resolved: true,
+                    })
+                })
+            });
+            let handler = handler_with(provider_with("triage", triage_cfg(3)), agent, tool_fn_ok());
+            handler
+                .execute(
+                    "t",
+                    "e",
+                    "triage",
+                    "sess-1",
+                    &json!({
+                        "user_text": "look",
+                        "attachments": [
+                            {"mime_type": "image/png", "url": format!("artifact://{}", "a".repeat(64)), "name": "secret.png"},
+                            {"mime_type": "application/pdf", "url": null, "name": "b.pdf"}
+                        ]
+                    }),
+                )
+                .await
+                .expect("execute should succeed");
+            let seen = seen.lock().unwrap().join("\n");
+            // Counted like the `dw.agent` path: only the file the runner would
+            // read is "not available"; the one the host could not store gets
+            // its own fixed notice, and is not counted twice.
+            let note = greentic_aw_runtime::attachments_materialize::unreadable_note(1);
+            assert!(
+                seen.contains(&format!(
+                    "look\n[attachment not used: a file was not stored for the agent]{note}"
+                )),
+                "{seen}"
+            );
+            assert!(!seen.contains("secret.png"), "{seen}");
+            assert!(!seen.contains("b.pdf"), "{seen}");
         }
 
         #[tokio::test]

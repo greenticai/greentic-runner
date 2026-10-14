@@ -54,6 +54,10 @@ pub(crate) fn a2a_source_from_packs(
                 auth_header_name: route.auth_header_name.clone(),
                 auth_team: route.auth_team.clone(),
                 requires_auth: route.requires_auth,
+                auth_mode: route.auth_mode.clone(),
+                oauth_endpoint: route.oauth_endpoint.clone(),
+                oauth_scope: route.oauth_scope.clone(),
+                oauth_audience: route.oauth_audience.clone(),
             });
         }
     }
@@ -396,6 +400,7 @@ mod tests {
                     text: "go".into(),
                     conversational: false,
                     resume_payload: None,
+                    ..Default::default()
                 },
             )
             .await

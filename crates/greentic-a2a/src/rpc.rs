@@ -95,14 +95,29 @@ pub struct SendMessageParams {
     /// makes that a MUST, not a courtesy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The caller's rendering preferences. Only `acceptedOutputModes` is
+    /// modelled: it is how a caller opts in to an Adaptive Card, which a
+    /// Greentic worker withholds from a caller that did not ask for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<SendMessageConfiguration>,
     /// Arbitrary caller-supplied metadata, carried on the proto's
     /// `SendMessageRequest` alongside `configuration`.
     ///
-    /// `configuration` (blocking/streaming preferences, push-notification
-    /// config, history length) is deliberately left unmodelled until a
-    /// consumer needs it — an omission recorded as a decision, not missed.
+    /// The rest of `configuration` (blocking/streaming preferences,
+    /// push-notification config, history length) is deliberately left
+    /// unmodelled until a consumer needs it — an omission recorded as a
+    /// decision, not missed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+}
+
+/// The `SendMessageRequest.configuration` fields this client sets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageConfiguration {
+    /// Media types the caller can render. An empty list is not serialised.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_output_modes: Vec<String>,
 }
 
 /// What `SendMessage` answers with.
@@ -244,6 +259,7 @@ mod tests {
                     metadata: None,
                 },
                 tenant: Some("acme".into()),
+                configuration: None,
                 metadata: None,
             },
         );
@@ -271,6 +287,7 @@ mod tests {
                     metadata: None,
                 },
                 tenant: None,
+                configuration: None,
                 metadata: None,
             },
         );
@@ -296,6 +313,7 @@ mod tests {
                     metadata: None,
                 },
                 tenant: None,
+                configuration: None,
                 metadata: None,
             },
         );
@@ -358,6 +376,7 @@ mod tests {
                 metadata: None,
             },
             tenant: Some("acme".into()),
+            configuration: None,
             metadata: Some(serde_json::json!({"k": 1})),
         };
         let value = serde_json::to_value(&send_message).expect("serialises");

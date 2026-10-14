@@ -1062,6 +1062,7 @@ fn an_agent_gets_the_nested_agents_reply_through_a_flow_tool() -> Result<()> {
             text: "ask the helper".into(),
             conversational: false,
             resume_payload: None,
+            ..Default::default()
         },
     ))?;
     assert_eq!(out.reply, "the helper said hi");

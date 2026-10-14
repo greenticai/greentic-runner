@@ -940,8 +940,10 @@ mod call_site_ratchet {
         ),
         (
             "src/runner/agent_node.rs",
-            3,
-            "three test constructors; both production paths mount",
+            4,
+            "four test constructors; both production paths mount. The fourth \
+             is `a_later_turn_without_attachments_replays_nothing`, which \
+             reads persisted history only and answers from no corpus",
         ),
         (
             "src/runner/a2a_pack_source.rs",

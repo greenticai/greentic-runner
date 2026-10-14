@@ -82,7 +82,7 @@ impl LlmBackend for EchoLlmBackend {
             .history
             .iter()
             .filter_map(|m| {
-                if let greentic_aw_runtime::state::ChatMessage::User { content } = m {
+                if let greentic_aw_runtime::state::ChatMessage::User { content, .. } = m {
                     Some(content.clone())
                 } else {
                     None
@@ -309,6 +309,7 @@ async fn pii_guardrail_masks_inbound_email() {
                 text: "email me at x@y.com please".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -358,6 +359,7 @@ async fn pii_guardrail_denies_blocklist_match() {
                 text: "this message contains forbidden content".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await;
@@ -439,6 +441,7 @@ async fn pii_guardrail_enforce_denial_notifies_real_observer() {
                 text: "this message contains forbidden content".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
             observer.clone(),
         )
@@ -489,6 +492,7 @@ async fn pii_guardrail_monitor_denial_notifies_real_observer_without_blocking() 
                 text: "this message contains forbidden content".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
             observer.clone(),
         )
@@ -551,6 +555,18 @@ fn build_full_runtime_with_llm(
     mode: GuardrailMode,
     llm: Arc<dyn LlmBackend>,
 ) -> (AgentRuntime, TenantContext) {
+    build_full_runtime_with_tools(wasm_src, tmp, ext_dir, guardrail_config, mode, llm, vec![])
+}
+
+fn build_full_runtime_with_tools(
+    wasm_src: &std::path::Path,
+    tmp: &tempfile::TempDir,
+    ext_dir: &std::path::Path,
+    guardrail_config: serde_json::Value,
+    mode: GuardrailMode,
+    llm: Arc<dyn LlmBackend>,
+    tools: Vec<greentic_aw_runtime::ToolRef>,
+) -> (AgentRuntime, TenantContext) {
     let paths = DiscoveryPaths::new(tmp.path().to_path_buf());
     // Root the trust store at the tempdir — see the note on the direct
     // construction above. Every caller of this helper registers a freshly
@@ -580,7 +596,7 @@ fn build_full_runtime_with_llm(
     let agent_config = AgentConfig {
         agent_id: "pii-agent".into(),
         system_prompt: "You are a helpful assistant.".into(),
-        tools: vec![],
+        tools,
         guardrails: vec![],
         llm: LlmProviderRef {
             provider: "mock".into(),
@@ -588,7 +604,8 @@ fn build_full_runtime_with_llm(
             credential_ref: None,
         },
         limits: AgentLimits {
-            max_iter: 2,
+            // Room for the attachment tests' three tool iterations plus the reply.
+            max_iter: 5,
             timeout: Duration::from_secs(30),
             ..AgentLimits::default()
         },
@@ -674,6 +691,7 @@ async fn the_trace_records_the_guarded_reply() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         ),
     )
@@ -766,6 +784,7 @@ async fn the_user_ledger_records_the_guarded_reply() {
                 text: "hello".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -784,3 +803,7 @@ async fn the_user_ledger_records_the_guarded_reply() {
         "the ledger gets what the user saw"
     );
 }
+
+#[cfg(feature = "greentic-llm-backend")]
+#[path = "guardrail_e2e/attachments.rs"]
+mod attachments;

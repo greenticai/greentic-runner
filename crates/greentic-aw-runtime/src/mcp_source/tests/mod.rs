@@ -7,4 +7,5 @@
 
 mod catalog;
 mod dispatch;
+mod oauth;
 mod pack_routes;

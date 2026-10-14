@@ -163,6 +163,7 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
                     text: user_text,
                     conversational,
                     resume_payload: None,
+                    attachments: Vec::new(),
                 },
             )
             .await

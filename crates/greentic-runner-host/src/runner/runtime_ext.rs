@@ -335,6 +335,27 @@ mod tests {
     /// in `runtime.rs` the ingest has to precede every agent-runtime build. The
     /// order used to be enforced by one `cfg` block sitting above the others; a
     /// textual check is what keeps it now that the call is unconditional.
+    /// An extension instantiated before the artifact port is installed would
+    /// hold a runtime without it, so the install precedes every load.
+    #[test]
+    fn build_ext_runtime_installs_the_artifact_port_before_any_extension_loads() {
+        let src = include_str!("agent_node.rs");
+        let start = src
+            .find("pub(crate) fn build_ext_runtime(")
+            .expect("fn present");
+        let body = &src[start..];
+        let install = body
+            .find("with_artifact_port(")
+            .expect("the port must be installed");
+        let first_load = body
+            .find("register_loaded_from_dir(")
+            .expect("loads follow");
+        assert!(
+            install < first_load,
+            "the artifact port must be installed before the first extension is registered"
+        );
+    }
+
     #[test]
     fn boot_ingests_before_any_runtime_is_built() {
         let source =

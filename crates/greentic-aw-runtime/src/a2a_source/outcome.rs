@@ -38,11 +38,20 @@ use serde_json::{Value, json};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum A2aOutcome {
     /// The agent answered. This is the only variant that produces a `reply`.
-    Answered { text: String },
+    ///
+    /// `card` is the Adaptive Card the agent attached, present only when the
+    /// caller opted in to one (interop contract D10) and the agent sent it.
+    Answered { text: String, card: Option<Value> },
     /// The agent needs something from us before it can answer, and the task
     /// it is holding open is recorded in the conversation's continuation, so
     /// the next call to this agent resumes it.
-    InputRequired { question: Option<String> },
+    ///
+    /// `card` is the agent's own Adaptive Card for the question (a form with
+    /// inputs, say), under the same opt-in rule as [`Self::Answered`].
+    InputRequired {
+        question: Option<String>,
+        card: Option<Value>,
+    },
     /// The agent took the work and has not finished. Not an answer, and
     /// deliberately not an error either: nothing has gone wrong.
     Working {
@@ -105,23 +114,29 @@ impl A2aOutcome {
     /// result that does not say which agent produced it cannot be acted on.
     pub(super) fn to_value(&self, agent_id: &str) -> Value {
         match self {
-            Self::Answered { text } => json!({
-                "status": "completed",
-                "agent": agent_id,
-                "reply": text,
-            }),
-            Self::InputRequired { question } => json!({
-                "status": "input_required",
-                "agent": agent_id,
-                "question": question.clone().unwrap_or_else(|| format!(
-                    "a2a agent {agent_id} needs more information but did not say what"
-                )),
-                "next_step": format!(
-                    "The remote agent {agent_id} is waiting and has NOT answered yet. \
-                     Ask the user for what it needs, then call this tool again with \
-                     their answer; the same remote task continues."
-                ),
-            }),
+            Self::Answered { text, card } => with_card(
+                json!({
+                    "status": "completed",
+                    "agent": agent_id,
+                    "reply": text,
+                }),
+                card,
+            ),
+            Self::InputRequired { question, card } => with_card(
+                json!({
+                    "status": "input_required",
+                    "agent": agent_id,
+                    "question": question.clone().unwrap_or_else(|| format!(
+                        "a2a agent {agent_id} needs more information but did not say what"
+                    )),
+                    "next_step": format!(
+                        "The remote agent {agent_id} is waiting and has NOT answered yet. \
+                         Ask the user for what it needs, then call this tool again with \
+                         their answer; the same remote task continues."
+                    ),
+                }),
+                card,
+            ),
             Self::Working { state, detail } => json!({
                 "status": "working",
                 "agent": agent_id,
@@ -142,6 +157,17 @@ impl A2aOutcome {
             }),
         }
     }
+}
+
+/// Add the agent's Adaptive Card to a rendered outcome, when it sent one.
+///
+/// The key is absent rather than `null` when there is none, so an existing
+/// reader that never asked for a card sees the exact value it always did.
+fn with_card(mut value: Value, card: &Option<Value>) -> Value {
+    if let (Some(card), Some(map)) = (card, value.as_object_mut()) {
+        map.insert("card".to_string(), card.clone());
+    }
+    value
 }
 
 /// The result value for a call that never reached a remote task at all: an
@@ -173,11 +199,16 @@ mod tests {
         vec![
             A2aOutcome::Answered {
                 text: "an omelette".into(),
+                card: None,
             },
             A2aOutcome::InputRequired {
                 question: Some("Which city?".into()),
+                card: None,
             },
-            A2aOutcome::InputRequired { question: None },
+            A2aOutcome::InputRequired {
+                question: None,
+                card: None,
+            },
             A2aOutcome::Working {
                 state: TaskState::Working,
                 detail: None,
@@ -266,6 +297,7 @@ mod tests {
     fn input_required_surfaces_the_question_and_says_the_agent_is_waiting() {
         let value = A2aOutcome::InputRequired {
             question: Some("Which city?".into()),
+            card: None,
         }
         .to_value("travel");
         assert_eq!(value["status"], "input_required");
@@ -278,7 +310,11 @@ mod tests {
     fn input_required_with_no_question_still_says_the_agent_is_waiting() {
         // A conformant agent may park a task without a status message. The
         // model must still learn it is expected to come back with something.
-        let value = A2aOutcome::InputRequired { question: None }.to_value("travel");
+        let value = A2aOutcome::InputRequired {
+            question: None,
+            card: None,
+        }
+        .to_value("travel");
         assert_eq!(value["status"], "input_required");
         assert!(
             value["question"]
@@ -328,5 +364,30 @@ mod tests {
                 "{token}"
             );
         }
+    }
+
+    #[test]
+    fn a_card_rides_beside_the_text_and_is_absent_when_there_is_none() {
+        let card = json!({"type": "AdaptiveCard", "body": []});
+        let with = A2aOutcome::Answered {
+            text: "hi".into(),
+            card: Some(card.clone()),
+        }
+        .to_value("a");
+        assert_eq!(with["card"], card);
+        assert_eq!(with["reply"], "hi");
+        let asking = A2aOutcome::InputRequired {
+            question: Some("q".into()),
+            card: Some(card.clone()),
+        }
+        .to_value("a");
+        assert_eq!(asking["card"], card);
+        assert!(asking.get("reply").is_none());
+        let without = A2aOutcome::Answered {
+            text: "hi".into(),
+            card: None,
+        }
+        .to_value("a");
+        assert!(without.get("card").is_none(), "no key, not null");
     }
 }

@@ -163,6 +163,7 @@ async fn a_completed_tool_is_traced_without_its_args_and_shown_to_the_next_reque
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         ),
     )

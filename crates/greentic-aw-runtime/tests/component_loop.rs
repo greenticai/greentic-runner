@@ -203,6 +203,7 @@ async fn component_tool_offered_called_and_result_in_trail() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
@@ -265,6 +266,7 @@ async fn empty_component_source_offers_no_tool() {
                 text: "go".into(),
                 conversational: false,
                 resume_payload: None,
+                ..Default::default()
             },
         )
         .await
