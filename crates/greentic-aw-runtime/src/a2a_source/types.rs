@@ -218,6 +218,7 @@ impl A2aToolCatalog {
                 prior.as_ref(),
                 options.want_card,
                 options.answer.as_ref(),
+                options.caller.as_ref(),
             )
             .await
         {
@@ -264,6 +265,11 @@ pub struct A2aCallOptions {
     /// message text. This is how a form the agent parked on is submitted
     /// (interop contract section 9.4); text alone cannot carry it.
     pub answer: Option<Value>,
+    /// The already-vetted caller block to carry on `message.metadata.caller`.
+    /// `None` leaves the message byte-identical to one sent without the
+    /// option. The caller of this API owns the whitelist and the limits; this
+    /// layer only places the value.
+    pub caller: Option<Value>,
 }
 
 /// The text an A2A agent receives for a tool call's `args`.

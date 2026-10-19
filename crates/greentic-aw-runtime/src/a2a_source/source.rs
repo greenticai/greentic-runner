@@ -195,7 +195,7 @@ impl A2aToolSource {
     pub async fn call(&self, agent_id: &str, text: &str) -> Result<String, String> {
         match self
             .transport
-            .send(agent_id, text, None, false, None)
+            .send(agent_id, text, None, false, None, None)
             .await?
         {
             A2aReply {
@@ -314,6 +314,7 @@ impl Transport {
         prior: Option<&A2aContinuation>,
         want_card: bool,
         answer: Option<&Value>,
+        caller: Option<&Value>,
     ) -> Result<A2aReply, String> {
         let route = self
             .agents
@@ -369,7 +370,9 @@ impl Transport {
             task_id: prior.and_then(|c| c.task_id.clone()),
             role: Role::User,
             parts: message_parts(text, answer),
-            metadata: None,
+            // Only a flow `a2a` node that opted in and holds a verified caller
+            // sets this; every other path sends no metadata at all.
+            metadata: caller.map(|block| serde_json::json!({ "caller": block })),
         };
         // An Adaptive Card is sent only to a caller that names it here (interop
         // contract D10), so asking is what makes a worker's form reach us at

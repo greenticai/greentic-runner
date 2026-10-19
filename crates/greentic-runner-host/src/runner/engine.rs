@@ -2522,6 +2522,19 @@ impl FlowEngine {
         // rather than failing a call the remote would have answered.
         let state_ctx = self.state_tenant_ctx(ctx).ok();
 
+        // Opt-in, and only a provider-VERIFIED caller (`FlowContext::caller`,
+        // never anything in the node payload) is ever forwarded.
+        let forwarded_caller = if crate::runner::a2a_forward_caller::wants_forward_caller(&payload)
+        {
+            let block = crate::runner::a2a_forward_caller::forwarded_caller(ctx.caller);
+            if block.is_some() {
+                tracing::info!(agent = agent_id, "a2a node forwards the verified caller");
+            }
+            block
+        } else {
+            None
+        };
+
         let result = crate::runner::a2a_node::aw::invoke(
             crate::runner::a2a_node::aw::A2aCall {
                 source: source.as_ref(),
@@ -2539,6 +2552,7 @@ impl FlowEngine {
                 want_card: crate::runner::a2a_node::wants_card(&payload),
                 answer,
                 card_submit_to: card_submit_to.as_deref(),
+                caller: forwarded_caller,
             },
             agent_id,
             message,

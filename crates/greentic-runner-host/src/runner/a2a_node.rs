@@ -31,6 +31,16 @@
 //! `assets/a2a-routes.json`, never another pack's) and where the remote
 //! context is remembered (below).
 //!
+//! # Optional: `forward_caller`
+//!
+//! `forward_caller: true` (or the text `"true"`) asks the node to carry the
+//! turn's provider-verified caller to the remote agent at
+//! `message.metadata.caller` (see [`super::a2a_forward_caller`] for the wire
+//! block, whitelist and limits). Only a caller with `user_verified: true` is
+//! forwarded; otherwise, and when the key is absent, the request is
+//! byte-identical to one without the key. This node only: the worker `a2a:`
+//! tool path never forwards a caller.
+//!
 //! # Five statuses, and a flow ROUTES on them
 //!
 //! A flow cannot stop mid-node to ask a human, so a remote agent that answers
@@ -374,6 +384,9 @@ pub mod aw {
         pub answer: Option<Value>,
         /// The node the returned card's submit actions navigate back to.
         pub card_submit_to: Option<&'a str>,
+        /// The vetted caller block for `message.metadata.caller`
+        /// (`forward_caller`); `None` sends the request exactly as before.
+        pub caller: Option<Value>,
     }
 
     /// Ask `agent_id` one question and return the value the node binds.
@@ -416,6 +429,7 @@ pub mod aw {
                 A2aCallOptions {
                     want_card: call.want_card,
                     answer: call.answer.clone(),
+                    caller: call.caller.clone(),
                 },
             )
             .await;
