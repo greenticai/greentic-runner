@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod catalog;
 mod credentials;
 mod dispatch;
+mod forward_caller;
 mod oauth;
 
 /// A real-shaped agent card. `PLACEHOLDER` becomes the interface URL, so a

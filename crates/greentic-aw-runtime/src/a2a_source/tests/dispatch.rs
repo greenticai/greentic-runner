@@ -872,6 +872,7 @@ async fn a_caller_that_asks_for_a_card_sends_the_opt_in_and_gets_the_card() {
             A2aCallOptions {
                 want_card: true,
                 answer: None,
+                caller: None,
             },
         )
         .await;
@@ -938,6 +939,7 @@ async fn an_answer_travels_as_a_data_part_beside_the_text() {
             A2aCallOptions {
                 want_card: true,
                 answer: Some(answer.clone()),
+                ..Default::default()
             },
         )
         .await;
@@ -980,6 +982,7 @@ async fn text_and_an_answer_both_travel_and_an_empty_answer_is_ignored() {
                 A2aCallOptions {
                     want_card: false,
                     answer: Some(answer),
+                    ..Default::default()
                 },
             )
             .await;

@@ -413,8 +413,20 @@ nodes:
       agent: 8d2f0c1e-recipe     # the admin row id, as the sidecar names it
       message: "{{ entry.text }}"
       output: answer             # optional state key to bind the result under
+      forward_caller: true       # optional; bool or the text "true"
     routing: [ ... ]
 ```
+
+`forward_caller` (optional) carries the turn's provider-VERIFIED caller
+(`FlowContext::caller` = `extensions.caller`, `user_verified == true`) to the
+remote agent at `message.metadata.caller` (not request metadata):
+`{sub, iss?, teams[], groups[], role?, user_verified: true}`, a strict
+whitelist (a singular `team` becomes `teams`), at most 4096 bytes, 64 list
+items and 256 characters per string (over the limit: trim/drop and warn, never
+fail the turn). Unverified or absent caller sends no `metadata.caller`; absent
+key or `false` leaves the request byte-identical. Implementation:
+`runner/a2a_forward_caller.rs`, `A2aCallOptions::caller`. The worker `a2a:`
+tool path never forwards a caller. The value is never logged.
 
 `agent` is read from the payload; `operation: "<agent_id>"` and an
 `a2a:<agent_id>` component ref are the fallbacks, exactly as the `mcp` node's
