@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use runner_core::{Index, PackConfig, PackManager};
+use parking_lot::Mutex;
+use runner_core::{Index, PackConfig, PackManager, PackPolicy};
 use tokio::sync::mpsc;
 use tokio::task;
 
@@ -18,6 +19,10 @@ use crate::secrets::DynSecretsManager;
 use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
 use crate::wasi::RunnerWasiPolicy;
+
+/// Digests (main + overlays) last applied per tenant, used to skip rebuilding
+/// tenants whose packs did not change.
+type AppliedDigests = Arc<Mutex<HashMap<String, Vec<String>>>>;
 
 pub struct PackWatcher {
     handle: tokio::task::JoinHandle<()>,
@@ -48,8 +53,19 @@ pub async fn start_pack_watcher(
     cfg: PackConfig,
     refresh: Duration,
 ) -> Result<(PackWatcher, PackReloadHandle)> {
+    start_pack_watcher_with_policy(host, cfg, PackPolicy::from_env(), refresh).await
+}
+
+/// Like [`start_pack_watcher`], with an explicit pack verification policy
+/// (strict signature enforcement, filesystem locator confinement).
+pub async fn start_pack_watcher_with_policy(
+    host: Arc<RunnerHost>,
+    cfg: PackConfig,
+    policy: PackPolicy,
+    refresh: Duration,
+) -> Result<(PackWatcher, PackReloadHandle)> {
     let cfg_clone = cfg.clone();
-    let manager = task::spawn_blocking(move || PackManager::new(cfg_clone))
+    let manager = task::spawn_blocking(move || PackManager::with_policy(cfg_clone, policy))
         .await
         .context("pack manager init task failed")??;
     let manager = Arc::new(manager);
@@ -73,10 +89,12 @@ pub async fn start_pack_watcher(
     #[cfg(feature = "agentic-worker")]
     let stream_observers = host.stream_observers();
 
+    let applied: AppliedDigests = Arc::new(Mutex::new(HashMap::new()));
     reload_once(
         configs.as_ref(),
         &manager,
         &cfg,
+        &applied,
         &active,
         &health,
         session_host.clone(),
@@ -101,6 +119,7 @@ pub async fn start_pack_watcher(
     let (tx, mut rx) = mpsc::channel::<()>(4);
     let index_cfg = cfg.clone();
     let manager_clone = Arc::clone(&manager);
+    let applied_clone = Arc::clone(&applied);
     let health_clone = Arc::clone(&health);
     let active_clone = Arc::clone(&active);
     let configs_clone = Arc::clone(&configs);
@@ -118,7 +137,10 @@ pub async fn start_pack_watcher(
     #[cfg(feature = "agentic-worker")]
     let stream_observers_clone = stream_observers.clone();
     let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(refresh);
+        // The initial load already ran above; start ticking one period from
+        // now so the first tick does not trigger an immediate second load.
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + refresh, refresh);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {},
@@ -132,6 +154,7 @@ pub async fn start_pack_watcher(
                 configs_clone.as_ref(),
                 &manager_clone,
                 &index_cfg,
+                &applied_clone,
                 &active_clone,
                 &health_clone,
                 session_host.clone(),
@@ -169,6 +192,7 @@ async fn reload_once(
     configs: &HashMap<String, Arc<HostConfig>>,
     manager: &Arc<PackManager>,
     cfg: &PackConfig,
+    applied: &AppliedDigests,
     active: &Arc<ActivePacks>,
     health: &Arc<HealthState>,
     session_host: Arc<dyn SessionHost>,
@@ -184,42 +208,66 @@ async fn reload_once(
     #[cfg(feature = "agentic-worker")]
     stream_observers: crate::http::agent_stream::StreamObserverRegistry,
 ) -> Result<()> {
-    let index = Index::load(&cfg.index_location)?;
-    let resolved = manager.resolve_all_for_index(&index)?;
-    let mut next = HashMap::new();
-    for (tenant, record) in resolved.tenants() {
-        let config = configs
-            .get(tenant)
-            .cloned()
-            .with_context(|| format!("no host config registered for tenant {tenant}"))?;
-        let oauth_config = config.oauth_broker_config();
-        let mut packs = Vec::new();
-        let main_runtime = Arc::new(
-            PackRuntime::load(
-                &record.main.path,
-                Arc::clone(&config),
-                None,
-                Some(&record.main.path),
-                Some(Arc::clone(&session_store)),
-                Some(Arc::clone(&state_store)),
-                Arc::clone(&wasi_policy),
-                Arc::clone(&secrets_manager),
-                oauth_config.clone(),
-                true,
-                ComponentResolution::default(),
-            )
-            .await
-            .with_context(|| format!("failed to load pack for tenant {tenant}"))?,
-        );
-        packs.push((main_runtime, Some(record.main.digest.as_str().to_string())));
+    // Index fetch, pack download and hashing are blocking; keep them off the
+    // async workers.
+    let manager_for_resolve = Arc::clone(manager);
+    let index_location = cfg.index_location.clone();
+    let resolved = task::spawn_blocking(move || {
+        let index = Index::load(&index_location)?;
+        Ok::<_, anyhow::Error>(manager_for_resolve.resolve_each_for_index(&index))
+    })
+    .await
+    .context("pack resolve task failed")??;
 
-        for overlay in &record.overlays {
-            let runtime = Arc::new(
+    let mut next = HashMap::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut new_applied: HashMap<String, Vec<String>> = HashMap::new();
+    for (tenant, record) in resolved {
+        // A failing tenant keeps its previous runtime; others still reload.
+        let previous = active.load_pack(&tenant);
+        let record = match record {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::error!(tenant = %tenant, error = %format!("{err:#}"), "pack resolve failed; keeping previous runtime");
+                failures.push(format!("{tenant}: {err:#}"));
+                if let Some(prev) = previous {
+                    next.insert(RuntimeKey::legacy(tenant.clone()), prev);
+                    if let Some(digests) = applied.lock().get(&tenant).cloned() {
+                        new_applied.insert(tenant.clone(), digests);
+                    }
+                }
+                continue;
+            }
+        };
+        let digests: Vec<String> = std::iter::once(record.main.digest.as_str().to_string())
+            .chain(
+                record
+                    .overlays
+                    .iter()
+                    .map(|overlay| overlay.digest.as_str().to_string()),
+            )
+            .collect();
+        if let Some(prev) = previous.clone()
+            && applied.lock().get(&tenant) == Some(&digests)
+        {
+            tracing::debug!(tenant = %tenant, "packs unchanged; keeping runtime");
+            next.insert(RuntimeKey::legacy(tenant.clone()), prev);
+            new_applied.insert(tenant.clone(), digests);
+            continue;
+        }
+        let built: Result<Arc<TenantRuntime>> = async {
+            let config = configs
+                .get(&tenant)
+                .cloned()
+                .with_context(|| format!("no host config registered for tenant {tenant}"))?;
+            let oauth_config = config.oauth_broker_config();
+            let mut packs = Vec::new();
+            let main_runtime = Arc::new(
                 PackRuntime::load(
-                    &overlay.path,
+                    &record.main.path,
                     Arc::clone(&config),
                     None,
-                    Some(&overlay.path),
+                    Some(&record.main.path),
                     Some(Arc::clone(&session_store)),
                     Some(Arc::clone(&state_store)),
                     Arc::clone(&wasi_policy),
@@ -229,43 +277,88 @@ async fn reload_once(
                     ComponentResolution::default(),
                 )
                 .await
-                .with_context(|| {
-                    format!(
-                        "failed to load overlay {} for tenant {tenant}",
-                        overlay.reference.name
-                    )
-                })?,
+                .with_context(|| format!("failed to load pack for tenant {tenant}"))?,
             );
-            packs.push((runtime, Some(overlay.digest.as_str().to_string())));
+            packs.push((main_runtime, Some(record.main.digest.as_str().to_string())));
+
+            for overlay in &record.overlays {
+                let runtime = Arc::new(
+                    PackRuntime::load(
+                        &overlay.path,
+                        Arc::clone(&config),
+                        None,
+                        Some(&overlay.path),
+                        Some(Arc::clone(&session_store)),
+                        Some(Arc::clone(&state_store)),
+                        Arc::clone(&wasi_policy),
+                        Arc::clone(&secrets_manager),
+                        oauth_config.clone(),
+                        true,
+                        ComponentResolution::default(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to load overlay {} for tenant {tenant}",
+                            overlay.reference.name
+                        )
+                    })?,
+                );
+                packs.push((runtime, Some(overlay.digest.as_str().to_string())));
+            }
+
+            let runtime = TenantRuntime::from_packs_with_artifact_reader(
+                Arc::clone(&config),
+                packs,
+                None,
+                Arc::clone(&session_host),
+                Arc::clone(&session_store),
+                Arc::clone(&state_store),
+                Arc::clone(&state_host),
+                Arc::clone(&secrets_manager),
+                #[cfg(feature = "agentic-worker")]
+                ext_llm_port.clone(),
+                #[cfg(feature = "agentic-worker")]
+                mcp_source.clone(),
+                #[cfg(feature = "agentic-worker")]
+                artifact_reader.clone(),
+                #[cfg(feature = "agentic-worker")]
+                ext_artifact_port.clone(),
+                #[cfg(feature = "agentic-worker")]
+                Some(stream_observers.clone()),
+            )
+            .await?;
+            let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
+            runtime.register_timers(timers);
+            Ok(runtime)
         }
-
-        let runtime = TenantRuntime::from_packs_with_artifact_reader(
-            Arc::clone(&config),
-            packs,
-            None,
-            Arc::clone(&session_host),
-            Arc::clone(&session_store),
-            Arc::clone(&state_store),
-            Arc::clone(&state_host),
-            Arc::clone(&secrets_manager),
-            #[cfg(feature = "agentic-worker")]
-            ext_llm_port.clone(),
-            #[cfg(feature = "agentic-worker")]
-            mcp_source.clone(),
-            #[cfg(feature = "agentic-worker")]
-            artifact_reader.clone(),
-            #[cfg(feature = "agentic-worker")]
-            ext_artifact_port.clone(),
-            #[cfg(feature = "agentic-worker")]
-            Some(stream_observers.clone()),
-        )
-        .await?;
-        let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
-        runtime.register_timers(timers);
-
-        next.insert(RuntimeKey::legacy(tenant.clone()), runtime);
+        .await;
+        match built {
+            Ok(runtime) => {
+                next.insert(RuntimeKey::legacy(tenant.clone()), runtime);
+                new_applied.insert(tenant.clone(), digests);
+            }
+            Err(err) => {
+                tracing::error!(tenant = %tenant, error = %format!("{err:#}"), "tenant reload failed; keeping previous runtime");
+                failures.push(format!("{tenant}: {err:#}"));
+                if let Some(prev) = previous {
+                    next.insert(RuntimeKey::legacy(tenant.clone()), prev);
+                    if let Some(old) = applied.lock().get(&tenant).cloned() {
+                        new_applied.insert(tenant.clone(), old);
+                    }
+                }
+            }
+        }
     }
     active.replace_legacy(next);
+    *applied.lock() = new_applied;
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "pack reload failed for {} tenant(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
     health.record_reload_success();
     tracing::info!("pack reload completed successfully");
     Ok(())

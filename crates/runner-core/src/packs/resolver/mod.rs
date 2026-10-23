@@ -71,7 +71,23 @@ impl ResolverRegistry {
         fs_root: PathBuf,
         network: Option<&greentic_config_types::NetworkConfig>,
     ) -> Result<()> {
-        self.register(FsResolver::new(fs_root));
+        self.register_builtin_confined(fs_root, network, None)
+    }
+
+    /// Like [`Self::register_builtin`], but when `fs_allowed_roots` is `Some`
+    /// the filesystem resolver rejects absolute locators outside `fs_root` and
+    /// the listed roots.
+    pub fn register_builtin_confined(
+        &mut self,
+        fs_root: PathBuf,
+        network: Option<&greentic_config_types::NetworkConfig>,
+        fs_allowed_roots: Option<Vec<PathBuf>>,
+    ) -> Result<()> {
+        let mut fs_resolver = FsResolver::new(fs_root);
+        if let Some(roots) = fs_allowed_roots {
+            fs_resolver = fs_resolver.with_allowed_roots(roots);
+        }
+        self.register(fs_resolver);
         self.register(HttpResolver::new("http", network)?);
         self.register(HttpResolver::new("https", network)?);
         self.register(OciResolver::new(network)?);

@@ -236,19 +236,15 @@ impl HostConfig {
 
         let secrets_policy = SecretsPolicy::from_bindings(&bindings);
         let http_enabled = bindings.flow_type_bindings.contains_key("messaging");
-        let webhook_policy = bindings
-            .flow_type_bindings
-            .get("webhook")
-            .and_then(|binding| {
-                serde_yaml::from_value::<WebhookBindingConfig>(binding.config.clone())
-                    .map(WebhookPolicy::from)
-                    .map_err(|err| {
-                        tracing::warn!(error = %err, "failed to parse webhook binding config");
-                        err
-                    })
-                    .ok()
-            })
-            .unwrap_or_default();
+        let webhook_policy = webhook_policy_from_bindings(&bindings)?;
+
+        // Reject unusable tenant ids up front instead of silently running as
+        // the `local` tenant later.
+        tenant_ctx_for(
+            &bindings.tenant,
+            std::env::var("GREENTIC_ENV").ok().as_deref(),
+        )
+        .with_context(|| format!("invalid tenant in bindings file {path:?}"))?;
 
         Ok(Self {
             tenant: bindings.tenant.clone(),
@@ -348,13 +344,60 @@ impl HostConfig {
 
     /// Derive a tenant context for the current configuration. This is used when
     /// evaluating scoped requirements (e.g. secrets).
+    ///
+    /// Fails when the tenant id or `GREENTIC_ENV` is not a valid identifier;
+    /// it never substitutes the `local` tenant/env.
+    pub fn try_tenant_ctx(&self) -> Result<greentic_types::TenantCtx> {
+        tenant_ctx_for(&self.tenant, std::env::var("GREENTIC_ENV").ok().as_deref())
+    }
+
+    /// Infallible variant kept for callers that cannot propagate errors.
+    ///
+    /// Configs are validated with [`Self::try_tenant_ctx`] when loaded
+    /// (`load_from_path`, `run`), so the fallback below is unreachable for
+    /// validated configs; it logs loudly if it is ever taken.
     pub fn tenant_ctx(&self) -> greentic_types::TenantCtx {
-        let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
-        let env_id = greentic_types::EnvId::from_str(&env)
-            .unwrap_or_else(|_| greentic_types::EnvId::new("local").expect("local env id"));
-        let tenant_id = greentic_types::TenantId::from_str(&self.tenant)
-            .unwrap_or_else(|_| greentic_types::TenantId::new("local").expect("tenant id"));
-        greentic_types::TenantCtx::new(env_id, tenant_id)
+        match self.try_tenant_ctx() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                tracing::error!(
+                    tenant = %self.tenant,
+                    error = %err,
+                    "invalid tenant/env identifier; falling back to local context"
+                );
+                local_fallback_ctx()
+            }
+        }
+    }
+}
+
+/// Last-resort context for the infallible [`HostConfig::tenant_ctx`] shim.
+///
+/// `local` is a compile-time literal that satisfies the identifier grammar, so
+/// the `expect`s below cannot fire; validated configs never reach this path.
+#[allow(clippy::expect_used)]
+fn local_fallback_ctx() -> greentic_types::TenantCtx {
+    greentic_types::TenantCtx::new(
+        greentic_types::EnvId::new("local").expect("`local` is a valid env id"),
+        greentic_types::TenantId::new("local").expect("`local` is a valid tenant id"),
+    )
+}
+
+fn tenant_ctx_for(tenant: &str, env: Option<&str>) -> Result<greentic_types::TenantCtx> {
+    let env = env.unwrap_or("local");
+    let env_id = greentic_types::EnvId::from_str(env)
+        .map_err(|err| anyhow::anyhow!("invalid GREENTIC_ENV `{env}`: {err}"))?;
+    let tenant_id = greentic_types::TenantId::from_str(tenant)
+        .map_err(|err| anyhow::anyhow!("invalid tenant id `{tenant}`: {err}"))?;
+    Ok(greentic_types::TenantCtx::new(env_id, tenant_id))
+}
+
+fn webhook_policy_from_bindings(bindings: &BindingsFile) -> Result<WebhookPolicy> {
+    match bindings.flow_type_bindings.get("webhook") {
+        Some(binding) => serde_yaml::from_value::<WebhookBindingConfig>(binding.config.clone())
+            .map(WebhookPolicy::from)
+            .context("failed to parse webhook binding config"),
+        None => Ok(WebhookPolicy::default()),
     }
 }
 
@@ -834,6 +877,36 @@ fast2flow:
             .oauth_broker_config_with_env(Some("env-only-secret"))
             .expect("missing broker config");
         assert_eq!(broker.shared_secret.as_deref(), Some("env-only-secret"));
+    }
+
+    #[test]
+    fn invalid_webhook_binding_config_is_an_error_not_allow_all() {
+        let bindings: BindingsFile = serde_yaml::from_str(
+            "tenant: demo\nflow_type_bindings:\n  webhook:\n    adapter: webhook\n    config:\n      deny_paths: not-a-list\n",
+        )
+        .expect("bindings parse");
+        let err = webhook_policy_from_bindings(&bindings).expect_err("must fail");
+        assert!(format!("{err:#}").contains("webhook binding config"));
+    }
+
+    #[test]
+    fn valid_webhook_binding_config_keeps_deny_paths() {
+        let bindings: BindingsFile = serde_yaml::from_str(
+            "tenant: demo\nflow_type_bindings:\n  webhook:\n    adapter: webhook\n    config:\n      deny_paths: [/admin]\n",
+        )
+        .expect("bindings parse");
+        let policy = webhook_policy_from_bindings(&bindings).expect("policy");
+        assert!(!policy.is_allowed("/admin/x"));
+        assert!(policy.is_allowed("/hook"));
+    }
+
+    #[test]
+    fn tenant_ctx_for_rejects_invalid_ids_instead_of_falling_back() {
+        assert!(tenant_ctx_for("bad tenant!", None).is_err());
+        assert!(tenant_ctx_for("demo", Some("bad env!")).is_err());
+        let ctx = tenant_ctx_for("demo", None).expect("valid");
+        assert_eq!(ctx.tenant.as_str(), "demo");
+        assert_eq!(ctx.env.as_str(), "local");
     }
 
     #[test]

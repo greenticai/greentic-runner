@@ -485,6 +485,7 @@ pub fn exec_ctx_v0_5_for(
     }
 }
 
+#[cfg(test)]
 pub fn envelope_v0_6(
     ctx: &node::ExecCtx,
     component_id: &str,

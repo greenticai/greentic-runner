@@ -209,10 +209,7 @@ impl RunnerConfig {
         )?;
         maybe_write_gtbind_index(&tenant_bindings, &resolved_config.config.paths, &mut pack)?;
         let refresh = parse_refresh_interval(std::env::var("PACK_REFRESH_INTERVAL").ok())?;
-        let port = std::env::var("PORT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(8080);
+        let port = parse_port(std::env::var("PORT").ok())?;
         let default_tenant = resolved_config
             .config
             .dev
@@ -231,12 +228,26 @@ impl RunnerConfig {
             wasi_policy = wasi_policy.allow_env(key);
         }
 
-        let admin = AdminAuth::new(resolved_config.config.services.as_ref().and_then(|s| {
+        let config_admin_token = resolved_config.config.services.as_ref().and_then(|s| {
             s.events
                 .as_ref()
                 .and_then(|svc| svc.headers.as_ref())
                 .and_then(|headers| headers.get("x-admin-token").cloned())
-        }));
+        });
+        let (admin_token, admin_source) =
+            resolve_admin_token(std::env::var("ADMIN_TOKEN").ok(), config_admin_token);
+        match admin_source {
+            AdminTokenSource::Env => {
+                tracing::info!("admin API auth: bearer token (ADMIN_TOKEN)")
+            }
+            AdminTokenSource::Config => {
+                tracing::info!("admin API auth: bearer token (services.events.headers)")
+            }
+            AdminTokenSource::None => tracing::warn!(
+                "admin API auth: no ADMIN_TOKEN configured; admin routes are loopback-only"
+            ),
+        }
+        let admin = AdminAuth::new(admin_token);
         let secrets_backend = SecretsBackend::from_config(&resolved_config.config.secrets)?;
         Ok(Self {
             tenant_bindings,
@@ -346,6 +357,76 @@ fn maybe_write_gtbind_index(
     Ok(())
 }
 
+/// Parse the `PORT` value; an unset variable yields the default, an invalid
+/// one is an error instead of a silent fallback.
+fn parse_port(value: Option<String>) -> Result<u16> {
+    match value {
+        None => Ok(8080),
+        Some(raw) => raw
+            .trim()
+            .parse::<u16>()
+            .map_err(|err| anyhow!("invalid PORT `{raw}`: {err}")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminTokenSource {
+    Env,
+    Config,
+    None,
+}
+
+/// `ADMIN_TOKEN` wins over the `x-admin-token` header from config.
+fn resolve_admin_token(
+    env_token: Option<String>,
+    config_token: Option<String>,
+) -> (Option<String>, AdminTokenSource) {
+    if let Some(token) = env_token.filter(|value| !value.is_empty()) {
+        return (Some(token), AdminTokenSource::Env);
+    }
+    if let Some(token) = config_token.filter(|value| !value.is_empty()) {
+        return (Some(token), AdminTokenSource::Config);
+    }
+    (None, AdminTokenSource::None)
+}
+
+/// Resolve when the process receives ctrl-c or (on unix) SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to install SIGTERM handler; using ctrl-c only");
+                let _ = signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
+}
+
+/// Whether strict pack verification is requested via config or environment.
+fn pack_policy_from(resolved: &ResolvedConfig) -> runner_core::PackPolicy {
+    let require_signatures = resolved
+        .config
+        .packs
+        .as_ref()
+        .and_then(|packs| packs.trust.as_ref())
+        .map(|trust| trust.require_signatures)
+        .unwrap_or(false);
+    let policy = runner_core::PackPolicy::from_env();
+    let strict = policy.verify_strict || require_signatures;
+    policy.strict(strict)
+}
+
 fn parse_refresh_interval(value: Option<String>) -> Result<Duration> {
     let raw = value.unwrap_or_else(|| "30s".into());
     humantime::parse_duration(&raw).map_err(|err| anyhow!("invalid PACK_REFRESH_INTERVAL: {err}"))
@@ -392,13 +473,15 @@ fn pack_config_from(
                 runner_core::env::IndexLocation::from_value(url)?
             }
             PackSourceConfig::OciRegistry { reference } => {
-                runner_core::env::IndexLocation::from_value(reference)?
+                anyhow::bail!(
+                    "OCI registry pack sources are not supported (reference `{reference}`); \
+                     use a local or HTTP(S) index"
+                )
             }
         };
-        let public_key = cfg
-            .trust
-            .as_ref()
-            .and_then(|trust| trust.public_keys.first().cloned());
+        let public_key = runner_core::join_public_keys(
+            cfg.trust.as_ref().map(|trust| trust.public_keys.as_slice()),
+        );
         return Ok(PackConfig {
             source: runner_core::env::PackSource::Fs,
             index_location,
@@ -558,14 +641,20 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         telemetry,
         secrets_backend,
         wasi_policy,
-        resolved_config: _resolved_config,
+        resolved_config,
         trace,
         validation,
     } = cfg;
+    let pack_policy = pack_policy_from(&resolved_config);
 
     let mut builder = HostBuilder::new();
     for bindings in tenant_bindings.into_values() {
         let mut host_config = HostConfig::from_gtbind(bindings);
+        // Fail fast on tenant ids / GREENTIC_ENV that are not valid identifiers
+        // rather than silently running scoped lookups as `local`.
+        host_config.try_tenant_ctx().with_context(|| {
+            format!("invalid tenant configuration for `{}`", host_config.tenant)
+        })?;
         host_config.trace = trace.clone();
         host_config.validation = validation.clone();
         builder = builder.with_config(host_config);
@@ -600,8 +689,13 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
     #[cfg(feature = "agentic-worker")]
     maybe_spawn_inproc_agentic_serve();
 
-    let (watcher, reload_handle) =
-        watcher::start_pack_watcher(Arc::clone(&host), pack.clone(), refresh_interval).await?;
+    let (watcher, reload_handle) = watcher::start_pack_watcher_with_policy(
+        Arc::clone(&host),
+        pack.clone(),
+        pack_policy,
+        refresh_interval,
+    )
+    .await?;
 
     let routing = TenantRouting::new(routing.clone());
     let server = HostServer::new(
@@ -618,7 +712,7 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         result = server.serve() => {
             result?;
         }
-        _ = signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             tracing::info!("received shutdown signal");
         }
     }
@@ -642,6 +736,30 @@ mod tests {
             cache_dir: temp.path().join("cache"),
             logs_dir: temp.path().join("logs"),
         }
+    }
+
+    #[test]
+    fn parse_port_defaults_and_rejects_invalid_values() {
+        assert_eq!(parse_port(None).expect("default"), 8080);
+        assert_eq!(parse_port(Some("9090".into())).expect("valid"), 9090);
+        assert!(parse_port(Some("not-a-port".into())).is_err());
+        assert!(parse_port(Some("70000".into())).is_err());
+    }
+
+    #[test]
+    fn admin_token_prefers_env_then_config() {
+        let (token, source) = resolve_admin_token(Some("env".into()), Some("cfg".into()));
+        assert_eq!(
+            (token.as_deref(), source),
+            (Some("env"), AdminTokenSource::Env)
+        );
+        let (token, source) = resolve_admin_token(Some(String::new()), Some("cfg".into()));
+        assert_eq!(
+            (token.as_deref(), source),
+            (Some("cfg"), AdminTokenSource::Config)
+        );
+        let (token, source) = resolve_admin_token(None, None);
+        assert_eq!((token, source), (None, AdminTokenSource::None));
     }
 
     #[test]
