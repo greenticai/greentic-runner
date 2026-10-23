@@ -137,9 +137,11 @@ pub fn build_email_http_payload(request: &EmailSendRequest) -> Result<Value> {
             let cc = optional_string_list(message.get("cc"));
             let bcc = optional_string_list(message.get("bcc"));
             let from = message.get("from").and_then(Value::as_str);
-            let raw = build_gmail_raw_message(from, &to, &cc, &bcc, subject, body);
+            let raw = build_gmail_raw_message(from, &to, &cc, &bcc, subject, body)?;
+            // The Gmail API requires base64url (RFC 4648 section 5), not the
+            // standard alphabet.
             Ok(json!({
-                "raw": base64::engine::general_purpose::STANDARD_NO_PAD.encode(raw.as_bytes())
+                "raw": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
             }))
         }
     }
@@ -198,6 +200,46 @@ fn optional_string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Reject CR/LF in a header value: they would let a caller-supplied field
+/// inject extra headers (or a body) into the message.
+fn checked_header_value<'a>(field: &str, value: &'a str) -> Result<&'a str> {
+    if value.contains(['\r', '\n']) {
+        bail!("gmail email request field `{field}` must not contain CR or LF");
+    }
+    Ok(value)
+}
+
+/// RFC 2047 encoded-word form (`=?UTF-8?B?...?=`) for a non-ASCII subject;
+/// ASCII subjects pass through unchanged. Long subjects are split into several
+/// encoded words, each within the 75-character limit.
+fn encode_subject(subject: &str) -> String {
+    if subject.is_ascii() {
+        return subject.to_string();
+    }
+    // 45 raw bytes -> 60 base64 chars; + 12 chars of framing = 72 <= 75.
+    const MAX_CHUNK_BYTES: usize = 45;
+    let mut words = Vec::new();
+    let mut chunk = String::new();
+    for ch in subject.chars() {
+        if chunk.len() + ch.len_utf8() > MAX_CHUNK_BYTES {
+            words.push(encode_word(&chunk));
+            chunk.clear();
+        }
+        chunk.push(ch);
+    }
+    if !chunk.is_empty() {
+        words.push(encode_word(&chunk));
+    }
+    words.join("\r\n ")
+}
+
+fn encode_word(chunk: &str) -> String {
+    format!(
+        "=?UTF-8?B?{}?=",
+        base64::engine::general_purpose::STANDARD.encode(chunk.as_bytes())
+    )
+}
+
 fn build_gmail_raw_message(
     from: Option<&str>,
     to: &[String],
@@ -205,23 +247,33 @@ fn build_gmail_raw_message(
     bcc: &[String],
     subject: &str,
     body: &str,
-) -> String {
-    let mut lines = Vec::new();
+) -> Result<String> {
+    let join_checked = |field: &str, values: &[String]| -> Result<String> {
+        for value in values {
+            checked_header_value(field, value)?;
+        }
+        Ok(values.join(", "))
+    };
+    let mut lines = vec!["MIME-Version: 1.0".to_string()];
     if let Some(from) = from.filter(|value| !value.trim().is_empty()) {
-        lines.push(format!("From: {from}"));
+        lines.push(format!("From: {}", checked_header_value("from", from)?));
     }
-    lines.push(format!("To: {}", to.join(", ")));
+    lines.push(format!("To: {}", join_checked("to", to)?));
     if !cc.is_empty() {
-        lines.push(format!("Cc: {}", cc.join(", ")));
+        lines.push(format!("Cc: {}", join_checked("cc", cc)?));
     }
     if !bcc.is_empty() {
-        lines.push(format!("Bcc: {}", bcc.join(", ")));
+        lines.push(format!("Bcc: {}", join_checked("bcc", bcc)?));
     }
-    lines.push(format!("Subject: {subject}"));
+    lines.push(format!(
+        "Subject: {}",
+        encode_subject(checked_header_value("subject", subject)?)
+    ));
     lines.push("Content-Type: text/plain; charset=utf-8".into());
+    lines.push("Content-Transfer-Encoding: 8bit".into());
     lines.push(String::new());
     lines.push(body.to_string());
-    lines.join("\r\n")
+    Ok(lines.join("\r\n"))
 }
 
 #[cfg(test)]
@@ -369,6 +421,45 @@ mod tests {
     }
 
     #[test]
+    fn gmail_raw_is_base64url_without_standard_alphabet_characters() {
+        // `>>>???` encodes to `Pj4-Pz8_` in base64url (`+`/`/` in standard).
+        let raw = build_gmail_raw_message(
+            None,
+            &["to@example.com".to_string()],
+            &[],
+            &[],
+            "s",
+            ">>>???~~~",
+        )
+        .unwrap();
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
+        assert!(!encoded.contains(['+', '/', '=']));
+        assert!(encoded.contains(['-', '_']) || !encoded.is_empty());
+    }
+
+    #[test]
+    fn header_values_with_crlf_are_rejected() {
+        let to = vec!["a@example.com".to_string()];
+        let injected = build_gmail_raw_message(None, &to, &[], &[], "hi\r\nBcc: evil@x.com", "b");
+        assert!(injected.is_err());
+        let bad_to = vec!["a@example.com\nBcc: evil@x.com".to_string()];
+        assert!(build_gmail_raw_message(None, &bad_to, &[], &[], "s", "b").is_err());
+        assert!(build_gmail_raw_message(Some("x\ry"), &to, &[], &[], "s", "b").is_err());
+    }
+
+    #[test]
+    fn non_ascii_subject_is_rfc2047_encoded() {
+        assert_eq!(encode_subject("Hello"), "Hello");
+        let encoded = encode_subject("Halo dunia \u{1F30F} caf\u{e9}");
+        assert!(encoded.starts_with("=?UTF-8?B?") && encoded.ends_with("?="));
+        assert!(encoded.is_ascii());
+        let long = encode_subject(&"\u{e9}".repeat(100));
+        for word in long.split("\r\n ") {
+            assert!(word.len() <= 75, "encoded word too long: {}", word.len());
+        }
+    }
+
+    #[test]
     fn gmail_payload_is_encoded_as_raw_message() {
         let value = json!({
             "provider": "gmail",
@@ -396,7 +487,7 @@ mod tests {
             .get("raw")
             .and_then(Value::as_str)
             .expect("raw field");
-        let decoded = base64::engine::general_purpose::STANDARD_NO_PAD
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(raw.as_bytes())
             .expect("valid base64");
         let decoded = String::from_utf8(decoded).expect("utf8");

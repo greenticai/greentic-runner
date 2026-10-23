@@ -230,6 +230,32 @@ mod aw {
         Some(greentic_aw_runtime::guardrail_provider::HttpGuardrailPolicy::new(endpoint, token))
     }
 
+    /// Install the platform guardrail policy on `runtime`: the admin-served
+    /// policy when `GREENTIC_AW_ADMIN_ENDPOINT`/`_TOKEN` are set (an
+    /// undeterminable policy fails CLOSED in the runtime), else a static one
+    /// built from `fallback`.
+    ///
+    /// The single builder shared by the out-of-process serve path, the
+    /// in-process `dw.agent` handler and graph turns, so none of them can run
+    /// an agent with fewer guardrails than another.
+    pub(crate) fn attach_guardrails(
+        runtime: AgentRuntime,
+        ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
+        fallback: Vec<greentic_aw_runtime::config::GuardrailRef>,
+    ) -> AgentRuntime {
+        let policy: Arc<dyn greentic_aw_runtime::guardrail::GuardrailPolicy> =
+            match guardrail_policy_from_env() {
+                Some(http) => Arc::new(http),
+                None => Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
+                    fallback,
+                )),
+            };
+        runtime.with_guardrails(
+            policy,
+            Arc::new(greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator { ext_runtime }),
+        )
+    }
+
     /// Production [`AgentNodeHandler`] wrapping the agentic-worker runtime.
     ///
     /// Holds a shared [`AgentRuntime`] and translates a `DwAgent` flow node's
@@ -368,16 +394,18 @@ mod aw {
 
     /// Build a [`greentic_types::TenantCtx`] for the agent-audit observer from
     /// the flow node's plain `tenant_id`/`env_id` strings. Mirrors
-    /// `HostConfig::tenant_ctx`'s fallback-to-"local" pattern: an id that fails
-    /// the newtype's validation (which should not happen once a flow has been
-    /// routed to a tenant) still yields a well-formed `TenantCtx` rather than
-    /// panicking — the audit event is best-effort, never load-bearing.
-    fn tenant_ctx_for_audit(tenant_id: &str, env_id: &str) -> greentic_types::TenantCtx {
+    /// An id that fails the newtype's validation is an error: silently mapping
+    /// it to a shared `local` tenant would attribute audit and metering events
+    /// to the wrong tenant.
+    pub(crate) fn tenant_ctx_for_audit(
+        tenant_id: &str,
+        env_id: &str,
+    ) -> Result<greentic_types::TenantCtx> {
         let env = greentic_types::EnvId::from_str(env_id)
-            .unwrap_or_else(|_| greentic_types::EnvId::new("local").expect("local env id"));
+            .map_err(|err| anyhow::anyhow!("invalid env id `{env_id}`: {err}"))?;
         let tenant = greentic_types::TenantId::from_str(tenant_id)
-            .unwrap_or_else(|_| greentic_types::TenantId::new("local").expect("local tenant id"));
-        greentic_types::TenantCtx::new(env, tenant)
+            .map_err(|err| anyhow::anyhow!("invalid tenant id `{tenant_id}`: {err}"))?;
+        Ok(greentic_types::TenantCtx::new(env, tenant))
     }
 
     #[async_trait::async_trait]
@@ -468,7 +496,7 @@ mod aw {
             if let Some(sink) = &self.audit_sink {
                 observers.push(Arc::new(AgentAuditObserver::new(
                     sink.clone(),
-                    tenant_ctx_for_audit(tenant_id, env_id),
+                    tenant_ctx_for_audit(tenant_id, env_id)?,
                     agent_id.to_string(),
                     session_id.to_string(),
                 )));
@@ -530,7 +558,7 @@ mod aw {
                     // mirrors the audit-sink "off" branch's byte-identical
                     // behaviour above.
                     if let Some(sink) = &self.audit_sink {
-                        let tenant_ctx = tenant_ctx_for_audit(tenant_id, env_id);
+                        let tenant_ctx = tenant_ctx_for_audit(tenant_id, env_id)?;
                         sink.emit(
                             metering_subject(tenant_id),
                             &build_agent_run_metering_event(
@@ -2291,6 +2319,9 @@ mod aw {
         .with_playbook_source(playbooks)
         .with_share_policy(share_policy)
         .with_user_ledger(ledger_binding);
+        // The same mandatory-guardrail policy the serve path installs; without
+        // it an in-process worker ran with no guardrails at all.
+        let base = attach_guardrails(base, ext_runtime.clone(), Vec::new());
 
         // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
         // `dw.agent` workers ground on the ingested corpus exactly as the
@@ -2853,24 +2884,8 @@ mod aw {
             // tools are still ADVERTISED to the LLM from the agent config's own
             // `ToolRef` schemas.
             mcp_source_from_env(crate::runner::mcp_node::aw::secrets_from_env()),
-        )
-        .with_guardrails(
-            {
-                let policy: Arc<dyn greentic_aw_runtime::guardrail::GuardrailPolicy> =
-                    match guardrail_policy_from_env() {
-                        Some(http) => Arc::new(http),
-                        None => Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
-                            Vec::new(),
-                        )),
-                    };
-                policy
-            },
-            Arc::new(
-                greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
-                    ext_runtime: ext_runtime.clone(),
-                },
-            ),
         );
+        let base = attach_guardrails(base, ext_runtime.clone(), Vec::new());
         // Short-term ("working") memory: in-memory provider is always available
         // (no external deps); the remember/recall tools stay gated by
         // config.memory.short_term in the loop.
@@ -4233,18 +4248,17 @@ mod aw {
 
         #[test]
         fn tenant_ctx_for_audit_uses_real_ids_when_valid() {
-            let ctx = super::tenant_ctx_for_audit("acme", "prod");
+            let ctx = super::tenant_ctx_for_audit("acme", "prod").expect("valid ids");
             assert_eq!(ctx.tenant.as_str(), "acme");
             assert_eq!(ctx.env.as_str(), "prod");
         }
 
         #[test]
-        fn tenant_ctx_for_audit_falls_back_to_local_on_invalid_ids() {
-            // Empty strings fail the newtype validation; the helper must not
-            // panic and should fall back to "local" for both fields.
-            let ctx = super::tenant_ctx_for_audit("", "");
-            assert_eq!(ctx.tenant.as_str(), "local");
-            assert_eq!(ctx.env.as_str(), "local");
+        fn tenant_ctx_for_audit_rejects_invalid_ids() {
+            // Empty strings fail the newtype validation: an error, never a
+            // silent fall back to a shared "local" tenant.
+            assert!(super::tenant_ctx_for_audit("", "prod").is_err());
+            assert!(super::tenant_ctx_for_audit("acme", "").is_err());
         }
 
         #[tokio::test]
@@ -5937,9 +5951,10 @@ pub use aw::{build_agent_node_handler_ephemeral, build_agent_node_wiring_ephemer
 
 #[cfg(feature = "agentic-worker")]
 pub(crate) use aw::{
-    EnvSecretsBackend, attachments_from_flow_input, build_agent_node_wiring_metered,
-    build_ext_runtime, build_llm_backend, component_source_from_packs, mcp_secrets_manager,
-    mcp_source_from_env, text_with_skipped_notices,
+    EnvSecretsBackend, attach_guardrails, attachments_from_flow_input,
+    build_agent_node_wiring_metered, build_ext_runtime, build_llm_backend,
+    component_source_from_packs, mcp_secrets_manager, mcp_source_from_env, tenant_ctx_for_audit,
+    text_with_skipped_notices,
 };
 
 #[cfg(feature = "desktop-agent-ephemeral")]

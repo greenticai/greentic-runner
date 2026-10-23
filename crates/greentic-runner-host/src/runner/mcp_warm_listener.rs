@@ -40,7 +40,11 @@ struct WarmEvent {
 /// dropped so the subscription never terminates due to a single bad message or a
 /// transient store outage.
 pub async fn run_mcp_warm_listener(client: async_nats::Client) -> Result<()> {
-    let mut subscription = client.subscribe("greentic.mcp.warm.v1").await?;
+    // Queue group: the warm cache is process-global, so one delivery per event
+    // is enough however many tenant runtimes (or reloads of one) spawn a listener.
+    let mut subscription = client
+        .queue_subscribe("greentic.mcp.warm.v1", "runner-mcp-warm".to_string())
+        .await?;
 
     while let Some(msg) = subscription.next().await {
         let event = match serde_json::from_slice::<WarmEvent>(&msg.payload) {

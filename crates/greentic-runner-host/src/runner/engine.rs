@@ -1015,6 +1015,18 @@ impl FlowEngine {
         self.execute_with_entry(ctx, input, None).await
     }
 
+    /// [`Self::execute`] without the user-facing failure envelope: a terminal
+    /// error is returned as `Err` even for a session flow. Used by nested
+    /// executions (`flow.call`) whose caller must SEE the failure rather than
+    /// receive a "something went wrong" card as if the sub-flow had succeeded.
+    async fn execute_propagating_failure(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+    ) -> Result<FlowExecution> {
+        self.execute_with_options(ctx, input, None, false).await
+    }
+
     /// Execute a flow whose cursor starts at `entry_node` instead of the flow's
     /// declared entrypoint.
     ///
@@ -1047,6 +1059,20 @@ impl FlowEngine {
         input: Value,
         entry_node: Option<String>,
     ) -> Result<FlowExecution> {
+        self.execute_with_options(ctx, input, entry_node, true)
+            .await
+    }
+
+    /// `surface_failures`: convert a terminal error of a session flow into a
+    /// metadata-only completed envelope (top-level behaviour) instead of
+    /// returning it.
+    async fn execute_with_options(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+        entry_node: Option<String>,
+        surface_failures: bool,
+    ) -> Result<FlowExecution> {
         // Validate the caller's entry node BEFORE the retry loop below, whose
         // session-flow arm converts a terminal error into an Ok envelope. A
         // node id the flow does not have is a caller/pack defect, not a
@@ -1068,6 +1094,10 @@ impl FlowEngine {
         let metric_flow_id = ctx.flow_id.to_string();
         let started = std::time::Instant::now();
         let observer = ctx.observer;
+        // Set when a session flow's terminal failure was rendered as a
+        // completed envelope: metrics must still report it as a failure.
+        let mut surfaced_failure = false;
+        let surfaced_ref = &mut surfaced_failure;
         let result = async move {
             let mut attempt = 0u32;
             loop {
@@ -1084,8 +1114,7 @@ impl FlowEngine {
                         node_id: ctx.node_id,
                         attempt: ctx.attempt,
                     };
-                    maybe_fail(FaultPoint::Timeout, fault_ctx)
-                        .map_err(|err| anyhow!(err.to_string()))?;
+                    maybe_fail(FaultPoint::Timeout, fault_ctx).map_err(injected_error)?;
                 }
                 match self
                     .execute_once(&ctx, original_input.clone(), entry_node.clone())
@@ -1101,7 +1130,8 @@ impl FlowEngine {
                             // error as a metadata-only Ok envelope so the
                             // messaging provider renders it instead of leaking
                             // raw engine text to the chat.
-                            if ctx.session_id.is_some() {
+                            if surface_failures && ctx.session_id.is_some() {
+                                *surfaced_ref = true;
                                 return Ok(FlowExecution::completed(
                                     json!({
                                         "text": user_facing_flow_failure_text(&original_input),
@@ -1139,7 +1169,11 @@ impl FlowEngine {
         if let Some(observer) = observer {
             observer.on_flow_exit(&metric_flow_id);
         }
-        let status = if result.is_ok() { "ok" } else { "err" };
+        let status = if result.is_ok() && !surfaced_failure {
+            "ok"
+        } else {
+            "err"
+        };
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         crate::metrics::record_flow_execution(&metric_tenant, &metric_flow_id, status, duration_ms);
         result
@@ -1275,8 +1309,7 @@ impl FlowEngine {
                     node_id: Some(current.as_str()),
                     attempt: ctx.attempt,
                 };
-                maybe_fail(FaultPoint::TemplateRender, fault_ctx)
-                    .map_err(|err| anyhow!(err.to_string()))?;
+                maybe_fail(FaultPoint::TemplateRender, fault_ctx).map_err(injected_error)?;
             }
             let mut payload =
                 render_template_value(&payload_template, &ctx_value, TemplateOptions::default())
@@ -1339,7 +1372,7 @@ impl FlowEngine {
             let owned_the_submit =
                 attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.note_created_artifacts(std::mem::take(&mut output.created));
-            state.nodes.insert(node_id.clone().into(), output.clone());
+            state.record_node_output(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
             // context where `prev` is this node's own output payload (already
@@ -1372,10 +1405,12 @@ impl FlowEngine {
                     let decision = match &node.routing {
                         Routing::Next { node_id } => NextDecision::Next(node_id.clone()),
                         Routing::End | Routing::Reply => NextDecision::End,
-                        Routing::Branch { default, .. } => match default {
-                            Some(target) => NextDecision::Next(target.clone()),
-                            None => NextDecision::End,
-                        },
+                        Routing::Branch { on_status, default } => {
+                            match branch_target(on_status, default.as_ref(), &output) {
+                                Some(target) => NextDecision::Next(target),
+                                None => NextDecision::End,
+                            }
+                        }
                         Routing::Custom(raw) => {
                             match evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
                             {
@@ -1404,10 +1439,10 @@ impl FlowEngine {
                         NextDecision::Next(n) => current = n,
                         NextDecision::End => {
                             let node_outputs = state.outputs_map();
-                            let nodes_snapshot = state.nodes.clone();
+                            let failure = state.first_unhandled_failure(&flow_ir);
                             let final_output = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::completed(
-                                lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
+                                lift_node_error(final_output, failure.as_ref()),
                                 node_outputs,
                             ));
                         }
@@ -1447,7 +1482,9 @@ impl FlowEngine {
                     let next: Option<NodeId> = match &node.routing {
                         Routing::Next { node_id } => Some(node_id.clone()),
                         Routing::End | Routing::Reply => None,
-                        Routing::Branch { default, .. } => default.clone(),
+                        Routing::Branch { on_status, default } => {
+                            branch_target(on_status, default.as_ref(), &output)
+                        }
                         Routing::Custom(raw) => {
                             match evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
                             {
@@ -1574,10 +1611,10 @@ impl FlowEngine {
                     });
                     state.push_egress(response);
                     let node_outputs = state.outputs_map();
-                    let nodes_snapshot = state.nodes.clone();
+                    let failure = state.first_unhandled_failure(&flow_ir);
                     let final_output = state.finalize_with(None);
                     return Ok(FlowExecution::completed(
-                        lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
+                        lift_node_error(final_output, failure.as_ref()),
                         node_outputs,
                     ));
                 }
@@ -2652,7 +2689,10 @@ impl FlowEngine {
         // robust whether `ctx.session_id` is already bare (the production case)
         // or has accreted a marker.
         let raw_hint = ctx.session_id.unwrap_or_default();
-        let bare_hint = raw_hint.split("::").next().unwrap_or_default();
+        // Strip only the trailing dispatch markers: the hint itself may contain
+        // `::` (e.g. the `ep=<eid>::` endpoint prefix) and must survive intact.
+        let bare_hint =
+            crate::runner::runtime_session_resumer::parse_correlation(raw_hint).bare_hint;
         // The store key (`FlowResumeStore::save`) hashes the inbound reply
         // scope's `conversation`/`thread`/`reply_to`. The bare canonical hint
         // only encodes `conversation`, so a wait saved against a non-empty
@@ -2665,14 +2705,7 @@ impl FlowEngine {
         let mut correlation_id =
             format!("{}::pack={}::flow={}", bare_hint, ctx.pack_id, ctx.flow_id);
         if let Some(scope) = ctx.reply_scope {
-            if let Some(thread) = scope.thread.as_deref().filter(|value| !value.is_empty()) {
-                correlation_id.push_str("::thread=");
-                correlation_id.push_str(thread);
-            }
-            if let Some(reply_to) = scope.reply_to.as_deref().filter(|value| !value.is_empty()) {
-                correlation_id.push_str("::reply=");
-                correlation_id.push_str(reply_to);
-            }
+            crate::runner::runtime_session_resumer::push_scope_markers(&mut correlation_id, scope);
         }
         // An approval's correlation id is its responder's idempotency key:
         // greentic-designer-admin UNIQUE-indexes it and upserts only while the
@@ -2950,7 +2983,27 @@ impl FlowEngine {
             caller: ctx.caller,
         };
 
-        let execution = Box::pin(self.execute(sub_ctx, sub_input))
+        let depth = FLOW_CALL_DEPTH.try_with(|depth| *depth).unwrap_or(0);
+        if depth >= MAX_FLOW_CALL_DEPTH {
+            bail!(
+                "flow.call nesting exceeds {MAX_FLOW_CALL_DEPTH} levels (calling {})",
+                flow_id_owned
+            );
+        }
+        // The caller's own retry loop owns retries; a nested loop would multiply
+        // attempts. The failure is propagated, never rendered as an envelope.
+        let sub_ctx = FlowContext {
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                ..sub_ctx.retry_config
+            },
+            ..sub_ctx
+        };
+        let execution = FLOW_CALL_DEPTH
+            .scope(
+                depth + 1,
+                Box::pin(self.execute_propagating_failure(sub_ctx, sub_input)),
+            )
             .await
             .with_context(|| format!("flow.call failed for {}", flow_id_owned))?;
         match execution.status {
@@ -2962,6 +3015,40 @@ impl FlowEngine {
             ),
         }
     }
+}
+
+/// Resolve a `Routing::Branch`: the node's reported `status` selects an
+/// `on_status` entry, otherwise the `default` target applies.
+///
+/// The status is read from the node output payload's `status` field (string,
+/// number or bool), falling back to `meta.status`.
+fn branch_target(
+    on_status: &std::collections::BTreeMap<String, NodeId>,
+    default: Option<&NodeId>,
+    output: &NodeOutput,
+) -> Option<NodeId> {
+    let status_of = |value: &Value| match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    };
+    let status = output
+        .payload
+        .get("status")
+        .and_then(status_of)
+        .or_else(|| output.meta.get("status").and_then(status_of));
+    status
+        .and_then(|status| on_status.get(&status).cloned())
+        .or_else(|| default.cloned())
+}
+
+/// Deepest `flow.call` nesting allowed before the call is refused.
+const MAX_FLOW_CALL_DEPTH: u32 = 16;
+
+tokio::task_local! {
+    /// How many `flow.call` frames enclose the node currently executing.
+    static FLOW_CALL_DEPTH: u32;
 }
 
 /// Build the jump that hands this turn over to another flow.
@@ -3179,8 +3266,7 @@ impl FlowEngine {
                 node_id: Some(node_id),
                 attempt: ctx.attempt,
             };
-            maybe_fail(FaultPoint::BeforeComponentCall, fault_ctx)
-                .map_err(|err| anyhow!(err.to_string()))?;
+            maybe_fail(FaultPoint::BeforeComponentCall, fault_ctx).map_err(injected_error)?;
         }
         let value = pack
             .invoke_component_for(
@@ -3201,8 +3287,7 @@ impl FlowEngine {
                 node_id: Some(node_id),
                 attempt: ctx.attempt,
             };
-            maybe_fail(FaultPoint::AfterComponentCall, fault_ctx)
-                .map_err(|err| anyhow!(err.to_string()))?;
+            maybe_fail(FaultPoint::AfterComponentCall, fault_ctx).map_err(injected_error)?;
         }
 
         if let Some((code, message)) = component_error(&value) {
@@ -3279,8 +3364,6 @@ impl FlowEngine {
             in_map: Value,
             #[serde(default)]
             out_map: Value,
-            #[serde(default)]
-            err_map: Value,
         }
 
         let payload: ProviderPayload =
@@ -3365,8 +3448,7 @@ impl FlowEngine {
                 node_id: Some(node_id),
                 attempt: ctx.attempt,
             };
-            maybe_fail(FaultPoint::BeforeToolCall, fault_ctx)
-                .map_err(|err| anyhow!(err.to_string()))?;
+            maybe_fail(FaultPoint::BeforeToolCall, fault_ctx).map_err(injected_error)?;
         }
         let provider_metric_id = payload
             .provider_id
@@ -3394,8 +3476,7 @@ impl FlowEngine {
                 node_id: Some(node_id),
                 attempt: ctx.attempt,
             };
-            maybe_fail(FaultPoint::AfterToolCall, fault_ctx)
-                .map_err(|err| anyhow!(err.to_string()))?;
+            maybe_fail(FaultPoint::AfterToolCall, fault_ctx).map_err(injected_error)?;
         }
 
         let output = if payload.out_map.is_null() {
@@ -3415,7 +3496,6 @@ impl FlowEngine {
             )
             .context("failed to render provider.invoke out_map")?
         };
-        let _ = payload.err_map;
         Ok(NodeOutput::new(output))
     }
 
@@ -3427,9 +3507,9 @@ impl FlowEngine {
         input_json: &[u8],
         tenant: &str,
     ) -> Result<Option<NodeOutput>> {
-        eprintln!(
-            "[DEBUG] provider.invoke: pack-local failed, has_resolver={}",
-            self.cross_pack_resolver.is_some()
+        tracing::debug!(
+            has_resolver = self.cross_pack_resolver.is_some(),
+            "provider.invoke: pack-local failed"
         );
         let Some(resolver) = self.cross_pack_resolver.as_ref() else {
             return Ok(None);
@@ -3711,6 +3791,11 @@ pub struct ExecutionState {
     input: Value,
     #[serde(default)]
     nodes: HashMap<String, NodeOutput>,
+    /// Node ids in the order their (latest) output was recorded. `nodes` is a
+    /// `HashMap`, so without this "the first failed node" was whichever the
+    /// hasher happened to yield.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    node_order: Vec<String>,
     #[serde(default)]
     egress: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3787,6 +3872,7 @@ impl ExecutionState {
             entry: input.clone(),
             input,
             nodes: HashMap::new(),
+            node_order: Vec::new(),
             egress: Vec::new(),
             last_output: None,
             redirect_count: 0,
@@ -3832,6 +3918,43 @@ impl ExecutionState {
             "park_turns": self.park_turns.clone(),
             "pending_agent_await": self.pending_agent_await.keys().cloned().collect::<Vec<_>>(),
         })
+    }
+
+    /// Record `output` as the latest result of `node_id`, tracking execution order.
+    fn record_node_output(&mut self, node_id: String, output: NodeOutput) {
+        self.node_order.retain(|id| id != &node_id);
+        self.node_order.push(node_id.clone());
+        self.nodes.insert(node_id, output);
+    }
+
+    /// The first node, in execution order, that finished `ok == false` and is
+    /// NOT handled by an error edge (a handled failure was routed, not
+    /// unhandled, and must not be lifted into the reply as if it escaped).
+    fn first_unhandled_failure(&self, flow: &HostFlow) -> Option<(String, NodeOutput)> {
+        let handled = |id: &str| {
+            NodeId::from_str(id)
+                .ok()
+                .and_then(|node_id| flow.nodes.get(&node_id))
+                .is_some_and(|node| node_has_error_route(&node.routing))
+        };
+        let ordered = self
+            .node_order
+            .iter()
+            .filter_map(|id| self.nodes.get(id).map(|out| (id, out)));
+        // Nodes restored from a snapshot written before `node_order` existed
+        // have no recorded order: fall back to sorted ids so the pick is at
+        // least deterministic.
+        let mut unordered: Vec<(&String, &NodeOutput)> = self
+            .nodes
+            .iter()
+            .filter(|(id, _)| !self.node_order.contains(id))
+            .collect();
+        unordered.sort_by(|a, b| a.0.cmp(b.0));
+        unordered
+            .into_iter()
+            .chain(ordered)
+            .find(|(id, out)| !out.ok && !handled(id))
+            .map(|(id, out)| (id.clone(), out.clone()))
     }
 
     fn outputs_map(&self) -> JsonMap<String, Value> {
@@ -6735,6 +6858,77 @@ mod approval_gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn should_retry_only_typed_transient_errors() {
+        assert!(!should_retry(&anyhow!("internal server error")));
+        assert!(!should_retry(&anyhow!("service unavailable: timeout")));
+        assert!(should_retry(&anyhow::Error::new(TransientFlowError(
+            "upstream hiccup".into()
+        ))));
+        let wrapped = anyhow::Error::new(TransientFlowError("x".into())).context("node failed");
+        assert!(should_retry(&wrapped));
+        let io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(should_retry(&io));
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!should_retry(&denied));
+    }
+
+    #[test]
+    fn branch_target_routes_on_status_then_default() {
+        let a = NodeId::from_str("a").unwrap();
+        let b = NodeId::from_str("b").unwrap();
+        let d = NodeId::from_str("d").unwrap();
+        let mut on_status = std::collections::BTreeMap::new();
+        on_status.insert("approved".to_string(), a.clone());
+        on_status.insert("true".to_string(), b.clone());
+        let out = NodeOutput::new(json!({ "status": "approved" }));
+        assert_eq!(branch_target(&on_status, Some(&d), &out), Some(a));
+        let flag = NodeOutput::new(json!({ "status": true }));
+        assert_eq!(branch_target(&on_status, Some(&d), &flag), Some(b));
+        let unknown = NodeOutput::new(json!({ "status": "other" }));
+        assert_eq!(
+            branch_target(&on_status, Some(&d), &unknown),
+            Some(d.clone())
+        );
+        let none = NodeOutput::new(json!({}));
+        assert_eq!(branch_target(&on_status, None, &none), None);
+    }
+
+    #[test]
+    fn first_unhandled_failure_uses_execution_order_and_skips_handled_nodes() {
+        let failed = |msg: &str| {
+            let mut out = NodeOutput::new(json!({}));
+            out.ok = false;
+            out.meta = json!({ "error": { "message": msg } });
+            out
+        };
+        let mut state = ExecutionState::new(json!({}));
+        // Recorded z-then-a: execution order, not key order, decides.
+        state.record_node_output("z_first".to_string(), failed("first"));
+        state.record_node_output("a_second".to_string(), failed("second"));
+
+        let mut flow = HostFlow {
+            id: "f".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        };
+        let (id, _) = state.first_unhandled_failure(&flow).expect("a failure");
+        assert_eq!(id, "z_first");
+
+        // Give `z_first` an error edge: its failure was routed, so the next
+        // unhandled failure is the one lifted.
+        let mut handled = HostNode::for_test("comp", Some("op"));
+        handled.routing = Routing::Custom(json!([
+            { "condition": "event == \"on_error\"", "to": "recover" }
+        ]));
+        flow.nodes
+            .insert(NodeId::from_str("z_first").unwrap(), handled);
+        let (id, _) = state.first_unhandled_failure(&flow).expect("a failure");
+        assert_eq!(id, "a_second");
+    }
 
     /// The loader and the engine must agree on which op-keys are runner-native.
     ///
@@ -15328,8 +15522,23 @@ pub struct RetryConfig {
 /// `ExecutionState` because the callers have already consumed `state` via
 /// `state.finalize_with(...)`; we capture a cheap clone of `state.nodes` up
 /// front and pass it in here.
+#[cfg(test)]
 fn lift_first_node_error_from_nodes(output: Value, nodes: &HashMap<String, NodeOutput>) -> Value {
-    let Some((node_id, failed)) = nodes.iter().find(|(_, out)| !out.ok) else {
+    // No execution order is available here, so pick deterministically by id.
+    let failure = nodes
+        .iter()
+        .filter(|(_, out)| !out.ok)
+        .min_by(|a, b| a.0.cmp(b.0))
+        .map(|(id, out)| (id.clone(), out.clone()));
+    lift_node_error(output, failure.as_ref())
+}
+
+/// Lift `failure` (a node id and its failed output) into `output.metadata`;
+/// see [`lift_first_node_error_from_nodes`]. Production callers choose the
+/// failure with [`ExecutionState::first_unhandled_failure`]: execution order,
+/// skipping nodes whose failure an error edge already routed.
+fn lift_node_error(output: Value, failure: Option<&(String, NodeOutput)>) -> Value {
+    let Some((node_id, failed)) = failure else {
         return output;
     };
     let err_meta = failed.meta.get("error");
@@ -15373,12 +15582,46 @@ fn lift_first_node_error_from_nodes(output: Value, nodes: &HashMap<String, NodeO
     Value::Object(output)
 }
 
+/// Marks a failure as transient, i.e. worth re-running the flow for. Wrap a
+/// source error in this (via `anyhow::Error::new`) where a failure is known to
+/// be retryable; nothing is retried on the strength of its message text.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct TransientFlowError(pub String);
+
+/// Retry only failures that are TYPED as transient: an explicit
+/// [`TransientFlowError`], a timeout (`tokio::time::error::Elapsed`), or a
+/// transient I/O error kind. Substring-matching the message ("internal",
+/// "unavailable", ...) re-ran whole flows, side effects included, for errors
+/// that merely mentioned those words.
 fn should_retry(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    lower.contains("transient")
-        || lower.contains("unavailable")
-        || lower.contains("internal")
-        || lower.contains("timeout")
+    err.chain().any(|cause| {
+        if cause.is::<TransientFlowError>() || cause.is::<tokio::time::error::Elapsed>() {
+            return true;
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+            )
+        })
+    })
+}
+
+#[cfg(feature = "fault-injection")]
+fn injected_error(err: crate::testing::fault_injection::InjectedError) -> anyhow::Error {
+    use crate::testing::fault_injection::FaultErrorKind;
+    match err.kind {
+        FaultErrorKind::Transient | FaultErrorKind::Timeout => {
+            anyhow::Error::new(TransientFlowError(err.to_string()))
+        }
+        _ => anyhow!(err.to_string()),
+    }
 }
 
 impl From<FlowRetryConfig> for RetryConfig {

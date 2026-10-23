@@ -301,6 +301,10 @@ pub struct TenantRuntime {
     http_client: Client,
     mocks: Option<Arc<MockLayer>>,
     timer_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// NATS response listeners and the MCP warm listener this runtime spawned.
+    /// Aborted on drop so a reload (which swaps in a fresh `TenantRuntime`)
+    /// does not leave the old listeners running beside the new ones.
+    background_handles: Mutex<Vec<JoinHandle<()>>>,
     secrets: DynSecretsManager,
     operator_registry: OperatorRegistry,
     operator_metrics: Arc<OperatorMetrics>,
@@ -510,14 +514,79 @@ impl RevisionHostOptions {
 }
 
 /// Block on a future whether or not we're already inside a tokio runtime.
-pub fn block_on<F: Future<Output = R>, R>(future: F) -> R {
-    if let Ok(handle) = Handle::try_current() {
-        handle.block_on(future)
-    } else {
-        Runtime::new()
-            .expect("failed to create tokio runtime")
-            .block_on(future)
+///
+/// `Handle::block_on` panics when called from async context, so inside a
+/// multi-thread runtime this yields the worker via `block_in_place`, and inside
+/// a current-thread runtime (where `block_in_place` also panics) it drives the
+/// future on a short-lived helper thread with its own runtime.
+///
+/// Infallible by signature; if even the fallback runtime cannot be built it
+/// degrades to a runtime-less executor rather than panicking. Prefer
+/// [`try_block_on`] when the caller can surface the error.
+pub fn block_on<F, R>(future: F) -> R
+where
+    F: Future<Output = R> + Send,
+    R: Send,
+{
+    match Handle::try_current() {
+        Ok(handle) => block_in_context(&handle, future).unwrap_or_else(|(future, err)| {
+            tracing::warn!(error = %err, "falling back to a runtime-less executor");
+            futures::executor::block_on(future)
+        }),
+        Err(_) => match build_scoped_runtime() {
+            Ok(rt) => rt.block_on(future),
+            Err(err) => {
+                tracing::warn!(error = %err, "falling back to a runtime-less executor");
+                futures::executor::block_on(future)
+            }
+        },
     }
+}
+
+/// [`block_on`], surfacing a failure to build the helper runtime or a panic on
+/// the helper thread as an error.
+pub fn try_block_on<F, R>(future: F) -> Result<R>
+where
+    F: Future<Output = R> + Send,
+    R: Send,
+{
+    match Handle::try_current() {
+        Ok(handle) => block_in_context(&handle, future).map_err(|(_, err)| err),
+        Err(_) => Ok(build_scoped_runtime()?.block_on(future)),
+    }
+}
+
+fn build_scoped_runtime() -> Result<Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")
+}
+
+/// Run `future` to completion from inside a tokio runtime context. On failure
+/// the future is handed back alongside the error when it was never polled.
+fn block_in_context<F, R>(handle: &Handle, future: F) -> std::result::Result<R, (F, anyhow::Error)>
+where
+    F: Future<Output = R> + Send,
+    R: Send,
+{
+    use tokio::runtime::RuntimeFlavor;
+    if matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread) {
+        return Ok(tokio::task::block_in_place(|| handle.block_on(future)));
+    }
+    let rt = match build_scoped_runtime() {
+        Ok(rt) => rt,
+        Err(err) => return Err((future, err)),
+    };
+    // `std::thread::scope` joins before returning, so `future` may borrow.
+    std::thread::scope(|scope| {
+        match scope.spawn(move || rt.block_on(future)).join() {
+            Ok(value) => Ok(value),
+            // The future panicked: surface that panic to the caller as it
+            // would have been on a direct poll.
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 impl TenantRuntime {
@@ -1710,6 +1779,7 @@ impl TenantRuntime {
         // we run one listener per runtime so every `*.call` node's responses
         // (`greentic.<runtime>.response.v1`) are consumed. Only started when the
         // dispatcher above connected successfully.
+        let mut background_handles: Vec<JoinHandle<()>> = Vec::new();
         if let Some(client) = dispatch_nats_client {
             let resumer = Arc::new(
                 crate::runner::runtime_session_resumer::RuntimeSessionResumer::new(Arc::clone(
@@ -1717,11 +1787,22 @@ impl TenantRuntime {
                 )),
             );
             for runtime_name in ["sorla", "operala", "agentic", "telco-x", "approval"] {
-                tokio::spawn(crate::runner::dispatch_listener::run_response_listener(
-                    client.clone(),
-                    runtime_name.to_string(),
-                    Arc::clone(&resumer)
-                        as Arc<dyn crate::runner::dispatch_listener::SessionResumer>,
+                // Per-tenant queue group + tenant filter: replicas and reloaded
+                // runtimes of one tenant share a delivery, and one tenant's
+                // runtime never resumes another tenant's response.
+                let scope = crate::runner::dispatch_listener::ListenerScope {
+                    queue_group: Some(format!("runner-{}-{runtime_name}", config.tenant)),
+                    tenant: Some(config.tenant.clone()),
+                };
+                background_handles.push(spawn_listener_logged(
+                    runtime_name,
+                    crate::runner::dispatch_listener::run_response_listener_scoped(
+                        client.clone(),
+                        runtime_name.to_string(),
+                        Arc::clone(&resumer)
+                            as Arc<dyn crate::runner::dispatch_listener::SessionResumer>,
+                        scope,
+                    ),
                 ));
             }
             // Eagerly pre-cache local-wasm MCP components when the admin publishes
@@ -1729,8 +1810,9 @@ impl TenantRuntime {
             // `mcp_store_pull` lives in `greentic-aw-runtime` which is only
             // present when that feature is enabled.
             #[cfg(feature = "agentic-worker")]
-            tokio::spawn(crate::runner::mcp_warm_listener::run_mcp_warm_listener(
-                client.clone(),
+            background_handles.push(spawn_listener_logged(
+                "mcp-warm",
+                crate::runner::mcp_warm_listener::run_mcp_warm_listener(client.clone()),
             ));
             tracing::info!(
                 "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call / telco-x.call"
@@ -1748,6 +1830,7 @@ impl TenantRuntime {
             http_client,
             mocks,
             timer_handles: Mutex::new(Vec::new()),
+            background_handles: Mutex::new(background_handles),
             secrets: secrets_manager,
             operator_registry,
             operator_metrics,
@@ -1953,14 +2036,53 @@ impl TenantRuntime {
     }
 }
 
+/// Spawn a long-running listener future, logging (rather than discarding) the
+/// error if it ends. Returns the task handle so the owner can abort it:
+/// aborting drops the inner future, which closes its subscription.
+fn spawn_listener_logged<F>(name: &'static str, listener: F) -> JoinHandle<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) = listener.await {
+            tracing::warn!(listener = name, %error, "background listener stopped");
+        }
+    })
+}
+
 impl Drop for TenantRuntime {
     fn drop(&mut self) {
         for handle in self.timer_handles.lock().drain(..) {
             handle.abort();
         }
+        for handle in self.background_handles.lock().drain(..) {
+            handle.abort();
+        }
         if let Some(inbox) = &self.approval_inbox {
             inbox.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod block_on_tests {
+    use super::*;
+
+    #[test]
+    fn works_without_a_runtime() {
+        assert_eq!(block_on(async { 7 }), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn does_not_panic_inside_a_multi_thread_runtime() {
+        assert_eq!(block_on(async { 8 }), 8);
+        assert_eq!(try_block_on(async { 9 }).ok(), Some(9));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_panic_inside_a_current_thread_runtime() {
+        assert_eq!(block_on(async { 10 }), 10);
+        assert_eq!(try_block_on(async { 11 }).ok(), Some(11));
     }
 }
 

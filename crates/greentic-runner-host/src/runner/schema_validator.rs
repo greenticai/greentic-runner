@@ -76,6 +76,21 @@ fn collect_unsupported_constraints(schema: &Value, path: &str, out: &mut Vec<Str
     }
     for (key, value) in map {
         let next = format!("{}/{}", path_or_root(path), key);
+        // Data, not schema: never scan instance values for keywords.
+        if matches!(key.as_str(), "enum" | "const" | "default" | "examples") {
+            continue;
+        }
+        // Keys of these maps are user-chosen NAMES (a property may legitimately
+        // be called `format` or `pattern`); only their values are subschemas.
+        if matches!(key.as_str(), "properties" | "$defs" | "definitions")
+            && let Value::Object(named) = value
+        {
+            for (name, subschema) in named {
+                let sub_path = format!("{next}/{name}");
+                collect_unsupported_constraints(subschema, &sub_path, out);
+            }
+            continue;
+        }
         match value {
             Value::Object(_) => collect_unsupported_constraints(value, &next, out),
             Value::Array(items) => {
@@ -97,6 +112,32 @@ fn path_or_root(path: &str) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn properties_named_like_keywords_are_not_flagged() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "format": { "type": "string" },
+                "pattern": { "type": "string" },
+                "mode": { "enum": ["format", "pattern"] }
+            },
+            "$defs": { "format": { "type": "integer" } }
+        });
+        let mut out = Vec::new();
+        collect_unsupported_constraints(&schema, "", &mut out);
+        assert!(out.is_empty(), "unexpected flags: {out:?}");
+    }
+
+    #[test]
+    fn a_real_pattern_under_a_property_is_still_flagged() {
+        let schema = json!({
+            "properties": { "format": { "type": "string", "pattern": "^a$" } }
+        });
+        let mut out = Vec::new();
+        collect_unsupported_constraints(&schema, "", &mut out);
+        assert_eq!(out, vec!["/properties/format/pattern".to_string()]);
+    }
 
     #[test]
     fn strict_mode_rejects_unsupported_constraints() {
