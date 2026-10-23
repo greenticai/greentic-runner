@@ -123,9 +123,7 @@ impl SessionLockInner for KvSessionLock {
             if ok {
                 Ok(())
             } else {
-                Err(StateError::Redis(
-                    "lock no longer owned by this holder".into(),
-                ))
+                Err(StateError::LockLost)
             }
         })
     }

@@ -122,6 +122,8 @@ pub async fn ensure_cached(
     component_version: &str,
     component_digest: &str,
 ) -> Result<(), StorePullError> {
+    validate_component_ref(component_ref)?;
+    validate_component_version(component_version)?;
     let dest = cache_dir().join(format!("{component_ref}.wasm"));
     // Cache-hit ONLY when the cached wasm, its execution-digest sidecar, AND the
     // pinned-gtxpack marker are all present and the marker matches THIS request's
@@ -185,6 +187,44 @@ pub async fn ensure_cached(
 }
 
 /// Return the sidecar path for a cached wasm file (e.g. `router_echo.wasm.sha256`).
+/// Reject a `component_ref` that could escape the cache directory or alter the
+/// artifact URL path: it becomes a file stem (`<cache>/<ref>.wasm`) and a URL
+/// path segment, so only `[A-Za-z0-9._-]` is accepted, with no `..` and no
+/// leading dot.
+pub(crate) fn validate_component_ref(component_ref: &str) -> Result<(), StorePullError> {
+    let ok = !component_ref.is_empty()
+        && component_ref.len() <= 128
+        && !component_ref.starts_with('.')
+        && !component_ref.contains("..")
+        && component_ref
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(StorePullError::Config(format!(
+            "invalid component_ref {component_ref:?}: only [A-Za-z0-9._-] is allowed, no path traversal"
+        )))
+    }
+}
+
+/// Same constraint for the version segment of the artifact URL.
+fn validate_component_version(version: &str) -> Result<(), StorePullError> {
+    let ok = !version.is_empty()
+        && version.len() <= 128
+        && !version.contains("..")
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'));
+    if ok {
+        Ok(())
+    } else {
+        Err(StorePullError::Config(format!(
+            "invalid component_version {version:?}"
+        )))
+    }
+}
+
 pub(crate) fn sidecar_path(wasm_dest: &std::path::Path) -> std::path::PathBuf {
     let mut path = wasm_dest.to_path_buf();
     let new_extension = match path.extension() {

@@ -901,6 +901,92 @@ pub fn ledger_key(tenant: &TenantContext, session_id: &str, call_id: &str) -> St
     format!("{}:{session_id}:tool_calls:{call_id}", tenant.key_prefix())
 }
 
+/// Give every call in a batch a non-empty id that is unique within the batch.
+///
+/// Some providers (and the streaming accumulator) can emit an empty or
+/// repeated `tool_call_id`. Left alone, two calls would share one ledger entry
+/// and one of them would be answered with the other's cached result, and the
+/// `Tool` messages could not be paired with their calls.
+pub(crate) fn ensure_unique_call_ids(calls: &mut [ToolCallRecord]) {
+    let mut seen = std::collections::HashSet::new();
+    for call in calls.iter_mut() {
+        if call.call_id.trim().is_empty() || !seen.insert(call.call_id.clone()) {
+            call.call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+            seen.insert(call.call_id.clone());
+        }
+    }
+}
+
+/// The idempotency-ledger id for a call: the provider's call id plus a digest
+/// of what was asked (extension, tool, arguments). A reused or colliding call
+/// id with different arguments then misses the cache instead of replaying an
+/// unrelated result.
+pub(crate) fn ledger_call_id(call: &ToolCallRecord) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(call.extension_id.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(call.tool_name.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(call.args.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let mut suffix = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        suffix.push_str(&format!("{byte:02x}"));
+    }
+    format!("{}:{suffix}", call.call_id)
+}
+
+/// Whether a tool's `Ok` value is really a failure report (`{"error": ...}`).
+/// Such a result must not be cached: a retry should run the tool again.
+pub(crate) fn is_error_result(result: &serde_json::Value) -> bool {
+    result.as_object().is_some_and(|o| o.contains_key("error"))
+}
+
+#[cfg(test)]
+mod ledger_id_tests {
+    use super::*;
+
+    fn call(id: &str, args: serde_json::Value) -> ToolCallRecord {
+        ToolCallRecord {
+            call_id: id.into(),
+            extension_id: "e".into(),
+            tool_name: "t".into(),
+            args,
+        }
+    }
+
+    #[test]
+    fn empty_and_repeated_call_ids_are_replaced_with_unique_ones() {
+        let mut calls = vec![
+            call("", serde_json::json!({})),
+            call("", serde_json::json!({})),
+            call("a", serde_json::json!({})),
+            call("a", serde_json::json!({})),
+        ];
+        ensure_unique_call_ids(&mut calls);
+        let ids: std::collections::HashSet<_> = calls.iter().map(|c| c.call_id.clone()).collect();
+        assert_eq!(ids.len(), 4);
+        assert!(calls.iter().all(|c| !c.call_id.is_empty()));
+        assert_eq!(calls[2].call_id, "a", "first holder of an id keeps it");
+    }
+
+    #[test]
+    fn ledger_id_changes_with_the_arguments_but_not_between_replays() {
+        let a = call("c1", serde_json::json!({"x": 1}));
+        let b = call("c1", serde_json::json!({"x": 2}));
+        assert_ne!(ledger_call_id(&a), ledger_call_id(&b));
+        assert_eq!(ledger_call_id(&a), ledger_call_id(&a.clone()));
+    }
+
+    #[test]
+    fn error_shaped_results_are_not_cacheable() {
+        assert!(is_error_result(&serde_json::json!({"error": "boom"})));
+        assert!(!is_error_result(&serde_json::json!({"ok": true})));
+        assert!(!is_error_result(&serde_json::json!("error")));
+    }
+}
+
 /// Idempotency ledger for tool calls. Records tool results keyed by
 /// `tool_call_id` so a state-save failure does not cause a duplicate
 /// dispatch (re-sending the same email, etc.) on the next `step()`.

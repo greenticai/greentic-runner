@@ -36,6 +36,12 @@ pub struct LlmRequest {
         Option<std::sync::Arc<dyn crate::attachment_guard::AttachmentTextGuard>>,
 }
 
+/// Reserved argument key a backend sets when the model's tool-call arguments
+/// were not valid JSON. The loop answers such a call with a tool error instead
+/// of dispatching it with made-up (empty) arguments. The value is a bounded
+/// prefix of the raw text.
+pub const MALFORMED_ARGS_KEY: &str = "__malformed_arguments";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LlmToolSchema {
     pub extension_id: String,
@@ -87,8 +93,9 @@ pub trait LlmBackend: Send + Sync {
     }
 }
 
-/// Wraps any [`LlmBackend`] with exponential-backoff retry on
-/// [`LlmError::ServiceUnavailable`]. 4xx-class errors are NOT retried.
+/// Wraps any [`LlmBackend`] with exponential-backoff retry on transient
+/// errors (see [`LlmError::is_retryable`]: 5xx, 429, transport). Other 4xx-class
+/// errors are NOT retried.
 pub struct RetryingLlmBackend<B: LlmBackend> {
     inner: B,
     attempts: u32,
@@ -116,8 +123,8 @@ impl<B: LlmBackend + Send + Sync> LlmBackend for RetryingLlmBackend<B> {
             for attempt in 0..self.attempts.max(1) {
                 match self.inner.complete(request.clone()).await {
                     Ok(r) => return Ok(r),
-                    Err(LlmError::ServiceUnavailable) => {
-                        last_err = Some(LlmError::ServiceUnavailable);
+                    Err(e) if e.is_retryable() => {
+                        last_err = Some(e);
                         if attempt + 1 < self.attempts {
                             tokio::time::sleep(delay).await;
                             delay = delay.saturating_mul(2);
@@ -156,14 +163,14 @@ impl<B: LlmBackend + Send + Sync> LlmBackend for RetryingLlmBackend<B> {
                     .await
                 {
                     Ok(r) => return Ok(r),
-                    Err(LlmError::ServiceUnavailable) => {
+                    Err(e) if e.is_retryable() => {
                         // Once partial output has reached the consumer we
                         // must NOT retry — a fresh attempt would duplicate
                         // already-emitted tokens. Surface the error instead.
                         if emitted.load(Ordering::SeqCst) {
-                            return Err(LlmError::ServiceUnavailable);
+                            return Err(e);
                         }
-                        last_err = Some(LlmError::ServiceUnavailable);
+                        last_err = Some(e);
                         if attempt + 1 < self.attempts {
                             tokio::time::sleep(delay).await;
                             delay = delay.saturating_mul(2);
@@ -177,11 +184,76 @@ impl<B: LlmBackend + Send + Sync> LlmBackend for RetryingLlmBackend<B> {
     }
 }
 
+/// An `Arc<dyn LlmBackend>` as a sized [`LlmBackend`], so the runtime's shared
+/// backend can sit inside a [`RetryingLlmBackend`].
+pub(crate) struct SharedLlm(pub(crate) Arc<dyn LlmBackend>);
+
+impl LlmBackend for SharedLlm {
+    fn complete<'a>(
+        &'a self,
+        request: LlmRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        self.0.complete(request)
+    }
+
+    fn complete_streaming<'a>(
+        &'a self,
+        request: LlmRequest,
+        on_delta: OnDelta,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        self.0.complete_streaming(request, on_delta)
+    }
+}
+
+/// The runtime's shared backend wrapped with the retry policy an agent's
+/// [`crate::config::AgentLimits`] declares (`llm_retry_attempts` /
+/// `llm_retry_backoff`).
+pub(crate) fn retrying_for(
+    llm: &Arc<dyn LlmBackend>,
+    limits: &crate::config::AgentLimits,
+) -> RetryingLlmBackend<SharedLlm> {
+    RetryingLlmBackend::new(
+        SharedLlm(llm.clone()),
+        limits.llm_retry_attempts,
+        limits.llm_retry_backoff,
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn retries_rate_limits_and_transport_errors() {
+        let inner = ScriptedBackend {
+            responses: Mutex::new(vec![
+                Err(LlmError::RateLimited("429".into())),
+                Err(LlmError::Transport("reset".into())),
+                Ok(ok_resp()),
+            ]),
+        };
+        let r = RetryingLlmBackend::new(inner, 3, Duration::from_millis(1));
+        assert_eq!(
+            r.complete(req()).await.unwrap().content.as_deref(),
+            Some("hi")
+        );
+    }
+
+    #[tokio::test]
+    async fn retrying_for_uses_the_agent_limits() {
+        let shared: Arc<dyn LlmBackend> = Arc::new(ScriptedBackend {
+            responses: Mutex::new(vec![Err(LlmError::ServiceUnavailable), Ok(ok_resp())]),
+        });
+        let limits = crate::config::AgentLimits {
+            llm_retry_attempts: 2,
+            llm_retry_backoff: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let r = retrying_for(&shared, &limits);
+        assert!(r.complete(req()).await.is_ok());
+    }
 
     struct ScriptedBackend {
         responses: Mutex<Vec<Result<LlmResponse, LlmError>>>,

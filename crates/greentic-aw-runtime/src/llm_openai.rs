@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::error::LlmError;
-use crate::llm::{LlmBackend, LlmRequest, LlmResponse, LlmToolSchema, OnDelta};
+use crate::llm::{LlmBackend, LlmRequest, LlmResponse, LlmToolSchema, MALFORMED_ARGS_KEY, OnDelta};
 use crate::state::{ChatMessage, ToolCallRecord};
 use crate::tool_wire_name::{ToolNameCodec, wire_tool_name};
 
@@ -169,6 +169,8 @@ struct OaResponse {
 #[derive(Deserialize)]
 struct OaChoice {
     message: OaMessageIn,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -233,7 +235,7 @@ impl LlmBackend for OpenAiLlmBackend {
             }
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(LlmError::BadRequest(format!("{status}: {text}")));
+                return Err(map_client_error(status, &text));
             }
             let oa: OaResponse = resp
                 .json()
@@ -244,6 +246,14 @@ impl LlmBackend for OpenAiLlmBackend {
                 .into_iter()
                 .next()
                 .ok_or_else(|| LlmError::Decode("no choices".into()))?;
+            check_finish_reason(
+                choice.finish_reason.as_deref(),
+                choice
+                    .message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty()),
+            )?;
             let tool_calls = choice
                 .message
                 .tool_calls
@@ -312,7 +322,7 @@ impl LlmBackend for OpenAiLlmBackend {
             }
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(LlmError::BadRequest(format!("{status}: {text}")));
+                return Err(map_client_error(status, &text));
             }
 
             let mut acc = StreamAccumulator::new();
@@ -338,6 +348,9 @@ impl LlmBackend for OpenAiLlmBackend {
             {
                 on_delta(&text);
             }
+            // A body that ends without `[DONE]` or a `finish_reason` was cut
+            // off (proxy reset, server crash): never treat it as a reply.
+            acc.check_complete()?;
             Ok(acc.finish(&codec))
         })
     }
@@ -405,6 +418,10 @@ struct StreamAccumulator {
     tool_calls: BTreeMap<u32, ToolCallFrag>,
     tokens_in: u32,
     tokens_out: u32,
+    /// Saw the `data: [DONE]` terminator.
+    done: bool,
+    /// Last non-null `finish_reason` any choice reported.
+    finish_reason: Option<String>,
 }
 
 #[derive(Default)]
@@ -421,7 +438,21 @@ impl StreamAccumulator {
             tool_calls: BTreeMap::new(),
             tokens_in: 0,
             tokens_out: 0,
+            done: false,
+            finish_reason: None,
         }
+    }
+
+    /// Whether the stream ended the way a provider ends a finished reply:
+    /// `[DONE]` or a `finish_reason`. Also rejects a reply cut at the token
+    /// limit while it was still emitting a tool call.
+    fn check_complete(&self) -> Result<(), LlmError> {
+        if !self.done && self.finish_reason.is_none() {
+            return Err(LlmError::Transport(
+                "stream ended before [DONE] or a finish_reason".into(),
+            ));
+        }
+        check_finish_reason(self.finish_reason.as_deref(), !self.tool_calls.is_empty())
     }
 
     /// Parse one streaming line. Returns `Ok(Some(text))` when the line
@@ -437,6 +468,7 @@ impl StreamAccumulator {
             None => return Ok(None), // comments / keep-alives
         };
         if payload == "[DONE]" {
+            self.done = true;
             return Ok(None);
         }
         let chunk: OaStreamChunk =
@@ -447,6 +479,9 @@ impl StreamAccumulator {
         }
         let mut emit: Option<String> = None;
         for choice in chunk.choices {
+            if let Some(reason) = choice.finish_reason {
+                self.finish_reason = Some(reason);
+            }
             let delta = choice.delta;
             if let Some(text) = delta.content
                 && !text.is_empty()
@@ -503,6 +538,8 @@ struct OaStreamChunk {
 #[derive(Deserialize)]
 struct OaStreamChoice {
     delta: OaStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -534,8 +571,10 @@ struct OaStreamToolFn {
 /// carries: the call id, the dotted `extension.tool` name, and the
 /// JSON-encoded `arguments` string. Shared by the blocking ([`complete`])
 /// and streaming ([`StreamAccumulator::finish`]) paths so both decode
-/// arguments and split the name identically. Malformed argument JSON
-/// degrades to an empty object rather than failing the whole turn.
+/// arguments and split the name identically. Malformed argument JSON does NOT
+/// degrade to `{}` (that would run the tool with no arguments): the raw text is
+/// parked under [`MALFORMED_ARGS_KEY`] and the loop answers the call with a
+/// tool error instead of dispatching it.
 ///
 /// [`complete`]: OpenAiLlmBackend::complete
 fn build_tool_call_record(
@@ -544,7 +583,7 @@ fn build_tool_call_record(
     name: &str,
     raw_args: &str,
 ) -> ToolCallRecord {
-    let args: serde_json::Value = serde_json::from_str(raw_args).unwrap_or(serde_json::json!({}));
+    let args = parse_tool_args(raw_args);
     let (extension_id, tool_name) = codec.decode(name);
     ToolCallRecord {
         call_id,
@@ -552,6 +591,53 @@ fn build_tool_call_record(
         tool_name,
         args,
     }
+}
+
+/// Longest slice of unparseable arguments echoed back to the model.
+const MALFORMED_ARGS_ECHO_BYTES: usize = 512;
+
+/// Parse a tool call's JSON-encoded `arguments`. A blank string is a call with
+/// no arguments (`{}`); text that is not valid JSON becomes
+/// `{ MALFORMED_ARGS_KEY: "<prefix of the raw text>" }`.
+fn parse_tool_args(raw_args: &str) -> serde_json::Value {
+    if raw_args.trim().is_empty() {
+        return serde_json::json!({});
+    }
+    match serde_json::from_str(raw_args) {
+        Ok(value) => value,
+        Err(_) => {
+            let mut cut = raw_args.len().min(MALFORMED_ARGS_ECHO_BYTES);
+            while !raw_args.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            serde_json::json!({ MALFORMED_ARGS_KEY: &raw_args[..cut] })
+        }
+    }
+}
+
+/// Map a non-2xx, non-5xx reply: 429 is a retryable rate limit, the rest are
+/// deterministic client errors.
+fn map_client_error(status: reqwest::StatusCode, body: &str) -> LlmError {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        LlmError::RateLimited(format!("{status}: {body}"))
+    } else {
+        LlmError::BadRequest(format!("{status}: {body}"))
+    }
+}
+
+/// Reject a reply the model cut off at its token limit while writing a tool
+/// call: the arguments are a truncated prefix and must not be executed. A
+/// text reply cut the same way is kept (it is still the model's answer).
+fn check_finish_reason(finish_reason: Option<&str>, has_tool_calls: bool) -> Result<(), LlmError> {
+    if finish_reason == Some("length") {
+        if has_tool_calls {
+            return Err(LlmError::Decode(
+                "response hit the token limit in the middle of a tool call".into(),
+            ));
+        }
+        tracing::warn!("llm reply truncated at the token limit (finish_reason=length)");
+    }
+    Ok(())
 }
 
 /// Encode an `(extension_id, tool_name)` pair into a single OpenAI function
@@ -826,6 +912,52 @@ mod tests {
         assert_eq!(resp.tool_calls[0].args, serde_json::json!({"q":"x"}));
         assert_eq!(resp.tokens_in, 7);
         assert_eq!(resp.tokens_out, 9);
+    }
+
+    #[test]
+    fn malformed_tool_arguments_are_flagged_not_silently_emptied() {
+        let args = parse_tool_args(r#"{"q": "unterminated"#);
+        assert!(args.get(MALFORMED_ARGS_KEY).is_some(), "{args}");
+        assert_eq!(parse_tool_args(""), serde_json::json!({}));
+        assert_eq!(parse_tool_args(r#"{"q":1}"#), serde_json::json!({"q":1}));
+    }
+
+    #[test]
+    fn a_stream_without_done_or_finish_reason_is_a_transport_error() {
+        let mut acc = StreamAccumulator::new();
+        acc.push_line(r#"data: {"choices":[{"delta":{"content":"par"}}]}"#)
+            .expect("parse");
+        assert!(matches!(acc.check_complete(), Err(LlmError::Transport(_))));
+        acc.push_line("data: [DONE]").expect("parse");
+        assert!(acc.check_complete().is_ok());
+    }
+
+    #[test]
+    fn a_finish_reason_alone_completes_the_stream() {
+        let mut acc = StreamAccumulator::new();
+        acc.push_line(r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#)
+            .expect("parse");
+        assert!(acc.check_complete().is_ok());
+    }
+
+    #[test]
+    fn length_cutoff_inside_a_tool_call_is_rejected() {
+        let mut acc = StreamAccumulator::new();
+        acc.push_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"kb_FN_lookup","arguments":"{"}}]},"finish_reason":"length"}]}"#,
+        )
+        .expect("parse");
+        assert!(matches!(acc.check_complete(), Err(LlmError::Decode(_))));
+        assert!(check_finish_reason(Some("length"), false).is_ok());
+    }
+
+    #[test]
+    fn http_429_is_a_retryable_rate_limit() {
+        let err = map_client_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        assert!(matches!(err, LlmError::RateLimited(_)));
+        assert!(err.is_retryable());
+        let err = map_client_error(reqwest::StatusCode::BAD_REQUEST, "no");
+        assert!(matches!(err, LlmError::BadRequest(_)));
     }
 
     #[test]

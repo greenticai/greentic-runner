@@ -150,9 +150,83 @@ impl TenantContext {
     }
 }
 
+/// Longest tenant / env / session id accepted from an untrusted source.
+const MAX_ID_LEN: usize = 256;
+
+/// Reject a tenant or env id that could escape its slot in a Redis key
+/// (`aw:{tenant}:{env}:...`) or a URL path: empty, over-long, or containing
+/// `:`, `/`, `\\`, `..` or a control character.
+pub fn validate_scope_id(kind: &str, id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err(format!("{kind} id is empty"));
+    }
+    if id.len() > MAX_ID_LEN {
+        return Err(format!("{kind} id is longer than {MAX_ID_LEN} bytes"));
+    }
+    if id.contains(['/', '\\', ':']) || id.contains("..") || id.chars().any(char::is_control) {
+        return Err(format!("{kind} id contains a forbidden character"));
+    }
+    Ok(())
+}
+
+/// Reject a session id that is empty, over-long, or could traverse a path or
+/// carry a control character. Unlike tenant/env ids a session id MAY contain
+/// `:` (dispatch correlation ids use `::` markers) because it is always the
+/// LAST variable segment of a key.
+pub fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("session id is empty".to_string());
+    }
+    if id.len() > MAX_ID_LEN * 4 {
+        return Err("session id is too long".to_string());
+    }
+    if id.contains(['/', '\\']) || id.contains("..") || id.chars().any(char::is_control) {
+        return Err("session id contains a forbidden character".to_string());
+    }
+    Ok(())
+}
+
+/// Percent-encode one URL path segment (RFC 3986 unreserved characters pass
+/// through), so an id can never add `/`, `?` or `..` to a request path.
+pub fn percent_encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_ids_reject_separators_traversal_and_empties() {
+        assert!(validate_scope_id("tenant", "acme-1").is_ok());
+        for bad in ["", "a:b", "a/b", "..", "a..b", "a\\b", "a\nb"] {
+            assert!(validate_scope_id("tenant", bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_scope_id("tenant", &"x".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn session_ids_allow_correlation_colons_but_not_traversal() {
+        assert!(validate_session_id("s1::pack=p::flow=f").is_ok());
+        for bad in ["", "a/b", "..", "a\u{0}b"] {
+            assert!(validate_session_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn percent_encoding_neutralises_path_metacharacters() {
+        assert_eq!(percent_encode_segment("acme-1_x.y"), "acme-1_x.y");
+        assert_eq!(percent_encode_segment("a/b?c#d e"), "a%2Fb%3Fc%23d%20e");
+        assert_eq!(percent_encode_segment("é"), "%C3%A9");
+    }
 
     #[test]
     fn key_prefix_formats_as_expected() {

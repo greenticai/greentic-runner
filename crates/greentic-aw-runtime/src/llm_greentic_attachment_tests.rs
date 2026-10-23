@@ -381,8 +381,9 @@ async fn an_error_that_is_not_an_image_refusal_is_never_retried() {
             .await
             .unwrap_err();
         assert_eq!(p.calls(), 1, "not retried: {expected}");
+        // A 429 surfaces as the retryable `RateLimited`; the rest stay 4xx.
         assert!(
-            matches!(&err, LlmError::BadRequest(m) if *m == expected),
+            matches!(&err, LlmError::BadRequest(m) | LlmError::RateLimited(m) if *m == expected),
             "the error surfaces unchanged: {err:?} vs {expected}"
         );
     }

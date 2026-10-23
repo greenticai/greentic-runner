@@ -186,9 +186,7 @@ impl SessionLockInner for RedisSessionLock {
             if refreshed == 1 {
                 Ok(())
             } else {
-                Err(StateError::Redis(
-                    "lock no longer owned by this holder".into(),
-                ))
+                Err(StateError::LockLost)
             }
         })
     }

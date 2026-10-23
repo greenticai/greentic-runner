@@ -25,13 +25,26 @@ pub const LLM_COMPLETE_TOOL: &str = "complete";
 /// Host-resolved credential passed to the bridge per call (spec Decision 1:
 /// the host resolves creds and passes them in the request; the extension is a
 /// stateless bridge). `secret_ref` is reserved for a future hardening path.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct BridgeCredential {
     pub provider: String,
     pub model: String,
     pub api_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+}
+
+// Manual `Debug`: the derived one would print `api_key` into any log line that
+// formats a request or credential.
+impl std::fmt::Debug for BridgeCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeCredential")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 /// The wire payload sent to the bridge's `complete` tool.
@@ -182,6 +195,13 @@ mod tests {
     use crate::config::LlmProviderRef;
     use crate::state::ToolCallRecord;
     use std::sync::Mutex;
+
+    #[test]
+    fn credential_debug_redacts_the_api_key() {
+        let dbg = format!("{:?}", cred());
+        assert!(!dbg.contains("sk-test"), "{dbg}");
+        assert!(dbg.contains("<redacted>"));
+    }
 
     fn cred() -> BridgeCredential {
         BridgeCredential {

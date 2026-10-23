@@ -197,3 +197,30 @@ fn map_trust_error_folds_into_signature() {
         other => panic!("expected Signature, got {other:?}"),
     }
 }
+
+#[test]
+fn validate_component_ref_rejects_traversal_and_separators() {
+    for bad in [
+        "", "..", "../x", "a/b", "a\\b", ".hidden", "a..b", "a b", "a?b", "a%2fb",
+    ] {
+        assert!(
+            validate_component_ref(bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    for good in ["router_echo", "my-ext.v2", "A1"] {
+        assert!(validate_component_ref(good).is_ok(), "{good:?} must pass");
+    }
+}
+
+#[tokio::test]
+async fn ensure_cached_rejects_traversal_ref_before_any_io() {
+    let err = ensure_cached("../../etc/x", "1.0.0", "00")
+        .await
+        .expect_err("traversal must fail");
+    assert!(matches!(err, StorePullError::Config(_)), "{err:?}");
+    let err = ensure_cached("ok", "1/../2", "00")
+        .await
+        .expect_err("bad version must fail");
+    assert!(matches!(err, StorePullError::Config(_)), "{err:?}");
+}

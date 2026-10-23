@@ -76,14 +76,16 @@ impl ConversationState {
     /// Truncate the oldest messages until the count of non-system messages is
     /// at or below `max_turns`.
     ///
-    /// System messages are always kept. The unit of removal is a GROUP: an
-    /// assistant turn carrying `tool_calls` goes together with the `Tool`
-    /// results that answer it (a provider refuses a `tool` message with no
-    /// preceding `tool_calls`, and an assistant `tool_calls` turn with no
-    /// answer), and a stray `Tool` is removed alone. The group holding the
-    /// parked flow tool's call is never removed, so the result stays
-    /// answerable; if only protected groups remain, truncation stops short of
-    /// `max_turns`.
+    /// System messages are always kept. The unit of removal is a whole TURN:
+    /// a `User` message together with everything up to the next `User`
+    /// (assistant replies, assistant `tool_calls` and the `Tool` results that
+    /// answer them). Removing a turn at a time keeps every `tool_calls` /
+    /// `Tool` pair together and leaves the history starting at a `User`
+    /// message, which providers require. The turn holding the parked flow
+    /// tool's call is never removed (its result must stay answerable), and
+    /// neither is the newest turn, so truncating mid-step cannot discard the
+    /// message being answered; if only protected turns remain, truncation
+    /// stops short of `max_turns`.
     pub fn truncate_history(&mut self, max_turns: u32) {
         let max = max_turns as usize;
         let pending_id = self.pending_tool.as_ref().map(|p| p.call_id.clone());
@@ -96,29 +98,32 @@ impl ConversationState {
             if non_system <= max {
                 return;
             }
-            let Some((start, end)) = self.oldest_removable_group(pending_id.as_deref()) else {
+            let Some((start, end)) = self.oldest_removable_turn(pending_id.as_deref()) else {
                 return;
             };
             self.messages.drain(start..end);
         }
     }
 
-    /// `[start, end)` of the oldest non-system group that does not hold
-    /// `protected_call_id`.
-    fn oldest_removable_group(&self, protected_call_id: Option<&str>) -> Option<(usize, usize)> {
+    /// `[start, end)` of the oldest non-system turn that is neither the newest
+    /// turn nor the one holding `protected_call_id`.
+    fn oldest_removable_turn(&self, protected_call_id: Option<&str>) -> Option<(usize, usize)> {
         let mut i = 0;
         while i < self.messages.len() {
             if matches!(self.messages[i], ChatMessage::System { .. }) {
                 i += 1;
                 continue;
             }
+            // A turn runs from its `User` message to the next `User`.
             let mut end = i + 1;
-            if matches!(&self.messages[i],
-                ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+            while end < self.messages.len()
+                && !matches!(self.messages[end], ChatMessage::User { .. })
             {
-                while matches!(self.messages.get(end), Some(ChatMessage::Tool { .. })) {
-                    end += 1;
-                }
+                end += 1;
+            }
+            if end >= self.messages.len() {
+                // The newest turn is never removed.
+                return None;
             }
             let holds_protected = protected_call_id.is_some_and(|id| {
                 self.messages[i..end].iter().any(|m| match m {
@@ -136,6 +141,32 @@ impl ConversationState {
         }
         None
     }
+}
+
+/// Largest serialised size of one tool result kept in the conversation
+/// history. A single unbounded result (a big MCP or HTTP response) would
+/// otherwise be re-sent on every later turn until it overflowed the model's
+/// context window and bricked the session.
+pub const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+
+/// Bound a tool result before it is stored in history. A result within
+/// [`MAX_TOOL_RESULT_BYTES`] is returned unchanged; a larger one is replaced
+/// by a small JSON object the model can read, carrying a prefix of the
+/// original text.
+pub fn cap_tool_result(result: serde_json::Value) -> serde_json::Value {
+    let text = result.to_string();
+    if text.len() <= MAX_TOOL_RESULT_BYTES {
+        return result;
+    }
+    let mut cut = MAX_TOOL_RESULT_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    serde_json::json!({
+        "truncated": true,
+        "original_bytes": text.len(),
+        "preview": &text[..cut],
+    })
 }
 
 /// How long a parked flow tool waits for the user before the next turn
@@ -584,6 +615,42 @@ mod tests {
         );
         assert!(pairing_is_valid(&s.messages), "{:?}", s.messages);
     }
+    #[test]
+    fn truncate_removes_whole_turns_and_starts_at_a_user_message() {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = vec![
+            user("a"),
+            asst_calls(&["c1"]),
+            tool("c1"),
+            asst_text("done a"),
+            user("b"),
+            asst_text("r"),
+        ];
+        // Dropping 2 messages would split turn one; the whole turn goes.
+        s.truncate_history(4);
+        assert!(matches!(s.messages.first(), Some(ChatMessage::User { .. })));
+        assert_eq!(s.messages.len(), 2, "{:?}", s.messages);
+        assert!(pairing_is_valid(&s.messages));
+    }
+
+    #[test]
+    fn truncate_never_removes_the_newest_turn() {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = vec![user("q"), asst_calls(&["c1"]), tool("c1"), asst_text("r")];
+        s.truncate_history(1);
+        assert_eq!(s.messages.len(), 4);
+    }
+
+    #[test]
+    fn cap_tool_result_passes_small_and_bounds_large() {
+        let small = serde_json::json!({ "ok": true });
+        assert_eq!(cap_tool_result(small.clone()), small);
+        let big = serde_json::json!({ "blob": "é".repeat(MAX_TOOL_RESULT_BYTES) });
+        let capped = cap_tool_result(big);
+        assert_eq!(capped["truncated"], true);
+        assert!(capped.to_string().len() < MAX_TOOL_RESULT_BYTES + 200);
+    }
+
     #[test]
     #[allow(clippy::unwrap_used)]
     fn user_message_without_attachments_serializes_exactly_as_before() {
