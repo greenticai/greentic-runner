@@ -261,7 +261,11 @@ impl HttpBillingMeter {
     /// GET `{base}/v1/tenants/{tenant_id}/wallet` and parse the `available`
     /// field (string) to i64. Returns `None` on any error (fail-open).
     async fn fetch_available(&self, tenant_id: &str) -> Option<i64> {
-        let url = format!("{}/v1/tenants/{tenant_id}/wallet", self.base_url);
+        let url = format!(
+            "{}/v1/tenants/{}/wallet",
+            self.base_url,
+            crate::tenant::percent_encode_segment(tenant_id)
+        );
         let res = self
             .http
             .get(&url)

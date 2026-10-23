@@ -179,6 +179,11 @@ impl LlmBackend for GreenticLlmBackend {
                         .await
                         .map_err(|_| LlmError::BadRequest(first.to_string()))?
                 }
+                // A 429 is transient; every other greentic-llm error stays
+                // deterministic (auth/config) so the retry decorator skips it.
+                Err(e @ greentic_llm::LlmError::Status { status: 429, .. }) => {
+                    return Err(LlmError::RateLimited(e.to_string()));
+                }
                 Err(e) => return Err(LlmError::BadRequest(e.to_string())),
             };
             Ok(map_response(response, &codec))

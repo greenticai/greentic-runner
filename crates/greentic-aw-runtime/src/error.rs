@@ -35,6 +35,9 @@ pub enum AgentError {
     #[error("session lock could not be acquired within wait window")]
     LockTimeout,
 
+    #[error("session lock was lost mid-step; aborting without saving")]
+    LockLost,
+
     #[error("loop exceeded max iterations")]
     MaxIterations,
 
@@ -51,6 +54,18 @@ pub enum AgentError {
         message: String,
         details: Option<String>,
     },
+}
+
+impl LlmError {
+    /// Whether a fresh attempt can succeed: provider 5xx, 429 and transport
+    /// failures are transient; 4xx and undecodable replies are deterministic.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::ServiceUnavailable | Self::RateLimited(_) | Self::Transport(_)
+        )
+    }
 }
 
 impl AgentError {
@@ -95,6 +110,11 @@ pub enum StateError {
     Decode(String),
     #[error("lock acquisition timed out after {0:?}")]
     LockTimeout(std::time::Duration),
+    /// A held lock is no longer owned by this holder (expired and possibly
+    /// taken by another worker). Distinct from a transient backend error on
+    /// refresh: the step must stop rather than save over the new owner's state.
+    #[error("session lock no longer owned by this holder")]
+    LockLost,
 }
 
 #[derive(Debug, Error)]
@@ -103,6 +123,9 @@ pub enum LlmError {
     ServiceUnavailable,
     #[error("provider returned 4xx: {0}")]
     BadRequest(String),
+    /// Provider returned 429. Retryable, unlike the other 4xx-class errors.
+    #[error("provider rate limited: {0}")]
+    RateLimited(String),
     #[error("transport: {0}")]
     Transport(String),
     #[error("decode: {0}")]
@@ -207,6 +230,15 @@ mod tests {
             budget,
             AgentError::Internal("x".into()).user_facing_message(&cfg)
         );
+    }
+
+    #[test]
+    fn rate_limits_and_transport_errors_are_retryable_but_4xx_is_not() {
+        assert!(LlmError::ServiceUnavailable.is_retryable());
+        assert!(LlmError::RateLimited("429".into()).is_retryable());
+        assert!(LlmError::Transport("reset".into()).is_retryable());
+        assert!(!LlmError::BadRequest("400".into()).is_retryable());
+        assert!(!LlmError::Decode("bad".into()).is_retryable());
     }
 
     #[test]

@@ -369,24 +369,25 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
 #[tokio::test]
 async fn llm_provider_unavailable_after_retries_returns_error() {
     use greentic_aw_runtime::error::LlmError;
-    use greentic_aw_runtime::llm::{LlmBackend, RetryingLlmBackend};
+    use greentic_aw_runtime::llm::LlmBackend;
 
-    // Scripted backend returns ServiceUnavailable 3 times; RetryingLlmBackend
-    // (attempts=3, tiny backoff) exhausts all retries → loop returns
-    // LlmProviderUnavailable.
+    // Scripted backend returns ServiceUnavailable 3 times; the loop applies
+    // the agent's `llm_retry_attempts` (default 3) itself, exhausts all
+    // retries → loop returns LlmProviderUnavailable.
     let inner = MockLlmBackend::new(vec![
         Err(LlmError::ServiceUnavailable),
         Err(LlmError::ServiceUnavailable),
         Err(LlmError::ServiceUnavailable),
     ]);
-    let llm: Arc<dyn LlmBackend> =
-        Arc::new(RetryingLlmBackend::new(inner, 3, Duration::from_millis(1)));
+    let llm: Arc<dyn LlmBackend> = Arc::new(inner);
 
     let store = Arc::new(MockAgentStateStore::new());
     let telemetry = Arc::new(MockTelemetry::new());
     let cp = MockConfigProvider::new();
     let tc = TenantContext::new("acme", "prod");
-    cp.insert(&tc, "a", cfg(8, 60_000, vec![], None));
+    let mut config = cfg(8, 60_000, vec![], None);
+    config.limits.llm_retry_backoff = Duration::from_millis(1);
+    cp.insert(&tc, "a", config);
     let cp = Arc::new(cp);
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger = Arc::new(NoopToolLedger);

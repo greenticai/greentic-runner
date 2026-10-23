@@ -17,6 +17,7 @@ use aw_event_bridge::{AgentDispatchInvoker, InvokeOutcome, run_bridge, run_bridg
 use serde_json::{Value, json};
 
 use crate::dispatch_ledger::{DispatchLedger, NoopDispatchLedger};
+use crate::error::TerminationReason;
 use crate::tenant::TenantContext;
 use crate::{AgentInput, AgentRuntime};
 
@@ -93,6 +94,23 @@ fn extract_user_text(input: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Whether a step that ended for `reason` produced a usable result.
+///
+/// A step cut short by the wall-clock timeout, the iteration cap or an error
+/// ends with an empty reply; reporting that as `ok: true` made the caller's
+/// flow carry on as if the agent had answered. The output keeps its
+/// `{reply, trail, terminated_by}` shape either way, so a consumer can read
+/// `terminated_by` to tell which limit was hit.
+fn step_succeeded(reason: &TerminationReason) -> bool {
+    !matches!(
+        reason,
+        TerminationReason::Timeout
+            | TerminationReason::MaxIterations
+            | TerminationReason::Error
+            | TerminationReason::TokenBudgetExceeded
+    )
+}
+
 /// Resolve the session id for the step.
 ///
 /// Prefers an explicit `session_id` field in the input; otherwise falls back to
@@ -141,8 +159,13 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
             }
         }
 
+        // Tenant, env and session ids arrive from the wire and become Redis key
+        // segments: refuse the ones that could alias another tenant's keys.
+        crate::tenant::validate_scope_id("tenant", tenant).map_err(anyhow::Error::msg)?;
+        crate::tenant::validate_scope_id("env", env).map_err(anyhow::Error::msg)?;
         let user_text = extract_user_text(&input);
         let session_id = resolve_session_id(&input, idempotency_key);
+        crate::tenant::validate_session_id(&session_id).map_err(anyhow::Error::msg)?;
         let tenant_ctx = TenantContext::new(tenant, env);
         // Forward-compatible: honour a `conversational` flag on the dispatch
         // input if the caller (engine remote-dispatch) supplies it, so the
@@ -175,16 +198,20 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
             "terminated_by": output.terminated_by,
         });
 
-        // Record the result for future redeliveries (best-effort: a ledger
-        // write error is logged but does NOT fail the dispatch).
-        if let Some(key) = idempotency_key
+        let ok = step_succeeded(&output.terminated_by);
+
+        // Record a successful result for future redeliveries (best-effort: a
+        // ledger write error is logged but does NOT fail the dispatch). A
+        // timed-out / exhausted step is not cached, so a retry can succeed.
+        if ok
+            && let Some(key) = idempotency_key
             && let Err(e) = self.ledger.record(key, outcome_output.clone()).await
         {
             tracing::warn!(key, error = %e, "dispatch ledger record failed; redelivery will re-run step");
         }
 
         Ok(InvokeOutcome {
-            ok: true,
+            ok,
             output: outcome_output,
             events: vec![],
         })
@@ -425,6 +452,16 @@ mod env_gate_tests {
 #[cfg(all(test, feature = "test-mock"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limit_terminations_are_not_reported_as_success() {
+        assert!(step_succeeded(&TerminationReason::FinalReply));
+        assert!(step_succeeded(&TerminationReason::ConversationEnded));
+        assert!(step_succeeded(&TerminationReason::AwaitingToolInput));
+        assert!(!step_succeeded(&TerminationReason::Timeout));
+        assert!(!step_succeeded(&TerminationReason::MaxIterations));
+        assert!(!step_succeeded(&TerminationReason::Error));
+    }
 
     #[test]
     fn extract_user_text_accepts_node_and_raw_shapes() {

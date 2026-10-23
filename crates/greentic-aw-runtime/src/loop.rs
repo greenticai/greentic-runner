@@ -6,8 +6,15 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::error::{AgentError, LlmError, TerminationReason};
-use crate::llm::LlmRequest;
+// Spelled `feature, test` (not `test, feature`) so the source-pinning tests
+// that split this file at the first `all(test, feature = "test-mock")` marker
+// still see the whole production half.
+#[cfg(all(feature = "test-mock", test))]
+#[path = "loop_resilience_tests.rs"]
+mod resilience_tests;
+
+use crate::error::{AgentError, LlmError, StateError, TerminationReason};
+use crate::llm::{LlmBackend, LlmRequest};
 use crate::state::{ChatMessage, ConversationState};
 use crate::telemetry::StepTelemetryCtx;
 use crate::tenant::TenantContext;
@@ -53,6 +60,61 @@ fn preflight_warn_tools(agent_id: &str, missing: &[crate::tools::MissingTool], d
         "{}",
         message
     );
+}
+
+/// Stop the step when its session lock is no longer ours.
+///
+/// A refresh that fails for a transient reason only logs (losing one
+/// extension is preferable to aborting a partially-complete turn), but a lock
+/// that is genuinely gone means another worker may now own the session:
+/// carrying on would let two turns race and the last save win.
+async fn ensure_lock_held(lock: &crate::state::SessionLock) -> Result<(), AgentError> {
+    match lock.refresh().await {
+        Ok(()) => Ok(()),
+        Err(StateError::LockLost) => {
+            warn!("session lock lost mid-step; aborting without saving");
+            Err(AgentError::LockLost)
+        }
+        Err(e) => {
+            warn!(error = %e, "lock refresh failed; continuing");
+            Ok(())
+        }
+    }
+}
+
+/// Whether `call` addresses a host built-in tool (`recall_memory`,
+/// `remember`, `recall`, `end_conversation`): the reserved `host` extension AND
+/// the tool name. Matching the name alone would let any MCP/component tool
+/// that happens to be called `recall` be silently routed to host memory.
+fn is_host_tool(call: &crate::state::ToolCallRecord, tool_name: &str) -> bool {
+    call.extension_id == HOST_EXTENSION_ID && call.tool_name == tool_name
+}
+
+/// Extension id the host built-in tools are declared under.
+const HOST_EXTENSION_ID: &str = "host";
+
+/// Record the telemetry for a step that ends in an error. Without this an
+/// LLM failure or a lost lock left no trace in the step metrics.
+#[allow(clippy::too_many_arguments)]
+fn record_error_exit(
+    runtime: &AgentRuntime,
+    tenant: &TenantContext,
+    session_id: &str,
+    agent_id: &str,
+    iterations: u32,
+    total_tokens: u64,
+    started: Instant,
+) {
+    runtime.telemetry.record_step(&StepTelemetryCtx {
+        tenant_id: tenant.tenant_id.clone(),
+        env_id: tenant.env_id.clone(),
+        session_id: session_id.to_string(),
+        agent_id: agent_id.to_string(),
+        terminated_by: TerminationReason::Error,
+        iterations,
+        total_tokens,
+        duration: started.elapsed(),
+    });
 }
 
 /// One agent turn.
@@ -367,7 +429,14 @@ async fn run_step_scoped(
                 },
             )
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                warn!(
+                    agent_id = %config.agent_id,
+                    error = %e,
+                    "long-term recall failed; the turn proceeds without recalled facts"
+                );
+                Default::default()
+            });
         crate::long_term::augment_system_prompt(&config.system_prompt, &facts)
     } else {
         config.system_prompt.clone()
@@ -582,16 +651,32 @@ async fn run_step_scoped(
     for iter in iter_range {
         iterations = iter + 1;
 
-        // Extend the lock TTL each iteration; losing the extension is
-        // preferable to aborting a partially-complete turn.
-        if let Err(e) = lock.refresh().await {
-            warn!(error = %e, "lock refresh failed; continuing");
+        // Extend the lock TTL each iteration. A transient refresh failure only
+        // logs; a lock that is no longer ours aborts the step (see
+        // `ensure_lock_held`).
+        if let Err(e) = ensure_lock_held(&lock).await {
+            record_error_exit(
+                runtime,
+                &tenant,
+                session_id,
+                agent_id,
+                iterations,
+                total_tokens,
+                started,
+            );
+            return Err(e);
         }
 
         if started.elapsed() >= config.limits.timeout {
             terminated_by = TerminationReason::Timeout;
             break;
         }
+
+        // Bound the history BEFORE every LLM call, not only on the success
+        // path: a session whose history had outgrown the model's context used
+        // to fail every later call and, since truncation never ran on the
+        // error paths, could never recover.
+        state.truncate_history(config.limits.max_history_turns);
 
         let mut tools_schema = catalogs.list_for_llm(&runtime.ext_runtime, &config.tools);
         if lt_active {
@@ -627,23 +712,52 @@ async fn run_step_scoped(
         // tokens, but usage only arrives in the stream's final chunk; those
         // partial tokens are NOT metered here. This matches the blocking
         // path, which likewise meters nothing when complete() errors.
-        let llm_result = if observer.wants_streaming() {
-            let obs = observer.clone();
-            let on_delta: crate::llm::OnDelta =
-                Box::new(move |chunk: &str| obs.on_token_delta(chunk));
-            runtime.llm.complete_streaming(request, on_delta).await
-        } else {
-            runtime.llm.complete(request).await
-        };
-        let response = match llm_result {
-            Ok(r) => r,
-            Err(LlmError::ServiceUnavailable) => {
-                let _ = runtime.state_store.save(&tenant, session_id, &state).await;
-                return Err(AgentError::LlmProviderUnavailable);
+        //
+        // The call goes through the retry decorator configured by the agent's
+        // `llm_retry_*` limits and is bounded by what is left of the step's
+        // wall-clock budget.
+        let retrying = crate::llm::retrying_for(&runtime.llm, &config.limits);
+        let remaining = config.limits.timeout.saturating_sub(started.elapsed());
+        let llm_call = async {
+            if observer.wants_streaming() {
+                let obs = observer.clone();
+                let on_delta: crate::llm::OnDelta =
+                    Box::new(move |chunk: &str| obs.on_token_delta(chunk));
+                retrying.complete_streaming(request, on_delta).await
+            } else {
+                retrying.complete(request).await
             }
-            Err(other) => {
-                let _ = runtime.state_store.save(&tenant, session_id, &state).await;
-                return Err(AgentError::Llm(other));
+        };
+        let llm_result = match tokio::time::timeout(remaining, llm_call).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(agent_id = %agent_id, "llm call exceeded the step timeout");
+                terminated_by = TerminationReason::Timeout;
+                break;
+            }
+        };
+        let mut response = match llm_result {
+            Ok(r) => r,
+            Err(e) => {
+                // Persist the (bounded) history so far; a failed save is
+                // logged, not swallowed.
+                state.truncate_history(config.limits.max_history_turns);
+                if let Err(save_err) = runtime.state_store.save(&tenant, session_id, &state).await {
+                    warn!(error = %save_err, "state save failed after llm error");
+                }
+                record_error_exit(
+                    runtime,
+                    &tenant,
+                    session_id,
+                    agent_id,
+                    iterations,
+                    total_tokens,
+                    started,
+                );
+                return Err(match e {
+                    LlmError::ServiceUnavailable => AgentError::LlmProviderUnavailable,
+                    other => AgentError::Llm(other),
+                });
             }
         };
 
@@ -685,6 +799,9 @@ async fn run_step_scoped(
 
         // --- Mixed text + tool_calls: tool_calls win (spec Decision 12) ---
         if !response.tool_calls.is_empty() {
+            // Empty / repeated provider call ids would alias ledger entries and
+            // break the call <-> result pairing in history.
+            crate::tools::ensure_unique_call_ids(&mut response.tool_calls);
             // --- Host built-in: `end_conversation` (conversational agents) ---
             // Agent-driven exit signal (SP1). Short-circuit BEFORE recording the
             // multi-tool assistant message so saved history carries no dangling
@@ -694,7 +811,7 @@ async fn run_step_scoped(
                 && let Some(end_call) = response
                     .tool_calls
                     .iter()
-                    .find(|c| c.tool_name == crate::end_conversation::END_CONVERSATION_TOOL)
+                    .find(|c| is_host_tool(c, crate::end_conversation::END_CONVERSATION_TOOL))
             {
                 observer.on_tool_call(&end_call.tool_name, &end_call.call_id, &end_call.args);
                 let closing = end_call
@@ -738,7 +855,43 @@ async fn run_step_scoped(
                 content: response.content.clone().unwrap_or_default(),
                 tool_calls: response.tool_calls.clone(),
             });
+            // Set once a tool call exhausted the step's time budget: later calls
+            // in the batch are answered with an error instead of run.
+            let mut step_timed_out = false;
             for call in response.tool_calls {
+                if step_timed_out {
+                    state.messages.push(ChatMessage::Tool {
+                        call_id: call.call_id.clone(),
+                        content: serde_json::json!({
+                            "error": "step timed out before this tool ran"
+                        }),
+                    });
+                    continue;
+                }
+                // --- The model's arguments were not valid JSON ---
+                // Never run the tool on made-up (empty) arguments: tell the
+                // model so it can re-issue the call correctly.
+                if let Some(raw) = call.args.get(crate::llm::MALFORMED_ARGS_KEY) {
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let err_obs = serde_json::json!({
+                        "error": "tool arguments were not valid JSON; re-issue the call with a valid JSON object",
+                        "received": raw,
+                    });
+                    observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
+                    state.messages.push(ChatMessage::Tool {
+                        call_id: call.call_id.clone(),
+                        content: err_obs.clone(),
+                    });
+                    trail.push(AgentStep::ToolCall {
+                        name: call.tool_name.clone(),
+                        call_id: call.call_id.clone(),
+                        args: call.args.clone(),
+                        result: err_obs,
+                        duration_ms: 0,
+                    });
+                    turn_had_tool_error = true;
+                    continue;
+                }
                 // --- A flow tool earlier in this batch parked on the user ---
                 // Every later call still gets a result so no tool_call dangles
                 // in history, but none of them runs: the user must answer first.
@@ -756,7 +909,7 @@ async fn run_step_scoped(
                 // --- Host built-in: `recall_memory` (long-term lookup) ---
                 // Intercepted before the allow-list + WASM dispatch; routed to
                 // the runtime's long-term backend instead of an extension.
-                if lt_active && call.tool_name == crate::long_term::RECALL_MEMORY_TOOL {
+                if lt_active && is_host_tool(&call, crate::long_term::RECALL_MEMORY_TOOL) {
                     observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                     let t0 = Instant::now();
                     let result = host_recall_memory(runtime, &tenant, &call).await;
@@ -778,7 +931,7 @@ async fn run_step_scoped(
                 // --- Host built-in: short-term `remember` / `recall` ---
                 // Intercepted before the allow-list + WASM dispatch; routed to
                 // the runtime's short-term backend instead of an extension.
-                if st_active && call.tool_name == crate::short_term::REMEMBER_TOOL {
+                if st_active && is_host_tool(&call, crate::short_term::REMEMBER_TOOL) {
                     observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                     let t0 = Instant::now();
                     let result = host_remember(runtime, &tenant, session_id, &call).await;
@@ -797,7 +950,7 @@ async fn run_step_scoped(
                     });
                     continue;
                 }
-                if st_active && call.tool_name == crate::short_term::RECALL_TOOL {
+                if st_active && is_host_tool(&call, crate::short_term::RECALL_TOOL) {
                     observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                     let t0 = Instant::now();
                     let result = host_recall(runtime, &tenant, session_id, &call).await;
@@ -834,13 +987,15 @@ async fn run_step_scoped(
                 }
 
                 // --- Idempotency: reuse a previously-recorded result ---
-                match runtime.ledger.get(&tenant, session_id, &call.call_id).await {
-                    Ok(Some(cached)) => {
+                let ledger_id = crate::tools::ledger_call_id(&call);
+                match runtime.ledger.get(&tenant, session_id, &ledger_id).await {
+                    // A cached failure report is not a result worth replaying.
+                    Ok(Some(cached)) if !crate::tools::is_error_result(&cached) => {
                         observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                         observer.on_tool_result(&call.tool_name, &call.call_id, &cached);
                         state.messages.push(ChatMessage::Tool {
                             call_id: call.call_id.clone(),
-                            content: cached,
+                            content: crate::state::cap_tool_result(cached),
                         });
                         trail.push(AgentStep::ToolCallReused {
                             name: call.tool_name.clone(),
@@ -848,7 +1003,7 @@ async fn run_step_scoped(
                         });
                         continue;
                     }
-                    Ok(None) => {} // fall through to dispatch
+                    Ok(_) => {} // fall through to dispatch
                     Err(e) => {
                         warn!(error = %e, "ledger get failed; dispatching without idempotency");
                     }
@@ -933,14 +1088,26 @@ async fn run_step_scoped(
                         }
                     }
                 } else {
-                    catalogs
-                        .dispatch(
+                    let remaining = config.limits.timeout.saturating_sub(started.elapsed());
+                    match tokio::time::timeout(
+                        remaining,
+                        catalogs.dispatch(
                             runtime.ext_runtime.clone(),
                             call.clone(),
                             &tenant,
                             Some(&mut state.a2a),
-                        )
-                        .await
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            step_timed_out = true;
+                            Err(AgentError::ToolDispatch(
+                                "tool call exceeded the step timeout".into(),
+                            ))
+                        }
+                    }
                 };
                 let result = match dispatched {
                     Ok(r) => r,
@@ -991,18 +1158,20 @@ async fn run_step_scoped(
                     );
                 }
 
-                // Record successful result in ledger (best-effort).
-                if let Err(e) = runtime
-                    .ledger
-                    .record(&tenant, session_id, &call.call_id, result.clone())
-                    .await
+                // Record successful result in ledger (best-effort). A tool that
+                // reports failure as `{"error": ...}` stays retryable.
+                if !crate::tools::is_error_result(&result)
+                    && let Err(e) = runtime
+                        .ledger
+                        .record(&tenant, session_id, &ledger_id, result.clone())
+                        .await
                 {
                     warn!(error = %e, "ledger record failed; continuing");
                 }
 
                 state.messages.push(ChatMessage::Tool {
                     call_id: call.call_id.clone(),
-                    content: result.clone(),
+                    content: crate::state::cap_tool_result(result.clone()),
                 });
                 trail.push(AgentStep::ToolCall {
                     name: call.tool_name.clone(),
@@ -1011,6 +1180,10 @@ async fn run_step_scoped(
                     result,
                     duration_ms,
                 });
+            }
+            if step_timed_out {
+                terminated_by = TerminationReason::Timeout;
+                break;
             }
             if suspension.is_some() {
                 // The turn ends here, waiting on the user. The assistant text
@@ -1088,6 +1261,7 @@ async fn run_step_scoped(
         });
 
         state.truncate_history(config.limits.max_history_turns);
+        ensure_lock_held(&lock).await?;
         if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
             warn!(error = %e, "state save failed at end of step");
         }
@@ -1163,6 +1337,7 @@ async fn run_step_scoped(
     let side_turn = side_pending
         && crate::flow_suspend::finish_side_turn(&mut state, &mut terminated_by, &mut suspension);
     state.truncate_history(config.limits.max_history_turns);
+    ensure_lock_held(&lock).await?;
     if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
         warn!(error = %e, "state save failed at end of step");
     }

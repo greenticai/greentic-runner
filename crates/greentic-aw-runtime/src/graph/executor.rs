@@ -35,7 +35,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::tenant::TenantContext;
 
-use super::checkpoint::{CheckpointError, CheckpointStore, GraphRunRecord, RunStatus};
+use super::checkpoint::{
+    CheckpointError, CheckpointStore, GraphRunRecord, NodeVisitOutcome, RunStatus,
+};
 use super::model::{GraphConfig, GraphError, NodeKind};
 use super::router::route;
 use super::state::{GraphRole, GraphRunState};
@@ -935,7 +937,8 @@ impl GraphExecutor {
                             };
 
                             let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
-                            self.store
+                            let outcome = self
+                                .store
                                 .record_node_visit(
                                     tenant,
                                     run_id,
@@ -944,12 +947,17 @@ impl GraphExecutor {
                                     &serde_json::json!({"decision": branch}),
                                 )
                                 .await?;
+                            // A visit already ledgered for this attempt (duplicate
+                            // resume racing another decision) wins: honour the
+                            // STORED decision so both resumes take the same edge.
+                            let (branch, replayed, next_cursor) =
+                                resolve_decision(&cfg, &cursor, branch, next_cursor, outcome)?;
 
                             trail.push(serde_json::json!({
                                 "node": cursor,
                                 "kind": "approval",
                                 "attempt": attempt,
-                                "replayed": false,
+                                "replayed": replayed,
                                 "branch": branch,
                             }));
 
@@ -1017,11 +1025,17 @@ impl GraphExecutor {
 
         // Effect not yet recorded — invoke and record before returning.
         let value = invoke().await?;
-        // Record BEFORE checkpoint (replayable resume ordering).
-        self.store
+        // Record BEFORE checkpoint (replayable resume ordering). If a concurrent
+        // duplicate resume recorded first, its stored value is canonical: return
+        // that (as replayed) so both resumes continue from the same result.
+        match self
+            .store
             .record_node_visit(tenant, run_id, node_id, attempt, &value)
-            .await?;
-        Ok((value, false))
+            .await?
+        {
+            NodeVisitOutcome::Recorded => Ok((value, false)),
+            NodeVisitOutcome::Replayed(stored) => Ok((stored, true)),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1725,6 +1739,48 @@ fn next_linear(cfg: &GraphConfig, id: &str) -> Result<String, GraphExecError> {
                 "node '{id}' has no outgoing edge"
             )))
         })
+}
+
+/// Reconcile an approval decision with the outcome of recording its node visit.
+///
+/// `Recorded` keeps the caller's decision. `Replayed(stored)` means another
+/// resume already ledgered this attempt, so the STORED decision is authoritative:
+/// its edge is looked up and returned so a duplicate resume cannot fork the run.
+/// Returns `(branch, replayed, next_cursor)`.
+fn resolve_decision(
+    cfg: &GraphConfig,
+    node_id: &str,
+    branch: String,
+    next_cursor: String,
+    outcome: NodeVisitOutcome,
+) -> Result<(String, bool, String), GraphExecError> {
+    let NodeVisitOutcome::Replayed(stored) = outcome else {
+        return Ok((branch, false, next_cursor));
+    };
+    let stored_branch = stored
+        .get("decision")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            GraphExecError::Graph(GraphError::Invalid(format!(
+                "approval node '{node_id}': stored decision record is malformed"
+            )))
+        })?;
+    if stored_branch == branch {
+        return Ok((branch, true, next_cursor));
+    }
+    let next = cfg
+        .graph
+        .edges_from(node_id)
+        .find(|e| e.branch.as_deref() == Some(stored_branch.as_str()))
+        .map(|e| e.to.clone())
+        .ok_or_else(|| {
+            GraphExecError::Graph(GraphError::Invalid(format!(
+                "approval node '{node_id}': stored decision branch '{stored_branch}' does not \
+                 match any outgoing edge"
+            )))
+        })?;
+    Ok((stored_branch, true, next))
 }
 
 /// Resolve the single join node for a parallel region by forward BFS from the
@@ -3075,6 +3131,48 @@ mod tests {
 
     fn approval_cfg() -> GraphConfig {
         GraphConfig::from_json(&approval_json()).expect("approval fixture is valid")
+    }
+
+    #[test]
+    fn resolve_decision_prefers_the_stored_decision_on_replay() {
+        let cfg = approval_cfg();
+        // Recorded: caller's decision stands.
+        let (b, replayed, next) = resolve_decision(
+            &cfg,
+            "approval",
+            "approved".into(),
+            "respond".into(),
+            NodeVisitOutcome::Recorded,
+        )
+        .expect("recorded");
+        assert_eq!(
+            (b.as_str(), replayed, next.as_str()),
+            ("approved", false, "respond")
+        );
+
+        // Replayed with a different stored branch that has no edge: surfaced, not ignored.
+        let err = resolve_decision(
+            &cfg,
+            "approval",
+            "approved".into(),
+            "respond".into(),
+            NodeVisitOutcome::Replayed(serde_json::json!({"decision": "rejected"})),
+        );
+        assert!(
+            err.is_err(),
+            "stored branch must be honoured, not discarded"
+        );
+
+        // Replayed with the same branch: flagged as replayed.
+        let (_, replayed, _) = resolve_decision(
+            &cfg,
+            "approval",
+            "approved".into(),
+            "respond".into(),
+            NodeVisitOutcome::Replayed(serde_json::json!({"decision": "approved"})),
+        )
+        .expect("same");
+        assert!(replayed);
     }
 
     /// Test 17: an approval node with an `Awaiting` `ApprovalFn` parks the run
