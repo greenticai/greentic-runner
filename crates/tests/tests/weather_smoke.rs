@@ -14,10 +14,7 @@ use tokio::time::sleep;
 async fn weather_smoke() -> Result<()> {
     let pack_path = match env::var("WEATHER_PACK_PATH") {
         Ok(path) => path,
-        Err(_) => {
-            eprintln!("skipping: set WEATHER_PACK_PATH to a .gtpack for the live smoke test");
-            return Ok(());
-        }
+        Err(_) => bail!("set WEATHER_PACK_PATH to a .gtpack for the live smoke test"),
     };
     let flow_id = env::var("WEATHER_FLOW_ID").unwrap_or_else(|_| "weather_flow".to_string());
     let bindings_path = env::var("WEATHER_BINDINGS_PATH")

@@ -136,6 +136,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # The three crates.io publish lanes must list the same crates in the same
+  # dependency order; drift half-publishes a release (see #655).
+  publish-lists:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert publish lanes agree on the crate list
+        run: bash ci/assert_publish_crate_lists_match.sh
+
   toolchain-check:
     runs-on: ubuntu-latest
     steps:
@@ -145,8 +154,8 @@ jobs:
         run: |
           set -euo pipefail
           BASE="https://raw.githubusercontent.com/greenticai/.github/main/toolchain"
-          curl -sL "${BASE}/host/rust-toolchain.toml" -o /tmp/canonical-toolchain.toml
-          curl -sL "${BASE}/rustfmt.toml" -o /tmp/canonical-rustfmt.toml
+          curl -fsSL "${BASE}/host/rust-toolchain.toml" -o /tmp/canonical-toolchain.toml
+          curl -fsSL "${BASE}/rustfmt.toml" -o /tmp/canonical-rustfmt.toml
           if ! diff -q rust-toolchain.toml /tmp/canonical-toolchain.toml >/dev/null 2>&1; then
             echo "::warning::rust-toolchain.toml differs from canonical host variant"
             diff rust-toolchain.toml /tmp/canonical-toolchain.toml || true
@@ -179,4 +188,4 @@ jobs:
           GREENTIC_HEAVY_WASM: "1"
         run: |
           cargo test -p greentic-runner-host --test component_v06_introspection --features component-v0-6-introspection --locked
-          cargo test -p greentic-runner --test contract_cli contract_pack_rejects_mismatched_artifact --locked
+          cargo test -p greentic-runner --test contract_cli contract_pack_rejects_mismatched_artifact --locked -- --ignored

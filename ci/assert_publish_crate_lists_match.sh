@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Assert the two crates.io publish lanes agree on which crates they publish.
+# Assert the crates.io publish lanes agree on which crates they publish.
 #
-# `release-binaries.yml` (tag `v*`) and `crates-publish.yml` (tag
-# `runnercrates-v*`) both call the shared greenticai/.github publish workflow.
-# The list is duplicated in the two files with nothing keeping them in sync.
+# `release-binaries.yml` (tag `v*`), `crates-publish.yml` (tag
+# `runnercrates-v*`) and `dev-publish.yml` (develop) all call the shared
+# greenticai/.github publish workflow. The list is duplicated in the three
+# files with nothing but this check keeping them in sync.
 #
 # When they drift, the damage is silent and only shows up mid-release: cargo
 # strips `path` when packaging, so each crate is verified against its
@@ -21,6 +22,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 release="${repo_root}/.github/workflows/release-binaries.yml"
 publish="${repo_root}/.github/workflows/crates-publish.yml"
+dev="${repo_root}/.github/workflows/dev-publish.yml"
 
 extract_crate_list() {
   local file="$1"
@@ -45,17 +47,19 @@ extract_crate_list() {
 
 release_list="$(extract_crate_list "${release}")"
 publish_list="$(extract_crate_list "${publish}")"
+dev_list="$(extract_crate_list "${dev}")"
 
-if [[ "${release_list}" != "${publish_list}" ]]; then
-  echo "ERROR: the two crates.io publish lanes disagree on the crate list." >&2
+if [[ "${release_list}" != "${publish_list}" || "${release_list}" != "${dev_list}" ]]; then
+  echo "ERROR: the crates.io publish lanes disagree on the crate list." >&2
   echo >&2
   echo "  release-binaries.yml: ${release_list}" >&2
   echo "  crates-publish.yml:   ${publish_list}" >&2
+  echo "  dev-publish.yml:      ${dev_list}" >&2
   echo >&2
-  echo "Both must list the same crates in the same dependency order — a crate" >&2
+  echo "All must list the same crates in the same dependency order — a crate" >&2
   echo "missing from either lane half-publishes a release (see #655)." >&2
   exit 1
 fi
 
-echo "OK: both publish lanes agree on the crate list."
+echo "OK: all publish lanes agree on the crate list."
 echo "    ${release_list}"

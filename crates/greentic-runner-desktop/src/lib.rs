@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use greentic_pack::reader::{VerifyReport, open_pack};
 use greentic_runner_host::RunnerWasiPolicy;
 use greentic_runner_host::config::{
@@ -297,6 +297,17 @@ pub fn desktop_defaults() -> RunOptions {
     }
 }
 
+/// Directory packs carry no signature, so they cannot satisfy a strict
+/// signing policy. Refuse them rather than silently skipping verification.
+fn ensure_directory_pack_allowed(signing: SigningPolicy) -> Result<()> {
+    if signing == SigningPolicy::Strict {
+        bail!(
+            "pack verification failed: directory packs are unsigned and cannot be run under the strict signing policy"
+        );
+    }
+    Ok(())
+}
+
 fn resolve_secrets_manager(opts: &RunOptions) -> Result<DynSecretsManager> {
     if let Some(manager) = opts.secrets_manager.clone() {
         Ok(manager)
@@ -368,6 +379,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             }
         }
     } else {
+        ensure_directory_pack_allowed(opts.signing)?;
         note_verify_outcome(&recorder, VerifyOutcome::DirectorySkipped);
     }
 
@@ -568,9 +580,10 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         opts.session_state_dir.as_deref(),
         resolved_profile.session_id.as_str(),
     );
-    let resume_snapshot = session_snapshot_path
-        .as_deref()
-        .and_then(load_session_snapshot);
+    let resume_snapshot = match session_snapshot_path.as_deref() {
+        Some(path) => load_session_snapshot(path)?,
+        None => None,
+    };
 
     let execution = if let Some(snapshot) = resume_snapshot {
         // A parked snapshot OUTRANKS `entry_node`. A card parks awaiting the
@@ -653,27 +666,39 @@ fn session_snapshot_file(session_state_dir: Option<&Path>, session_id: &str) -> 
     if session_id.is_empty() {
         return None;
     }
-    let safe_id: String = session_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ':' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    // Escape every byte outside a small safe set so distinct session ids
+    // always map to distinct files ("a/b" -> "a%2fb", never colliding with
+    // "a_b"). The escape character itself is escaped, which keeps the
+    // mapping injective.
+    let mut safe_id = String::with_capacity(session_id.len());
+    for byte in session_id.bytes() {
+        let ch = char::from(byte);
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+            safe_id.push(ch);
+        } else {
+            safe_id.push_str(&format!("%{byte:02x}"));
+        }
+    }
     Some(dir.join(format!("{safe_id}.snapshot.json")))
 }
 
-/// Load a persisted `FlowSnapshot` from disk if one exists. Returns `None`
-/// when the file is missing or unreadable — the caller falls back to a
-/// fresh execution in that case (which is also the pre-resume behaviour).
+/// Load a persisted `FlowSnapshot` from disk if one exists. A missing file
+/// means "no parked run" (`Ok(None)`); an unreadable or corrupt file is an
+/// error, since silently restarting at the flow entry would drop the user's
+/// parked state.
 fn load_session_snapshot(
     path: &Path,
-) -> Option<greentic_runner_host::runner::engine::FlowSnapshot> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+) -> Result<Option<greentic_runner_host::runner::engine::FlowSnapshot>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read session snapshot {}", path.display()));
+        }
+    };
+    let snapshot = serde_json::from_slice(&bytes)
+        .with_context(|| format!("corrupt session snapshot {}", path.display()))?;
+    Ok(Some(snapshot))
 }
 
 /// Persist a `FlowSnapshot` to disk for later resume. Errors propagate to
@@ -1484,7 +1509,32 @@ fn redact_recursive(value: &Value, path: &str, acc: &mut Vec<String>) -> Value {
 
 fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    const MARKERS: [&str; 5] = ["secret", "token", "password", "authorization", "cookie"];
+    // LLM usage counters contain "token" but are not credentials.
+    const TOKEN_COUNTERS: [&str; 8] = [
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    ];
+    if TOKEN_COUNTERS.contains(&lower.as_str()) {
+        return false;
+    }
+    const MARKERS: [&str; 10] = [
+        "secret",
+        "token",
+        "password",
+        "authorization",
+        "cookie",
+        "api_key",
+        "apikey",
+        "private_key",
+        "credential",
+        "bearer",
+    ];
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
@@ -1913,7 +1963,9 @@ mod tests {
             serde_json::from_value(snapshot_json.clone()).expect("deserialize seed snapshot");
 
         save_session_snapshot(&snapshot_path, &original).expect("save snapshot");
-        let reloaded = load_session_snapshot(&snapshot_path).expect("load snapshot");
+        let reloaded = load_session_snapshot(&snapshot_path)
+            .expect("load snapshot")
+            .expect("snapshot present");
 
         let original_value = serde_json::to_value(&original).unwrap();
         let reloaded_value = serde_json::to_value(&reloaded).unwrap();
@@ -1932,10 +1984,74 @@ mod tests {
             .file_name()
             .and_then(|n| n.to_str())
             .expect("file name");
-        // `/` -> `_`, but `:`, `-`, `.` are preserved.
-        assert_eq!(file_name, "tenant_team:user-1.session.snapshot.json");
+        // `/` -> `%2f`, but `:`, `-`, `.` are preserved.
+        assert_eq!(file_name, "tenant%2fteam:user-1.session.snapshot.json");
         assert!(session_snapshot_file(None, "any").is_none());
         assert!(session_snapshot_file(Some(tmp.path()), "").is_none());
+    }
+
+    #[test]
+    fn session_snapshot_file_is_injective_for_lookalike_ids() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let slash = session_snapshot_file(Some(tmp.path()), "a/b").expect("path");
+        let underscore = session_snapshot_file(Some(tmp.path()), "a_b").expect("path");
+        let escaped = session_snapshot_file(Some(tmp.path()), "a%2fb").expect("path");
+        assert_ne!(slash, underscore);
+        assert_ne!(slash, escaped);
+    }
+
+    #[test]
+    fn corrupt_session_snapshot_is_an_error_and_missing_is_none() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let missing = tmp.path().join("missing.snapshot.json");
+        assert!(
+            load_session_snapshot(&missing)
+                .expect("missing ok")
+                .is_none()
+        );
+        let corrupt = tmp.path().join("corrupt.snapshot.json");
+        std::fs::write(&corrupt, b"{not json").expect("write corrupt");
+        let err = load_session_snapshot(&corrupt).expect_err("corrupt must error");
+        assert!(
+            err.to_string().contains("corrupt session snapshot"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn directory_packs_are_refused_under_strict_signing() {
+        assert!(ensure_directory_pack_allowed(SigningPolicy::DevOk).is_ok());
+        let err = ensure_directory_pack_allowed(SigningPolicy::Strict).expect_err("strict");
+        assert!(err.to_string().contains("strict signing"), "{err}");
+    }
+
+    #[test]
+    fn redaction_covers_api_keys_but_not_token_counters() {
+        let (redacted, paths) = redact_value(
+            &json!({
+                "api_key": "k1",
+                "apiKey": "k2",
+                "private_key": "k3",
+                "credentials": "k4",
+                "bearer_value": "k5",
+                "max_tokens": 256,
+                "usage": { "prompt_tokens": 3, "total_tokens": 9 }
+            }),
+            "$",
+        );
+        for key in [
+            "api_key",
+            "apiKey",
+            "private_key",
+            "credentials",
+            "bearer_value",
+        ] {
+            assert_eq!(redacted[key], "__REDACTED__", "{key}");
+        }
+        assert_eq!(redacted["max_tokens"], 256);
+        assert_eq!(redacted["usage"]["prompt_tokens"], 3);
+        assert_eq!(redacted["usage"]["total_tokens"], 9);
+        assert_eq!(paths.len(), 5);
     }
 
     #[test]

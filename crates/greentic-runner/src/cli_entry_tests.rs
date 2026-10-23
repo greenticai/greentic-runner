@@ -56,11 +56,14 @@ fn cli_parses_run_flags_and_subcommands() {
         "--config-explain",
     ]);
     assert!(cli.command.is_none());
-    assert_eq!(cli.run.port, 9001);
+    assert_eq!(cli.run.port, Some(9001));
     assert!(cli.run.no_cache && cli.run.json && cli.run.allow_dev && cli.run.config_explain);
     assert_eq!(cli.run.locale.as_deref(), Some("id"));
-    assert!(matches!(cli.run.trace, TraceArg::Always));
-    assert!(matches!(cli.run.trace_capture_inputs, TraceCaptureArg::On));
+    assert!(matches!(cli.run.trace, Some(TraceArg::Always)));
+    assert!(matches!(
+        cli.run.trace_capture_inputs,
+        Some(TraceCaptureArg::On)
+    ));
     assert!(matches!(cli.run.validation, Some(ValidationArg::Warn)));
 
     assert!(matches!(
@@ -441,9 +444,13 @@ fn contract_report_carries_schemas_and_stable_hashes() {
     assert_eq!(report.describe_hash, again.describe_hash);
     assert_eq!(report.schema_hash, again.schema_hash);
 
-    // The legacy `input_schema` field is honoured when `input.schema` is null.
+    // A requested operation that is not first is selected, and the legacy
+    // `input_schema` field is honoured when `input.schema` is null.
     let other = contract_from_describe("other", &typed, "unit".into()).expect("report");
-    assert_eq!(other.selected_operation, "run");
+    assert_eq!(other.selected_operation, "other");
+    assert_eq!(other.input_schema, json!({ "type": "null" }));
+    let unknown = contract_from_describe("missing", &typed, "unit".into()).expect("report");
+    assert_eq!(unknown.selected_operation, "run");
 
     let empty = parse_typed_describe_from_value(json!({}), "t").expect("typed");
     let err = contract_from_describe("run", &empty, "unit".into()).expect_err("no ops");
@@ -530,4 +537,68 @@ async fn contract_with_an_unreadable_pack_fails_to_load() {
     args.pack = Some(dir.path().join("missing.gtpack"));
     args.component = Some("c".into());
     assert!(run_contract(args).await.is_err());
+}
+
+#[test]
+fn operation_selection_finds_a_non_first_requested_operation() {
+    let typed = parse_typed_describe_from_value(
+        json!({ "operations": [ { "id": "first" }, { "id": "second" } ] }),
+        "t",
+    )
+    .expect("typed");
+    assert_eq!(
+        select_operation_from_describe(&typed, "second").as_deref(),
+        Some("second")
+    );
+    // `run` fallback is also found when it is not the first operation.
+    let with_run = parse_typed_describe_from_value(
+        json!({ "operations": [ { "id": "first" }, { "id": "run" } ] }),
+        "t",
+    )
+    .expect("typed");
+    assert_eq!(
+        select_operation_from_describe(&with_run, "missing").as_deref(),
+        Some("run")
+    );
+}
+
+#[test]
+fn port_flag_is_optional_so_env_is_not_always_overridden() {
+    assert_eq!(parse(&["--bindings", "a.gtbind"]).run.port, None);
+}
+
+#[test]
+fn trace_flags_only_override_env_when_given() {
+    let base = TraceConfig {
+        mode: TraceMode::Always,
+        out_path: PathBuf::from("env-trace.json"),
+        buffer_size: 8,
+        capture_inputs: true,
+    };
+    let untouched = build_trace_config(base.clone(), None, None, None);
+    assert_eq!(untouched.mode, TraceMode::Always);
+    assert_eq!(untouched.out_path, PathBuf::from("env-trace.json"));
+    assert!(untouched.capture_inputs);
+
+    let overridden = build_trace_config(
+        base,
+        Some(TraceArg::Off),
+        Some(PathBuf::from("cli-trace.json")),
+        Some(TraceCaptureArg::Off),
+    );
+    assert_eq!(overridden.mode, TraceMode::Off);
+    assert_eq!(overridden.out_path, PathBuf::from("cli-trace.json"));
+    assert!(!overridden.capture_inputs);
+}
+
+#[test]
+fn component_digest_is_verified_before_caching() {
+    let bytes = b"component-bytes";
+    let good = sha256_prefixed(bytes);
+    assert!(verify_component_digest("c", &good, bytes).is_ok());
+    let blake = format!("blake3:{}", blake3::hash(bytes).to_hex());
+    assert!(verify_component_digest("c", &blake, bytes).is_ok());
+    let err = verify_component_digest("c", &good, b"tampered").expect_err("mismatch");
+    assert!(err.to_string().contains("digest mismatch"), "got: {err}");
+    assert!(verify_component_digest("c", "md5:abc", bytes).is_err());
 }

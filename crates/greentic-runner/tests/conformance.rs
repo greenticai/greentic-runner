@@ -56,33 +56,62 @@ async fn conformance_levels_pass() -> Result<()> {
     let pack_path = packs_dir.join("messaging-conformance.gtpack");
     build_conformance_pack(&pack_path)?;
 
-    run_conformance(&packs_dir, "l0", None)?;
-    run_conformance(&packs_dir, "l1", None)?;
-
-    let report_path = temp.path().join("report.json");
-    run_conformance(&packs_dir, "l2", Some(report_path.as_path()))?;
-    let report = fs::read(&report_path).context("read report")?;
-    let value: serde_json::Value = serde_json::from_slice(&report)?;
-    assert_eq!(value["summary"]["failed"], 0);
-    assert_eq!(value["packs"][0]["status"], "pass");
+    for level in ["l0", "l1", "l2"] {
+        let report_path = temp.path().join(format!("report-{level}.json"));
+        let value = run_conformance(&packs_dir, level, &report_path)?;
+        assert_eq!(value["summary"]["failed"], 0, "{level} report: {value}");
+        assert_eq!(value["summary"]["total"], 1, "{level} report: {value}");
+        assert_eq!(
+            value["packs"][0]["status"], "pass",
+            "{level} report: {value}"
+        );
+    }
     Ok(())
 }
 
-fn run_conformance(packs_dir: &Path, level: &str, report: Option<&Path>) -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_greentic-runner"));
-    cmd.arg("conformance")
+#[tokio::test]
+#[serial]
+async fn conformance_fails_when_filter_matches_no_pack() -> Result<()> {
+    let _backend_guard = EnvGuard::set("SECRETS_BACKEND", "env");
+    let temp = TempDir::new()?;
+    let packs_dir = temp.path().join("packs");
+    fs::create_dir_all(&packs_dir)?;
+    build_conformance_pack(&packs_dir.join("messaging-conformance.gtpack"))?;
+
+    let status = Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
+        .arg("conformance")
+        .arg("--packs")
+        .arg(&packs_dir)
+        .arg("--level")
+        .arg("l1")
+        .arg("--provider")
+        .arg("no-such-provider")
+        .status()
+        .context("run conformance")?;
+    assert!(
+        !status.success(),
+        "a filter matching nothing must exit non-zero"
+    );
+    Ok(())
+}
+
+fn run_conformance(packs_dir: &Path, level: &str, report: &Path) -> Result<serde_json::Value> {
+    let status = Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
+        .arg("conformance")
         .arg("--packs")
         .arg(packs_dir)
         .arg("--level")
-        .arg(level);
-    if let Some(report) = report {
-        cmd.arg("--report").arg(report);
-    }
-    let status = cmd.status().context("run conformance")?;
+        .arg(level)
+        .arg("--report")
+        .arg(report)
+        .status()
+        .context("run conformance")?;
+    let bytes = fs::read(report).context("read report")?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
     if !status.success() {
-        anyhow::bail!("conformance command failed");
+        anyhow::bail!("conformance command failed at {level}: {value}");
     }
-    Ok(())
+    Ok(value)
 }
 
 fn build_conformance_pack(pack_path: &Path) -> Result<()> {
