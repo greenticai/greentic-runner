@@ -82,6 +82,8 @@ pub fn load_gtbinds(paths: &[PathBuf]) -> Result<HashMap<String, TenantBindings>
             .map(|flow| flow.id)
             .filter(|id| !id.trim().is_empty())
             .collect::<Vec<_>>();
+        // `" demo"` and `"demo"` are the same tenant; key on the trimmed name.
+        let tenant_key = raw.tenant.trim().to_string();
         let pack = PackBinding {
             pack_id: raw.pack_id,
             pack_ref: raw.pack_ref,
@@ -89,9 +91,9 @@ pub fn load_gtbinds(paths: &[PathBuf]) -> Result<HashMap<String, TenantBindings>
             flows,
         };
         let entry = tenants
-            .entry(raw.tenant.clone())
+            .entry(tenant_key.clone())
             .or_insert_with(|| TenantBindings {
-                tenant: raw.tenant.clone(),
+                tenant: tenant_key.clone(),
                 packs: Vec::new(),
                 env_passthrough: Vec::new(),
             });
@@ -166,6 +168,22 @@ mod tests {
 
     fn write_file(path: &Path, body: &str) {
         fs::write(path, body).expect("write file");
+    }
+
+    #[test]
+    fn tenant_key_is_trimmed() {
+        let dir = std::env::temp_dir().join(format!("gtbind-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let a = dir.join("a.gtbind");
+        let b = dir.join("b.gtbind");
+        std::fs::write(&a, "tenant: \" demo \"\npack_id: pack\npack_ref: pack@1\n").expect("a");
+        std::fs::write(&b, "tenant: demo\npack_id: pack2\npack_ref: pack2@1\n").expect("b");
+        let tenants = load_gtbinds(&[a, b]).expect("load");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(tenants.len(), 1);
+        let demo = tenants.get("demo").expect("trimmed key");
+        assert_eq!(demo.tenant, "demo");
+        assert_eq!(demo.packs.len(), 2);
     }
 
     #[test]

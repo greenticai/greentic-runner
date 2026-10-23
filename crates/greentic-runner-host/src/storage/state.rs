@@ -27,14 +27,36 @@ pub(crate) const STATE_PREFIX: &str = "runner";
 /// serialise every state access in the process behind one connection.
 pub struct StateStoreHost {
     store: Offloaded<dyn StateStore>,
+    /// Expiry applied to every `set_json`. `None` keeps entries until deleted.
+    ttl_secs: Option<u32>,
 }
+
+/// Env var bounding the lifetime of flow state (seconds). Unset or `0` keeps
+/// the historical "never expires" behaviour, which on Redis means abandoned
+/// conversations leave permanent keys.
+pub const STATE_TTL_ENV: &str = "GREENTIC_FLOW_STATE_TTL_SECS";
 
 impl StateStoreHost {
     pub fn new(store: DynStateStore) -> Self {
         Self {
             store: Offloaded::new(store, StoreKind::State),
+            ttl_secs: None,
         }
     }
+
+    /// Expire every state entry written through this host after `ttl_secs`.
+    #[must_use]
+    pub fn with_ttl_secs(mut self, ttl_secs: Option<u32>) -> Self {
+        self.ttl_secs = ttl_secs.filter(|secs| *secs > 0);
+        self
+    }
+}
+
+fn ttl_from_env() -> Option<u32> {
+    std::env::var(STATE_TTL_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|secs| *secs > 0)
 }
 
 pub fn new_state_store() -> DynStateStore {
@@ -81,7 +103,7 @@ fn probe(store: &DynStateStore) -> Result<()> {
 }
 
 pub fn state_host_from(store: DynStateStore) -> Arc<dyn StateHost> {
-    Arc::new(StateStoreHost::new(store))
+    Arc::new(StateStoreHost::new(store).with_ttl_secs(ttl_from_env()))
 }
 
 #[async_trait]
@@ -98,9 +120,10 @@ impl StateHost for StateStoreHost {
     async fn set_json(&self, key: &SessionKey, value: Value) -> GResult<()> {
         let tenant = tenant_ctx_from_key(key)?;
         let state_key = derive_state_key(key);
+        let ttl_secs = self.ttl_secs;
         self.store
             .call(move |store| {
-                store.set_json(&tenant, STATE_PREFIX, &state_key, None, &value, None)
+                store.set_json(&tenant, STATE_PREFIX, &state_key, None, &value, ttl_secs)
             })
             .await
             .map_err(map_state_error)
@@ -117,13 +140,15 @@ impl StateHost for StateStoreHost {
     }
 
     async fn del_prefix(&self, _key_prefix: &str) -> GResult<()> {
-        // Deliberately a no-op, and it must stay one until someone decides
-        // otherwise on purpose. `RedisStateStore::del_prefix` runs an unbounded
-        // `SCAN MATCH` across the whole keyspace, which on a shared Redis is a
-        // cost paid by every other tenant on the box. Nothing in this crate
-        // needs prefix deletion; forwarding would make that cost arrive by
-        // accident. Pinned by `del_prefix_never_reaches_the_backing_store`.
-        Ok(())
+        // Deliberately NOT forwarded: `RedisStateStore::del_prefix` runs an
+        // unbounded `SCAN MATCH` across the whole keyspace, which on a shared
+        // Redis is a cost paid by every other tenant on the box. It used to
+        // return `Ok(())`, which told the caller the keys were deleted when
+        // they were not; it now reports the operation as unsupported so the
+        // caller finds out. Pinned by `del_prefix_is_unsupported_and_never_reaches_the_backing_store`.
+        Err(RunnerError::State {
+            reason: "del_prefix is not supported by the durable state store".to_string(),
+        })
     }
 }
 
@@ -143,11 +168,36 @@ fn tenant_ctx_from_key(key: &SessionKey) -> GResult<TenantCtx> {
     Ok(TenantCtx::new(env_id, tenant_id))
 }
 
+/// Escape `%` and `/` so a segment can never contain the key separator.
+fn escape_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for ch in segment.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Injective key for one session's state.
+///
+/// Segments are escaped (`%` and `/`), so `pack/a/flow/b/session/x` cannot be
+/// produced by a different `(pack, flow, hint)` triple. `-` is the marker for
+/// "no hint"; a literal `-` hint is escaped to `%2D` so the two cannot alias.
+/// Keys without `%`, `/` or a bare `-` hint are identical to the historical
+/// format, so existing state stays addressable.
 fn derive_state_key(key: &SessionKey) -> StoreStateKey {
-    let hint = key.session_hint.as_deref().unwrap_or("-");
+    let hint = match key.session_hint.as_deref() {
+        None => "-".to_string(),
+        Some("-") => "%2D".to_string(),
+        Some(hint) => escape_segment(hint),
+    };
     StoreStateKey::from(format!(
         "pack/{}/flow/{}/session/{hint}",
-        key.pack_id, key.flow_id
+        escape_segment(&key.pack_id),
+        escape_segment(&key.flow_id),
     ))
 }
 
@@ -246,15 +296,15 @@ mod tests {
 
     /// `RedisStateStore::del_prefix` walks the WHOLE keyspace with an unbounded
     /// `SCAN MATCH`, a cost every other tenant on a shared Redis pays. Nothing
-    /// in this crate needs prefix deletion, so the adapter answers it without
-    /// touching the store. If that ever changes it must be a decision, and this
-    /// test is what forces it to be one.
+    /// in this crate needs prefix deletion, so the adapter refuses it (rather
+    /// than pretending to succeed) without touching the store. If that ever
+    /// changes it must be a decision, and this test is what forces it to be one.
     #[tokio::test]
-    async fn del_prefix_never_reaches_the_backing_store() {
+    async fn del_prefix_is_unsupported_and_never_reaches_the_backing_store() {
         let store = Arc::new(RecordingStore::default());
         let host = StateStoreHost::new(store.clone());
 
-        host.del_prefix("runner/pack").await.expect("del_prefix");
+        assert!(host.del_prefix("runner/pack").await.is_err());
 
         assert!(
             store.calls().is_empty(),
@@ -276,6 +326,95 @@ mod tests {
         host.del(&key).await.expect("del");
 
         assert_eq!(store.calls(), vec!["set_json", "get_json", "del"]);
+    }
+
+    #[test]
+    fn state_keys_do_not_alias() {
+        let mut a = sample_key();
+        a.pack_id = "p/flow/f".into();
+        a.flow_id = "x".into();
+        let mut b = sample_key();
+        b.pack_id = "p".into();
+        b.flow_id = "f/session/h".into();
+        b.session_hint = None;
+        assert_ne!(derive_state_key(&a), derive_state_key(&b));
+
+        let mut none = sample_key();
+        none.session_hint = None;
+        let mut dash = sample_key();
+        dash.session_hint = Some("-".into());
+        assert_ne!(derive_state_key(&none), derive_state_key(&dash));
+
+        // Plain keys keep the historical shape.
+        assert_eq!(
+            derive_state_key(&sample_key()),
+            StoreStateKey::from("pack/pack.demo/flow/flow.main/session/hint")
+        );
+    }
+
+    #[derive(Default)]
+    struct TtlRecorder(Mutex<Vec<Option<u32>>>);
+
+    impl StateStore for TtlRecorder {
+        fn get_json(
+            &self,
+            _t: &TenantCtx,
+            _p: &str,
+            _k: &StoreStateKey,
+            _path: Option<&StatePath>,
+        ) -> TypesResult<Option<Value>> {
+            Ok(None)
+        }
+        fn set_json(
+            &self,
+            _t: &TenantCtx,
+            _p: &str,
+            _k: &StoreStateKey,
+            _path: Option<&StatePath>,
+            _v: &Value,
+            ttl_secs: Option<u32>,
+        ) -> TypesResult<()> {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(ttl_secs);
+            }
+            Ok(())
+        }
+        fn set_json_if_absent(
+            &self,
+            _t: &TenantCtx,
+            _p: &str,
+            _k: &StoreStateKey,
+            _v: &Value,
+            _ttl: Option<u32>,
+        ) -> TypesResult<bool> {
+            Ok(true)
+        }
+        fn del(&self, _t: &TenantCtx, _p: &str, _k: &StoreStateKey) -> TypesResult<bool> {
+            Ok(true)
+        }
+        fn del_prefix(&self, _t: &TenantCtx, _p: &str) -> TypesResult<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_ttl_reaches_set_json() {
+        let store = Arc::new(TtlRecorder::default());
+        let host = StateStoreHost::new(store.clone()).with_ttl_secs(Some(90));
+        host.set_json(&sample_key(), Value::Null)
+            .await
+            .expect("set");
+        let plain = StateStoreHost::new(store.clone());
+        plain
+            .set_json(&sample_key(), Value::Null)
+            .await
+            .expect("set");
+        let zero = StateStoreHost::new(store.clone()).with_ttl_secs(Some(0));
+        zero.set_json(&sample_key(), Value::Null)
+            .await
+            .expect("set");
+        let seen = store.0.lock().map(|v| v.clone()).unwrap_or_default();
+        assert_eq!(seen, vec![Some(90), None, None]);
     }
 
     /// The in-memory default must still be reachable with no configuration.

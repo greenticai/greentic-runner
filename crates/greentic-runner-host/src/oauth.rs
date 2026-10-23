@@ -67,19 +67,43 @@ pub fn build_resource_token_request(
     })
 }
 
+/// Build `<base>/resource-token`, normalising the base path so a base without
+/// a trailing slash (`https://host/api`) does not lose its last segment.
+fn resource_token_url(base: &Url) -> Result<Url> {
+    let mut base = base.clone();
+    if !base.path().ends_with('/') {
+        let path = format!("{}/", base.path());
+        base.set_path(&path);
+    }
+    Ok(base.join("resource-token")?)
+}
+
+/// Request a resource token without broker authentication.
+///
+/// Prefer [`request_resource_token_with_auth`] when the broker has a shared
+/// secret configured.
 pub async fn request_resource_token(
     client: &reqwest::Client,
     request: &ResourceTokenRequest,
 ) -> Result<ResourceTokenResponse> {
+    request_resource_token_with_auth(client, request, None).await
+}
+
+/// Async counterpart of [`request_resource_token_blocking`]: when
+/// `shared_secret` is `Some`, an `Authorization: Bearer <secret>` header is sent.
+pub async fn request_resource_token_with_auth(
+    client: &reqwest::Client,
+    request: &ResourceTokenRequest,
+    shared_secret: Option<&str>,
+) -> Result<ResourceTokenResponse> {
     let base = Url::parse(&request.http_base_url)?;
     validate_https_url_no_credentials_and_no_query(&base, "oauth broker http_base_url")?;
-    let url = base.join("resource-token")?;
-    let response = client
-        .post(url)
-        .json(request)
-        .send()
-        .await?
-        .error_for_status()?;
+    let url = resource_token_url(&base)?;
+    let mut rb = client.post(url).json(request);
+    if let Some(secret) = shared_secret {
+        rb = rb.bearer_auth(secret);
+    }
+    let response = rb.send().await?.error_for_status()?;
     Ok(response.json().await?)
 }
 
@@ -115,7 +139,7 @@ pub fn request_resource_token_blocking(
 ) -> anyhow::Result<ResourceTokenResponse> {
     let base = Url::parse(&request.http_base_url)?;
     validate_https_url_no_credentials_and_no_query(&base, "oauth broker http_base_url")?;
-    let url = base.join("resource-token")?;
+    let url = resource_token_url(&base)?;
     let mut rb = client.post(url).json(request);
     if let Some(secret) = shared_secret {
         rb = rb.bearer_auth(secret);
@@ -194,6 +218,20 @@ mod tests {
         let base = Url::parse(&request.http_base_url).expect("base url");
         let url = base.join("resource-token").expect("joined url");
         assert_eq!(url.as_str(), "https://oauth.example/api/resource-token");
+    }
+
+    #[test]
+    fn resource_token_url_keeps_last_segment_without_trailing_slash() {
+        let base = Url::parse("https://oauth.example/api").expect("base");
+        assert_eq!(
+            resource_token_url(&base).expect("url").as_str(),
+            "https://oauth.example/api/resource-token"
+        );
+        let base = Url::parse("https://oauth.example").expect("base");
+        assert_eq!(
+            resource_token_url(&base).expect("url").as_str(),
+            "https://oauth.example/resource-token"
+        );
     }
 
     #[test]

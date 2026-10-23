@@ -6,7 +6,10 @@ use axum::extract::{FromRef, FromRequestParts};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderName};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::runner::ServerState;
 
@@ -16,10 +19,21 @@ pub struct AdminAuth {
 }
 
 impl AdminAuth {
+    /// Build the admin guard.
+    ///
+    /// With no token, admin routes are reachable from loopback peers only.
+    /// That check looks at the TCP peer address, so a reverse proxy running on
+    /// the same host makes every request look like loopback. Set `ADMIN_TOKEN`
+    /// whenever a local proxy fronts this process.
     pub fn new(token: Option<String>) -> Self {
-        Self {
-            token: token.filter(|v| !v.is_empty()),
+        let token = token.filter(|v| !v.is_empty());
+        if token.is_none() {
+            tracing::warn!(
+                "no admin token configured: /admin and /agent endpoints accept any loopback peer; \
+                 a local reverse proxy would bypass this check, set ADMIN_TOKEN to require a bearer token"
+            );
         }
+        Self { token }
     }
 
     fn authorize(&self, addr: SocketAddr, bearer: Option<&str>) -> Result<(), StatusCode> {
@@ -82,23 +96,30 @@ where
 }
 
 fn extract_bearer(parts: &Parts) -> Option<String> {
-    let header = parts.headers.get(AUTHORIZATION)?.to_str().ok()?;
+    bearer_from_headers(&parts.headers, &AUTHORIZATION)
+}
+
+/// Shared bearer-token extractor: case-insensitive `Bearer` scheme, token
+/// trimmed, empty tokens rejected. Used by admin auth and tenant routing.
+pub(crate) fn bearer_from_headers(headers: &HeaderMap, name: &HeaderName) -> Option<String> {
+    let header = headers.get(name)?.to_str().ok()?;
     let (scheme, value) = header.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("Bearer") {
         return None;
     }
-    Some(value.trim().to_string())
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
 }
 
+/// Compare secrets without leaking their length: both sides are hashed to a
+/// fixed-size digest first, then compared with `subtle`.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&left, &right) in a.iter().zip(b.iter()) {
-        diff |= left ^ right;
-    }
-    diff == 0
+    let left = Sha256::digest(a);
+    let right = Sha256::digest(b);
+    left.ct_eq(&right).into()
 }
 
 #[cfg(test)]
@@ -214,6 +235,20 @@ mod tests {
     #[test]
     fn constant_time_eq_rejects_length_mismatch() {
         assert!(!constant_time_eq(b"short", b"longer"));
+        assert!(!constant_time_eq(b"", b"longer"));
+        assert!(constant_time_eq(b"same", b"same"));
+    }
+
+    #[test]
+    fn bearer_extractor_trims_and_rejects_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "BEARER   tok  ".parse().unwrap());
+        assert_eq!(
+            bearer_from_headers(&headers, &AUTHORIZATION).as_deref(),
+            Some("tok")
+        );
+        headers.insert(AUTHORIZATION, "Bearer    ".parse().unwrap());
+        assert_eq!(bearer_from_headers(&headers, &AUTHORIZATION), None);
     }
 
     #[test]

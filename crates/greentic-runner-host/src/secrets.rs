@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::runtime::block_on;
@@ -145,6 +146,10 @@ pub struct CachingSecretsManager {
     inner: DynSecretsManager,
     cache: Mutex<LruCache<String, CacheEntry>>,
     ttl: Duration,
+    /// Bumped by every write/delete. A read only populates the cache when no
+    /// write landed while its backend fetch was in flight, so a stale value
+    /// fetched before a write cannot overwrite the invalidation.
+    generation: AtomicU64,
 }
 
 impl CachingSecretsManager {
@@ -166,6 +171,7 @@ impl CachingSecretsManager {
             inner,
             cache: Mutex::new(LruCache::new(max)),
             ttl,
+            generation: AtomicU64::new(0),
         })
     }
 }
@@ -185,32 +191,43 @@ impl SecretsManager for CachingSecretsManager {
             }
         }
 
+        let generation = self.generation.load(Ordering::SeqCst);
         let data = self.inner.read(path).await?;
 
         {
             let mut cache = self.cache.lock();
-            cache.put(
-                path.to_owned(),
-                CacheEntry {
-                    data: data.clone(),
-                    inserted_at: Instant::now(),
-                },
-            );
+            // Writers bump the generation before and after touching the
+            // backend and pop the entry afterwards, so a read that raced a
+            // write sees a changed generation and skips the insert.
+            if self.generation.load(Ordering::SeqCst) == generation {
+                cache.put(
+                    path.to_owned(),
+                    CacheEntry {
+                        data: data.clone(),
+                        inserted_at: Instant::now(),
+                    },
+                );
+            }
         }
         Ok(data)
     }
 
     async fn write(&self, path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
-        self.inner.write(path, bytes).await?;
-        // Invalidate so the next read sees the fresh value.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.write(path, bytes).await;
+        // Invalidate (also after a failed write: its outcome is unknown) so
+        // the next read sees the fresh value.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.cache.lock().pop(path);
-        Ok(())
+        result
     }
 
     async fn delete(&self, path: &str) -> greentic_secrets_lib::Result<()> {
-        self.inner.delete(path).await?;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.delete(path).await;
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.cache.lock().pop(path);
-        Ok(())
+        result
     }
 }
 
@@ -582,7 +599,18 @@ pub fn write_secret_blocking(
 }
 
 fn ensure_env_secrets_allowed() -> Result<()> {
-    let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+    let env = match std::env::var("GREENTIC_ENV") {
+        Ok(value) => value,
+        Err(_) => {
+            // Documented default, kept for local dev flows. Failing closed is
+            // safer for production but changes behaviour (deferred).
+            tracing::warn!(
+                "GREENTIC_ENV is unset: assuming `local` and allowing the env secrets backend; \
+                 set GREENTIC_ENV explicitly in deployed environments"
+            );
+            "local".to_string()
+        }
+    };
     let env = env.trim().to_ascii_lowercase();
     if matches!(env.as_str(), "local" | "dev" | "test") {
         Ok(())
@@ -1195,6 +1223,7 @@ mod tests {
             inner: inner as DynSecretsManager,
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             ttl: Duration::from_secs(300),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -1246,12 +1275,72 @@ mod tests {
             inner: Arc::clone(&inner) as DynSecretsManager,
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             ttl: Duration::from_millis(1), // expires almost immediately
+            generation: AtomicU64::new(0),
         };
 
         cached.read("secrets://dev/t/team/pack/key").await.unwrap();
         std::thread::sleep(Duration::from_millis(5));
         cached.read("secrets://dev/t/team/pack/key").await.unwrap();
         assert_eq!(inner.reads(), 2, "expired entry should re-fetch");
+    }
+
+    /// Backend whose first read returns the old value only after the test lets
+    /// it go, modelling a slow read racing a write.
+    struct GatedManager {
+        value: Mutex<Vec<u8>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        first: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SecretsManager for GatedManager {
+        async fn read(&self, _path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            let snapshot = self.value.lock().clone();
+            if self.first.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(snapshot)
+        }
+
+        async fn write(&self, _path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+            *self.value.lock() = bytes.to_vec();
+            Ok(())
+        }
+
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_read_does_not_repopulate_cache_after_write() {
+        let inner = Arc::new(GatedManager {
+            value: Mutex::new(b"old".to_vec()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            first: AtomicUsize::new(0),
+        });
+        let cached = Arc::new(CachingSecretsManager {
+            inner: Arc::clone(&inner) as DynSecretsManager,
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())),
+            ttl: Duration::from_secs(300),
+            generation: AtomicU64::new(0),
+        });
+
+        let reader = {
+            let cached = Arc::clone(&cached);
+            tokio::spawn(async move { cached.read("secrets://dev/t/_/p/k").await })
+        };
+        inner.started.notified().await;
+        cached.write("secrets://dev/t/_/p/k", b"new").await.unwrap();
+        inner.release.notify_one();
+        let stale = reader.await.unwrap().unwrap();
+        assert_eq!(stale, b"old");
+
+        let fresh = cached.read("secrets://dev/t/_/p/k").await.unwrap();
+        assert_eq!(fresh, b"new", "stale value must not be cached");
     }
 
     #[test]

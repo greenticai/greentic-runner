@@ -47,12 +47,20 @@ pub struct TraceConfig {
 }
 
 impl TraceConfig {
+    /// Trace capture is opt-in: without `GREENTIC_TRACE_OUT` the mode is `Off`,
+    /// so a stock deployment does not write `./trace.json` (shared by every
+    /// flow in the process) on each failure. Setting the variable, or passing
+    /// an explicit mode via [`Self::with_overrides`], turns it on.
     pub fn from_env() -> Self {
-        let out_path = env::var_os("GREENTIC_TRACE_OUT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_TRACE_FILE));
+        let explicit = env::var_os("GREENTIC_TRACE_OUT").map(PathBuf::from);
+        let mode = if explicit.is_some() {
+            TraceMode::On
+        } else {
+            TraceMode::Off
+        };
+        let out_path = explicit.unwrap_or_else(|| PathBuf::from(DEFAULT_TRACE_FILE));
         Self {
-            mode: TraceMode::On,
+            mode,
             out_path,
             buffer_size: DEFAULT_BUFFER_SIZE,
             capture_inputs: env::var("GREENTIC_TRACE_CAPTURE_INPUTS").ok().as_deref() == Some("1"),
@@ -466,11 +474,19 @@ fn write_trace_atomic(path: &Path, trace: &TraceEnvelope) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(DEFAULT_TRACE_FILE);
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    // Unique per write: concurrent flows (or processes) targeting the same
+    // output path must not interleave bytes in one shared temp file.
+    let tmp = path.with_file_name(format!(
+        "{file_name}.{}.{}.tmp",
+        std::process::id(),
+        generate_audit_event_id()
+    ));
     let payload = serde_json::to_vec_pretty(trace).context("serialize trace")?;
     fs::write(&tmp, payload).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
+    }
     Ok(())
 }
 

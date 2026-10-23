@@ -44,6 +44,8 @@ impl AgentAuditObserver {
     }
 
     fn emit(&self, event: &str, payload: Value) {
+        // (see `summarize_value`: tool args / results / errors never leave the
+        // process verbatim)
         let envelope = build_agent_audit_event(
             &self.tenant,
             &self.agent_id,
@@ -60,6 +62,71 @@ impl AgentAuditObserver {
     }
 }
 
+/// Longest preview kept in an audit event, in characters.
+const PREVIEW_MAX_CHARS: usize = 256;
+/// Nesting depth after which the redactor stops descending.
+const REDACT_MAX_DEPTH: usize = 6;
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "api-key",
+        "cookie",
+        "credential",
+        "private_key",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn redact(value: &Value, depth: usize) -> Value {
+    if depth >= REDACT_MAX_DEPTH {
+        return Value::String("[truncated]".to_string());
+    }
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, val)| {
+                    let val = if is_sensitive_key(key) {
+                        Value::String("[redacted]".to_string())
+                    } else {
+                        redact(val, depth + 1)
+                    };
+                    (key.clone(), val)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(|v| redact(v, depth + 1)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// What an audit event carries instead of a tool's raw arguments / result:
+/// a content hash, the byte size, and a short, key-redacted preview. The raw
+/// value can hold customer data or credentials and the bus is not a secret
+/// store; the hash still lets an auditor correlate an event with the payload
+/// held in the run trace.
+fn summarize_value(value: &Value) -> Value {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let preview_full = serde_json::to_string(&redact(value, 0)).unwrap_or_default();
+    let truncated = preview_full.chars().count() > PREVIEW_MAX_CHARS;
+    let preview: String = preview_full.chars().take(PREVIEW_MAX_CHARS).collect();
+    json!({
+        "blake3": hash,
+        "size_bytes": bytes.len(),
+        "preview": preview,
+        "preview_truncated": truncated,
+    })
+}
+
 impl StepObserver for AgentAuditObserver {
     fn wants_streaming(&self) -> bool {
         false
@@ -74,7 +141,7 @@ impl StepObserver for AgentAuditObserver {
                 "agent_id": self.agent_id,
                 "tool": name,
                 "call_id": call_id,
-                "args": args,
+                "args": summarize_value(args),
             }),
         );
     }
@@ -86,7 +153,7 @@ impl StepObserver for AgentAuditObserver {
                 "agent_id": self.agent_id,
                 "tool": name,
                 "call_id": call_id,
-                "result": result,
+                "result": summarize_value(result),
             }),
         );
     }
@@ -98,7 +165,7 @@ impl StepObserver for AgentAuditObserver {
                 "agent_id": self.agent_id,
                 "tool": name,
                 "call_id": call_id,
-                "error": error,
+                "error": summarize_value(error),
             }),
         );
     }
@@ -170,9 +237,17 @@ mod tests {
             value.get("payload").and_then(|p| p.get("call_id")),
             Some(&json!("c1"))
         );
+        let args = value
+            .get("payload")
+            .and_then(|p| p.get("args"))
+            .expect("args summary");
         assert_eq!(
-            value.get("payload").and_then(|p| p.get("args")),
-            Some(&json!({"url": "https://example.com"}))
+            args.get("blake3").and_then(Value::as_str).map(str::len),
+            Some(64)
+        );
+        assert_eq!(
+            args.get("size_bytes").and_then(Value::as_u64),
+            Some(br#"{"url":"https://example.com"}"#.len() as u64)
         );
 
         assert!(rx.try_recv().is_err(), "exactly one event enqueued");
@@ -194,9 +269,17 @@ mod tests {
                 .expect("type is a string")
                 .ends_with("agent.tool_result")
         );
+        let result = value
+            .get("payload")
+            .and_then(|p| p.get("result"))
+            .expect("result summary");
         assert_eq!(
-            value.get("payload").and_then(|p| p.get("result")),
-            Some(&json!({"ok": true}))
+            result.get("preview").and_then(Value::as_str),
+            Some(r#"{"ok":true}"#)
+        );
+        assert!(
+            result.get("ok").is_none(),
+            "raw result must not be published"
         );
 
         assert!(rx.try_recv().is_err(), "exactly one event enqueued");
@@ -218,9 +301,12 @@ mod tests {
                 .expect("type is a string")
                 .ends_with("agent.tool_result")
         );
-        assert_eq!(
-            value.get("payload").and_then(|p| p.get("error")),
-            Some(&json!({"error": "connection refused"}))
+        assert!(
+            value
+                .get("payload")
+                .and_then(|p| p.get("error"))
+                .and_then(|e| e.get("blake3"))
+                .is_some()
         );
         assert!(
             value.get("payload").and_then(|p| p.get("result")).is_none(),
@@ -228,6 +314,25 @@ mod tests {
         );
 
         assert!(rx.try_recv().is_err(), "exactly one event enqueued");
+    }
+
+    #[tokio::test]
+    async fn tool_result_is_published_as_hash_size_and_redacted_preview() {
+        let (observer, mut rx) = observer_with_channel();
+        let big = "x".repeat(5000);
+        observer.on_tool_result(
+            "http",
+            "c1",
+            &json!({"authorization": "Bearer abc", "body": big}),
+        );
+        let (_subject, bytes) = rx.try_recv().expect("event enqueued");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(!text.contains("Bearer abc"), "secret leaked: {text}");
+        assert!(!text.contains(&"x".repeat(1000)), "payload not truncated");
+        let value: Value = serde_json::from_str(&text).expect("json");
+        let result = &value["payload"]["result"];
+        assert_eq!(result["preview_truncated"], json!(true));
+        assert!(result["size_bytes"].as_u64().unwrap_or(0) > 5000);
     }
 
     #[tokio::test]

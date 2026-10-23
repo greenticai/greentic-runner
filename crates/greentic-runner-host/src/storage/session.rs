@@ -30,15 +30,46 @@ pub type DynSessionStore = Arc<dyn SessionStore>;
 /// The store is held behind [`Offloaded`], so every call reaches it through
 /// `spawn_blocking` — `SessionStore` is a synchronous trait and its Redis
 /// implementation blocks on a socket.
+///
+/// # Known limitation (deferred)
+///
+/// `greentic_session`'s `find_by_user` only sees sessions registered as
+/// *waits*, so against the in-memory and Redis stores a plain `put` is not found
+/// again by `get`. Registering sessions as waits fixes that, but it changes what
+/// the flow engine observes (the parked-flow and resumer end-to-end suites
+/// regress), so it needs an engine-side decision first. `touch` therefore also
+/// cannot enforce a store-level TTL yet.
+///
+/// # Concurrency
+///
+/// Read-modify-write operations (`put`, `update_cas`, `touch`, `delete`) on one
+/// session are serialised by a per-session in-process lock, so two concurrent
+/// `update_cas` calls with the same expected revision cannot both succeed
+/// within one process. The `SessionStore` trait offers no atomic
+/// compare-and-swap, so across processes sharing a Redis store this is still
+/// last-writer-wins; closing that needs a CAS primitive in `greentic-session`.
 pub struct SessionStoreHost {
     store: Offloaded<dyn SessionStore>,
+    locks: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl SessionStoreHost {
     pub fn new(store: DynSessionStore) -> Self {
         Self {
             store: Offloaded::new(store, StoreKind::Session),
+            locks: dashmap::DashMap::new(),
         }
+    }
+
+    /// The in-process lock guarding one session (keyed by its derived user id,
+    /// which covers tenant, pack, flow and hint).
+    fn lock_for(&self, key: &SessionKey) -> GResult<Arc<tokio::sync::Mutex<()>>> {
+        let user = user_id_from_key(key)?;
+        let entry = self
+            .locks
+            .entry(user.as_str().to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+        Ok(Arc::clone(entry.value()))
     }
 
     async fn lookup_entry(&self, key: &SessionKey) -> GResult<Option<StoreEntry>> {
@@ -196,6 +227,8 @@ impl SessionHost for SessionStoreHost {
     }
 
     async fn put(&self, snapshot: SessionSnapshot) -> GResult<()> {
+        let lock = self.lock_for(&snapshot.key)?;
+        let _guard = lock.lock().await;
         let base_ctx = tenant_ctx_from_key(&snapshot.key)?;
         let user = user_id_from_key(&snapshot.key)?;
         let ctx = base_ctx.with_user(Some(user.clone()));
@@ -208,6 +241,8 @@ impl SessionHost for SessionStoreHost {
         mut snapshot: SessionSnapshot,
         expected_revision: u64,
     ) -> GResult<bool> {
+        let lock = self.lock_for(&snapshot.key)?;
+        let _guard = lock.lock().await;
         let Some(entry) = self.lookup_entry(&snapshot.key).await? else {
             return Ok(false);
         };
@@ -220,16 +255,23 @@ impl SessionHost for SessionStoreHost {
     }
 
     async fn delete(&self, key: &SessionKey) -> GResult<()> {
+        let lock = self.lock_for(key)?;
+        let _guard = lock.lock().await;
         if let Some(entry) = self.lookup_entry(key).await? {
             self.store
                 .call(move |store| store.remove_session(&entry.key))
                 .await
                 .map_err(map_store_error)?;
         }
+        // The session is gone; drop its lock entry so the map does not grow
+        // with every conversation ever seen.
+        self.locks.remove(user_id_from_key(key)?.as_str());
         Ok(())
     }
 
     async fn touch(&self, key: &SessionKey, ttl: Duration) -> GResult<()> {
+        let lock = self.lock_for(key)?;
+        let _guard = lock.lock().await;
         if let Some(mut entry) = self.lookup_entry(key).await? {
             entry.snapshot.ttl = ttl;
             self.upsert(&entry.snapshot, entry.ctx, &entry.user).await?;
@@ -287,13 +329,28 @@ fn tenant_ctx_from_key(key: &SessionKey) -> GResult<TenantCtx> {
 }
 
 fn user_id_from_key(key: &SessionKey) -> GResult<UserId> {
-    let hint = key
-        .session_hint
-        .clone()
-        .unwrap_or_else(|| format!("{}::{}::{}", key.tenant_key, key.pack_id, key.flow_id));
-    let digest = Sha256::digest(hint.as_bytes());
+    let digest = Sha256::digest(session_identity(key).as_bytes());
     let slug = format!("sess{}", hex::encode(&digest[..8]));
     UserId::from_str(&slug).map_err(map_store_error)
+}
+
+/// Identity string of one session: tenant, pack, flow AND hint. The hint alone
+/// is not enough: two packs or flows (or tenants) sharing a conversation hint
+/// must not share a store slot. Length-prefixed so segment boundaries cannot
+/// alias (`a::b` + `c` vs `a` + `b::c`).
+fn session_identity(key: &SessionKey) -> String {
+    let hint = key.session_hint.as_deref().unwrap_or("");
+    format!(
+        "{}:{}|{}:{}|{}:{}|{}:{}",
+        key.tenant_key.len(),
+        key.tenant_key,
+        key.pack_id.len(),
+        key.pack_id,
+        key.flow_id.len(),
+        key.flow_id,
+        hint.len(),
+        hint,
+    )
 }
 
 fn map_store_error(err: GreenticError) -> RunnerError {
@@ -801,6 +858,54 @@ mod host_tests {
         host.put(snapshot.clone()).await?;
         let loaded = host.get(&key).await?;
         assert_eq!(loaded, Some(snapshot));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_update_cas_has_a_single_winner() -> Result<()> {
+        let host = host();
+        let key = key_for("cas");
+        host.put(SessionSnapshot::new(key.clone(), "sid".into()))
+            .await?;
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let host = Arc::clone(&host);
+            let key = key.clone();
+            tasks.push(tokio::spawn(async move {
+                host.update_cas(SessionSnapshot::new(key, "sid".into()), 0)
+                    .await
+            }));
+        }
+        let mut wins = 0;
+        for task in tasks {
+            if task.await.map_err(|e| anyhow!("{e}"))?? {
+                wins += 1;
+            }
+        }
+        assert_eq!(wins, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn user_ids_differ_across_pack_flow_and_tenant_for_one_hint() -> Result<()> {
+        let base = key_for("shared-hint");
+        let mut other_pack = base.clone();
+        other_pack.pack_id = "pack.other".into();
+        let mut other_flow = base.clone();
+        other_flow.flow_id = "flow.other".into();
+        let mut other_tenant = base.clone();
+        other_tenant.tenant_key = "local::other".into();
+        let ids = [
+            user_id_from_key(&base)?,
+            user_id_from_key(&other_pack)?,
+            user_id_from_key(&other_flow)?,
+            user_id_from_key(&other_tenant)?,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
         Ok(())
     }
 
