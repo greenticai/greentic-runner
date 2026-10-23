@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 use crate::cache::PruneReport;
 use crate::cache::engine_profile::EngineProfile;
@@ -71,6 +72,17 @@ impl DiskCache {
             self.delete_entry(&paths)?;
             return Ok(None);
         }
+        // Integrity: the artifact is later passed to `Component::deserialize`
+        // (unsafe), so refuse anything whose hash does not match the metadata.
+        let expected_hash = meta.artifact_sha256.as_deref();
+        if expected_hash != Some(sha256_hex(&artifact_bytes).as_str()) {
+            tracing::warn!(
+                wasm_digest = %key.wasm_digest,
+                "cached artifact failed integrity check; deleting entry"
+            );
+            self.delete_entry(&paths)?;
+            return Ok(None);
+        }
         self.update_access(&paths, meta).ok();
         Ok(Some(artifact_bytes))
     }
@@ -87,26 +99,44 @@ impl DiskCache {
             bail!("cache metadata digest does not match artifact key");
         }
         let paths = self.paths_for(key)?;
-        fs::create_dir_all(&paths.artifacts_dir).with_context(|| {
+        create_private_dir(&paths.artifacts_dir).with_context(|| {
             format!(
                 "failed to create cache dir {}",
                 paths.artifacts_dir.display()
             )
         })?;
-        fs::create_dir_all(&paths.tmp_dir).with_context(|| {
+        create_private_dir(&paths.tmp_dir).with_context(|| {
             format!("failed to create cache tmp dir {}", paths.tmp_dir.display())
         })?;
         let tmp_artifact = paths.tmp_path("artifact");
         let tmp_meta = paths.tmp_path("meta");
-        fs::write(&tmp_artifact, bytes)
+        let result = self.write_entry(&paths, &tmp_artifact, &tmp_meta, bytes, meta);
+        if result.is_err() {
+            // Never leave partial temp files behind after a failed write.
+            let _ = fs::remove_file(&tmp_artifact);
+            let _ = fs::remove_file(&tmp_meta);
+        }
+        result
+    }
+
+    fn write_entry(
+        &self,
+        paths: &DiskPaths,
+        tmp_artifact: &Path,
+        tmp_meta: &Path,
+        bytes: &[u8],
+        meta: &ArtifactMetadata,
+    ) -> Result<()> {
+        let meta = meta.clone().with_artifact_sha256(sha256_hex(bytes));
+        write_private_file(tmp_artifact, bytes)
             .with_context(|| format!("failed to write {}", tmp_artifact.display()))?;
         let meta_json =
-            serde_json::to_vec_pretty(meta).context("failed to serialize cache metadata")?;
-        fs::write(&tmp_meta, meta_json)
+            serde_json::to_vec_pretty(&meta).context("failed to serialize cache metadata")?;
+        write_private_file(tmp_meta, &meta_json)
             .with_context(|| format!("failed to write {}", tmp_meta.display()))?;
-        fs::rename(&tmp_artifact, &paths.artifact_path)
+        fs::rename(tmp_artifact, &paths.artifact_path)
             .with_context(|| format!("failed to rename {}", paths.artifact_path.display()))?;
-        fs::rename(&tmp_meta, &paths.meta_path)
+        fs::rename(tmp_meta, &paths.meta_path)
             .with_context(|| format!("failed to rename {}", paths.meta_path.display()))?;
         Ok(())
     }
@@ -220,9 +250,14 @@ impl DiskCache {
         meta.touch();
         let tmp = paths.tmp_path("meta");
         let json = serde_json::to_vec_pretty(&meta)?;
-        let _ = fs::create_dir_all(&paths.tmp_dir);
-        fs::write(&tmp, json).ok();
-        let _ = fs::rename(&tmp, &paths.meta_path);
+        let _ = create_private_dir(&paths.tmp_dir);
+        if write_private_file(&tmp, &json).is_ok() {
+            if fs::rename(&tmp, &paths.meta_path).is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
         Ok(())
     }
 
@@ -266,6 +301,36 @@ impl DiskPaths {
         let pid = std::process::id();
         self.tmp_dir.join(format!("tmp_{}_{}_{}", pid, now, suffix))
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Create `path` (and parents) restricted to the owner (0700) on unix.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Write `bytes` to `path`, owner read/write only (0600) on unix.
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)
 }
 
 fn digest_to_filename(digest: &str) -> String {

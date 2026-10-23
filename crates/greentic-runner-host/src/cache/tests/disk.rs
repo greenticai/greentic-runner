@@ -147,3 +147,45 @@ fn prune_removes_oldest_entries() {
 
     let _ = fs::metadata(root);
 }
+
+#[test]
+fn tampered_artifact_fails_integrity_check_and_is_deleted() {
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let root = build_cache_root(&temp, &profile);
+    let cache = DiskCache::new(root.clone(), profile.clone(), None);
+
+    let digest = "sha256:feed".to_string();
+    let key = ArtifactKey::new(profile.id().to_string(), digest.clone());
+    let bytes = b"hello".to_vec();
+    let meta = ArtifactMetadata::new(&profile, digest.clone(), bytes.len() as u64);
+    cache.write_atomic(&key, &bytes, &meta).expect("write");
+
+    // Same length, different content: size check passes, hash check must not.
+    let (artifact_path, meta_path) = artifact_paths(&root, &digest);
+    std::fs::write(&artifact_path, b"HELLO").expect("tamper");
+    assert_eq!(cache.try_read(&key).expect("read"), None);
+    assert!(!artifact_path.exists());
+    assert!(!meta_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_dirs_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let root = temp.path().join("fresh-cache");
+    let cache = DiskCache::new(root.clone(), profile.clone(), None);
+    let digest = "sha256:beef".to_string();
+    let key = ArtifactKey::new(profile.id().to_string(), digest.clone());
+    let meta = ArtifactMetadata::new(&profile, digest, 1);
+    cache.write_atomic(&key, b"x", &meta).expect("write");
+    let mode = std::fs::metadata(root.join("artifacts"))
+        .expect("stat")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0);
+}

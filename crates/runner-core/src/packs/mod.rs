@@ -16,6 +16,8 @@ pub use index::{Index, PackEntry, TenantRecord};
 pub use resolver::{FetchResponse, FsResolver, ResolverRegistry};
 pub use verify::PackVerifier;
 
+use verify::parse_verifiers;
+
 mod cache;
 mod index;
 pub mod resolver;
@@ -156,47 +158,157 @@ impl ResolvedSet {
     }
 }
 
+/// Verification policy for [`PackManager`].
+#[derive(Debug, Clone, Default)]
+pub struct PackPolicy {
+    /// Fail closed: a public key and a valid signature are required for every
+    /// pack, and non-filesystem sources must pin a digest.
+    pub verify_strict: bool,
+    /// Extra roots (besides the working directory) that absolute `fs://`
+    /// locators may point into. Confinement is enforced when this is `Some`
+    /// or when `verify_strict` is set; otherwise absolute paths are
+    /// unrestricted (dev behaviour).
+    pub fs_allowed_roots: Option<Vec<PathBuf>>,
+}
+
+impl PackPolicy {
+    /// Read `PACK_VERIFY_STRICT` and `PACK_FS_ALLOWED_ROOTS` (path list).
+    pub fn from_env() -> Self {
+        let verify_strict = std::env::var("PACK_VERIFY_STRICT")
+            .map(|value| is_truthy(&value))
+            .unwrap_or(false);
+        let fs_allowed_roots = std::env::var_os("PACK_FS_ALLOWED_ROOTS")
+            .map(|raw| std::env::split_paths(&raw).collect::<Vec<_>>());
+        Self {
+            verify_strict,
+            fs_allowed_roots,
+        }
+    }
+
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.verify_strict = strict;
+        self
+    }
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Coordinates resolvers, cache, and verification.
 pub struct PackManager {
     cfg: PackConfig,
     cache: PackCache,
     registry: ResolverRegistry,
-    verifier: Option<PackVerifier>,
+    verifiers: Vec<PackVerifier>,
+    policy: PackPolicy,
 }
 
 impl PackManager {
+    /// Build a manager using the policy from the process environment.
     pub fn new(cfg: PackConfig) -> Result<Self> {
-        let verifier = cfg
-            .public_key
-            .as_deref()
-            .map(PackVerifier::from_env_value)
-            .transpose()?;
+        Self::with_policy(cfg, PackPolicy::from_env())
+    }
+
+    pub fn with_policy(cfg: PackConfig, policy: PackPolicy) -> Result<Self> {
+        let verifiers = match cfg.public_key.as_deref() {
+            Some(value) => parse_verifiers(value)?,
+            None => Vec::new(),
+        };
+        if policy.verify_strict && verifiers.is_empty() {
+            bail!("strict pack verification is enabled but no public key is configured");
+        }
         let mut registry = ResolverRegistry::default();
         let fs_root = std::env::current_dir()
             .context("failed to resolve current directory")?
             .canonicalize()
             .context("failed to canonicalize current directory")?;
-        registry.register_builtin(fs_root, cfg.network.as_ref())?;
+        let fs_allowed_roots = match (&policy.fs_allowed_roots, policy.verify_strict) {
+            (Some(roots), _) => Some(roots.clone()),
+            (None, true) => Some(Vec::new()),
+            (None, false) => None,
+        };
+        registry.register_builtin_confined(fs_root, cfg.network.as_ref(), fs_allowed_roots)?;
         Ok(Self {
             cache: PackCache::new(cfg.cache_dir.clone()),
             cfg,
             registry,
-            verifier,
+            verifiers,
+            policy,
         })
+    }
+
+    /// Verify the entry signature against any configured key. The canonical
+    /// identity message `{name, version, digest}` is tried first; the legacy
+    /// digest-only message is still accepted for existing signatures.
+    fn verify_signature(&self, entry: &PackEntry, digest: &PackDigest) -> Result<()> {
+        if self.verifiers.is_empty() {
+            return Ok(());
+        }
+        let signature = entry.signature.as_deref().ok_or_else(|| {
+            anyhow!(
+                "signature missing for pack {} but a public key is configured",
+                entry.reference.name
+            )
+        })?;
+        let canonical = canonical_signing_message(&entry.reference, digest);
+        let mut last_err = None;
+        for verifier in &self.verifiers {
+            match verifier.verify(canonical.as_bytes(), signature) {
+                Ok(()) => return Ok(()),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        for verifier in &self.verifiers {
+            if verifier
+                .verify(digest.as_str().as_bytes(), signature)
+                .is_ok()
+            {
+                // Legacy digest-only signature: still accepted so existing
+                // signed indexes keep working.
+                return Ok(());
+            }
+        }
+        match last_err {
+            Some(err) => Err(err.context(format!(
+                "no configured public key verified the signature for pack {}",
+                entry.reference.name
+            ))),
+            None => bail!("no public key configured"),
+        }
     }
 
     /// Resolve all packs referenced in the provided index.
     pub fn resolve_all_for_index(&self, index: &Index) -> Result<ResolvedSet> {
         let mut tenants = BTreeMap::new();
         for (tenant, record) in index.tenants() {
-            let main = self.resolve_entry(&record.main_pack)?;
-            let mut overlays = Vec::new();
-            for overlay in &record.overlays {
-                overlays.push(self.resolve_entry(overlay)?);
-            }
-            tenants.insert(tenant.clone(), TenantPacks { main, overlays });
+            tenants.insert(tenant.clone(), self.resolve_tenant(record)?);
         }
         Ok(ResolvedSet { tenants })
+    }
+
+    /// Resolve every tenant independently. A failing tenant yields an `Err`
+    /// entry instead of aborting the whole set, so callers can keep serving
+    /// the previous runtime for it while applying the others.
+    pub fn resolve_each_for_index(&self, index: &Index) -> BTreeMap<String, Result<TenantPacks>> {
+        index
+            .tenants()
+            .iter()
+            .map(|(tenant, record)| (tenant.clone(), self.resolve_tenant(record)))
+            .collect()
+    }
+
+    /// Resolve the main pack and overlays for one tenant.
+    pub fn resolve_tenant(&self, record: &TenantRecord) -> Result<TenantPacks> {
+        let main = self.resolve_entry(&record.main_pack)?;
+        let mut overlays = Vec::new();
+        for overlay in &record.overlays {
+            overlays.push(self.resolve_entry(overlay)?);
+        }
+        Ok(TenantPacks { main, overlays })
     }
 
     fn resolve_entry(&self, entry: &PackEntry) -> Result<ResolvedPack> {
@@ -210,6 +322,20 @@ impl PackManager {
             .with_context(|| format!("resolver failed for {}", locator))?;
 
         let fetched_digest = compute_digest(response.path())?;
+        let has_pinned_digest = entry
+            .content_digest
+            .as_ref()
+            .or_else(|| entry.reference.version.as_digest())
+            .is_some();
+        if self.policy.verify_strict
+            && !has_pinned_digest
+            && !locator.to_ascii_lowercase().starts_with("fs://")
+        {
+            bail!(
+                "strict verification requires a pinned digest for remote pack {}",
+                entry.reference.name
+            );
+        }
         if entry
             .content_digest
             .as_ref()
@@ -235,15 +361,7 @@ impl PackManager {
             );
         }
 
-        if let Some(verifier) = &self.verifier {
-            let signature = entry.signature.as_deref().ok_or_else(|| {
-                anyhow!(
-                    "signature missing for pack {} but PACK_PUBLIC_KEY is configured",
-                    entry.reference.name
-                )
-            })?;
-            verifier.verify(fetched_digest.as_str().as_bytes(), signature)?;
-        }
+        self.verify_signature(entry, &fetched_digest)?;
 
         let cached = self.cache.store(entry, response.path(), &fetched_digest)?;
         let PackLoad {
@@ -265,6 +383,18 @@ impl PackManager {
             report,
         })
     }
+}
+
+/// Canonical message signed by pack publishers: binds the pack identity to
+/// its content digest so a valid signature cannot be replayed for another
+/// name/version.
+pub fn canonical_signing_message(reference: &PackRef, digest: &PackDigest) -> String {
+    format!(
+        "greentic-pack-sig-v1\nname={}\nversion={}\ndigest={}",
+        reference.name,
+        reference.version.cache_label(),
+        digest.as_str()
+    )
 }
 
 fn compute_digest(path: &Path) -> Result<PackDigest> {

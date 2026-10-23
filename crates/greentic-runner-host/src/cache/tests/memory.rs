@@ -66,3 +66,17 @@ fn stats_track_hits_and_bytes() {
     assert_eq!(stats.misses, 1);
     assert!(stats.total_bytes >= 8);
 }
+
+#[test]
+fn second_pass_evicts_hot_entries_when_first_pass_evicts_nothing() {
+    let cache = MemoryCache::new(10, 1);
+    let component = build_component();
+    let hot = key("sha256:hot");
+    cache.insert(hot.clone(), Arc::clone(&component), 6, false);
+    cache.get(&hot);
+    // Pinned insert cannot be evicted and the hot entry is LFU-protected in the
+    // first pass, so only the second pass can bring the cache under budget.
+    cache.insert(key("sha256:pinned"), Arc::clone(&component), 6, true);
+    assert!(cache.get(&hot).is_none());
+    assert!(cache.stats().total_bytes <= 10);
+}

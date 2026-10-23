@@ -139,6 +139,10 @@ pub struct PackRuntime {
     /// has no hint". `ArcSwap`-driven revision swaps allocate a fresh
     /// `PackRuntime` so this cache is naturally invalidated.
     identify_hint_cache: RwLock<HashMap<String, Option<IdentifyInstanceHint>>>,
+    /// Components whose describe-identify probe failed recently. Failures are
+    /// remembered only for [`IDENTIFY_FAILURE_BACKOFF`] so a transient error
+    /// does not disable hinting for the lifetime of the runtime.
+    identify_hint_failures: RwLock<HashMap<String, std::time::Instant>>,
     secrets: DynSecretsManager,
     oauth_config: Option<OAuthBrokerConfig>,
     cache: CacheManager,
@@ -231,7 +235,53 @@ impl IdentifyOutcome {
     }
 }
 
-fn run_on_wasi_thread<F, T>(task_name: &'static str, task: F) -> Result<T>
+/// Describe a panic payload from a joined/caught Wasmtime thread.
+fn wasi_panic_reason(err: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = err.downcast_ref::<&str>() {
+        msg.to_string()
+    } else if let Some(msg) = err.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Run `task` on a dedicated OS thread and await its result without parking a
+/// tokio worker (the result is delivered through a oneshot channel).
+async fn run_on_wasi_thread<F, T>(task_name: &'static str, task: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel::<std::thread::Result<Result<T>>>();
+    let builder = std::thread::Builder::new().name(format!("greentic-wasmtime-{task_name}"));
+    builder
+        .spawn(move || {
+            let pid = std::process::id();
+            let thread_id = std::thread::current().id();
+            tracing::info!(
+                event = "wasmtime.thread.start",
+                task = task_name,
+                pid,
+                thread_id = ?thread_id,
+                "starting Wasmtime thread"
+            );
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+            let _ = tx.send(outcome);
+        })
+        .context("failed to spawn Wasmtime thread")?;
+    match rx.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => Err(anyhow!(
+            "Wasmtime thread panicked: {}",
+            wasi_panic_reason(panic.as_ref())
+        )),
+        Err(_) => Err(anyhow!("Wasmtime thread ended without producing a result")),
+    }
+}
+
+/// Synchronous variant for callers that are not async (blocks the caller).
+fn run_on_wasi_thread_blocking<F, T>(task_name: &'static str, task: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
@@ -268,6 +318,16 @@ where
         .and_then(|res| res)
 }
 
+/// How long a failed describe-identify probe suppresses re-probing.
+const IDENTIFY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+fn identify_failure_backoff_active(
+    failed_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    failed_at.is_some_and(|at| now.saturating_duration_since(at) < IDENTIFY_FAILURE_BACKOFF)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ComponentResolution {
     /// Root of a materialized pack directory containing `manifest.cbor` and `components/`.
@@ -282,15 +342,17 @@ pub struct ComponentResolution {
     pub allow_missing_hash: bool,
 }
 
-fn build_blocking_client() -> BlockingClient {
+fn build_blocking_client() -> Result<BlockingClient, String> {
+    // Built on a scratch thread: the blocking client must not be constructed
+    // inside an async context.
     std::thread::spawn(|| {
         BlockingClient::builder()
             .no_proxy()
             .build()
-            .expect("blocking client")
+            .map_err(|err| format!("failed to build blocking http client: {err}"))
     })
     .join()
-    .expect("client build thread panicked")
+    .map_err(|_| "blocking http client builder thread panicked".to_string())?
 }
 
 fn normalize_pack_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -324,7 +386,16 @@ fn normalize_pack_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((root, safe))
 }
 
-static HTTP_CLIENT: Lazy<Arc<BlockingClient>> = Lazy::new(|| Arc::new(build_blocking_client()));
+static HTTP_CLIENT: Lazy<Result<Arc<BlockingClient>, String>> =
+    Lazy::new(|| build_blocking_client().map(Arc::new));
+
+/// Shared blocking HTTP client; construction failure is an error, not a panic.
+fn shared_http_client() -> Result<Arc<BlockingClient>> {
+    match &*HTTP_CLIENT {
+        Ok(client) => Ok(Arc::clone(client)),
+        Err(message) => Err(anyhow!("{message}")),
+    }
+}
 
 /// Default for [`FlowDescriptor::entry`]. A flow is treated as an entrypoint
 /// unless it is explicitly tagged `internal`, so packs (and serialized
@@ -611,7 +682,8 @@ impl HostState {
             let runtime = bindings.greentic_component_component_runtime();
 
             // Encode input as CBOR — the component's run() expects CBOR bytes.
-            let input_value: Value = serde_json::from_str(input_json).unwrap_or(Value::Null);
+            let input_value: Value =
+                serde_json::from_str(input_json).context("component input is not valid JSON")?;
             let input_cbor =
                 serde_cbor::to_vec(&input_value).context("encode input as CBOR for v0.6")?;
             let empty_state = serde_cbor::to_vec(&Value::Object(Default::default()))
@@ -709,19 +781,35 @@ impl HostState {
     }
 
     fn tenant_ctx_from_v1(&self, ctx: Option<StateTenantCtx>) -> Result<TypesTenantCtx> {
-        let tenant_raw = ctx
+        // The tenant and env are bound by the host. Guest-supplied values are
+        // never trusted: honouring them would let a component read or write
+        // another tenant's state.
+        let tenant_raw = self
+            .exec_ctx
             .as_ref()
-            .map(|ctx| ctx.tenant.clone())
-            .or_else(|| self.exec_ctx.as_ref().map(|ctx| ctx.tenant.tenant.clone()))
+            .map(|ctx| ctx.tenant.tenant.clone())
             .unwrap_or_else(|| self.config.tenant.clone());
-        let env_raw = ctx
-            .as_ref()
-            .map(|ctx| ctx.env.clone())
-            .unwrap_or_else(|| self.default_env.clone());
+        let env_raw = self.default_env.clone();
+        if let Some(guest) = ctx.as_ref() {
+            if !guest.tenant.is_empty() && guest.tenant != tenant_raw {
+                warn!(
+                    pack_id = %self.pack_id,
+                    guest_tenant = %guest.tenant,
+                    "ignoring guest-supplied tenant in state ctx; using host-bound tenant"
+                );
+            }
+            if !guest.env.is_empty() && guest.env != env_raw {
+                warn!(
+                    pack_id = %self.pack_id,
+                    guest_env = %guest.env,
+                    "ignoring guest-supplied env in state ctx; using host-bound env"
+                );
+            }
+        }
         let tenant_id = TenantId::from_str(&tenant_raw)
             .with_context(|| format!("invalid tenant id `{tenant_raw}`"))?;
-        let env_id = EnvId::from_str(&env_raw)
-            .unwrap_or_else(|_| EnvId::from_str("local").expect("default env must be valid"));
+        let env_id =
+            EnvId::from_str(&env_raw).with_context(|| format!("invalid env id `{env_raw}`"))?;
         let mut tenant_ctx = TypesTenantCtx::new(env_id, tenant_id);
         if let Some(exec_ctx) = self.exec_ctx.as_ref() {
             if let Some(team) = exec_ctx.tenant.team.as_ref() {
@@ -865,7 +953,16 @@ impl HostState {
                 )
             })
             .collect::<Vec<_>>();
-        let body_bytes = response.bytes().ok().map(|b| b.to_vec());
+        let body_bytes = match response.bytes() {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(err) => {
+                warn!(url = %req.url, error = %err, "http response body read failed");
+                return Err(HttpClientError {
+                    code: "unavailable".into(),
+                    message: format!("failed to read response body: {err}"),
+                });
+            }
+        };
 
         if let Some((meta, true)) = mock_state.take()
             && let Some(mock) = &self.mocks
@@ -914,6 +1011,14 @@ mod canonicalize_tests {
     }
 }
 
+/// Whether a secrets read failure means "no such secret" (as opposed to a
+/// backend failure such as an outage or permission error, which must not be
+/// reported to the guest as an absent secret).
+fn secret_error_is_not_found(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("not found") || message.contains("no such") || message.contains("missing")
+}
+
 impl SecretsStoreHost for HostState {
     fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, SecretsError> {
         if provider_core_only::is_enabled() {
@@ -934,7 +1039,11 @@ impl SecretsStoreHost for HostState {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
                 warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
-                Err(SecretsError::NotFound)
+                if secret_error_is_not_found(&err) {
+                    Err(SecretsError::NotFound)
+                } else {
+                    Err(SecretsError::Internal)
+                }
             }
         }
     }
@@ -960,7 +1069,11 @@ impl SecretsStoreHostV1_1 for HostState {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
                 warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
-                Err(SecretsErrorV1_1::NotFound)
+                if secret_error_is_not_found(&err) {
+                    Err(SecretsErrorV1_1::NotFound)
+                } else {
+                    Err(SecretsErrorV1_1::Internal)
+                }
             }
         }
     }
@@ -1185,7 +1298,10 @@ impl StateStoreHost for HostState {
         }
         let key = StoreStateKey::from(key);
         match store.get_json(&tenant_ctx, STATE_PREFIX, &key, None) {
-            Ok(Some(value)) => Ok(serde_json::to_vec(&value).unwrap_or_else(|_| Vec::new())),
+            Ok(Some(value)) => state_bytes_from_value(&value).map_err(|err| StateError {
+                code: "internal".into(),
+                message: format!("failed to encode stored state value: {err}"),
+            }),
             Ok(None) => Err(StateError {
                 code: "not_found".into(),
                 message: "state key not found".into(),
@@ -1243,8 +1359,7 @@ impl StateStoreHost for HostState {
             }
         }
         let key = StoreStateKey::from(key);
-        let value = serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()));
+        let value = state_value_from_bytes(&bytes);
         match store.set_json(&tenant_ctx, STATE_PREFIX, &key, None, &value, None) {
             Ok(()) => Ok(StateOpAck::Ok),
             Err(err) => Err(StateError {
@@ -1286,6 +1401,46 @@ impl StateStoreHost for HostState {
             }),
         }
     }
+}
+
+/// Marker key of the envelope used to store state values that are neither JSON
+/// nor valid UTF-8, so the original bytes survive a write/read round trip.
+const STATE_BYTES_ENVELOPE_KEY: &str = "$greentic_bytes_b64";
+
+/// Convert guest state bytes to the JSON value persisted by the state store.
+///
+/// JSON documents are stored as-is, other UTF-8 text as a JSON string (legacy
+/// behaviour), and arbitrary binary as a base64 envelope (never lossy).
+fn state_value_from_bytes(bytes: &[u8]) -> Value {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return value;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Value::String(text.to_string()),
+        Err(_) => {
+            use base64::Engine as _;
+            let mut envelope = serde_json::Map::new();
+            envelope.insert(
+                STATE_BYTES_ENVELOPE_KEY.to_string(),
+                Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            );
+            Value::Object(envelope)
+        }
+    }
+}
+
+/// Inverse of [`state_value_from_bytes`] for reads.
+fn state_bytes_from_value(value: &Value) -> Result<Vec<u8>, String> {
+    if let Value::Object(map) = value
+        && map.len() == 1
+        && let Some(Value::String(encoded)) = map.get(STATE_BYTES_ENVELOPE_KEY)
+    {
+        use base64::Engine as _;
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|err| format!("invalid binary state envelope: {err}"));
+    }
+    serde_json::to_vec(value).map_err(|err| err.to_string())
 }
 
 /// `StateStore::set_json_if_absent` reports a backend that has no atomic
@@ -1358,8 +1513,7 @@ impl HostState {
             }
         }
         let key = StoreStateKey::from(key);
-        let value = serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()));
+        let value = state_value_from_bytes(&bytes);
         store
             .set_json_if_absent(&tenant_ctx, STATE_PREFIX, &key, &value, None)
             .map_err(state_error_from_if_absent)
@@ -2193,7 +2347,7 @@ impl PackRuntime {
                     .map(|_| p)
             }) {
                 verify::verify_pack(verify_target).await?;
-                tracing::info!(pack_path = %verify_target.display(), "pack verification complete");
+                tracing::info!(pack_path = %verify_target.display(), "pack archive structure check passed (signature/digest checks happen at resolve time)");
             } else {
                 tracing::debug!("skipping archive verification (no archive source)");
             }
@@ -2421,7 +2575,7 @@ impl PackRuntime {
                 loaded
             }
         };
-        let http_client = Arc::clone(&HTTP_CLIENT);
+        let http_client = shared_http_client()?;
         let mut component_manifests = HashMap::new();
         if let Some(manifest) = manifest.as_ref() {
             for component in &manifest.components {
@@ -2454,6 +2608,7 @@ impl PackRuntime {
             assets_tempdir,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
+            identify_hint_failures: RwLock::new(HashMap::new()),
             secrets,
             oauth_config,
             cache,
@@ -2894,6 +3049,7 @@ impl PackRuntime {
             )?;
             HostState::convert_invoke_result(invoke_result)
         })
+        .await
     }
 
     /// Fold a provider instance's configured answers into its invocation
@@ -3136,6 +3292,7 @@ impl PackRuntime {
             };
             deserialize_json_bytes(result)
         })
+        .await
     }
 
     /// Call the provider component's `identify-instance` export
@@ -3233,6 +3390,7 @@ impl PackRuntime {
                 None => IdentifyOutcome::NoMatch,
             })
         })
+        .await
     }
 
     /// Call the provider component's `describe-identify-instance` export
@@ -3335,6 +3493,7 @@ impl PackRuntime {
                 }
             }
         })
+        .await
     }
 
     /// Cached wrapper around [`invoke_describe_identify_instance`]. The
@@ -3346,9 +3505,10 @@ impl PackRuntime {
     ///
     /// Returns `None` when the component does not export the describe
     /// world, when the probe returns no hint, or when the probe fails
-    /// (trap, timeout, instantiation error). Failures are warn-logged
-    /// and cached — the same trap is logged once per revision per
-    /// component, not per request.
+    /// (trap, timeout, instantiation error). Failures are warn-logged and
+    /// remembered only for a short backoff window (not cached permanently), so
+    /// a transient error is retried while a persistent trap is not re-run on
+    /// every request.
     ///
     /// [`invoke_describe_identify_instance`]:
     ///     PackRuntime::invoke_describe_identify_instance
@@ -3359,6 +3519,14 @@ impl PackRuntime {
         if let Some(cached) = self.identify_hint_cache.read().get(&binding.component_ref) {
             return cached.clone();
         }
+        let failed_at = self
+            .identify_hint_failures
+            .read()
+            .get(&binding.component_ref)
+            .copied();
+        if identify_failure_backoff_active(failed_at, std::time::Instant::now()) {
+            return None;
+        }
         let hint = match self.invoke_describe_identify_instance(binding).await {
             Ok(hint) => hint,
             Err(err) => {
@@ -3367,11 +3535,19 @@ impl PackRuntime {
                     component_ref = %binding.component_ref,
                     error = %err,
                     "describe-identify-instance probe failed; \
-                     falling back to unhinted wrapper for this component"
+                     falling back to unhinted wrapper for this component \
+                     (the probe is retried after a short backoff)"
                 );
-                None
+                // Do not cache the failure as a permanent `None`.
+                self.identify_hint_failures
+                    .write()
+                    .insert(binding.component_ref.clone(), std::time::Instant::now());
+                return None;
             }
         };
+        self.identify_hint_failures
+            .write()
+            .remove(&binding.component_ref);
         // Tolerate a concurrent populate — `insert` is idempotent on the
         // same (component_ref, hint) shape and the probe is pure w.r.t.
         // the component, so re-probing on a write-race yields identical
@@ -3582,16 +3758,13 @@ impl PackRuntime {
             .trim_start_matches("assets/")
             .trim_start_matches("/assets/");
         // Try assets tempdir first (extracted from archive).
-        if let Some(tempdir) = &self.assets_tempdir {
-            let full = tempdir.path().join("assets").join(normalized);
-            if full.exists() {
-                return std::fs::read(&full)
-                    .with_context(|| format!("read asset {}", full.display()));
-            }
+        if let Some(tempdir) = &self.assets_tempdir
+            && let Some(full) = confined_asset_path(&tempdir.path().join("assets"), normalized)?
+        {
+            return std::fs::read(&full).with_context(|| format!("read asset {}", full.display()));
         }
         // Try materialized directory.
-        let full = self.path.join("assets").join(normalized);
-        if full.exists() {
+        if let Some(full) = confined_asset_path(&self.path.join("assets"), normalized)? {
             return std::fs::read(&full).with_context(|| format!("read asset {}", full.display()));
         }
         bail!("asset not found: {}", asset_path)
@@ -3969,18 +4142,17 @@ impl PackRuntime {
             }
         };
         match archive.by_name(name) {
-            Ok(mut entry) => {
-                let mut bytes = Vec::new();
-                if let Err(error) = entry.read_to_end(&mut bytes) {
+            Ok(mut entry) => match read_to_end_bounded(&mut entry, MAX_ARCHIVE_ENTRY_READ_BYTES) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
                     tracing::warn!(
                         path = %archive_path.display(),
                         error = %error,
                         "failed to extract {name} from pack archive"
                     );
-                    return None;
+                    None
                 }
-                Some(bytes)
-            }
+            },
             Err(zip::result::ZipError::FileNotFound) => None,
             Err(error) => {
                 tracing::warn!(
@@ -4017,7 +4189,7 @@ impl PackRuntime {
         let runtime_config_non_secret = self.runtime_config_non_secret.clone();
         let runtime_refs = self.runtime_refs.clone();
 
-        run_on_wasi_thread("component.describe", move || {
+        run_on_wasi_thread_blocking("component.describe", move || {
             let mut linker = Linker::new(&engine);
             register_all(&mut linker, allow_state_store)?;
             add_component_control_to_linker(&mut linker)?;
@@ -4095,8 +4267,7 @@ impl PackRuntime {
                 .with_context(|| format!("failed to read pack {}", archive_path.display()))?;
             match archive.by_name(&rel) {
                 Ok(mut entry) => {
-                    let mut bytes = Vec::new();
-                    entry.read_to_end(&mut bytes)?;
+                    let bytes = read_to_end_bounded(&mut entry, MAX_ARCHIVE_ENTRY_READ_BYTES)?;
                     let value = serde_json::from_slice::<Value>(&bytes).with_context(|| {
                         format!("invalid schema JSON in {}:{}", archive_path.display(), rel)
                     })?;
@@ -4232,13 +4403,14 @@ impl PackRuntime {
             mocks: None,
             flows: Some(flows_cache),
             components: component_map,
-            http_client: Arc::clone(&HTTP_CLIENT),
+            http_client: shared_http_client()?,
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(RunnerWasiPolicy::new()),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
+            identify_hint_failures: RwLock::new(HashMap::new()),
             secrets: crate::secrets::default_manager()?,
             oauth_config: None,
             cache,
@@ -4802,8 +4974,8 @@ fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     let mut file = archive
         .by_name(name)
         .with_context(|| format!("entry {name} missing from archive"))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    let buf = read_to_end_bounded(&mut file, MAX_ARCHIVE_ENTRY_READ_BYTES)
+        .with_context(|| format!("failed to read entry {name} from archive"))?;
     Ok(buf)
 }
 
@@ -5292,20 +5464,25 @@ fn compute_sha256_digest_for(bytes: &[u8]) -> String {
     format!("sha256:{}", to_hex(&hasher.finalize()))
 }
 
-fn build_artifact_key(cache: &CacheManager, digest: Option<&str>, bytes: &[u8]) -> ArtifactKey {
-    let wasm_digest = digest
-        .map(normalize_digest)
-        .unwrap_or_else(|| compute_sha256_digest_for(bytes));
-    ArtifactKey::new(cache.engine_profile_id().to_string(), wasm_digest)
+/// Cache key derived from the sha256 of the actual wasm bytes. A manifest- or
+/// lock-declared digest is deliberately not used here: it may not have been
+/// verified against `bytes`, and keying the compiled-artifact cache by an
+/// unverified claim would let one component's compiled code be served for
+/// another.
+fn build_artifact_key(cache: &CacheManager, bytes: &[u8]) -> ArtifactKey {
+    ArtifactKey::new(
+        cache.engine_profile_id().to_string(),
+        compute_sha256_digest_for(bytes),
+    )
 }
 
 async fn compile_component_with_cache(
     cache: &CacheManager,
     engine: &Engine,
-    digest: Option<&str>,
+    _declared_digest: Option<&str>,
     bytes: Vec<u8>,
 ) -> Result<Arc<Component>> {
-    let key = build_artifact_key(cache, digest, &bytes);
+    let key = build_artifact_key(cache, &bytes);
     cache.get_component(engine, &key, || Ok(bytes)).await
 }
 
@@ -5836,6 +6013,59 @@ fn locate_pack_assets(
     Ok((None, None))
 }
 
+/// Per-entry cap for extracted pack assets (decompressed).
+const MAX_ASSET_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+/// Total cap for all extracted pack assets (decompressed).
+const MAX_ASSETS_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap for archive entries read fully into memory (manifests, schemas, ...).
+const MAX_ARCHIVE_ENTRY_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read at most `limit` bytes from `reader`; exceeding it is an error rather
+/// than silent truncation (guards against zip bombs).
+fn read_to_end_bounded<R: Read>(reader: R, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive entry exceeds the {limit} byte read limit"),
+        ));
+    }
+    Ok(buf)
+}
+
+/// Resolve `relative` under `root`, refusing anything that could leave it
+/// (`..`, absolute paths, symlinks pointing outside). `Ok(None)` when the file
+/// does not exist.
+fn confined_asset_path(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
+    use std::path::Component;
+    let mut clean = PathBuf::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            _ => bail!("invalid asset path: {relative}"),
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        bail!("invalid asset path: {relative}");
+    }
+    let candidate = root.join(&clean);
+    if !candidate.exists() {
+        return Ok(None);
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", root.display()))?;
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", candidate.display()))?;
+    if !canonical.starts_with(&canonical_root) {
+        bail!("asset path escapes the assets root: {relative}");
+    }
+    Ok(Some(canonical))
+}
+
 fn extract_assets_from_archive(path: &Path) -> Result<Option<(TempDir, PathBuf)>> {
     let file =
         File::open(path).with_context(|| format!("failed to open pack {}", path.display()))?;
@@ -5843,23 +6073,57 @@ fn extract_assets_from_archive(path: &Path) -> Result<Option<(TempDir, PathBuf)>
         ZipArchive::new(file).with_context(|| format!("failed to read pack {}", path.display()))?;
     let temp = TempDir::new().context("failed to create temporary assets directory")?;
     let mut found = false;
+    let mut total_bytes = 0u64;
     for idx in 0..archive.len() {
         let mut entry = archive.by_index(idx)?;
-        let name = entry.name();
-        if !name.starts_with("assets/") {
+        let raw_name = entry.name().to_string();
+        if !raw_name.starts_with("assets/") {
             continue;
         }
-        let dest = temp.path().join(name);
-        if name.ends_with('/') {
+        // `enclosed_name` rejects absolute paths and `..` escapes (zip-slip).
+        let Some(safe_name) = entry.enclosed_name() else {
+            bail!(
+                "pack {} contains an unsafe asset path `{raw_name}`",
+                path.display()
+            );
+        };
+        if entry.is_symlink() {
+            warn!(entry = %raw_name, "skipping symlink entry in pack assets");
+            continue;
+        }
+        let dest = temp.path().join(&safe_name);
+        if raw_name.ends_with('/') {
             std::fs::create_dir_all(&dest)?;
             found = true;
             continue;
+        }
+        if entry.size() > MAX_ASSET_ENTRY_BYTES {
+            bail!(
+                "asset `{raw_name}` in {} is too large ({} bytes, limit {MAX_ASSET_ENTRY_BYTES})",
+                path.display(),
+                entry.size()
+            );
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut outfile = std::fs::File::create(&dest)?;
-        std::io::copy(&mut entry, &mut outfile)?;
+        // Bound the real decompressed size, not just the declared one.
+        let mut limited = (&mut entry).take(MAX_ASSET_ENTRY_BYTES + 1);
+        let copied = std::io::copy(&mut limited, &mut outfile)?;
+        if copied > MAX_ASSET_ENTRY_BYTES {
+            bail!(
+                "asset `{raw_name}` in {} exceeds the size limit",
+                path.display()
+            );
+        }
+        total_bytes = total_bytes.saturating_add(copied);
+        if total_bytes > MAX_ASSETS_TOTAL_BYTES {
+            bail!(
+                "assets in {} exceed the total size limit ({MAX_ASSETS_TOTAL_BYTES} bytes)",
+                path.display()
+            );
+        }
         found = true;
     }
     if found {
@@ -6342,13 +6606,14 @@ pub(crate) mod tests {
             mocks: None,
             flows: None,
             components: HashMap::new(),
-            http_client: Arc::clone(&HTTP_CLIENT),
+            http_client: shared_http_client().expect("http client"),
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
+            identify_hint_failures: RwLock::new(HashMap::new()),
             secrets: crate::secrets::default_manager().expect("default secrets manager"),
             oauth_config: None,
             runtime_config_non_secret: None,
@@ -7034,5 +7299,153 @@ impl PackMetadata {
             entry_flows,
             secret_requirements: manifest.secret_requirements.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_hardening_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).expect("create zip");
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, body) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .expect("start file");
+            writer.write_all(body).expect("write entry");
+        }
+        writer.finish().expect("finish zip");
+    }
+
+    #[test]
+    fn extract_assets_rejects_zip_slip_entry() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("evil.gtpack");
+        write_zip(&archive, &[("assets/../../evil.txt", b"pwned")]);
+        let err =
+            extract_assets_from_archive(&archive).expect_err("zip-slip entry must be rejected");
+        assert!(err.to_string().contains("unsafe asset path"));
+        assert!(!dir.path().join("evil.txt").exists());
+    }
+
+    #[test]
+    fn extract_assets_extracts_regular_entries() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("ok.gtpack");
+        write_zip(
+            &archive,
+            &[("assets/cards/a.json", b"{}"), ("other.txt", b"x")],
+        );
+        let (temp, assets) = extract_assets_from_archive(&archive)
+            .expect("extract")
+            .expect("assets present");
+        assert_eq!(
+            std::fs::read(assets.join("cards/a.json")).expect("read"),
+            b"{}"
+        );
+        drop(temp);
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_entries() {
+        let data = [7u8; 100];
+        assert_eq!(
+            read_to_end_bounded(&data[..], 100).expect("fits").len(),
+            100
+        );
+        assert!(read_to_end_bounded(&data[..], 99).is_err());
+    }
+
+    #[test]
+    fn confined_asset_path_blocks_traversal_and_symlink_escape() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("assets");
+        std::fs::create_dir_all(root.join("cards")).expect("mkdir");
+        std::fs::write(root.join("cards/a.json"), b"{}").expect("write");
+        std::fs::write(dir.path().join("secret.txt"), b"top-secret").expect("write secret");
+
+        assert!(
+            confined_asset_path(&root, "cards/a.json")
+                .expect("ok")
+                .is_some()
+        );
+        assert!(
+            confined_asset_path(&root, "cards/missing.json")
+                .expect("ok")
+                .is_none()
+        );
+        assert!(confined_asset_path(&root, "../secret.txt").is_err());
+        assert!(confined_asset_path(&root, "/etc/passwd").is_err());
+        assert!(confined_asset_path(&root, "cards/../../secret.txt").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("secret.txt"), root.join("link.txt"))
+                .expect("symlink");
+            assert!(confined_asset_path(&root, "link.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn state_values_preserve_json_text_and_binary() {
+        assert_eq!(
+            state_value_from_bytes(b"{\"a\":1}"),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            state_value_from_bytes(b"plain text"),
+            Value::String("plain text".into())
+        );
+        let binary = vec![0xff, 0x00, 0xfe];
+        let stored = state_value_from_bytes(&binary);
+        assert_eq!(state_bytes_from_value(&stored).expect("decode"), binary);
+        assert_eq!(
+            state_bytes_from_value(&serde_json::json!({"a": 1})).expect("json"),
+            b"{\"a\":1}".to_vec()
+        );
+    }
+
+    #[test]
+    fn secret_not_found_is_distinguished_from_backend_errors() {
+        assert!(secret_error_is_not_found(&anyhow!(
+            "no secret at secrets://a/b (secret not found: x)"
+        )));
+        assert!(!secret_error_is_not_found(&anyhow!(
+            "no secret at secrets://a/b (connection refused)"
+        )));
+    }
+
+    #[test]
+    fn identify_failure_backoff_expires() {
+        let now = std::time::Instant::now();
+        assert!(!identify_failure_backoff_active(None, now));
+        assert!(identify_failure_backoff_active(Some(now), now));
+        let later = now + IDENTIFY_FAILURE_BACKOFF + Duration::from_secs(1);
+        assert!(!identify_failure_backoff_active(Some(now), later));
+    }
+
+    #[test]
+    fn artifact_key_is_derived_from_actual_bytes() {
+        let engine = Engine::default();
+        let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".into());
+        let cache = CacheManager::new(CacheConfig::default(), profile);
+        let key_a = build_artifact_key(&cache, b"one");
+        let key_b = build_artifact_key(&cache, b"two");
+        assert_ne!(key_a.wasm_digest, key_b.wasm_digest);
+        assert_eq!(key_a.wasm_digest, compute_sha256_digest_for(b"one"));
+    }
+
+    #[tokio::test]
+    async fn wasi_thread_reports_panics_as_errors_without_blocking() {
+        let err = run_on_wasi_thread::<_, ()>("test.panic", || panic!("boom"))
+            .await
+            .expect_err("panic is surfaced");
+        assert!(err.to_string().contains("boom"));
+        let ok = run_on_wasi_thread("test.ok", || Ok(41 + 1))
+            .await
+            .expect("ok");
+        assert_eq!(ok, 42);
     }
 }
