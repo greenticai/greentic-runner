@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -23,7 +23,10 @@ pub fn spawn_timers(runtime: Arc<TenantRuntime>) -> Result<Vec<JoinHandle<()>>> 
         let flow_id = timer.flow_id.clone();
         let schedule_id = timer.schedule_id().to_string();
         let tenant = runtime.config().tenant.clone();
-        let runtime_clone = Arc::clone(&runtime);
+        // Hold the runtime weakly: a task owning an `Arc<TenantRuntime>` would
+        // keep it alive forever, so `TenantRuntime::drop` (which aborts the
+        // timers) could never run and every reload would duplicate cron firing.
+        let runtime_weak: Weak<TenantRuntime> = Arc::downgrade(&runtime);
 
         let handle = tokio::spawn(async move {
             tracing::info!(
@@ -33,12 +36,23 @@ pub fn spawn_timers(runtime: Arc<TenantRuntime>) -> Result<Vec<JoinHandle<()>>> 
                 normalized_cron = %normalized,
                 "registered timer schedule"
             );
-            for next in schedule.upcoming(Utc) {
+            // Re-derive the next tick from "now" each round (rather than walking
+            // one `upcoming` iterator) so ticks that elapsed while a slow flow
+            // ran are skipped instead of fired back-to-back.
+            while let Some(next) = schedule.after(&Utc::now()).next() {
                 if let Some(wait) = duration_until(next) {
                     sleep(wait).await;
                 } else {
                     continue;
                 }
+                let Some(runtime_clone) = runtime_weak.upgrade() else {
+                    tracing::info!(
+                        flow_id = %flow_id,
+                        schedule_id = %schedule_id,
+                        "tenant runtime dropped; stopping timer schedule"
+                    );
+                    return;
+                };
                 let pack_id = match runtime_clone.engine().flow_by_id(&flow_id) {
                     Some(flow) => flow.pack_id.clone(),
                     None => {
@@ -175,6 +189,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timer_task_does_not_keep_the_runtime_alive() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime_with_timers(
+            r#"[{ flow_id: "flow.main", cron: "* * * * * *" }]"#,
+        )
+        .await
+        .expect("runtime");
+        let weak = Arc::downgrade(&runtime);
+        let mut timers = spawn_timers(runtime).expect("spawn timers");
+        // The caller's Arc was the only strong reference.
+        assert!(
+            weak.upgrade().is_none(),
+            "timer task must hold the runtime weakly"
+        );
+        let handle = timers.pop().expect("one timer");
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("timer task must stop once the runtime is gone")
+            .expect("timer task must not panic");
+    }
+
+    #[test]
+    fn next_tick_is_always_in_the_future() {
+        let schedule = Schedule::from_str("* * * * * *").expect("schedule");
+        let next = schedule.after(&Utc::now()).next().expect("next tick");
+        assert!(next > Utc::now() - chrono::Duration::milliseconds(50));
+    }
+
+    #[tokio::test]
     async fn spawn_timers_rejects_an_invalid_cron_expression() {
         let (_workspace, runtime) = crate::test_support::build_test_runtime_with_timers(
             r#"[{ flow_id: "flow.main", cron: "not a cron" }]"#,
@@ -195,7 +237,8 @@ mod tests {
         )
         .await
         .expect("runtime");
-        let handles = spawn_timers(runtime).expect("spawn timers");
+        // Keep the runtime alive: timers only hold it weakly.
+        let handles = spawn_timers(Arc::clone(&runtime)).expect("spawn timers");
         assert_eq!(handles.len(), 1);
         // Let at least one tick fire against the missing flow.
         sleep(Duration::from_millis(2300)).await;
@@ -206,5 +249,6 @@ mod tests {
         for handle in handles {
             handle.abort();
         }
+        drop(runtime);
     }
 }

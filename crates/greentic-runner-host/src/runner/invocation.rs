@@ -60,15 +60,13 @@ pub fn build_invocation_envelope_as(
     payload: Value,
 ) -> Result<InvocationEnvelope> {
     let parsed = InvocationPayload::parse(payload);
+    // An invalid id is refused, not mapped onto a shared default tenant/env:
+    // that would run the invocation (and bill and audit it) as someone else.
     let env_id = EnvId::from_str(meta.env)
-        .unwrap_or_else(|_| EnvId::from_str("local").expect("local env id is valid"));
-    let tenant_id = TenantId::from_str(meta.tenant).unwrap_or_else(|_| {
-        tracing::warn!(
-            tenant = meta.tenant,
-            "invalid tenant id in invocation envelope, falling back to tenant.default"
-        );
-        TenantId::from_str("tenant.default").expect("tenant fallback must be valid")
-    });
+        .map_err(|err| anyhow::anyhow!("invalid env id `{}` in invocation: {err}", meta.env))?;
+    let tenant_id = TenantId::from_str(meta.tenant).map_err(|err| {
+        anyhow::anyhow!("invalid tenant id `{}` in invocation: {err}", meta.tenant)
+    })?;
     let mut ctx = TenantCtx::new(env_id, tenant_id).with_flow(meta.flow_id.to_string());
     if let Some(provider) = meta.provider_id {
         ctx = ctx.with_provider(provider.to_string());
@@ -184,4 +182,38 @@ impl InvocationPayload {
 
 fn extract_string(value: Option<Value>) -> Option<String> {
     value.and_then(|v| v.as_str().map(|s| s.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn meta<'a>(env: &'a str, tenant: &'a str) -> InvocationMeta<'a> {
+        InvocationMeta {
+            env,
+            tenant,
+            flow_id: "flow.main",
+            node_id: None,
+            provider_id: None,
+            session_id: None,
+            attempt: 1,
+        }
+    }
+
+    #[test]
+    fn invalid_tenant_or_env_is_refused_not_defaulted() {
+        let bad_tenant =
+            build_invocation_envelope(meta("local", "Not A Tenant!"), "run", json!({}));
+        assert!(bad_tenant.is_err());
+        let bad_env = build_invocation_envelope(meta("bad env", "acme"), "run", json!({}));
+        assert!(bad_env.is_err());
+    }
+
+    #[test]
+    fn valid_ids_build_an_envelope_under_the_real_tenant() {
+        let envelope =
+            build_invocation_envelope(meta("local", "acme"), "run", json!({})).expect("valid ids");
+        assert_eq!(envelope.ctx.tenant_id.as_str(), "acme");
+    }
 }

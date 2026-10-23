@@ -85,6 +85,29 @@ pub async fn dispatch_to_resumer(resumer: Arc<dyn SessionResumer>, input: Resume
     }
 }
 
+/// Upper bound on response messages handled concurrently by one listener.
+pub const MAX_CONCURRENT_RESUMES: usize = 32;
+
+/// How a listener joins the broker: an optional queue group (so replicas and
+/// reloaded runtimes share one delivery of each message instead of each
+/// receiving a copy) and an optional tenant filter (messages for other tenants
+/// are not this listener's to resume).
+#[derive(Clone, Debug, Default)]
+pub struct ListenerScope {
+    pub queue_group: Option<String>,
+    pub tenant: Option<String>,
+}
+
+/// Pure: should a listener scoped to `scope_tenant` handle a message whose
+/// `Greentic-Tenant` header is `header_tenant`? A missing header is handled
+/// (the decoder applies its own default), a mismatching one is not.
+pub fn tenant_matches(scope_tenant: Option<&str>, header_tenant: Option<&str>) -> bool {
+    match (scope_tenant, header_tenant) {
+        (Some(scope), Some(header)) if !header.is_empty() => scope == header,
+        _ => true,
+    }
+}
+
 /// Subscribe to the runtime's response subject and resume sessions forever.
 ///
 /// Runs until the NATS subscription is closed (e.g. on server shutdown).
@@ -97,18 +120,51 @@ pub async fn run_response_listener(
     runtime: String,
     resumer: Arc<dyn SessionResumer>,
 ) -> Result<()> {
+    run_response_listener_scoped(client, runtime, resumer, ListenerScope::default()).await
+}
+
+/// [`run_response_listener`] with an explicit [`ListenerScope`]. Each message is
+/// handled on its own task (bounded by [`MAX_CONCURRENT_RESUMES`]) so one slow
+/// resume cannot stall every other conversation's response.
+pub async fn run_response_listener_scoped(
+    client: async_nats::Client,
+    runtime: String,
+    resumer: Arc<dyn SessionResumer>,
+    scope: ListenerScope,
+) -> Result<()> {
     let subject = response_topic(&runtime);
-    let mut subscription = client.subscribe(subject).await?;
+    let mut subscription = match scope.queue_group.clone() {
+        Some(group) => client.queue_subscribe(subject, group).await?,
+        None => client.subscribe(subject).await?,
+    };
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESUMES));
     while let Some(msg) = subscription.next().await {
         let headers = msg.headers.as_ref();
         let get_header = |name: &str| headers.and_then(|h| h.get(name)).map(|v| v.as_str());
+        if !tenant_matches(scope.tenant.as_deref(), get_header("Greentic-Tenant")) {
+            continue;
+        }
+        // Any response (including the watchdog's own) retires the deadline
+        // watchdog for this id, so a completed call never times out late.
+        if let Some(correlation) = get_header("Greentic-Correlation-Id") {
+            crate::runner::remote_dispatch::cancel_watchdog(correlation);
+        }
         match decode_response(
             get_header("Greentic-Correlation-Id"),
             get_header("Greentic-Tenant"),
             get_header("Greentic-Env"),
             &msg.payload,
         ) {
-            Ok(input) => dispatch_to_resumer(resumer.clone(), input).await,
+            Ok(input) => {
+                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                    break;
+                };
+                let resumer = Arc::clone(&resumer);
+                tokio::spawn(async move {
+                    dispatch_to_resumer(resumer, input).await;
+                    drop(permit);
+                });
+            }
             Err(error) => tracing::warn!(%error, "bad dispatch response; dropping"),
         }
     }
@@ -121,6 +177,15 @@ mod tests {
     use greentic_types::{DispatchError, RuntimeDispatchResponse};
     use serde_json::json;
     use std::sync::Mutex;
+
+    #[test]
+    fn tenant_filter_only_rejects_a_different_tenant() {
+        assert!(tenant_matches(None, Some("acme")));
+        assert!(tenant_matches(Some("acme"), Some("acme")));
+        assert!(!tenant_matches(Some("acme"), Some("other")));
+        assert!(tenant_matches(Some("acme"), None));
+        assert!(tenant_matches(Some("acme"), Some("")));
+    }
 
     // -----------------------------------------------------------------------
     // Broker-gated round-trip test

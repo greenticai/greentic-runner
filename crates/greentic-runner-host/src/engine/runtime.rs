@@ -210,6 +210,60 @@ impl FlowResumeStore {
     }
 }
 
+/// Metadata key the dispatch resumer sets on its synthesized envelope. Its
+/// presence is the "must resume" signal: the envelope is a runtime dispatch
+/// response for exactly that correlation id, and must never start a flow fresh
+/// nor resume a wait that is not awaiting that id.
+pub(crate) const DISPATCH_RESUME_METADATA_KEY: &str = "dispatch_resume_correlation";
+
+const AWAIT_RUNTIME_PREFIX: &str = "await-runtime:";
+
+fn dispatch_resume_correlation(envelope: &IngressEnvelope) -> Option<String> {
+    envelope
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get(DISPATCH_RESUME_METADATA_KEY))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeDecision {
+    /// Run (or resume) the flow as usual.
+    Proceed,
+    /// A dispatch response with no matching wait: drop it.
+    DropDispatchResponse(&'static str),
+    /// A plain inbound for a conversation awaiting a runtime response.
+    StillAwaiting(String),
+}
+
+/// Decide whether an envelope may touch the parked wait.
+///
+/// `parked` is `None` when nothing is parked, `Some(reason)` otherwise.
+fn classify_resume(
+    dispatch_correlation: Option<&str>,
+    parked: Option<Option<&str>>,
+) -> ResumeDecision {
+    match (dispatch_correlation, parked) {
+        (Some(_), None) => ResumeDecision::DropDispatchResponse("no wait is parked"),
+        (Some(corr), Some(Some(reason))) => {
+            if reason == format!("{AWAIT_RUNTIME_PREFIX}{corr}") {
+                ResumeDecision::Proceed
+            } else {
+                ResumeDecision::DropDispatchResponse(
+                    "parked wait is not awaiting this correlation id",
+                )
+            }
+        }
+        // A park recorded without a reason predates reasons; keep resuming it.
+        (Some(_), Some(None)) => ResumeDecision::Proceed,
+        (None, Some(Some(reason))) if reason.starts_with(AWAIT_RUNTIME_PREFIX) => {
+            ResumeDecision::StillAwaiting(reason.to_string())
+        }
+        (None, _) => ResumeDecision::Proceed,
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct FlowResumeRecord {
     snapshot: FlowSnapshot,
@@ -240,7 +294,7 @@ fn build_store_ctx(envelope: &IngressEnvelope) -> GResult<(TenantCtx, UserId, St
             reason: "Cannot suspend: reply_scope missing; provider plugin must supply ReplyScope"
                 .to_string(),
         })?;
-    let mut ctx = envelope.tenant_ctx();
+    let mut ctx = envelope.tenant_ctx()?;
     ctx = ctx.with_session(hint.clone());
     ctx = ctx.with_user(Some(user.clone()));
     Ok((ctx, user, hint, scope))
@@ -373,6 +427,43 @@ mod tests {
                 state,
             },
         }
+    }
+
+    #[test]
+    fn dispatch_response_without_a_wait_is_dropped() {
+        assert_eq!(
+            classify_resume(Some("c1"), None),
+            ResumeDecision::DropDispatchResponse("no wait is parked")
+        );
+    }
+
+    #[test]
+    fn dispatch_response_resumes_only_the_wait_awaiting_its_id() {
+        assert_eq!(
+            classify_resume(Some("c1"), Some(Some("await-runtime:c1"))),
+            ResumeDecision::Proceed
+        );
+        assert!(matches!(
+            classify_resume(Some("c1"), Some(Some("await-runtime:c2"))),
+            ResumeDecision::DropDispatchResponse(_)
+        ));
+        assert!(matches!(
+            classify_resume(Some("c1"), Some(Some("await-user"))),
+            ResumeDecision::DropDispatchResponse(_)
+        ));
+    }
+
+    #[test]
+    fn plain_inbound_does_not_resume_a_runtime_wait() {
+        assert_eq!(
+            classify_resume(None, Some(Some("await-runtime:c1"))),
+            ResumeDecision::StillAwaiting("await-runtime:c1".to_string())
+        );
+        assert_eq!(
+            classify_resume(None, Some(Some("await-user"))),
+            ResumeDecision::Proceed
+        );
+        assert_eq!(classify_resume(None, None), ResumeDecision::Proceed);
     }
 
     #[test]
@@ -680,7 +771,7 @@ mod tests {
     fn tenant_ctx_stamps_messaging_endpoint_id() {
         let mut envelope = sample_envelope();
         envelope.messaging_endpoint_id = Some("teams-legal".into());
-        let ctx = envelope.tenant_ctx();
+        let ctx = envelope.tenant_ctx().unwrap();
         assert_eq!(
             ctx.attributes.get(attr_keys::MESSAGING_ENDPOINT_ID),
             Some(&"teams-legal".to_string())
@@ -688,9 +779,19 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tenant_or_env_is_an_error_not_a_shared_default() {
+        let mut envelope = sample_envelope();
+        envelope.tenant = "Not A Tenant!".into();
+        assert!(envelope.tenant_ctx().is_err());
+        let mut envelope = sample_envelope();
+        envelope.env = Some("bad env".into());
+        assert!(envelope.tenant_ctx().is_err());
+    }
+
+    #[test]
     fn tenant_ctx_omits_messaging_endpoint_id_when_unset() {
         let envelope = sample_envelope();
-        let ctx = envelope.tenant_ctx();
+        let ctx = envelope.tenant_ctx().unwrap();
         assert!(
             !ctx.attributes
                 .contains_key(attr_keys::MESSAGING_ENDPOINT_ID)
@@ -850,6 +951,21 @@ impl StateMachineRuntime {
         Ok(snapshot.map(|snapshot| snapshot.state.pending_approvals()))
     }
 
+    /// Whether a wait is parked for the conversation `envelope` addresses.
+    /// `Ok(None)` when this runtime has no resume store (nothing can ever be
+    /// parked, so the caller cannot tell "missing" from "never parkable").
+    pub(crate) async fn has_parked_wait(&self, envelope: &IngressEnvelope) -> Result<Option<bool>> {
+        let Some(resume) = self.resume.as_ref() else {
+            return Ok(None);
+        };
+        let envelope = envelope.clone().canonicalize();
+        let snapshot = resume
+            .fetch(&envelope)
+            .await
+            .map_err(|err| anyhow!("failed to read the parked flow: {err}"))?;
+        Ok(Some(snapshot.is_some()))
+    }
+
     /// Execute the flow associated with the provided ingress event.
     pub async fn handle(&self, envelope: IngressEnvelope) -> Result<Value> {
         let result = self.run_flow_result(envelope).await?;
@@ -876,7 +992,7 @@ impl StateMachineRuntime {
         &self,
         envelope: IngressEnvelope,
     ) -> Result<super::api::RunFlowResult> {
-        let tenant_ctx = envelope.tenant_ctx();
+        let tenant_ctx = envelope.tenant_ctx()?;
         let session_hint = envelope
             .session_hint
             .clone()
@@ -1046,8 +1162,37 @@ impl Adapter for PackFlowAdapter {
         let provider_owned = envelope.provider.clone();
         let payload = envelope.payload.clone();
         let retry_config = self.config.retry_config().into();
-        let (resume_snapshot, resume_run) = match self.resume.fetch_with_run(&envelope).await? {
-            Some((snapshot, run)) => (Some(snapshot), run),
+        let parked_record = self.resume.fetch_record(&envelope).await?;
+        let dispatch_correlation = dispatch_resume_correlation(&envelope);
+        match classify_resume(
+            dispatch_correlation.as_deref(),
+            parked_record
+                .as_ref()
+                .map(|record| record.reason.as_deref()),
+        ) {
+            ResumeDecision::Proceed => {}
+            ResumeDecision::DropDispatchResponse(why) => {
+                tracing::warn!(
+                    correlation_id = dispatch_correlation.as_deref().unwrap_or_default(),
+                    why,
+                    "dropping runtime dispatch response: it does not match a parked wait"
+                );
+                return Ok((
+                    json!({ "status": "ignored", "reason": why }),
+                    serde_json::Map::new(),
+                ));
+            }
+            ResumeDecision::StillAwaiting(reason) => {
+                // An ordinary inbound while the conversation awaits a runtime
+                // response must neither resume the wait nor clobber it.
+                return Ok((
+                    json!({ "status": "pending", "reason": reason }),
+                    serde_json::Map::new(),
+                ));
+            }
+        }
+        let (resume_snapshot, resume_run) = match parked_record {
+            Some(record) => (Some(record.snapshot), record.run),
             None => (None, None),
         };
         let resume_flow_id = resume_snapshot
@@ -1117,7 +1262,11 @@ impl Adapter for PackFlowAdapter {
             // on the async execution path, so `AuditSink::new`'s
             // `tokio::spawn` runs inside a live tokio runtime context.
             let sink = self.audit_nats_client.clone().map(AuditSink::new);
-            let audit_tenant = sink.is_some().then(|| envelope.tenant_ctx());
+            let audit_tenant = if sink.is_some() {
+                Some(envelope.tenant_ctx()?)
+            } else {
+                None
+            };
             Some(TraceRecorder::new_with_audit(
                 trace_config,
                 trace_ctx,
@@ -1466,13 +1615,18 @@ impl IngressEnvelope {
         )
     }
 
-    pub fn tenant_ctx(&self) -> TenantCtx {
+    /// The tenant context this envelope runs under. An invalid tenant or env id
+    /// is an error: mapping it onto a shared default would run (and store the
+    /// parked wait of) one caller's traffic in another's namespace.
+    pub fn tenant_ctx(&self) -> GResult<TenantCtx> {
         let env_raw = self.env.clone().unwrap_or_else(|| DEFAULT_ENV.into());
-        let env = EnvId::from_str(env_raw.as_str())
-            .unwrap_or_else(|_| EnvId::from_str(DEFAULT_ENV).expect("default env must be valid"));
-        let tenant_id = TenantId::from_str(self.tenant.as_str()).unwrap_or_else(|_| {
-            TenantId::from_str("tenant.default").expect("tenant fallback must be valid")
-        });
+        let env = EnvId::from_str(env_raw.as_str()).map_err(|err| RunnerError::Session {
+            reason: format!("invalid env id `{env_raw}`: {err}"),
+        })?;
+        let tenant_id =
+            TenantId::from_str(self.tenant.as_str()).map_err(|err| RunnerError::Session {
+                reason: format!("invalid tenant id `{}`: {err}", self.tenant),
+            })?;
         let mut ctx = TenantCtx::new(env, tenant_id).with_flow(self.flow_id.clone());
         if let Some(provider) = &self.provider {
             ctx = ctx.with_provider(provider.clone());
@@ -1487,6 +1641,6 @@ impl IngressEnvelope {
             ctx.attributes
                 .insert(attr_keys::MESSAGING_ENDPOINT_ID.to_string(), eid.clone());
         }
-        ctx
+        Ok(ctx)
     }
 }

@@ -42,10 +42,12 @@ pub fn render_template_value(
 
 fn render_template_string(raw: &str, ctx: &Value, options: TemplateOptions) -> Result<Value> {
     if options.allow_pointer && raw.starts_with('/') && !raw.contains("{{") {
-        return ctx
-            .pointer(raw)
-            .cloned()
-            .ok_or_else(|| anyhow!("mapping path `{raw}` not found"));
+        // A literal string that merely starts with `/` (a URL path, a route)
+        // is not an error: fall back to the literal when no such pointer exists.
+        return Ok(match ctx.pointer(raw) {
+            Some(value) => value.clone(),
+            None => Value::String(raw.to_string()),
+        });
     }
 
     if let Some(expr) = extract_exact_expression(raw)
@@ -77,7 +79,11 @@ fn extract_exact_expression(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.starts_with("{{") && trimmed.ends_with("}}") {
         let inner = trimmed.trim_start_matches('{').trim_end_matches('}').trim();
-        if !inner.is_empty() {
+        // Only a SINGLE plain expression is an exact-path candidate. Anything
+        // with more mustaches (`{{a}} {{b}}`), a block/partial/comment sigil
+        // (`{{#if}}`, `{{> p}}`, `{{! c}}`) is left to Handlebars.
+        let is_sigil = inner.starts_with(['#', '/', '>', '!', '^', '&', '@']);
+        if !inner.is_empty() && !inner.contains("{{") && !inner.contains("}}") && !is_sigil {
             return Some(inner);
         }
     }
@@ -186,7 +192,9 @@ where
         chars.next();
     }
     let ident = buf.trim();
-    if ident.is_empty() {
+    // Whitespace inside an identifier means this is a helper call
+    // (`{{upper name}}`), not a path: let Handlebars evaluate it.
+    if ident.is_empty() || ident.contains(char::is_whitespace) {
         return None;
     }
     Some(ident.to_string())
@@ -212,6 +220,52 @@ fn resolve_path<'a>(root: &'a Value, path: &[PathSegment]) -> Option<&'a Value> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn multiple_expressions_fall_through_to_handlebars() {
+        let ctx = json!({ "a": "x", "b": "y" });
+        let rendered = render_template_value(
+            &Value::String("{{a}} {{b}}".to_string()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rendered, json!("x y"));
+    }
+
+    #[test]
+    fn blocks_and_helpers_are_not_treated_as_paths() {
+        let ctx = json!({ "flag": true, "name": "bob" });
+        let block = render_template_value(
+            &Value::String("{{#if flag}}yes{{else}}no{{/if}}".to_string()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(block, json!("yes"));
+        let helper = render_template_value(
+            &Value::String("{{lookup this \"name\"}}".to_string()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(helper, json!("bob"));
+    }
+
+    #[test]
+    fn pointer_mode_falls_back_to_the_literal_when_missing() {
+        let ctx = json!({ "a": { "b": 1 } });
+        let options = TemplateOptions {
+            allow_pointer: true,
+        };
+        let found =
+            render_template_value(&Value::String("/a/b".to_string()), &ctx, options).unwrap();
+        assert_eq!(found, json!(1));
+        let literal =
+            render_template_value(&Value::String("/api/v1/items".to_string()), &ctx, options)
+                .unwrap();
+        assert_eq!(literal, json!("/api/v1/items"));
+    }
 
     #[test]
     fn renders_prev_and_node_outputs() {
