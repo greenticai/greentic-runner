@@ -39,9 +39,10 @@
 //!
 //! `RedisStateStore::del_prefix` runs an unbounded `SCAN MATCH` over the whole
 //! keyspace, which would be a real hazard on a shared Redis. It is unreachable
-//! from this crate: [`StateStoreHost::del_prefix`](crate::storage::state) is a
-//! no-op and never forwards. `del_prefix_never_reaches_the_backing_store` pins
-//! that, so a future implementation has to make the cost a deliberate decision.
+//! from this crate: [`StateStoreHost::del_prefix`](crate::storage::state)
+//! returns an "unsupported" error and never forwards.
+//! `del_prefix_is_unsupported_and_never_reaches_the_backing_store` pins that, so
+//! a future implementation has to make the cost a deliberate decision.
 //!
 //! [`SessionSnapshot`]: crate::engine::host::SessionSnapshot
 //! [`find_wait_by_scope`]: greentic_session::SessionStore::find_wait_by_scope

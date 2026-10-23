@@ -33,6 +33,43 @@ pub struct OperatorRegistry {
     per_provider_type: HashMap<String, HashMap<String, OperatorBinding>>,
 }
 
+/// Insert `binding` for `op_id`, resolving duplicates deterministically.
+///
+/// Two packs (or two providers of one pack) can declare the same
+/// `(provider, op)`. The binding from the pack with the higher `pack_priority`
+/// (the later pack in load order) wins; on a tie the later declaration wins.
+/// The conflict is logged so an operator can see which binding was shadowed.
+fn insert_binding(
+    ops: &mut HashMap<String, OperatorBinding>,
+    op_id: &str,
+    binding: OperatorBinding,
+) {
+    match ops.get(op_id) {
+        Some(existing) if existing.pack_priority > binding.pack_priority => {
+            tracing::warn!(
+                op = %op_id,
+                provider_type = %binding.provider_type,
+                kept_pack = %existing.pack_ref,
+                ignored_pack = %binding.pack_ref,
+                "duplicate operator binding: keeping the higher-priority pack"
+            );
+        }
+        Some(existing) => {
+            tracing::warn!(
+                op = %op_id,
+                provider_type = %binding.provider_type,
+                replaced_pack = %existing.pack_ref,
+                winning_pack = %binding.pack_ref,
+                "duplicate operator binding: later declaration replaces the earlier one"
+            );
+            ops.insert(op_id.to_string(), binding);
+        }
+        None => {
+            ops.insert(op_id.to_string(), binding);
+        }
+    }
+}
+
 impl OperatorRegistry {
     pub fn build(packs: &[(Arc<PackRuntime>, Option<String>)]) -> Result<OperatorRegistry> {
         let mut per_provider_id: HashMap<String, HashMap<String, OperatorBinding>> = HashMap::new();
@@ -72,15 +109,19 @@ impl OperatorRegistry {
                         pack_priority,
                     };
                     if let Some(provider_id) = binding.provider_id.clone() {
-                        per_provider_id
-                            .entry(provider_id)
-                            .or_default()
-                            .insert(op_id.clone(), binding.clone());
+                        insert_binding(
+                            per_provider_id.entry(provider_id).or_default(),
+                            op_id,
+                            binding.clone(),
+                        );
                     }
-                    per_provider_type
-                        .entry(binding.provider_type.clone())
-                        .or_default()
-                        .insert(op_id.clone(), binding);
+                    insert_binding(
+                        per_provider_type
+                            .entry(binding.provider_type.clone())
+                            .or_default(),
+                        op_id,
+                        binding,
+                    );
                 }
             }
         }
@@ -122,5 +163,51 @@ impl OperatorRegistry {
             return ops.get(op_id).ok_or(OperatorResolveError::OpNotFound);
         }
         Err(OperatorResolveError::ProviderNotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(pack_ref: &str, pack_priority: usize) -> OperatorBinding {
+        OperatorBinding {
+            provider_id: None,
+            provider_type: "t".to_string(),
+            op_id: "send".to_string(),
+            runtime: ProviderRuntimeRef {
+                component_ref: "c".to_string(),
+                export: "e".to_string(),
+                world: "w".to_string(),
+            },
+            pack_ref: pack_ref.to_string(),
+            pack_digest: None,
+            config_schema_ref: None,
+            state_schema_ref: None,
+            docs_ref: None,
+            capabilities: Vec::new(),
+            pack_priority,
+        }
+    }
+
+    #[test]
+    fn higher_priority_pack_wins_regardless_of_insertion_order() {
+        let mut ops = HashMap::new();
+        insert_binding(&mut ops, "send", binding("high@1", 2));
+        insert_binding(&mut ops, "send", binding("low@1", 1));
+        assert_eq!(ops["send"].pack_ref, "high@1");
+
+        let mut ops = HashMap::new();
+        insert_binding(&mut ops, "send", binding("low@1", 1));
+        insert_binding(&mut ops, "send", binding("high@1", 2));
+        assert_eq!(ops["send"].pack_ref, "high@1");
+    }
+
+    #[test]
+    fn equal_priority_keeps_later_declaration() {
+        let mut ops = HashMap::new();
+        insert_binding(&mut ops, "send", binding("first@1", 0));
+        insert_binding(&mut ops, "send", binding("second@1", 0));
+        assert_eq!(ops["send"].pack_ref, "second@1");
     }
 }

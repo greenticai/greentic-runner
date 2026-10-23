@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 
 use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx};
 use crate::pack::PackRuntime;
@@ -8,7 +9,46 @@ use greentic_x_runtime::{
     RuntimeError, execute_component_with_strategies,
 };
 use serde_json::Value;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::{Builder, Handle, RuntimeFlavor};
+
+/// One process-wide runtime shared by every Greentic-X provider, instead of a
+/// fresh multi-thread runtime (and its worker threads) per provider.
+fn shared_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("greentic-x-provider")
+                .build()
+                .map_err(|err| err.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// Drive `fut` to completion from a synchronous provider method.
+///
+/// The Greentic-X provider traits are synchronous but are reached from async
+/// host code. Calling `Runtime::block_on` (or dropping a `Runtime`) inside a
+/// runtime panics, so:
+///
+/// * inside a multi-thread runtime: `block_in_place` + the current handle (the
+///   worker is handed off so the runtime keeps making progress);
+/// * inside a current-thread runtime: blocking would deadlock the only thread,
+///   so this is reported as an error instead of panicking;
+/// * outside any runtime: the shared runtime drives it.
+fn block_on_compat<F: Future>(fut: F) -> Result<F::Output, String> {
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
+        }
+        Ok(_) => Err(
+            "cannot block on a component invocation inside a current-thread runtime".to_string(),
+        ),
+        Err(_) => Ok(shared_runtime()?.block_on(fut)),
+    }
+}
 
 /// Greentic-X component provider backed by a materialized Greentic runner pack.
 ///
@@ -18,7 +58,6 @@ use tokio::runtime::{Builder, Runtime};
 /// contract used by descriptor-driven solutions such as Telco-X.
 pub struct RunnerPackComponentProvider {
     pack: Arc<PackRuntime>,
-    runtime: Runtime,
     default_operation: String,
     tenant: String,
     flow_id: String,
@@ -27,16 +66,12 @@ pub struct RunnerPackComponentProvider {
 
 impl RunnerPackComponentProvider {
     pub fn new(pack: Arc<PackRuntime>) -> Result<Self, RuntimeError> {
-        let runtime = Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| RuntimeError::ComponentInvocationFailed {
-                component_id: "runner-pack-provider".to_owned(),
-                message: format!("failed to create component invocation runtime: {err}"),
-            })?;
+        shared_runtime().map_err(|err| RuntimeError::ComponentInvocationFailed {
+            component_id: "runner-pack-provider".to_owned(),
+            message: format!("failed to create component invocation runtime: {err}"),
+        })?;
         Ok(Self {
             pack,
-            runtime,
             default_operation: "invoke".to_owned(),
             tenant: "default".to_owned(),
             flow_id: "greentic-x.component-invocation".to_owned(),
@@ -117,16 +152,18 @@ impl RunnerPackComponentProvider {
         let component_id = envelope.component_id.clone();
         let pack = Arc::clone(&self.pack);
 
-        let output = self
-            .runtime
-            .block_on(async move {
-                pack.invoke_component(&component_ref, ctx, &operation, None, input_json)
-                    .await
-            })
-            .map_err(|err| RuntimeError::ComponentInvocationFailed {
-                component_id: component_id.clone(),
-                message: err.to_string(),
-            })?;
+        let output = block_on_compat(async move {
+            pack.invoke_component(&component_ref, ctx, &operation, None, input_json)
+                .await
+        })
+        .map_err(|message| RuntimeError::ComponentInvocationFailed {
+            component_id: component_id.clone(),
+            message,
+        })?
+        .map_err(|err| RuntimeError::ComponentInvocationFailed {
+            component_id: component_id.clone(),
+            message: err.to_string(),
+        })?;
 
         Ok(ComponentInvocationResultEnvelope::success(
             invocation_id,
@@ -172,7 +209,6 @@ impl ComponentProvider for RunnerPackComponentProvider {
 /// implementation to live in a pack/component.
 pub struct RunnerPackFast2FlowRoutingProvider {
     pack: Arc<PackRuntime>,
-    runtime: Runtime,
     component_ref: String,
     operation: String,
     tenant: String,
@@ -181,16 +217,12 @@ pub struct RunnerPackFast2FlowRoutingProvider {
 
 impl RunnerPackFast2FlowRoutingProvider {
     pub fn new(pack: Arc<PackRuntime>) -> Result<Self, RuntimeError> {
-        let runtime = Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
-                scope: "runner-pack-routing-provider".to_owned(),
-                message: format!("failed to create routing invocation runtime: {err}"),
-            })?;
+        shared_runtime().map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
+            scope: "runner-pack-routing-provider".to_owned(),
+            message: format!("failed to create routing invocation runtime: {err}"),
+        })?;
         Ok(Self {
             pack,
-            runtime,
             component_ref: "fast2flow-routing".to_owned(),
             operation: "route".to_owned(),
             tenant: "default".to_owned(),
@@ -260,16 +292,18 @@ impl Fast2FlowRoutingProvider for RunnerPackFast2FlowRoutingProvider {
         let component_ref = self.component_ref.clone();
         let operation = self.operation.clone();
 
-        let output = self
-            .runtime
-            .block_on(async move {
-                pack.invoke_component(&component_ref, ctx, &operation, None, input_json)
-                    .await
-            })
-            .map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
-                scope: scope.clone(),
-                message: err.to_string(),
-            })?;
+        let output = block_on_compat(async move {
+            pack.invoke_component(&component_ref, ctx, &operation, None, input_json)
+                .await
+        })
+        .map_err(|message| RuntimeError::Fast2FlowRoutingFailed {
+            scope: scope.clone(),
+            message,
+        })?
+        .map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
+            scope: scope.clone(),
+            message: err.to_string(),
+        })?;
 
         serde_json::from_value(output).map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
             scope,
@@ -293,6 +327,21 @@ mod tests {
     use greentic_x_types::{ActorRef, Provenance};
 
     use super::*;
+
+    #[test]
+    fn block_on_compat_runs_outside_any_runtime() {
+        assert_eq!(block_on_compat(async { 7 }), Ok(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_on_compat_does_not_panic_inside_a_multi_thread_runtime() {
+        assert_eq!(block_on_compat(async { 8 }), Ok(8));
+    }
+
+    #[tokio::test]
+    async fn block_on_compat_errors_inside_a_current_thread_runtime() {
+        assert!(block_on_compat(async { 9 }).is_err());
+    }
 
     #[test]
     fn component_ref_prefers_metadata_mapping() {

@@ -54,9 +54,11 @@ pub fn tenant_context(
     node_id: Option<&str>,
     provider_id: Option<&str>,
     session_id: Option<&str>,
-) -> TenantCtx {
-    let env_id = EnvId::from_str(env).expect("invalid env id");
-    let tenant_id = TenantId::from_str(tenant).expect("invalid tenant id");
+) -> anyhow::Result<TenantCtx> {
+    use anyhow::Context as _;
+    let env_id = EnvId::from_str(env).with_context(|| format!("invalid env id `{env}`"))?;
+    let tenant_id =
+        TenantId::from_str(tenant).with_context(|| format!("invalid tenant id `{tenant}`"))?;
     let mut ctx = TenantCtx::new(env_id, tenant_id);
     let provider = provider_id.unwrap_or(PROVIDER_ID);
     ctx = ctx.with_provider(provider.to_string());
@@ -69,7 +71,7 @@ pub fn tenant_context(
     if let Some(session) = session_id {
         ctx = ctx.with_session(session.to_string());
     }
-    ctx
+    Ok(ctx)
 }
 
 /// Build the per-invocation tenant context for a flow execution, stamping the
@@ -89,14 +91,14 @@ fn flow_tenant_ctx(
     session_id: Option<&str>,
     pack_id: &str,
     rollout: &RolloutIds,
-) -> TenantCtx {
-    let mut ctx = tenant_context(env, tenant, Some(flow_id), node_id, provider_id, session_id);
+) -> anyhow::Result<TenantCtx> {
+    let mut ctx = tenant_context(env, tenant, Some(flow_id), node_id, provider_id, session_id)?;
     if !pack_id.is_empty() {
         ctx.attributes
             .insert(attr_keys::PACK_ID.to_string(), pack_id.to_string());
     }
     stamp_rollout_ids(&mut ctx, rollout);
-    ctx
+    Ok(ctx)
 }
 
 /// Project a [`TenantCtx`] into a [`greentic_telemetry::TelemetryCtx`] for span
@@ -169,7 +171,7 @@ pub fn set_flow_context(
     pack_id: &str,
     rollout: &RolloutIds,
 ) {
-    let ctx = flow_tenant_ctx(
+    let ctx = match flow_tenant_ctx(
         env,
         tenant,
         flow_id,
@@ -178,7 +180,15 @@ pub fn set_flow_context(
         session_id,
         pack_id,
         rollout,
-    );
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            // Telemetry attribution must never take a flow down: skip stamping
+            // the context for an id that does not validate.
+            tracing::warn!(error = %err, "skipping telemetry context for invalid env/tenant id");
+            return;
+        }
+    };
     set_current_tenant_ctx(&ctx);
     #[cfg(feature = "telemetry")]
     greentic_telemetry::annotate_span(span, &tenant_ctx_to_telemetry(&ctx));
@@ -240,7 +250,7 @@ pub fn backoff_delay_ms(base: u64, attempt: u32) -> u64 {
     let exp = base.saturating_mul(multiplier);
     let mut rng = rng();
     let jitter = rng.random_range(0..=exp.min(1000));
-    exp + jitter
+    exp.saturating_add(jitter)
 }
 
 #[cfg(test)]
@@ -248,7 +258,30 @@ mod tests {
     use super::*;
 
     fn ctx() -> TenantCtx {
-        tenant_context("prod-eu", "acme", None, None, None, None)
+        tenant_context("prod-eu", "acme", None, None, None, None).expect("valid ids")
+    }
+
+    #[test]
+    fn backoff_delay_saturates_instead_of_overflowing() {
+        assert_eq!(backoff_delay_ms(u64::MAX, 8), u64::MAX);
+    }
+
+    #[test]
+    fn invalid_ids_are_an_error_not_a_panic() {
+        assert!(tenant_context("bad env!", "acme", None, None, None, None).is_err());
+        assert!(tenant_context("prod", "bad tenant!", None, None, None, None).is_err());
+        let span = Span::none();
+        set_flow_context(
+            &span,
+            "bad env!",
+            "acme",
+            "flow",
+            None,
+            None,
+            None,
+            "",
+            &RolloutIds::default(),
+        );
     }
 
     #[test]
@@ -315,7 +348,8 @@ mod tests {
             None,
             "customer.support@1.2.0",
             &RolloutIds::default(),
-        );
+        )
+        .expect("valid ids");
         assert_eq!(
             ctx.attributes.get(attr_keys::PACK_ID).map(String::as_str),
             Some("customer.support@1.2.0")
@@ -340,7 +374,8 @@ mod tests {
                 bundle_id: Some("customer.support".into()),
                 revision_id: Some("01JTKR".into()),
             },
-        );
+        )
+        .expect("valid ids");
         assert_eq!(
             ctx.attributes.get(attr_keys::PACK_ID).map(String::as_str),
             Some("customer.support@1.2.0")
@@ -370,7 +405,8 @@ mod tests {
             None,
             "",
             &RolloutIds::default(),
-        );
+        )
+        .expect("valid ids");
         assert!(!ctx.attributes.contains_key(attr_keys::PACK_ID));
     }
 

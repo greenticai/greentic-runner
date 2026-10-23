@@ -182,18 +182,39 @@ async fn execute_chat(
         activity = activity.with_flow(flow);
     }
 
+    // Typed pre-check instead of matching on error text.
+    if host.active_packs().load_pack(&tenant).is_none() {
+        return Err(ChatError::TenantNotLoaded.into_response_parts());
+    }
+
     match host.handle_activity_traced(&tenant, activity).await {
         Ok(trace) => Ok(trace_to_response(trace)),
         Err(e) => {
-            let msg = format!("{e:#}");
-            // handle_activity returns "tenant <name> not loaded" when the tenant
-            // isn't present in ActivePacks. Surface that as 404.
-            let (code, error) = if msg.contains("not loaded") {
-                (StatusCode::NOT_FOUND, "tenant_not_loaded")
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, "agent_chat_failed")
-            };
-            Err((code, serde_json::json!({ "error": error, "message": msg })))
+            // Full chain goes to the log only; clients get a generic message.
+            tracing::error!(tenant = %tenant, error = %format!("{e:#}"), "agent chat turn failed");
+            Err(ChatError::Internal.into_response_parts())
+        }
+    }
+}
+
+/// Failure modes of one chat turn, mapped to a status and a stable client body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatError {
+    TenantNotLoaded,
+    Internal,
+}
+
+impl ChatError {
+    fn into_response_parts(self) -> (StatusCode, serde_json::Value) {
+        match self {
+            Self::TenantNotLoaded => (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({ "error": "tenant_not_loaded", "message": "tenant not loaded" }),
+            ),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "agent_chat_failed", "message": "agent chat failed" }),
+            ),
         }
     }
 }
@@ -383,8 +404,9 @@ pub fn agent_chat_stream_core(
                 }
             }
             Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "agent chat stream turn failed");
                 let _ = frame_tx.send(StreamFrame::Error {
-                    message: format!("{e:#}"),
+                    message: "agent chat failed".to_string(),
                 });
             }
         }
@@ -486,6 +508,13 @@ mod tests {
             .expect_err("unknown tenant should fail");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert_eq!(err.1["error"], "tenant_not_loaded");
+    }
+
+    #[test]
+    fn internal_chat_error_is_generic() {
+        let (code, body) = ChatError::Internal.into_response_parts();
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["message"], "agent chat failed");
     }
 
     /// With no loaded pack, the turn errors; the SSE core must still deliver a

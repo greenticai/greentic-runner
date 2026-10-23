@@ -89,7 +89,9 @@ pub async fn handler(State(state): State<ServerState>) -> impl IntoResponse {
         "secrets_ready": snapshot.secrets_ready,
         "active_packs": packs,
         "last_reload": last_reload,
-        "last_error": snapshot.last_error,
+        // Raw error text can leak paths and URLs; detail lives behind
+        // authentication at /admin/packs/status.
+        "last_reload_failed": snapshot.last_error.is_some(),
     }))
 }
 
@@ -155,5 +157,21 @@ mod tests {
         assert_eq!(json["telemetry_ready"], true);
         assert_eq!(json["secrets_ready"], true);
         assert_eq!(json["active_packs"], 0);
+    }
+
+    #[tokio::test]
+    async fn handler_does_not_expose_raw_error() {
+        let state = state();
+        state
+            .health
+            .record_reload_error(&anyhow::anyhow!("failed /secret/path"));
+
+        let response = handler(State(state)).await.into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(!text.contains("/secret/path"));
+        assert!(text.contains("\"last_reload_failed\":true"));
     }
 }

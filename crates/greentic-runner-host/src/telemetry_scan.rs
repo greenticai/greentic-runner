@@ -21,7 +21,25 @@
 //! That keeps the runner safe to enable in front of any component
 //! (telemetry-aware or not).
 
-use tracing::{Level as TracingLevel, debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
+
+/// Upper bound on buffered, not-yet-terminated guest output per stream and on a
+/// single scanned line. A guest that never writes `\n` (or writes one huge
+/// line) must not grow host memory without bound.
+const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Caps for guest-supplied attributes re-emitted into host logs.
+const MAX_COMPONENT_CHARS: usize = 64;
+const MAX_LOCATION_CHARS: usize = 256;
+const MAX_MESSAGE_CHARS: usize = 4096;
+
+/// Make guest-controlled text safe to log: control characters (log injection)
+/// are replaced and the length is bounded.
+fn sanitize_attr(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .take(max_chars)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
 
 /// Severity level parsed from a fallback line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,9 +200,12 @@ fn parse_fields(block: &str) -> Vec<(&str, &str)> {
 /// subscriber configured by the host (system.log, OTLP exporter, etc.).
 pub fn emit_as_tracing(line: &TelemetryLine<'_>) {
     let fields_json = fields_to_json(&line.fields);
-    let component = line.component;
-    let file_line = line.file_line;
-    let message = line.message;
+    // `provider` and the other attributes come from the guest; never trust
+    // their content or size.
+    let component = sanitize_attr(line.component, MAX_COMPONENT_CHARS);
+    let file_line = sanitize_attr(line.file_line, MAX_LOCATION_CHARS);
+    let message = sanitize_attr(line.message, MAX_MESSAGE_CHARS);
+    let message = message.as_str();
 
     // `tracing` macros require a static `Level`; we dispatch through the
     // matching macro per variant. `provider` is the canonical attribute key
@@ -221,8 +242,6 @@ pub fn emit_as_tracing(line: &TelemetryLine<'_>) {
             "{message}"
         ),
     }
-    // Quiet the unused-variable warning if no subscriber is installed yet.
-    let _ = TracingLevel::INFO;
 }
 
 fn fields_to_json(fields: &[(&str, &str)]) -> String {
@@ -342,6 +361,8 @@ impl TelemetryLineSink {
             if raw.is_empty() {
                 continue;
             }
+            // Bound what a single line can cost to parse / forward.
+            let raw = &raw[..raw.len().min(MAX_LINE_BYTES)];
             // Trim a CR if present (Windows-style line endings).
             let raw = if raw.last() == Some(&b'\r') {
                 &raw[..raw.len() - 1]
@@ -387,13 +408,25 @@ impl AsyncWrite for TelemetryLineSink {
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         // Accumulate, then drain complete lines.
-        let drained = {
+        let drained: Option<Vec<u8>> = {
             let mut guard = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
             guard.extend_from_slice(buf);
             // Find the index of the last '\n' so we keep partial trailing
             // bytes for the next write.
             let split_at = guard.iter().rposition(|b| *b == b'\n').map(|i| i + 1);
-            split_at.map(|i| guard.drain(..i).collect::<Vec<_>>())
+            let drained = split_at.map(|i| guard.drain(..i).collect::<Vec<_>>());
+            if guard.len() > MAX_LINE_BYTES {
+                // An unterminated line past the cap: flush what we have as a
+                // (truncated) line instead of buffering without bound.
+                let mut overflow = std::mem::take(&mut *guard);
+                overflow.truncate(MAX_LINE_BYTES);
+                overflow.push(b'\n');
+                let mut combined = drained.unwrap_or_default();
+                combined.extend_from_slice(&overflow);
+                Some(combined)
+            } else {
+                drained
+            }
         };
         if let Some(complete) = drained {
             self.dispatch_lines(&complete);
@@ -427,6 +460,30 @@ mod tests {
     use futures::task::noop_waker;
     use std::pin::Pin;
     use std::task::Context;
+
+    #[test]
+    fn sanitize_attr_strips_control_chars_and_bounds_length() {
+        assert_eq!(sanitize_attr("a\nb\x1b[31mc", 64), "a b [31mc");
+        assert_eq!(sanitize_attr(&"x".repeat(100), 10).len(), 10);
+    }
+
+    #[test]
+    fn unterminated_output_is_flushed_not_buffered_forever() {
+        let sink = TelemetryLineSink {
+            kind: StreamKind::Stdout,
+            forward_unmatched: Arc::new(AtomicBool::new(false)),
+            buffer: Mutex::new(Vec::new()),
+        };
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut sink = sink;
+        let chunk = vec![b'a'; 40 * 1024];
+        for _ in 0..8 {
+            let _ = Pin::new(&mut sink).poll_write(&mut cx, &chunk);
+            let held = sink.buffer.lock().map(|g| g.len()).unwrap_or(usize::MAX);
+            assert!(held <= MAX_LINE_BYTES, "buffer grew to {held}");
+        }
+    }
 
     #[test]
     fn parses_full_line_with_all_segments() {

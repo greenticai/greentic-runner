@@ -42,7 +42,13 @@ impl BrokerSecretsManager {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
-                .unwrap_or_else(|_| Client::new()),
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to build the secrets broker http client; falling back to a default client WITHOUT the 10s timeout"
+                    );
+                    Client::new()
+                }),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             token: token.into(),
         }
