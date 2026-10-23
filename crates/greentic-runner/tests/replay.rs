@@ -77,14 +77,27 @@ async fn replay_reproduces_failing_step() -> Result<()> {
 
     host.stop().await?;
 
-    let status = Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
+    let output = Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
         .arg("replay")
         .arg(&trace_path)
         .arg("--pack")
         .arg(&pack_path)
-        .status()
+        .output()
         .context("run greentic-runner replay")?;
-    assert!(status.success(), "replay command should exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "replay command should exit 0\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("step 1:"),
+        "replay should list steps: {stdout}"
+    );
+    assert!(
+        !stdout.contains("divergence"),
+        "replay must reproduce the recorded outputs: {stdout}"
+    );
 
     Ok(())
 }

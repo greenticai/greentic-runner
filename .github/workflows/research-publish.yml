@@ -74,7 +74,7 @@ jobs:
 
       # Strip unpublishable internal deps before publishing.
       #
-      # greentic-aw-runtime (publish=false) and greentic-ext-runtime (private git)
+      # greentic-aw-runtime (private git deps on this branch) and greentic-ext-runtime (private git)
       # are feature-gated behind the `agentic-worker` feature in greentic-runner-host,
       # greentic-runner-desktop, and greentic-runner. crates.io rejects any manifest
       # that references a git source or an unpublished path dep, even optional ones.
@@ -161,19 +161,22 @@ jobs:
       # Publish in dependency order (runner-core → greentic-runner-host →
       # greentic-runner-desktop → greentic-runner).
       #
-      # Crates excluded from this list because they have publish = false:
-      #   - crates/tests          (integration-test harness, never published)
-      #   - tests/fixtures/…      (test fixture component, never published)
-      #   - greentic-aw-runtime   (internal, no publish intent at this stage)
+      # Crates deliberately NOT in this list:
+      #   - crates/tests, crates/telco-x-event-bridge  (publish = false)
+      #   - greentic-aw-runtime, aw-event-bridge, greentic-a2a: these have no
+      #     `publish = false`, and the develop/main lanes (dev-publish.yml,
+      #     crates-publish.yml, release-binaries.yml) publish them. On this
+      #     branch greentic-aw-runtime carries private git dependencies, which
+      #     crates.io rejects, so the strip step above removes the
+      #     `agentic-worker` feature from the three crates below instead.
       #
       # --allow-dirty is required because the strip step above modifies Cargo.toml
       # files in-place without committing (CI-ephemeral operation).
       #
-      # warn-on-failure rather than hard-fail: if a partial publish run is
-      # re-triggered after fixing one crate, the already-published crates will
-      # return "already exists" — a warning lets the run continue to the
-      # remaining crates instead of aborting the whole job. The final step
-      # summarises which crates succeeded.
+      # Re-publishing an existing version returns "already exists", which is
+      # tolerated so a partial run can be re-triggered. Any other failure
+      # (auth, verification, a dependency issue) fails the job: continuing
+      # would publish dependents against a stale dependency.
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -181,16 +184,22 @@ jobs:
           set -euo pipefail
 
           published=()
-          failed=()
+          skipped=()
+          log="$(mktemp)"
 
           for crate in runner-core greentic-runner-host greentic-runner-desktop greentic-runner; do
             echo "==> publishing $crate"
-            if cargo publish -p "$crate" --allow-dirty --token "$CARGO_REGISTRY_TOKEN"; then
+            if cargo publish -p "$crate" --allow-dirty --token "$CARGO_REGISTRY_TOKEN" 2>&1 | tee "$log"; then
               published+=("$crate")
               echo "::notice::$crate published successfully"
+            elif grep -qiE 'already (exists|uploaded)' "$log"; then
+              skipped+=("$crate")
+              echo "::notice::$crate already published at this version; continuing"
             else
-              failed+=("$crate")
-              echo "::warning::publish of $crate failed (already published at this version, or a dependency issue) — continuing with remaining crates"
+              echo "::error::publish of $crate failed (not an 'already exists' error)"
+              echo "Published : ${published[*]:-none}"
+              echo "Skipped   : ${skipped[*]:-none}"
+              exit 1
             fi
             # Give the crates.io index time to ingest the new crate before the
             # next dependent crate tries to resolve it.
@@ -200,8 +209,4 @@ jobs:
           echo ""
           echo "===== Publish summary ====="
           echo "Published : ${published[*]:-none}"
-          echo "Failed    : ${failed[*]:-none}"
-
-          if [[ ${#failed[@]} -gt 0 ]]; then
-            echo "::warning::One or more crates failed to publish. Check the log above for details."
-          fi
+          echo "Skipped   : ${skipped[*]:-none}"

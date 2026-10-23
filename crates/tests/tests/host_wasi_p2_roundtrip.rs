@@ -16,17 +16,9 @@ use tempfile::TempDir;
 #[test]
 #[serial]
 fn wasi_preview2_policy_enforced() -> Result<()> {
-    if is_offline() {
-        eprintln!("skipping wasm fixture test in offline mode");
-        return Ok(());
-    }
-    let wasm_path = match build_fixture() {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("skipping wasm fixture test (fixture build failed: {err:?})");
-            return Ok(());
-        }
-    };
+    // A missing `wasm-tools` or failed fixture build must fail loudly rather
+    // than silently skipping the policy assertions.
+    let wasm_path = build_fixture().context("failed to build the wasi-p2-smoke fixture")?;
     let workspace = workspace_root();
     let bindings = workspace.join("examples/bindings/default.bindings.yaml");
     let config = Arc::new(HostConfig::load_from_path(&bindings)?);
@@ -42,13 +34,6 @@ fn wasi_preview2_policy_enforced() -> Result<()> {
     run_component(&wasm_path, Arc::clone(&config), base_policy.clone())?;
 
     Ok(())
-}
-
-fn is_offline() -> bool {
-    matches!(
-        std::env::var("CARGO_NET_OFFLINE"),
-        Ok(val) if val == "true" || val == "1"
-    )
 }
 
 fn run_component(wasm: &Path, config: Arc<HostConfig>, policy: RunnerWasiPolicy) -> Result<()> {

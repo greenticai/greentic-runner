@@ -29,14 +29,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: 1.94.0
+          toolchain: 1.95.0
           targets: wasm32-wasip2
 
       - name: Install wasm32-wasip2 target
-        run: rustup target add wasm32-wasip2 --toolchain 1.94.0
+        run: rustup target add wasm32-wasip2 --toolchain 1.95.0
 
       - name: Install llvm-tools-preview
-        run: rustup component add llvm-tools-preview --toolchain 1.94.0
+        run: rustup component add llvm-tools-preview --toolchain 1.95.0
 
       - uses: cargo-bins/cargo-binstall@main
 
@@ -51,10 +51,11 @@ jobs:
         # and then exits 70 looking like a Rust build break. All three tools publish
         # prebuilt binaries, so disabling the compile strategy costs nothing.
         run: |
-          cargo binstall --no-confirm --disable-strategies compile greentic-dev cargo-nextest cargo-llvm-cov
+          cargo binstall --no-confirm --disable-strategies compile greentic-dev cargo-nextest cargo-llvm-cov wasm-tools
           command -v greentic-dev
           command -v cargo-nextest
           command -v cargo-llvm-cov
+          command -v wasm-tools
 
       - uses: Swatinem/rust-cache@v2
         with:

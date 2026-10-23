@@ -223,7 +223,7 @@ fn main() -> Result<()> {
     if cli.strict_signing && cli.policy.is_some() {
         bail!("--policy and --strict-signing are mutually exclusive");
     }
-    let policy = cli.policy.unwrap_or(RunPolicyArg::Devok);
+    let policy = resolve_policy(cli.policy, cli.strict_signing);
 
     if cli.mock_exec {
         let input = parse_input(&cli)?;
@@ -267,7 +267,8 @@ fn main() -> Result<()> {
 
     let log_path = init_run_logging()?;
     log_runner_start();
-    println!("Run logs: {}", log_path.display());
+    // stderr keeps stdout clean for machine-readable `--json` output.
+    eprintln!("Run logs: {}", log_path.display());
     configure_wasmtime_home()?;
     configure_proxy_env();
     if cli.no_cache {
@@ -363,13 +364,7 @@ fn init_run_logging() -> Result<PathBuf> {
     let log_path = logs_dir.join(format!("pack-run-{timestamp}.log"));
     let make_writer = {
         let log_path = log_path.clone();
-        move || {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .unwrap()
-        }
+        move || open_log_writer(&log_path)
     };
 
     let file_layer = tracing_subscriber::fmt::layer()
@@ -389,33 +384,109 @@ fn init_run_logging() -> Result<PathBuf> {
     Ok(log_path)
 }
 
+/// Combine `--policy` and `--strict-signing` into the effective policy.
+/// An explicit `--policy` wins; otherwise `--strict-signing` selects `Strict`.
+fn resolve_policy(policy: Option<RunPolicyArg>, strict_signing: bool) -> RunPolicyArg {
+    match (policy, strict_signing) {
+        (Some(policy), _) => policy,
+        (None, true) => RunPolicyArg::Strict,
+        (None, false) => RunPolicyArg::Devok,
+    }
+}
+
+/// Open the run-log file; if that fails, note it on stderr and discard logs
+/// rather than panicking inside the tracing writer.
+fn open_log_writer(log_path: &Path) -> Box<dyn std::io::Write + Send> {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(file) => Box::new(file),
+        Err(err) => {
+            eprintln!(
+                "warning: failed to open run log {}: {err}; discarding logs",
+                log_path.display()
+            );
+            Box::new(std::io::sink())
+        }
+    }
+}
+
+/// Environment values that must be set to scope wasmtime state to the
+/// workspace. Only entries that are missing from the process environment are
+/// returned, so a valid user `HOME` / `WASMTIME_CACHE_DIR` is never clobbered.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WasmtimeEnvPlan {
+    home: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+}
+
+fn plan_wasmtime_env(home_set: bool, cache_dir_set: bool, workspace: &Path) -> WasmtimeEnvPlan {
+    let local_home = workspace.join(".greentic").join("wasmtime-home");
+    WasmtimeEnvPlan {
+        home: (!home_set).then(|| local_home.clone()),
+        cache_dir: (!cache_dir_set).then(|| {
+            local_home
+                .join("Library")
+                .join("Caches")
+                .join("BytecodeAlliance.wasmtime")
+        }),
+    }
+}
+
 fn configure_wasmtime_home() -> Result<()> {
-    if std::env::var_os("HOME").is_none() || std::env::var_os("WASMTIME_CACHE_DIR").is_none() {
-        let workspace = std::env::current_dir().context("failed to resolve workspace root")?;
-        let home = workspace.join(".greentic").join("wasmtime-home");
-        let cache_dir = home
-            .join("Library")
-            .join("Caches")
-            .join("BytecodeAlliance.wasmtime");
+    let workspace = std::env::current_dir().context("failed to resolve workspace root")?;
+    let plan = plan_wasmtime_env(
+        std::env::var_os("HOME").is_some(),
+        std::env::var_os("WASMTIME_CACHE_DIR").is_some(),
+        &workspace,
+    );
+    if let Some(home) = &plan.home {
         let config_dir = home
             .join("Library")
             .join("Application Support")
             .join("wasmtime");
-        fs::create_dir_all(&cache_dir)
-            .with_context(|| format!("failed to create {}", cache_dir.display()))?;
         fs::create_dir_all(&config_dir)
             .with_context(|| format!("failed to create {}", config_dir.display()))?;
-        // SAFETY: scope HOME and cache dir to a workspace-local directory to avoid
-        // writing outside the sandbox; this only affects the child Wasmtime engine.
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("WASMTIME_CACHE_DIR", &cache_dir);
+    }
+    if let Some(cache_dir) = &plan.cache_dir {
+        fs::create_dir_all(cache_dir)
+            .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+    }
+    // SAFETY: scope HOME and cache dir to a workspace-local directory to avoid
+    // writing outside the sandbox; this only affects the child Wasmtime engine.
+    unsafe {
+        if let Some(home) = &plan.home {
+            std::env::set_var("HOME", home);
+        }
+        if let Some(cache_dir) = &plan.cache_dir {
+            std::env::set_var("WASMTIME_CACHE_DIR", cache_dir);
         }
     }
     Ok(())
 }
 
+fn proxy_env_already_configured() -> bool {
+    [
+        "NO_PROXY",
+        "no_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some())
+}
+
 fn configure_proxy_env() {
+    // Respect any proxy settings the user already has.
+    if proxy_env_already_configured() {
+        return;
+    }
     // Avoid system proxy discovery (reqwest on macOS can panic in sandboxed CI).
     unsafe {
         std::env::set_var("NO_PROXY", "*");
@@ -815,4 +886,42 @@ fn seed_entry_to_bytes(entry: SeedEntry) -> Result<(String, Vec<u8>)> {
         bail!("seed entry {} missing value", entry.uri);
     };
     Ok((entry.uri, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn strict_signing_selects_strict_policy() {
+        assert!(matches!(resolve_policy(None, true), RunPolicyArg::Strict));
+        assert!(matches!(resolve_policy(None, false), RunPolicyArg::Devok));
+        assert!(matches!(
+            resolve_policy(Some(RunPolicyArg::Devok), false),
+            RunPolicyArg::Devok
+        ));
+    }
+
+    #[test]
+    fn wasmtime_env_plan_only_sets_missing_values() {
+        let ws = Path::new("/ws");
+        let both_set = plan_wasmtime_env(true, true, ws);
+        assert_eq!(both_set, WasmtimeEnvPlan::default());
+
+        let only_cache_missing = plan_wasmtime_env(true, false, ws);
+        assert!(only_cache_missing.home.is_none());
+        assert!(only_cache_missing.cache_dir.is_some());
+
+        let only_home_missing = plan_wasmtime_env(false, true, ws);
+        assert!(only_home_missing.home.is_some());
+        assert!(only_home_missing.cache_dir.is_none());
+    }
+
+    #[test]
+    fn open_log_writer_falls_back_to_sink() {
+        let missing = Path::new("/nonexistent-dir-for-greentic-test/run.log");
+        let mut writer = open_log_writer(missing);
+        assert!(writer.write_all(b"ignored").is_ok());
+    }
 }

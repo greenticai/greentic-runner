@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 : "${CI:=0}"
 : "${RUN_HOST:=never}"
 
@@ -41,9 +45,16 @@ run_dependency_sanity() {
   echo "==> dependency sanity"
 
   local package="${LOCAL_CHECK_HOST_PACKAGE:-greentic-runner-host}"
+  # Capture the tree first: inside a process substitution a failing
+  # `cargo tree` would be swallowed and the check would pass vacuously.
+  local tree
+  if ! tree="$(cargo tree -p "$package" --duplicates)"; then
+    echo "cargo tree -p $package --duplicates failed; cannot verify wasmtime versions" >&2
+    exit 1
+  fi
   local versions=()
   mapfile -t versions < <(
-    cargo tree -p "$package" --duplicates \
+    printf '%s\n' "$tree" \
       | awk '/^wasmtime v/ { sub(/^v/, "", $2); print $2 }' \
       | sort -u
   )
@@ -71,7 +82,7 @@ run_wit_sync() {
   # The check fetches raw.githubusercontent.com. Offline (or upstream
   # unreachable) it is a soft-skip so the rest of local CI still runs; CI with
   # network enforces it.
-  if ! ./scripts/verify-wit-sync.sh; then
+  if ! "${SCRIPT_DIR}/../scripts/verify-wit-sync.sh"; then
     if [[ "${CI:-}" == "1" || "${CI:-}" == "true" ]]; then
       echo "WIT sync check failed in CI"
       return 1
@@ -85,6 +96,62 @@ run_clippy() {
   cargo clippy --all-targets --all-features -- -D warnings
 }
 
+# Start the real host against the example bindings, wait for /healthz to answer,
+# then stop it. The runner has no "run once" mode, so liveness is the signal.
+host_smoke_probe() {
+  # `examples/bindings/default.bindings.yaml` is the legacy HostConfig format
+  # and is not loadable by `--bindings` (which takes *.gtbind), so describe the
+  # bundled demo pack with a generated gtbind instead.
+  local bindings_dir
+  bindings_dir="$(mktemp -d)"
+  cat >"${bindings_dir}/smoke.gtbind" <<GTBIND
+tenant: acme
+pack_id: runner.components
+pack_ref: runner.components@0.1.0
+pack_locator: fs://${REPO_ROOT}/examples/packs/demo.gtpack
+GTBIND
+  local port="${HOST_SMOKE_PORT:-18080}"
+  local timeout_secs="${HOST_SMOKE_TIMEOUT_SECS:-300}"
+  local log
+  log="$(mktemp)"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not found; cannot probe host health" >&2
+    return 1
+  fi
+  if ! cargo build -p greentic-runner --bin greentic-runner; then
+    return 1
+  fi
+  local target_dir="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+  local bin="${target_dir}/debug/greentic-runner"
+
+  "$bin" --bindings-dir "$bindings_dir" --port "$port" >"$log" 2>&1 &
+  local pid=$!
+  local ok=1
+  local waited=0
+  while (( waited < timeout_secs )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "host exited before becoming healthy; log:" >&2
+      cat "$log" >&2
+      return 1
+    fi
+    if curl -fsS "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+      ok=0
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if (( ok != 0 )); then
+    echo "host did not answer /healthz within ${timeout_secs}s; log:" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  echo "host smoke OK (/healthz answered on port ${port})"
+}
+
 run_host_smoke() {
   RUN_HOST="${RUN_HOST:-never}"
   if [[ "${RUN_HOST}" == "always" ]] || { [[ "${RUN_HOST}" == "auto" ]] && [[ -f "./examples/index.json" ]]; }; then
@@ -93,7 +160,7 @@ run_host_smoke() {
     export PACK_CACHE_DIR="${PACK_CACHE_DIR:-.packs}"
     export DEFAULT_TENANT="${DEFAULT_TENANT:-demo}"
 
-    if ! cargo run -p greentic-runner -- --bindings examples/bindings/demo.yaml --port 0 --once; then
+    if ! host_smoke_probe; then
       echo "Host smoke exited non-zero; continuing with tests but failing at end"
       HOST_SMOKE_FAILED=1
     fi
@@ -124,7 +191,7 @@ run_workspace_tests() {
 run_conformance() {
   if [[ "${RUN_CONFORMANCE:-0}" == "1" ]]; then
     echo "==> conformance harness"
-    cargo run -p greentic-runner -- conformance --packs tests/fixtures/packs --level L1
+    cargo run -p greentic-runner -- conformance --packs tests/fixtures/packs --level l1
   else
     echo "==> Skipping conformance (RUN_CONFORMANCE != 1)"
   fi
@@ -137,7 +204,6 @@ run_package() {
       echo "jq not found; skipping package dry-run"
     else
       manifests=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.publish != false and .publish != []) | .manifest_path')
-      skipped_package=0
       while IFS= read -r manifest; do
         [[ -z "$manifest" ]] && continue
         crate_dir="$(dirname "$manifest")"
@@ -149,9 +215,6 @@ run_package() {
         fi
         popd >/dev/null
       done <<< "$manifests"
-      if [[ "$skipped_package" -eq 1 ]]; then
-        echo "Package dry-run unfinished due to offline mode; rerun with LOCAL_CHECK_ONLINE=1 to verify packaging"
-      fi
     fi
   fi
 }

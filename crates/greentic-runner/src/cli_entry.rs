@@ -143,9 +143,9 @@ struct RunArgs {
     #[arg(long = "bindings-dir", value_name = "DIR")]
     bindings_dir: Vec<PathBuf>,
 
-    /// Port to serve the HTTP server on (default 8080)
-    #[arg(long, default_value = "8080")]
-    port: u16,
+    /// Port to serve the HTTP server on (overrides the PORT env var; default 8080)
+    #[arg(long)]
+    port: Option<u16>,
 
     /// Disable the component compilation cache
     #[arg(long)]
@@ -160,12 +160,12 @@ struct RunArgs {
     trace_out: Option<PathBuf>,
 
     /// Trace emission mode
-    #[arg(long = "trace", value_enum, default_value = "on")]
-    trace: TraceArg,
+    #[arg(long = "trace", value_enum)]
+    trace: Option<TraceArg>,
 
     /// Capture invocation inputs into trace.json (default off)
-    #[arg(long = "trace-capture-inputs", value_enum, default_value = "off")]
-    trace_capture_inputs: TraceCaptureArg,
+    #[arg(long = "trace-capture-inputs", value_enum)]
+    trace_capture_inputs: Option<TraceCaptureArg>,
 
     /// Invocation envelope validation mode
     #[arg(long = "validation", value_enum)]
@@ -314,17 +314,12 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
     }
     let bindings =
         greentic_runner_host::gtbind::collect_gtbind_paths(&run.bindings, &run.bindings_dir)?;
-    let trace_out = std::env::var_os("GREENTIC_TRACE_OUT").map(PathBuf::from);
-    let trace_config = TraceConfig::from_env()
-        .with_overrides(
-            match run.trace {
-                TraceArg::Off => TraceMode::Off,
-                TraceArg::On => TraceMode::On,
-                TraceArg::Always => TraceMode::Always,
-            },
-            trace_out.or(run.trace_out.clone()),
-        )
-        .with_capture_inputs(matches!(run.trace_capture_inputs, TraceCaptureArg::On));
+    let trace_config = build_trace_config(
+        TraceConfig::from_env(),
+        run.trace,
+        run.trace_out.clone(),
+        run.trace_capture_inputs,
+    );
     let validation_mode = run.validation.map(|value| match value {
         ValidationArg::Off => ValidationMode::Off,
         ValidationArg::Warn => ValidationMode::Warn,
@@ -333,10 +328,36 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
     let validation_config = validation_mode
         .map(|mode| ValidationConfig::from_env().with_mode(mode))
         .unwrap_or_else(ValidationConfig::from_env);
-    let mut cfg = RunnerConfig::from_config(resolved, bindings)?.with_port(run.port);
+    let mut cfg = RunnerConfig::from_config(resolved, bindings)?;
+    if let Some(port) = run.port {
+        cfg = cfg.with_port(port);
+    }
     cfg.trace = trace_config;
     cfg.validation = validation_config;
     run_host(cfg).await
+}
+
+/// Layer explicit CLI flags over the env-derived trace config. A flag that was
+/// not given leaves the env/default value untouched, so CLI beats env only when
+/// the user actually passed it.
+fn build_trace_config(
+    base: TraceConfig,
+    mode: Option<TraceArg>,
+    out_path: Option<PathBuf>,
+    capture_inputs: Option<TraceCaptureArg>,
+) -> TraceConfig {
+    let mode = match mode {
+        Some(TraceArg::Off) => TraceMode::Off,
+        Some(TraceArg::On) => TraceMode::On,
+        Some(TraceArg::Always) => TraceMode::Always,
+        None => base.mode,
+    };
+    let capture = match capture_inputs {
+        Some(value) => matches!(value, TraceCaptureArg::On),
+        None => base.capture_inputs,
+    };
+    base.with_overrides(mode, out_path)
+        .with_capture_inputs(capture)
 }
 
 fn emit_json_error(err: &anyhow::Error) {
@@ -480,8 +501,9 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
             .or_else(|| entry.digest.clone())
             .ok_or_else(|| anyhow::anyhow!("pack.lock component {} missing digest", entry.name))?;
         let wasm_digest = normalize_digest(&wasm_digest);
-        let key = ArtifactKey::new(cache.engine_profile_id().to_string(), wasm_digest);
+        let key = ArtifactKey::new(cache.engine_profile_id().to_string(), wasm_digest.clone());
         let bytes = resolve_component_bytes(&root, &entry, source_ref, &dist_client).await?;
+        verify_component_digest(&entry.name, &wasm_digest, &bytes)?;
         let _ = cache
             .get_component(&engine, &key, || Ok(bytes))
             .await
@@ -619,6 +641,25 @@ async fn resolve_component_bytes(
     async_fs::read(&cache_path)
         .await
         .with_context(|| format!("failed to read {}", cache_path.display()))
+}
+
+/// Check that `bytes` hash to the digest recorded in pack.lock before they are
+/// cached under it. Supports the `sha256:` and `blake3:` prefixes.
+fn verify_component_digest(name: &str, digest: &str, bytes: &[u8]) -> Result<()> {
+    let (algo, expected) = digest.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("component {name} digest {digest} has no algorithm prefix")
+    })?;
+    let actual = match algo {
+        "sha256" => to_hex(&Sha256::digest(bytes)),
+        "blake3" => blake3::hash(bytes).to_hex().to_string(),
+        other => bail!("component {name} uses unsupported digest algorithm {other}"),
+    };
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!(
+            "component {name} digest mismatch: pack.lock has {digest}, content hashes to {algo}:{actual}"
+        );
+    }
+    Ok(())
 }
 
 fn normalize_digest(digest: &str) -> String {
@@ -838,15 +879,15 @@ fn select_operation_from_describe(
     let ops = &payload.operations;
     let requested = ops
         .iter()
-        .find_map(operation_name)
-        .filter(|name| *name == requested_operation)
+        .filter_map(operation_name)
+        .find(|name| *name == requested_operation)
         .map(ToString::to_string);
     if requested.is_some() {
         return requested;
     }
     ops.iter()
-        .find_map(operation_name)
-        .filter(|name| *name == "run")
+        .filter_map(operation_name)
+        .find(|name| *name == "run")
         .map(ToString::to_string)
         .or_else(|| {
             ops.first()

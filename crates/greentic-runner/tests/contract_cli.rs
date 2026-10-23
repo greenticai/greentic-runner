@@ -74,12 +74,8 @@ fn contract_artifact_prints_report_when_gated() -> Result<()> {
 }
 
 #[test]
+#[ignore = "heavy wasm fixture build; run with `cargo test -- --ignored` (nightly heavy_wasm job)"]
 fn contract_pack_rejects_mismatched_artifact() -> Result<()> {
-    if std::env::var("GREENTIC_HEAVY_WASM").ok().as_deref() != Some("1") {
-        eprintln!("skipping heavy wasm contract mismatch test (set GREENTIC_HEAVY_WASM=1)");
-        return Ok(());
-    }
-
     let temp = TempDir::new()?;
     let pack_path = temp.path().join("component-v06.gtpack");
     let mismatch_artifact = temp.path().join("mismatch.describe.cbor");
