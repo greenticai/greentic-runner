@@ -20,9 +20,10 @@ use serde_json::Value;
 /// (`dispatch_listener`) are separate objects. An ADMITTED response cancels the
 /// matching watchdog so a call that already completed never publishes a late
 /// `timeout`.
-static WATCHDOGS: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, (u64, tokio::task::JoinHandle<()>)>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+type WatchdogMap = std::collections::HashMap<String, (u64, tokio::task::JoinHandle<()>)>;
+
+static WATCHDOGS: std::sync::LazyLock<parking_lot::Mutex<WatchdogMap>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 static WATCHDOG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

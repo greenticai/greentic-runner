@@ -488,9 +488,9 @@ mod tests {
     #[test]
     fn failed_step_carries_terminated_by_as_error_code_and_keeps_partial_reply() {
         let output = json!({"reply": "partial", "trail": [], "terminated_by": "timeout"});
-        let error = step_failure(false, &output).expect("failed step has an error");
-        assert_eq!(error.code, "timeout");
-        assert!(error.message.contains("timeout"));
+        let error = step_failure(false, &output);
+        assert_eq!(error.as_ref().map(|e| e.code.as_str()), Some("timeout"));
+        assert!(error.is_some_and(|e| e.message.contains("timeout")));
         assert_eq!(output["reply"], json!("partial"));
         assert!(step_failure(true, &output).is_none());
     }
