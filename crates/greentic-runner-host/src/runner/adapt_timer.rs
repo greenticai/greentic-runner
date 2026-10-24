@@ -40,7 +40,10 @@ pub fn spawn_timers(runtime: Arc<TenantRuntime>) -> Result<Vec<JoinHandle<()>>> 
             // one `upcoming` iterator) so ticks that elapsed while a slow flow
             // ran are skipped instead of fired back-to-back.
             let mut last_fired: Option<DateTime<Utc>> = None;
-            while let Some(next) = schedule.after(&search_origin(Utc::now(), last_fired)).next() {
+            while let Some(next) = schedule
+                .after(&search_origin(Utc::now(), last_fired))
+                .next()
+            {
                 last_fired = Some(next);
                 if let Some(wait) = duration_until(next) {
                     sleep(wait).await;
@@ -182,7 +185,10 @@ mod tests {
         let origin = search_origin(stepped_back, Some(fired));
         let next = schedule.after(&origin).next().expect("tick");
         assert!(next > fired);
-        assert_eq!(search_origin(fired + chrono::Duration::seconds(5), Some(fired)), fired + chrono::Duration::seconds(5));
+        assert_eq!(
+            search_origin(fired + chrono::Duration::seconds(5), Some(fired)),
+            fired + chrono::Duration::seconds(5)
+        );
     }
 
     #[test]

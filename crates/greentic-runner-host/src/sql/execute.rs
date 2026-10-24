@@ -321,7 +321,10 @@ fn pg_cell_to_json(row: &sqlx::postgres::PgRow, index: usize) -> Value {
 /// (tab, newline and carriage return excepted); `None` for binary payloads.
 fn printable_text(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
-    if text.is_empty() || text.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    if text.is_empty()
+        || text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
     {
         return None;
     }
@@ -506,7 +509,10 @@ mod tests {
     #[test]
     fn printable_text_accepts_text_and_rejects_binary_payloads() {
         assert_eq!(printable_text(b"happy").as_deref(), Some("happy"));
-        assert_eq!(printable_text("naïve\tlabel".as_bytes()).as_deref(), Some("naïve\tlabel"));
+        assert_eq!(
+            printable_text("naïve\tlabel".as_bytes()).as_deref(),
+            Some("naïve\tlabel")
+        );
         // INET (family 2, /32, not cidr, 4 bytes), array header, INTERVAL, empty.
         assert!(printable_text(&[2, 32, 0, 4, 10, 0, 0, 1]).is_none());
         assert!(printable_text(&[0, 0, 0, 1, 0, 0, 0, 0]).is_none());

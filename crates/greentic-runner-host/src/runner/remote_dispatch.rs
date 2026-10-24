@@ -32,11 +32,7 @@ fn next_watchdog_generation() -> u64 {
 
 /// Register `handle` as the watchdog for `correlation_id` under `generation`,
 /// aborting any previous one registered under the same id.
-fn register_watchdog(
-    correlation_id: String,
-    generation: u64,
-    handle: tokio::task::JoinHandle<()>,
-) {
+fn register_watchdog(correlation_id: String, generation: u64, handle: tokio::task::JoinHandle<()>) {
     if let Some((_, previous)) = WATCHDOGS
         .lock()
         .insert(correlation_id, (generation, handle))
@@ -347,7 +343,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_expiring_watchdog_never_removes_a_newer_one() {
-        let old = register_watchdog_for_test("corr-gen", tokio::spawn(std::future::pending::<()>()));
+        let old =
+            register_watchdog_for_test("corr-gen", tokio::spawn(std::future::pending::<()>()));
         let newer =
             register_watchdog_for_test("corr-gen", tokio::spawn(std::future::pending::<()>()));
         assert_ne!(old, newer);

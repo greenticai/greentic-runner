@@ -1129,7 +1129,11 @@ mod host_tests {
                 .await?;
             host.touch(&key, Duration::from_secs(1)).await?;
         }
-        assert!(host.locks.is_empty(), "{} stale lock entries", host.locks.len());
+        assert!(
+            host.locks.is_empty(),
+            "{} stale lock entries",
+            host.locks.len()
+        );
         Ok(())
     }
 

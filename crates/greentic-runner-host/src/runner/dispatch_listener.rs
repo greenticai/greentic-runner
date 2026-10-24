@@ -123,9 +123,8 @@ type Job = futures::future::BoxFuture<'static, ()>;
 /// it has work, so the map does not grow with finished conversations.
 #[derive(Clone, Default)]
 pub struct KeyedSerializer {
-    queues: Arc<
-        parking_lot::Mutex<std::collections::HashMap<String, std::collections::VecDeque<Job>>>,
-    >,
+    queues:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, std::collections::VecDeque<Job>>>>,
 }
 
 impl KeyedSerializer {
