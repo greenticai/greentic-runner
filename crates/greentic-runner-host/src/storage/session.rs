@@ -815,6 +815,9 @@ mod host_tests {
     #[derive(Default)]
     struct PerUserStore {
         slots: std::sync::Mutex<Vec<(UserId, StoreSessionKey, SessionData)>>,
+        /// Monotonic slot ids: deriving the id from `slots.len()` reused the id
+        /// of a live slot after a removal, so a later remove took both.
+        next_slot: std::sync::atomic::AtomicUsize,
     }
 
     impl PerUserStore {
@@ -837,7 +840,10 @@ mod host_tests {
                 .clone()
                 .unwrap_or_else(|| unreachable!("encode_snapshot always sets a user"));
             let mut slots = self.slots();
-            let key = StoreSessionKey::new(format!("slot-{}", slots.len()));
+            let id = self
+                .next_slot
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let key = StoreSessionKey::new(format!("slot-{id}"));
             slots.push((user, key.clone(), data));
             Ok(key)
         }
