@@ -454,21 +454,33 @@ impl PackLockComponent {
         }
     }
 
-    fn bundled_path(&self) -> Option<&str> {
+    fn bundled_path(&self) -> Result<Option<&str>> {
         match (&self.bundled_path, &self.legacy_path) {
-            (Some(primary), Some(legacy)) if primary == legacy => Some(primary.as_str()),
-            (Some(primary), None) => Some(primary.as_str()),
-            (None, Some(legacy)) => Some(legacy.as_str()),
-            _ => None,
+            (Some(primary), Some(legacy)) if primary == legacy => Ok(Some(primary.as_str())),
+            (Some(primary), Some(legacy)) => bail!(
+                "pack.lock component {} has conflicting paths: {} vs {}",
+                self.name,
+                primary,
+                legacy
+            ),
+            (Some(primary), None) => Ok(Some(primary.as_str())),
+            (None, Some(legacy)) => Ok(Some(legacy.as_str())),
+            (None, None) => Ok(None),
         }
     }
 
-    fn wasm_digest(&self) -> Option<String> {
+    fn wasm_digest(&self) -> Result<Option<String>> {
         match (&self.wasm_sha256, &self.legacy_sha256) {
-            (Some(primary), Some(legacy)) if primary == legacy => Some(primary.clone()),
-            (Some(primary), None) => Some(primary.clone()),
-            (None, Some(legacy)) => Some(legacy.clone()),
-            _ => None,
+            (Some(primary), Some(legacy)) if primary == legacy => Ok(Some(primary.clone())),
+            (Some(primary), Some(legacy)) => bail!(
+                "pack.lock component {} has conflicting wasm digests: {} vs {}",
+                self.name,
+                primary,
+                legacy
+            ),
+            (Some(primary), None) => Ok(Some(primary.clone())),
+            (None, Some(legacy)) => Ok(Some(legacy.clone())),
+            (None, None) => Ok(None),
         }
     }
 }
@@ -502,15 +514,22 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
         // `resolved_digest` / `digest` fallbacks are what the OCI distributor
         // recorded, which is the OCI *manifest* digest when the registry
         // returned one, so it is not necessarily a hash of the bytes.
-        let authoritative = entry.wasm_digest().is_some();
-        let wasm_digest = entry
-            .wasm_digest()
+        let declared_wasm_digest = entry.wasm_digest()?;
+        let wasm_digest = declared_wasm_digest
+            .clone()
             .or_else(|| entry.resolved_digest.clone())
             .or_else(|| entry.digest.clone())
             .ok_or_else(|| anyhow::anyhow!("pack.lock component {} missing digest", entry.name))?;
-        let wasm_digest = normalize_digest(&wasm_digest);
+        let wasm_digest = normalize_digest(&wasm_digest)
+            .with_context(|| format!("pack.lock component {}", entry.name))?;
         let key = ArtifactKey::new(cache.engine_profile_id().to_string(), wasm_digest.clone());
-        let bytes = resolve_component_bytes(&root, &entry, source_ref, &dist_client).await?;
+        let (bytes, from_local) =
+            resolve_component_bytes(&root, &entry, source_ref, &dist_client).await?;
+        // A bytes-hash is authoritative when it is declared as such, or when
+        // the bytes came from a local bundled file: a local file cannot be an
+        // OCI manifest, so a sha256 digest recorded for it must match.
+        let authoritative =
+            declared_wasm_digest.is_some() || (from_local && wasm_digest.starts_with("sha256:"));
         check_lock_digest(&entry.name, &wasm_digest, &bytes, authoritative)?;
         let _ = cache
             .get_component(&engine, &key, || Ok(bytes))
@@ -616,13 +635,14 @@ async fn resolve_component_bytes(
     entry: &PackLockComponent,
     source_ref: &str,
     dist_client: &DistClient,
-) -> Result<Vec<u8>> {
-    if let Some(relative) = entry.bundled_path() {
+) -> Result<(Vec<u8>, bool)> {
+    if let Some(relative) = entry.bundled_path()? {
         let path = root.join(relative);
         if path.exists() {
-            return async_fs::read(&path)
+            let bytes = async_fs::read(&path)
                 .await
-                .with_context(|| format!("failed to read {}", path.display()));
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            return Ok((bytes, true));
         }
     }
 
@@ -635,9 +655,10 @@ async fn resolve_component_bytes(
 
     if let Some(digest) = entry.resolved_digest.as_deref().or(entry.digest.as_deref()) {
         let cache_path = dist_client.fetch_digest(digest).await?;
-        return async_fs::read(&cache_path)
+        let bytes = async_fs::read(&cache_path)
             .await
-            .with_context(|| format!("failed to read {}", cache_path.display()));
+            .with_context(|| format!("failed to read {}", cache_path.display()))?;
+        return Ok((bytes, false));
     }
 
     let source = dist_client.parse_source(source_ref)?;
@@ -646,9 +667,10 @@ async fn resolve_component_bytes(
     let cache_path = resolved
         .cache_path
         .ok_or_else(|| anyhow::anyhow!("component {} missing cache path", entry.name))?;
-    async_fs::read(&cache_path)
+    let bytes = async_fs::read(&cache_path)
         .await
-        .with_context(|| format!("failed to read {}", cache_path.display()))
+        .with_context(|| format!("failed to read {}", cache_path.display()))?;
+    Ok((bytes, false))
 }
 
 /// Check that `bytes` hash to the digest recorded in pack.lock before they are
@@ -690,11 +712,14 @@ fn check_lock_digest(name: &str, digest: &str, bytes: &[u8], authoritative: bool
     }
 }
 
-fn normalize_digest(digest: &str) -> String {
-    if digest.starts_with("sha256:") || digest.starts_with("blake3:") {
-        digest.to_string()
-    } else {
-        format!("sha256:{digest}")
+/// Give a bare hex digest its `sha256:` prefix. A prefixed digest must use a
+/// supported algorithm (`sha256` / `blake3`); anything else is rejected rather
+/// than being wrapped into a nonsense `sha256:sha512:...` cache key.
+fn normalize_digest(digest: &str) -> Result<String> {
+    match digest.split_once(':') {
+        Some(("sha256" | "blake3", _)) => Ok(digest.to_string()),
+        Some((algo, _)) => bail!("unsupported digest algorithm {algo} in {digest}"),
+        None => Ok(format!("sha256:{digest}")),
     }
 }
 

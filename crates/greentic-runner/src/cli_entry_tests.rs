@@ -176,23 +176,29 @@ fn lock_component_prefers_agreeing_names_and_rejects_conflicts() {
         "name": "c", "source_ref": "oci://x/y:1", "bundled_path": "a.wasm", "wasm_sha256": "aa"
     }));
     assert_eq!(primary.source_ref().expect("ref"), "oci://x/y:1");
-    assert_eq!(primary.bundled_path(), Some("a.wasm"));
-    assert_eq!(primary.wasm_digest().as_deref(), Some("aa"));
+    assert_eq!(primary.bundled_path().expect("path"), Some("a.wasm"));
+    assert_eq!(
+        primary.wasm_digest().expect("digest").as_deref(),
+        Some("aa")
+    );
 
     let legacy = component(json!({
         "name": "c", "ref": "oci://x/y:2", "path": "b.wasm", "sha256": "bb"
     }));
     assert_eq!(legacy.source_ref().expect("ref"), "oci://x/y:2");
-    assert_eq!(legacy.bundled_path(), Some("b.wasm"));
-    assert_eq!(legacy.wasm_digest().as_deref(), Some("bb"));
+    assert_eq!(legacy.bundled_path().expect("path"), Some("b.wasm"));
+    assert_eq!(legacy.wasm_digest().expect("digest").as_deref(), Some("bb"));
 
     let agreeing = component(json!({
         "name": "c", "source_ref": "r", "ref": "r", "bundled_path": "p", "path": "p",
         "wasm_sha256": "d", "sha256": "d"
     }));
     assert_eq!(agreeing.source_ref().expect("ref"), "r");
-    assert_eq!(agreeing.bundled_path(), Some("p"));
-    assert_eq!(agreeing.wasm_digest().as_deref(), Some("d"));
+    assert_eq!(agreeing.bundled_path().expect("path"), Some("p"));
+    assert_eq!(
+        agreeing.wasm_digest().expect("digest").as_deref(),
+        Some("d")
+    );
 
     let conflicting = component(json!({
         "name": "c", "source_ref": "r1", "ref": "r2", "bundled_path": "p1", "path": "p2",
@@ -200,8 +206,20 @@ fn lock_component_prefers_agreeing_names_and_rejects_conflicts() {
     }));
     let err = conflicting.source_ref().expect_err("conflict");
     assert!(err.to_string().contains("conflicting refs"));
-    assert_eq!(conflicting.bundled_path(), None);
-    assert_eq!(conflicting.wasm_digest(), None);
+    assert!(
+        conflicting
+            .bundled_path()
+            .expect_err("path conflict")
+            .to_string()
+            .contains("conflicting paths")
+    );
+    assert!(
+        conflicting
+            .wasm_digest()
+            .expect_err("digest conflict")
+            .to_string()
+            .contains("conflicting wasm digests")
+    );
 
     let bare = component(json!({ "name": "bare" }));
     assert!(bare.source_ref().is_err());
@@ -209,9 +227,17 @@ fn lock_component_prefers_agreeing_names_and_rejects_conflicts() {
 
 #[test]
 fn digests_and_operations_are_normalised() {
-    assert_eq!(normalize_digest("abc"), "sha256:abc");
-    assert_eq!(normalize_digest("sha256:abc"), "sha256:abc");
-    assert_eq!(normalize_digest("blake3:abc"), "blake3:abc");
+    assert_eq!(normalize_digest("abc").expect("bare"), "sha256:abc");
+    assert_eq!(
+        normalize_digest("sha256:abc").expect("sha256"),
+        "sha256:abc"
+    );
+    assert_eq!(
+        normalize_digest("blake3:abc").expect("blake3"),
+        "blake3:abc"
+    );
+    assert!(normalize_digest("sha512:xyz").is_err());
+    assert!(normalize_digest("md5:xyz").is_err());
     assert_eq!(normalize_operation_id("  "), "run");
     assert_eq!(normalize_operation_id(" go "), "go");
     assert_eq!(to_hex(&[0, 255, 16]), "00ff10");
@@ -324,6 +350,67 @@ async fn warmup_reports_a_lock_entry_without_a_source() {
 }
 
 #[tokio::test]
+async fn warmup_rejects_conflicting_wasm_digests() {
+    let dir = TempDir::new().expect("tmp");
+    let lock = write(
+        dir.path(),
+        "pack.lock",
+        r#"{"schema_version":1,"components":[{"name":"c","source_ref":"oci://a/b:1","wasm_sha256":"aa","sha256":"bb"}]}"#,
+    );
+    let err = warmup_cache(CacheWarmupArgs {
+        pack: lock,
+        mode: CacheWarmupMode::Disk,
+    })
+    .await
+    .expect_err("conflicting digests");
+    assert!(
+        err.to_string().contains("conflicting wasm digests"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn warmup_rejects_unsupported_digest_algorithm() {
+    let dir = TempDir::new().expect("tmp");
+    let lock = write(
+        dir.path(),
+        "pack.lock",
+        r#"{"schema_version":1,"components":[{"name":"c","source_ref":"oci://a/b:1","resolved_digest":"sha512:xyz"}]}"#,
+    );
+    let err = warmup_cache(CacheWarmupArgs {
+        pack: lock,
+        mode: CacheWarmupMode::Disk,
+    })
+    .await
+    .expect_err("unsupported algorithm");
+    assert!(
+        err.to_string().contains("unsupported digest algorithm"),
+        "got: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn warmup_verifies_local_bundled_bytes_against_a_sha256_resolved_digest() {
+    let dir = TempDir::new().expect("tmp");
+    std::fs::write(dir.path().join("c.wasm"), b"wasm-bytes").expect("write");
+    let lock = write(
+        dir.path(),
+        "pack.lock",
+        &format!(
+            r#"{{"schema_version":1,"components":[{{"name":"c","source_ref":"oci://a/b:1","bundled_path":"c.wasm","resolved_digest":"sha256:{}"}}]}}"#,
+            "0".repeat(64)
+        ),
+    );
+    let err = warmup_cache(CacheWarmupArgs {
+        pack: lock,
+        mode: CacheWarmupMode::Disk,
+    })
+    .await
+    .expect_err("local bytes must match a sha256 digest");
+    assert!(err.to_string().contains("digest mismatch"), "got: {err:#}");
+}
+
+#[tokio::test]
 async fn bundled_component_bytes_are_read_from_the_pack_root() {
     let dir = TempDir::new().expect("tmp");
     std::fs::write(dir.path().join("c.wasm"), b"wasm-bytes").expect("write");
@@ -331,10 +418,11 @@ async fn bundled_component_bytes_are_read_from_the_pack_root() {
         "name": "c", "source_ref": "oci://a/b:1", "bundled_path": "c.wasm"
     }));
     let client = DistClient::new(DistOptions::default());
-    let bytes = resolve_component_bytes(dir.path(), &entry, "oci://a/b:1", &client)
+    let (bytes, from_local) = resolve_component_bytes(dir.path(), &entry, "oci://a/b:1", &client)
         .await
         .expect("bundled bytes");
     assert_eq!(bytes, b"wasm-bytes");
+    assert!(from_local);
 }
 
 #[tokio::test]
