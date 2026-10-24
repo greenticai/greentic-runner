@@ -413,7 +413,13 @@ impl SessionResumer for RuntimeSessionResumer {
             Err(error) => return Err(error),
         };
         match admit_response_with(self.mode, correlation_id, &output, parked.as_deref()) {
-            Admission::Resume => {}
+            Admission::Resume => {
+                // Retire the deadline watchdog at admission, BEFORE the resumed
+                // flow runs: `handle` runs it until it next parks, and that
+                // park may register a new watchdog under this same
+                // (deterministic) id which a later cancel would kill.
+                crate::runner::remote_dispatch::cancel_watchdog(correlation_id);
+            }
             Admission::WrongGate => {
                 // Not an error: the response is real, it just no longer has a
                 // gate to land on. Resuming would hand an earlier gate's

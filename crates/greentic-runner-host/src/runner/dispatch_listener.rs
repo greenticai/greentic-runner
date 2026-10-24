@@ -26,15 +26,21 @@ pub trait SessionResumer: Send + Sync {
 
     /// [`Self::resume`], reporting whether the response was ADMITTED (handed to
     /// the runtime) or dropped by an admission check (wrong gate, bad token).
-    /// The listener cancels the deadline watchdog only for an admitted
-    /// response, so a forged or stale one cannot retire the real watchdog.
-    /// The default treats every `Ok` as admitted.
+    /// An implementation cancels the deadline watchdog itself, at the moment
+    /// of admission and BEFORE the resumed flow runs, so a forged or stale
+    /// response cannot retire the real watchdog and the resumed flow's next
+    /// dispatch (same deterministic id) keeps its own. The default treats
+    /// every response as admitted.
     async fn resume_checked(
         &self,
         tenant: TenantCtx,
         correlation_id: &str,
         output: Value,
     ) -> Result<ResumeOutcome> {
+        // No admission check here, so every response is admitted: retire the
+        // watchdog BEFORE resuming (the resume runs the flow until it next
+        // parks, and that park may register a new watchdog under this same id).
+        crate::runner::remote_dispatch::cancel_watchdog(correlation_id);
         self.resume(tenant, correlation_id, output)
             .await
             .map(|()| ResumeOutcome::Admitted)
@@ -102,12 +108,10 @@ pub async fn dispatch_to_resumer(resumer: Arc<dyn SessionResumer>, input: Resume
         .resume_checked(input.tenant, &input.correlation_id, input.output)
         .await
     {
-        // Retire the deadline watchdog only once the response was admitted: a
-        // forged or wrong-token response must not cancel the real one.
-        Ok(ResumeOutcome::Admitted) => {
-            crate::runner::remote_dispatch::cancel_watchdog(&input.correlation_id);
-        }
-        Ok(ResumeOutcome::Dropped) => {}
+        // The watchdog was already retired inside `resume_checked`, at
+        // admission and before the resumed flow ran; cancelling here would kill
+        // a watchdog that flow registered for its next dispatch.
+        Ok(ResumeOutcome::Admitted | ResumeOutcome::Dropped) => {}
         Err(error) => tracing::error!(
             %error,
             correlation_id = %input.correlation_id,
@@ -142,7 +146,12 @@ impl KeyedSerializer {
         tokio::spawn(async move {
             let mut current = job;
             loop {
-                current.await;
+                // Isolate panics (the resumer runs WASM): a panicking job must
+                // not kill the worker before pop-or-remove, or the key and the
+                // queued jobs (with their semaphore permits) would leak.
+                if let Err(error) = tokio::spawn(current).await {
+                    tracing::error!(%error, key = %key, "keyed job panicked or was cancelled; continuing");
+                }
                 // Pop-or-remove under one lock so a concurrent `submit` either
                 // sees the queue (and is picked up here) or sees no key (and
                 // starts its own worker).
@@ -363,6 +372,71 @@ mod tests {
         assert!(!crate::runner::remote_dispatch::watchdog_pending(
             "corr-admit"
         ));
+    }
+
+    /// Models a resumed flow that parks on a second awaited dispatch with the
+    /// same deterministic id: it registers a new watchdog while resuming.
+    struct ReparkingResumer;
+
+    #[async_trait]
+    impl SessionResumer for ReparkingResumer {
+        async fn resume(&self, _: TenantCtx, id: &str, _: Value) -> Result<()> {
+            crate::runner::remote_dispatch::register_watchdog_for_test(
+                id,
+                tokio::spawn(std::future::pending::<()>()),
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn consecutive_awaited_dispatches_keep_the_second_watchdog() {
+        let body = serde_json::to_vec(&RuntimeDispatchResponse {
+            ok: true,
+            output: json!(null),
+            events: vec![],
+            error: None,
+        })
+        .unwrap();
+        crate::runner::remote_dispatch::register_watchdog_for_test(
+            "corr-repark",
+            tokio::spawn(std::future::pending::<()>()),
+        );
+        let input =
+            decode_response(Some("corr-repark"), Some("t1"), Some("default"), &body).unwrap();
+        dispatch_to_resumer(Arc::new(ReparkingResumer), input).await;
+        assert!(
+            crate::runner::remote_dispatch::watchdog_pending("corr-repark"),
+            "the watchdog the resumed flow armed must survive the listener"
+        );
+        crate::runner::remote_dispatch::cancel_watchdog("corr-repark");
+    }
+
+    #[tokio::test]
+    async fn keyed_serializer_survives_a_panicking_job() {
+        let serializer = KeyedSerializer::default();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        serializer.submit(
+            "k".to_string(),
+            Box::pin(async {
+                panic!("job panic (expected by test)");
+            }),
+        );
+        serializer.submit(
+            "k".to_string(),
+            Box::pin(async move {
+                let _ = tx.send(());
+            }),
+        );
+        let ran = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+        assert!(matches!(ran, Ok(Ok(()))), "next job on the key must run");
+        for _ in 0..50 {
+            if serializer.active_keys() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(serializer.active_keys(), 0, "key must be cleaned up");
     }
 
     // -----------------------------------------------------------------------

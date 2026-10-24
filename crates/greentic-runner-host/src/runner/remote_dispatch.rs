@@ -53,6 +53,37 @@ fn deregister_watchdog(correlation_id: &str, generation: u64) {
     }
 }
 
+/// Spawn the watchdog task and register it under `correlation_id` at once.
+/// After `deadline_ms` it deregisters itself (so its own echo through the
+/// listener does not abort the running task) and then runs `on_timeout`.
+/// Returns the generation it was registered under.
+fn arm_watchdog<F>(correlation_id: String, deadline_ms: u64, on_timeout: F) -> u64
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let generation = next_watchdog_generation();
+    let key = correlation_id.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(deadline_ms)).await;
+        deregister_watchdog(&key, generation);
+        on_timeout.await;
+    });
+    register_watchdog(correlation_id, generation, handle);
+    generation
+}
+
+/// Abort and remove the watchdog `generation` registered, if still current.
+fn disarm_watchdog(correlation_id: &str, generation: u64) {
+    let mut watchdogs = WATCHDOGS.lock();
+    if watchdogs
+        .get(correlation_id)
+        .is_some_and(|(current, _)| *current == generation)
+        && let Some((_, handle)) = watchdogs.remove(correlation_id)
+    {
+        handle.abort();
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn register_watchdog_for_test(
     correlation_id: &str,
@@ -278,43 +309,50 @@ impl RemoteDispatchHandler for NatsDispatcher {
         };
 
         let built = build_request(&request)?;
-        self.client
-            .publish_with_headers(built.subject, built.headers, built.body.into())
-            .await?;
 
-        // Spawn the deadline watchdog AFTER the request is on the wire.
-        if let Some((deadline_ms, runtime, correlation_id, tenant, env, decision_token)) =
-            maybe_timeout
-        {
-            let timeout_client = self.client.clone();
-            let watchdog_key = correlation_id.clone();
-            let generation = next_watchdog_generation();
-            let handle = tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(deadline_ms)).await;
-                // Deregister before publishing so the timeout's own echo through
-                // the listener does not try to abort this (running) task.
-                deregister_watchdog(&correlation_id, generation);
-                let (subject, headers, body) = build_timeout_response_message_with_token(
-                    &runtime,
-                    &correlation_id,
-                    &tenant,
-                    &env,
-                    deadline_ms,
-                    decision_token.as_deref(),
-                );
-                if let Err(publish_error) = timeout_client
-                    .publish_with_headers(subject, headers, body.into())
-                    .await
-                {
-                    tracing::warn!(
-                        %publish_error,
-                        %correlation_id,
+        // Arm the deadline watchdog BEFORE the request is on the wire: a fast
+        // response can be admitted before this task resumes, and its cancel
+        // must find the watchdog rather than let it arm afterwards and fire a
+        // spurious timeout.
+        let armed = maybe_timeout.map(
+            |(deadline_ms, runtime, correlation_id, tenant, env, decision_token)| {
+                let timeout_client = self.client.clone();
+                let watchdog_key = correlation_id.clone();
+                let generation = arm_watchdog(watchdog_key.clone(), deadline_ms, async move {
+                    let (subject, headers, body) = build_timeout_response_message_with_token(
+                        &runtime,
+                        &correlation_id,
+                        &tenant,
+                        &env,
                         deadline_ms,
-                        "failed to publish timeout response for awaited dispatch"
+                        decision_token.as_deref(),
                     );
-                }
-            });
-            register_watchdog(watchdog_key, generation, handle);
+                    if let Err(publish_error) = timeout_client
+                        .publish_with_headers(subject, headers, body.into())
+                        .await
+                    {
+                        tracing::warn!(
+                            %publish_error,
+                            %correlation_id,
+                            deadline_ms,
+                            "failed to publish timeout response for awaited dispatch"
+                        );
+                    }
+                });
+                (watchdog_key, generation)
+            },
+        );
+
+        if let Err(error) = self
+            .client
+            .publish_with_headers(built.subject, built.headers, built.body.into())
+            .await
+        {
+            // Nothing was sent, so there is nothing to time out.
+            if let Some((key, generation)) = armed {
+                disarm_watchdog(&key, generation);
+            }
+            return Err(error.into());
         }
 
         Ok(built.action)
@@ -353,6 +391,41 @@ mod tests {
         assert!(watchdog_pending("corr-gen"), "stale generation is a no-op");
         deregister_watchdog_for_test("corr-gen", newer);
         assert!(!watchdog_pending("corr-gen"));
+    }
+
+    #[tokio::test]
+    async fn a_response_admitted_right_after_arming_prevents_the_timeout() {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&fired);
+        // Armed first (before publish); the response then cancels it.
+        arm_watchdog("corr-early".to_string(), 30, async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            cancel_watchdog("corr-early"),
+            "cancel must find the armed watchdog"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_failed_publish_disarms_only_its_own_watchdog() {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&fired);
+        let old = arm_watchdog("corr-disarm".to_string(), 30, async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let newer = arm_watchdog("corr-disarm".to_string(), 10_000, async {});
+        disarm_watchdog("corr-disarm", old);
+        assert!(
+            watchdog_pending("corr-disarm"),
+            "stale generation is a no-op"
+        );
+        disarm_watchdog("corr-disarm", newer);
+        assert!(!watchdog_pending("corr-disarm"));
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
