@@ -210,60 +210,6 @@ impl FlowResumeStore {
     }
 }
 
-/// Metadata key the dispatch resumer sets on its synthesized envelope. Its
-/// presence is the "must resume" signal: the envelope is a runtime dispatch
-/// response for exactly that correlation id, and must never start a flow fresh
-/// nor resume a wait that is not awaiting that id.
-pub(crate) const DISPATCH_RESUME_METADATA_KEY: &str = "dispatch_resume_correlation";
-
-const AWAIT_RUNTIME_PREFIX: &str = "await-runtime:";
-
-fn dispatch_resume_correlation(envelope: &IngressEnvelope) -> Option<String> {
-    envelope
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get(DISPATCH_RESUME_METADATA_KEY))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ResumeDecision {
-    /// Run (or resume) the flow as usual.
-    Proceed,
-    /// A dispatch response with no matching wait: drop it.
-    DropDispatchResponse(&'static str),
-    /// A plain inbound for a conversation awaiting a runtime response.
-    StillAwaiting(String),
-}
-
-/// Decide whether an envelope may touch the parked wait.
-///
-/// `parked` is `None` when nothing is parked, `Some(reason)` otherwise.
-fn classify_resume(
-    dispatch_correlation: Option<&str>,
-    parked: Option<Option<&str>>,
-) -> ResumeDecision {
-    match (dispatch_correlation, parked) {
-        (Some(_), None) => ResumeDecision::DropDispatchResponse("no wait is parked"),
-        (Some(corr), Some(Some(reason))) => {
-            if reason == format!("{AWAIT_RUNTIME_PREFIX}{corr}") {
-                ResumeDecision::Proceed
-            } else {
-                ResumeDecision::DropDispatchResponse(
-                    "parked wait is not awaiting this correlation id",
-                )
-            }
-        }
-        // A park recorded without a reason predates reasons; keep resuming it.
-        (Some(_), Some(None)) => ResumeDecision::Proceed,
-        (None, Some(Some(reason))) if reason.starts_with(AWAIT_RUNTIME_PREFIX) => {
-            ResumeDecision::StillAwaiting(reason.to_string())
-        }
-        (None, _) => ResumeDecision::Proceed,
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 struct FlowResumeRecord {
     snapshot: FlowSnapshot,
@@ -427,43 +373,6 @@ mod tests {
                 state,
             },
         }
-    }
-
-    #[test]
-    fn dispatch_response_without_a_wait_is_dropped() {
-        assert_eq!(
-            classify_resume(Some("c1"), None),
-            ResumeDecision::DropDispatchResponse("no wait is parked")
-        );
-    }
-
-    #[test]
-    fn dispatch_response_resumes_only_the_wait_awaiting_its_id() {
-        assert_eq!(
-            classify_resume(Some("c1"), Some(Some("await-runtime:c1"))),
-            ResumeDecision::Proceed
-        );
-        assert!(matches!(
-            classify_resume(Some("c1"), Some(Some("await-runtime:c2"))),
-            ResumeDecision::DropDispatchResponse(_)
-        ));
-        assert!(matches!(
-            classify_resume(Some("c1"), Some(Some("await-user"))),
-            ResumeDecision::DropDispatchResponse(_)
-        ));
-    }
-
-    #[test]
-    fn plain_inbound_does_not_resume_a_runtime_wait() {
-        assert_eq!(
-            classify_resume(None, Some(Some("await-runtime:c1"))),
-            ResumeDecision::StillAwaiting("await-runtime:c1".to_string())
-        );
-        assert_eq!(
-            classify_resume(None, Some(Some("await-user"))),
-            ResumeDecision::Proceed
-        );
-        assert_eq!(classify_resume(None, None), ResumeDecision::Proceed);
     }
 
     #[test]
@@ -951,21 +860,6 @@ impl StateMachineRuntime {
         Ok(snapshot.map(|snapshot| snapshot.state.pending_approvals()))
     }
 
-    /// Whether a wait is parked for the conversation `envelope` addresses.
-    /// `Ok(None)` when this runtime has no resume store (nothing can ever be
-    /// parked, so the caller cannot tell "missing" from "never parkable").
-    pub(crate) async fn has_parked_wait(&self, envelope: &IngressEnvelope) -> Result<Option<bool>> {
-        let Some(resume) = self.resume.as_ref() else {
-            return Ok(None);
-        };
-        let envelope = envelope.clone().canonicalize();
-        let snapshot = resume
-            .fetch(&envelope)
-            .await
-            .map_err(|err| anyhow!("failed to read the parked flow: {err}"))?;
-        Ok(Some(snapshot.is_some()))
-    }
-
     /// Execute the flow associated with the provided ingress event.
     pub async fn handle(&self, envelope: IngressEnvelope) -> Result<Value> {
         let result = self.run_flow_result(envelope).await?;
@@ -1162,37 +1056,8 @@ impl Adapter for PackFlowAdapter {
         let provider_owned = envelope.provider.clone();
         let payload = envelope.payload.clone();
         let retry_config = self.config.retry_config().into();
-        let parked_record = self.resume.fetch_record(&envelope).await?;
-        let dispatch_correlation = dispatch_resume_correlation(&envelope);
-        match classify_resume(
-            dispatch_correlation.as_deref(),
-            parked_record
-                .as_ref()
-                .map(|record| record.reason.as_deref()),
-        ) {
-            ResumeDecision::Proceed => {}
-            ResumeDecision::DropDispatchResponse(why) => {
-                tracing::warn!(
-                    correlation_id = dispatch_correlation.as_deref().unwrap_or_default(),
-                    why,
-                    "dropping runtime dispatch response: it does not match a parked wait"
-                );
-                return Ok((
-                    json!({ "status": "ignored", "reason": why }),
-                    serde_json::Map::new(),
-                ));
-            }
-            ResumeDecision::StillAwaiting(reason) => {
-                // An ordinary inbound while the conversation awaits a runtime
-                // response must neither resume the wait nor clobber it.
-                return Ok((
-                    json!({ "status": "pending", "reason": reason }),
-                    serde_json::Map::new(),
-                ));
-            }
-        }
-        let (resume_snapshot, resume_run) = match parked_record {
-            Some(record) => (Some(record.snapshot), record.run),
+        let (resume_snapshot, resume_run) = match self.resume.fetch_with_run(&envelope).await? {
+            Some((snapshot, run)) => (Some(snapshot), run),
             None => (None, None),
         };
         let resume_flow_id = resume_snapshot

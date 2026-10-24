@@ -245,16 +245,7 @@ pub fn split_dispatch_nonce(correlation_id: &str) -> (&str, Option<&str>) {
 pub struct RuntimeSessionResumer {
     runtime: Arc<StateMachineRuntime>,
     mode: AdmissionMode,
-    /// How many times to re-check for a parked wait before dropping a response
-    /// that finds none, and the pause between checks. The request is published
-    /// from inside the node, before the flow turn returns and saves its wait,
-    /// so a fast responder can legitimately beat the save.
-    missing_wait_attempts: u32,
-    missing_wait_delay: std::time::Duration,
 }
-
-const DEFAULT_MISSING_WAIT_ATTEMPTS: u32 = 20;
-const DEFAULT_MISSING_WAIT_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How strictly a NONCED response must match the park before it resumes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,16 +272,7 @@ impl RuntimeSessionResumer {
         Self {
             runtime,
             mode: AdmissionMode::Lenient,
-            missing_wait_attempts: DEFAULT_MISSING_WAIT_ATTEMPTS,
-            missing_wait_delay: DEFAULT_MISSING_WAIT_DELAY,
         }
-    }
-
-    /// Override the bounded wait-for-park retry (see the field docs).
-    pub fn with_missing_wait_retry(mut self, attempts: u32, delay: std::time::Duration) -> Self {
-        self.missing_wait_attempts = attempts;
-        self.missing_wait_delay = delay;
-        self
     }
 
     /// A resumer for the HTTP approval inbox: a nonced response resumes only
@@ -300,8 +282,6 @@ impl RuntimeSessionResumer {
         Self {
             runtime,
             mode: AdmissionMode::Strict,
-            missing_wait_attempts: DEFAULT_MISSING_WAIT_ATTEMPTS,
-            missing_wait_delay: DEFAULT_MISSING_WAIT_DELAY,
         }
     }
 
@@ -407,14 +387,7 @@ impl RuntimeSessionResumer {
 impl SessionResumer for RuntimeSessionResumer {
     async fn resume(&self, tenant: TenantCtx, correlation_id: &str, output: Value) -> Result<()> {
         let nonced = split_dispatch_nonce(correlation_id).1.is_some();
-        let mut envelope = Self::build_resume_envelope(&tenant, correlation_id, output.clone());
-        // The must-resume signal: the runtime only resumes a wait awaiting
-        // exactly this correlation id and drops the response otherwise, instead
-        // of starting the flow fresh.
-        envelope.metadata = Some(serde_json::json!({
-            crate::engine::runtime::DISPATCH_RESUME_METADATA_KEY: correlation_id,
-        }));
-        self.wait_for_park(&envelope, correlation_id).await;
+        let envelope = Self::build_resume_envelope(&tenant, correlation_id, output.clone());
         // Read for EVERY response, not only nonced ones: a sender that omits
         // the nonce must not skip the token check. A read failure is fatal for
         // a nonced (approval) response, as before; for any other response it
@@ -453,26 +426,6 @@ impl SessionResumer for RuntimeSessionResumer {
             }
         }
         self.runtime.handle(envelope).await.map(|_| ())
-    }
-}
-
-impl RuntimeSessionResumer {
-    /// Give the originating turn a bounded moment to save its wait. Returns as
-    /// soon as a wait exists, the runtime cannot park at all, or the retries
-    /// are exhausted (the runtime then drops the response and logs it).
-    async fn wait_for_park(&self, envelope: &IngressEnvelope, correlation_id: &str) {
-        for attempt in 0..=self.missing_wait_attempts {
-            match self.runtime.has_parked_wait(envelope).await {
-                Ok(Some(false)) if attempt < self.missing_wait_attempts => {
-                    tokio::time::sleep(self.missing_wait_delay).await;
-                }
-                Ok(_) => return,
-                Err(error) => {
-                    tracing::warn!(%error, %correlation_id, "could not check for a parked wait");
-                    return;
-                }
-            }
-        }
     }
 }
 

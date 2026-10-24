@@ -6859,9 +6859,10 @@ mod approval_gate_tests {
 mod tests {
     use super::*;
     #[test]
-    fn should_retry_only_typed_transient_errors() {
-        assert!(!should_retry(&anyhow!("internal server error")));
-        assert!(!should_retry(&anyhow!("service unavailable: timeout")));
+    fn should_retry_typed_and_message_transient_errors() {
+        assert!(should_retry(&anyhow!("internal server error")));
+        assert!(should_retry(&anyhow!("service unavailable: timeout")));
+        assert!(!should_retry(&anyhow!("bad request")));
         assert!(should_retry(&anyhow::Error::new(TransientFlowError(
             "upstream hiccup".into()
         ))));
@@ -15589,13 +15590,13 @@ fn lift_node_error(output: Value, failure: Option<&(String, NodeOutput)>) -> Val
 #[error("{0}")]
 pub struct TransientFlowError(pub String);
 
-/// Retry only failures that are TYPED as transient: an explicit
-/// [`TransientFlowError`], a timeout (`tokio::time::error::Elapsed`), or a
-/// transient I/O error kind. Substring-matching the message ("internal",
-/// "unavailable", ...) re-ran whole flows, side effects included, for errors
-/// that merely mentioned those words.
+/// Retry transient failures: anything typed as transient (an explicit
+/// [`TransientFlowError`], a timeout, a transient I/O kind) or whose message
+/// names a transient condition ("transient", "unavailable", "internal",
+/// "timeout"). The message check is the long-standing behaviour that
+/// `FlowRetryConfig` callers (fault injection, state-store flakiness) rely on.
 fn should_retry(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
+    let typed = err.chain().any(|cause| {
         if cause.is::<TransientFlowError>() || cause.is::<tokio::time::error::Elapsed>() {
             return true;
         }
@@ -15610,7 +15611,15 @@ fn should_retry(err: &anyhow::Error) -> bool {
                     | std::io::ErrorKind::WouldBlock
             )
         })
-    })
+    });
+    if typed {
+        return true;
+    }
+    let lower = err.to_string().to_lowercase();
+    lower.contains("transient")
+        || lower.contains("unavailable")
+        || lower.contains("internal")
+        || lower.contains("timeout")
 }
 
 #[cfg(feature = "fault-injection")]

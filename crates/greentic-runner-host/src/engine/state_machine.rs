@@ -3,6 +3,7 @@ use super::error::{GResult, RunnerError};
 use super::host::{
     HostBundle, OutboxKey, SessionKey, SessionOutboxEntry, SessionSnapshot, SpanContext, WaitState,
 };
+use super::policy::retry_with_jitter;
 use super::policy::{Policy, policy_violation};
 use super::registry::{AdapterCall, AdapterRegistry};
 use greentic_types::TenantCtx;
@@ -336,13 +337,12 @@ impl StateMachine {
         call_clone.payload = resolved_payload.clone();
         // `call_traced` also yields the flow's per-node output map (keyed by the
         // real node id, e.g. `insights_agent`) when the adapter drives a flow.
-        //
-        // Called exactly once: there is deliberately no retry layer here. The
-        // flow engine retries typed-transient node failures itself, and an
-        // adapter call at this level is a whole flow turn, so retrying it would
-        // re-run every earlier node's side effects and multiply the engine's
-        // own attempts.
-        let (response, flow_nodes) = adapter_clone.call_traced(&call_clone).await?;
+        let (response, flow_nodes) = retry_with_jitter(&self.policy.retry, || {
+            let adapter = adapter_clone.clone();
+            let call = call_clone.clone();
+            async move { adapter.call_traced(&call).await }
+        })
+        .await?;
 
         session.cursor.position += 1;
         session.cursor.outbox_seq = session.cursor.outbox_seq.saturating_add(1);
