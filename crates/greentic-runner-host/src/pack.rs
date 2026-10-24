@@ -346,8 +346,11 @@ fn build_blocking_client() -> Result<BlockingClient, String> {
     // Built on a scratch thread: the blocking client must not be constructed
     // inside an async context.
     std::thread::spawn(|| {
+        let guard = crate::http_guard::HttpGuard::from_env();
         BlockingClient::builder()
             .no_proxy()
+            .dns_resolver(Arc::new(crate::http_guard::GuardedResolver { guard }))
+            .redirect(crate::http_guard::redirect_policy(guard))
             .build()
             .map_err(|err| format!("failed to build blocking http client: {err}"))
     })
@@ -906,6 +909,16 @@ impl HostState {
             }
         }
 
+        let guard = crate::http_guard::HttpGuard::from_env();
+        if let Ok(parsed) = url::Url::parse(&req.url)
+            && let Err(reason) = guard.check_url_literal(&parsed)
+        {
+            return Err(HttpClientError {
+                code: "denied".into(),
+                message: reason,
+            });
+        }
+
         let method = req.method.parse().unwrap_or(reqwest::Method::GET);
         let mut builder = self.http_client.request(method, &req.url);
         for (key, value) in req.headers {
@@ -938,6 +951,12 @@ impl HostState {
             Ok(resp) => resp,
             Err(err) => {
                 warn!(url = %req.url, error = %err, "http client request failed");
+                if crate::http_guard::is_blocked_error(&err) {
+                    return Err(HttpClientError {
+                        code: "denied".into(),
+                        message: crate::http_guard::BLOCKED_MARKER.to_string(),
+                    });
+                }
                 return Err(HttpClientError {
                     code: "unavailable".into(),
                     message: err.to_string(),
@@ -956,16 +975,17 @@ impl HostState {
                 )
             })
             .collect::<Vec<_>>();
-        let body_bytes = match response.bytes() {
-            Ok(bytes) => Some(bytes.to_vec()),
-            Err(err) => {
-                warn!(url = %req.url, error = %err, "http response body read failed");
-                return Err(HttpClientError {
-                    code: "unavailable".into(),
-                    message: format!("failed to read response body: {err}"),
-                });
-            }
-        };
+        let body_bytes =
+            match crate::http_guard::read_capped_body(response, guard.max_response_bytes) {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    warn!(url = %req.url, error = %err, "http response body read failed");
+                    return Err(HttpClientError {
+                        code: "unavailable".into(),
+                        message: format!("failed to read response body: {err}"),
+                    });
+                }
+            };
 
         if let Some((meta, true)) = mock_state.take()
             && let Some(mock) = &self.mocks
@@ -1884,7 +1904,7 @@ pub struct ComponentState {
     wasi_ctx: WasiCtx,
     wasi_tls_ctx: WasiTlsCtx,
     wasi_http_ctx: WasiHttpCtx,
-    http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks,
+    http_timeout_hooks: crate::http_guard::GuardedHooks,
     resource_table: ResourceTable,
     wasm_limits: crate::wasm_limits::WasmLimits,
     store_limits: wasmtime::StoreLimits,
@@ -1926,12 +1946,13 @@ impl ComponentState {
             .instantiate()
             .context("failed to build WASI context")?;
         let wasm_limits = crate::wasm_limits::WasmLimits::from_env();
+        let http_enabled = host.config.http_enabled;
         Ok(Self {
             host,
             wasi_ctx,
             wasi_tls_ctx: WasiTlsCtxBuilder::new().build(),
             wasi_http_ctx: WasiHttpCtx::new(),
-            http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks::from_env(),
+            http_timeout_hooks: crate::http_guard::GuardedHooks::from_env(http_enabled),
             resource_table: ResourceTable::new(),
             wasm_limits,
             store_limits: wasm_limits.store_limits(),

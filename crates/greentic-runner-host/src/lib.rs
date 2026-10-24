@@ -36,6 +36,7 @@ pub mod fault;
 pub mod greentic_x_provider;
 pub mod gtbind;
 pub mod http;
+mod http_guard;
 pub mod identify_hint;
 pub mod metrics;
 pub mod operator_metrics;
@@ -67,6 +68,9 @@ pub mod watcher;
 
 mod activity;
 mod host;
+// `http_guard::GuardedHooks` supersedes `HttpTimeoutHooks` (same ceiling, plus the
+// address guard and body cap); the timeout helpers it reuses stay here.
+#[allow(dead_code)]
 mod http_timeout_hooks;
 pub mod oauth;
 
