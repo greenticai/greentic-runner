@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# The `GREENTIC_FAIL_*` env faults are compiled out of the host without this.
+fault-injection = ["greentic-runner-host/fault-injection"]
+
 [dev-dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
