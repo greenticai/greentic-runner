@@ -66,6 +66,20 @@ pub type ArtifactReaderPort = Arc<dyn greentic_aw_runtime::ArtifactReader>;
 #[cfg(feature = "agentic-worker")]
 pub type ExtArtifactPort = Arc<dyn greentic_ext_runtime::host_ports::ArtifactPort>;
 
+/// Pick the effective storage: the embedder's explicit config always wins and
+/// the env resolver is not even consulted; otherwise the env decides.
+fn resolve_storage(
+    configured: &StorageConfig,
+    explicit: bool,
+    from_env: impl FnOnce() -> Result<StorageConfig, crate::storage::StorageConfigError>,
+) -> Result<StorageConfig, crate::storage::StorageConfigError> {
+    if explicit {
+        Ok(configured.clone())
+    } else {
+        from_env()
+    }
+}
+
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
@@ -73,6 +87,8 @@ pub struct HostBuilder {
     wasi_policy: RunnerWasiPolicy,
     secrets: Option<DynSecretsManager>,
     storage: StorageConfig,
+    /// `true` once an embedder called `with_storage`; that always beats env.
+    storage_explicit: bool,
     #[cfg(feature = "agentic-worker")]
     ext_llm_port: Option<ExtLlmPort>,
     #[cfg(feature = "agentic-worker")]
@@ -93,6 +109,7 @@ impl HostBuilder {
             wasi_policy: RunnerWasiPolicy::default(),
             secrets: None,
             storage: StorageConfig::default(),
+            storage_explicit: false,
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: None,
             #[cfg(feature = "agentic-worker")]
@@ -151,6 +168,7 @@ impl HostBuilder {
     /// ```
     pub fn with_storage(mut self, storage: StorageConfig) -> Self {
         self.storage = storage;
+        self.storage_explicit = true;
         self
     }
 
@@ -290,7 +308,13 @@ impl HostBuilder {
             .into_iter()
             .map(|(tenant, cfg)| (tenant, Arc::new(cfg)))
             .collect();
-        let (session_store, state_store) = stores_from_config(&self.storage)?;
+        // An embedder's `with_storage` always wins; env only fills the gap.
+        // A bad env value is a hard error here, never a fall back to memory.
+        let storage = resolve_storage(&self.storage, self.storage_explicit, || {
+            StorageConfig::from_redis_url_env()
+        })
+        .context("invalid session/state Redis environment configuration")?;
+        let (session_store, state_store) = stores_from_config(&storage)?;
         // `SessionStoreHost` is deliberately NOT pointed at a durable store.
         //
         // It is write-only by construction: `put` goes through
@@ -310,7 +334,7 @@ impl HostBuilder {
         // travel this path: `FlowResumeStore` uses `register_wait` /
         // `find_wait_by_scope` and gets `session_store` below. Closing the
         // write-only behaviour itself is an upstream change in greentic-session.
-        let session_host = if self.storage.session.is_durable() {
+        let session_host = if storage.session.is_durable() {
             session_host_from(crate::storage::new_session_store())
         } else {
             // Unchanged for every caller that names no storage: one store,
@@ -318,13 +342,13 @@ impl HostBuilder {
             session_host_from(Arc::clone(&session_store))
         };
         let state_host = state_host_from(Arc::clone(&state_store));
-        if self.storage.is_durable() {
+        if storage.is_durable() {
             // Names, never the configured values: a Redis URL may carry
             // `redis://user:password@host`, and a startup log line is the last
             // place a credential should land.
             tracing::info!(
-                session = self.storage.session.describe(),
-                state = self.storage.state.describe(),
+                session = storage.session.describe(),
+                state = storage.state.describe(),
                 "runner host using durable storage; parked flows survive a restart"
             );
         }
@@ -2225,5 +2249,54 @@ mod build_validation_tests {
             message.is_some_and(|m| m.contains("bad tenant!")),
             "build must fail naming the invalid tenant"
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_resolution_tests {
+    use super::*;
+    use crate::storage::{StateBackend, StorageConfigError, stores_from_config};
+
+    #[test]
+    fn explicit_embedder_storage_wins_and_env_is_not_consulted() {
+        let explicit = StorageConfig::redis("redis://embedder", "ns").expect("config");
+        let got = resolve_storage(&explicit, true, || {
+            Err(StorageConfigError::MissingSessionNamespace)
+        })
+        .expect("env resolver must not be consulted");
+        assert_eq!(got, explicit);
+    }
+
+    #[test]
+    fn without_explicit_storage_env_decides() {
+        let from_env = StorageConfig {
+            state: StateBackend::redis("redis://env").expect("state"),
+            ..StorageConfig::default()
+        };
+        let got = resolve_storage(&StorageConfig::default(), false, || Ok(from_env.clone()))
+            .expect("resolve");
+        assert_eq!(got, from_env);
+    }
+
+    #[test]
+    fn env_resolution_error_propagates() {
+        let err = resolve_storage(&StorageConfig::default(), false, || {
+            StorageConfig::from_redis_url_vars(Some("redis://x"), None, None, None, None)
+        })
+        .expect_err("missing namespace");
+        assert_eq!(err, StorageConfigError::MissingSessionNamespace);
+    }
+
+    #[test]
+    fn an_invalid_redis_url_is_a_build_time_error_not_a_memory_fallback() {
+        let config = StorageConfig::from_redis_url_vars(
+            Some("not-a-redis-url"),
+            Some("not-a-redis-url"),
+            None,
+            Some("test"),
+            None,
+        )
+        .expect("config parses; the URL is only checked on connect");
+        assert!(stores_from_config(&config).is_err());
     }
 }
