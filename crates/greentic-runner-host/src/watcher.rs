@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
@@ -23,21 +23,82 @@ use crate::wasi::RunnerWasiPolicy;
 /// Digests (main + overlays) last applied per tenant, used to skip rebuilding
 /// tenants whose packs did not change.
 type AppliedDigests = Arc<Mutex<HashMap<String, Vec<String>>>>;
-/// Per tenant, the pack digests whose runtime build last failed. A tick that
-/// resolves the same digests again skips the rebuild (and its repeated error
-/// logs) until the digests change.
-type FailedDigests = Arc<Mutex<HashMap<String, Vec<String>>>>;
+/// Default first retry delay after a failed tenant rebuild.
+const REBUILD_RETRY_BASE: Duration = Duration::from_secs(60);
+/// Upper bound for the exponential rebuild retry delay.
+const REBUILD_RETRY_CAP: Duration = Duration::from_secs(15 * 60);
 
-/// Whether a rebuild of `digests` for `tenant` already failed and nothing changed.
-fn rebuild_already_failed(
-    failed: &HashMap<String, Vec<String>>,
-    tenant: &str,
-    digests: &[String],
-) -> bool {
-    failed
-        .get(tenant)
-        .is_some_and(|known| known.as_slice() == digests)
+/// A failed rebuild of one tenant's pack digests.
+struct FailedRebuild {
+    digests: Vec<String>,
+    last_attempt: Instant,
+    attempts: u32,
 }
+
+/// Per tenant, the pack digests whose runtime build last failed, with an
+/// exponential retry backoff. `PackRuntime::load` can fail transiently
+/// (network fetch of remote components, secrets, IO), so a failed rebuild is
+/// retried after `base`, `2*base`, ... capped at `cap`, instead of being
+/// skipped until the digests change. A manual reload trigger clears all
+/// markers and retries immediately.
+struct FailedRebuilds {
+    base: Duration,
+    cap: Duration,
+    entries: HashMap<String, FailedRebuild>,
+}
+
+impl FailedRebuilds {
+    fn new(base: Duration, cap: Duration) -> Self {
+        Self {
+            base,
+            cap,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn delay_for(&self, attempts: u32) -> Duration {
+        let exp = attempts.saturating_sub(1).min(31);
+        self.base
+            .checked_mul(1u32 << exp)
+            .unwrap_or(self.cap)
+            .min(self.cap)
+    }
+
+    /// Whether a rebuild of `digests` for `tenant` failed and is still inside
+    /// its backoff window at `now`.
+    fn should_skip(&self, tenant: &str, digests: &[String], now: Instant) -> bool {
+        self.entries.get(tenant).is_some_and(|known| {
+            known.digests.as_slice() == digests
+                && now.saturating_duration_since(known.last_attempt)
+                    < self.delay_for(known.attempts)
+        })
+    }
+
+    fn record_failure(&mut self, tenant: &str, digests: &[String], now: Instant) {
+        let attempts = match self.entries.get(tenant) {
+            Some(known) if known.digests.as_slice() == digests => known.attempts.saturating_add(1),
+            _ => 1,
+        };
+        self.entries.insert(
+            tenant.to_string(),
+            FailedRebuild {
+                digests: digests.to_vec(),
+                last_attempt: now,
+                attempts,
+            },
+        );
+    }
+
+    fn clear_tenant(&mut self, tenant: &str) {
+        self.entries.remove(tenant);
+    }
+
+    fn clear_all(&mut self) {
+        self.entries.clear();
+    }
+}
+
+type FailedDigests = Arc<Mutex<FailedRebuilds>>;
 
 pub struct PackWatcher {
     handle: tokio::task::JoinHandle<()>,
@@ -63,6 +124,11 @@ impl PackReloadHandle {
     }
 }
 
+/// Starts the watcher with a policy taken from the environment only
+/// (`PackPolicy::from_env`). This wrapper has no access to the resolved config,
+/// so `packs.trust.require_signatures` is NOT honoured here; callers that need
+/// it must build the policy themselves and use
+/// [`start_pack_watcher_with_policy`] (as `run()` does via `pack_policy_from`).
 pub async fn start_pack_watcher(
     host: Arc<RunnerHost>,
     cfg: PackConfig,
@@ -105,7 +171,10 @@ pub async fn start_pack_watcher_with_policy(
     let stream_observers = host.stream_observers();
 
     let applied: AppliedDigests = Arc::new(Mutex::new(HashMap::new()));
-    let failed_digests: FailedDigests = Arc::new(Mutex::new(HashMap::new()));
+    let failed_digests: FailedDigests = Arc::new(Mutex::new(FailedRebuilds::new(
+        REBUILD_RETRY_BASE,
+        REBUILD_RETRY_CAP,
+    )));
     reload_once(
         configs.as_ref(),
         &manager,
@@ -166,6 +235,8 @@ pub async fn start_pack_watcher_with_policy(
                     if recv.is_none() {
                         break;
                     }
+                    // A manual trigger bypasses the failed-rebuild backoff.
+                    failed_clone.lock().clear_all();
                 }
             }
             if let Err(err) = reload_once(
@@ -267,6 +338,11 @@ async fn reload_once(
                     .map(|overlay| overlay.digest.as_str().to_string()),
             )
             .collect();
+        // Tenants whose digests are unchanged are NOT rebuilt: load-time inputs
+        // the digest does not cover (e.g. floating component tags resolved at
+        // load) stay frozen at the first load. A restart, or a digest change
+        // (a manual `PackReloadHandle::trigger` re-resolves the index and
+        // picks that up immediately), is needed to refresh them.
         if let Some(prev) = previous.clone()
             && applied.lock().get(&tenant) == Some(&digests)
         {
@@ -275,8 +351,11 @@ async fn reload_once(
             new_applied.insert(tenant.clone(), digests);
             continue;
         }
-        if rebuild_already_failed(&failed_digests.lock(), &tenant, &digests) {
-            tracing::debug!(tenant = %tenant, "pack digests unchanged since failed rebuild; skipping");
+        if failed_digests
+            .lock()
+            .should_skip(&tenant, &digests, Instant::now())
+        {
+            tracing::debug!(tenant = %tenant, "pack digests unchanged since failed rebuild; waiting for retry backoff");
             failures.push(format!(
                 "{tenant}: rebuild previously failed for these pack digests"
             ));
@@ -368,7 +447,7 @@ async fn reload_once(
         .await;
         match built {
             Ok(runtime) => {
-                failed_digests.lock().remove(&tenant);
+                failed_digests.lock().clear_tenant(&tenant);
                 next.insert(RuntimeKey::legacy(tenant.clone()), runtime);
                 new_applied.insert(tenant.clone(), digests);
             }
@@ -377,7 +456,7 @@ async fn reload_once(
                 failures.push(format!("{tenant}: {err:#}"));
                 failed_digests
                     .lock()
-                    .insert(tenant.clone(), digests.clone());
+                    .record_failure(&tenant, &digests, Instant::now());
                 if let Some(prev) = previous {
                     next.insert(RuntimeKey::legacy(tenant.clone()), prev);
                     if let Some(old) = applied.lock().get(&tenant).cloned() {
@@ -405,18 +484,48 @@ async fn reload_once(
 mod failed_digest_tests {
     use super::*;
 
+    fn d(s: &str) -> Vec<String> {
+        vec![s.to_string()]
+    }
+
     #[test]
-    fn a_failed_rebuild_is_skipped_until_the_digests_change() {
-        let mut failed = HashMap::new();
-        let digests = vec!["sha256:a".to_string()];
-        assert!(!rebuild_already_failed(&failed, "t", &digests));
-        failed.insert("t".to_string(), digests.clone());
-        assert!(rebuild_already_failed(&failed, "t", &digests));
-        assert!(!rebuild_already_failed(
-            &failed,
-            "t",
-            &["sha256:b".to_string()]
-        ));
-        assert!(!rebuild_already_failed(&failed, "other", &digests));
+    fn failed_rebuild_is_skipped_within_backoff_then_retried() {
+        let base = Duration::from_secs(10);
+        let mut f = FailedRebuilds::new(base, Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert!(!f.should_skip("t", &d("a"), t0));
+        f.record_failure("t", &d("a"), t0);
+        assert!(f.should_skip("t", &d("a"), t0 + Duration::from_secs(5)));
+        assert!(!f.should_skip("t", &d("a"), t0 + base));
+        assert!(!f.should_skip("t", &d("b"), t0));
+        assert!(!f.should_skip("other", &d("a"), t0));
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        let mut f = FailedRebuilds::new(Duration::from_secs(10), Duration::from_secs(50));
+        let t0 = Instant::now();
+        f.record_failure("t", &d("a"), t0);
+        f.record_failure("t", &d("a"), t0);
+        assert!(f.should_skip("t", &d("a"), t0 + Duration::from_secs(19)));
+        assert!(!f.should_skip("t", &d("a"), t0 + Duration::from_secs(20)));
+        for _ in 0..40 {
+            f.record_failure("t", &d("a"), t0);
+        }
+        assert_eq!(f.delay_for(41), Duration::from_secs(50));
+        assert!(!f.should_skip("t", &d("a"), t0 + Duration::from_secs(50)));
+    }
+
+    #[test]
+    fn manual_trigger_clear_bypasses_backoff() {
+        let mut f = FailedRebuilds::new(Duration::from_secs(60), Duration::from_secs(900));
+        let t0 = Instant::now();
+        f.record_failure("t", &d("a"), t0);
+        assert!(f.should_skip("t", &d("a"), t0));
+        f.clear_all();
+        assert!(!f.should_skip("t", &d("a"), t0));
+        f.record_failure("t", &d("a"), t0);
+        f.clear_tenant("t");
+        assert!(!f.should_skip("t", &d("a"), t0));
     }
 }
