@@ -28,7 +28,7 @@ pub fn agentic_stream_config() -> stream::Config {
 }
 
 /// Returns the durable pull consumer config (`agentic-workers`) with explicit
-/// ack and a max-deliver cap of 5 to prevent poison-pill messages from looping
+/// ack and a max-deliver cap ([`MAX_DELIVER`]) to prevent poison-pill messages from looping
 /// indefinitely.
 #[must_use]
 pub fn agentic_consumer_config() -> consumer::pull::Config {
@@ -71,11 +71,13 @@ pub async fn ensure_consumer(
     // `get_or_create_consumer` can hand back an existing durable unchanged: one
     // created by an older build keeps its 30s `ack_wait`, which is shorter than
     // a turn and would redeliver (and double-run) it. Converge it in place.
-    if ack_wait_is_stale(consumer.cached_info().config.ack_wait) {
+    if ack_wait_is_stale(consumer.cached_info().config.ack_wait)
+        || consumer.cached_info().config.max_deliver != MAX_DELIVER
+    {
         tracing::warn!(
             existing = ?consumer.cached_info().config.ack_wait,
             wanted = ?ACK_WAIT,
-            "agentic-workers consumer ack_wait is stale; updating"
+            "agentic-workers consumer ack_wait or max_deliver is stale; updating"
         );
         return stream
             .update_consumer(agentic_consumer_config())
@@ -92,10 +94,54 @@ pub fn ack_wait_is_stale(existing: Duration) -> bool {
 }
 
 /// Redelivery cap of the durable consumer (poison-pill guard).
-pub const MAX_DELIVER: i64 = 5;
+pub const MAX_DELIVER: i64 = 6;
 
-/// Delay before a request whose session was busy is redelivered.
+/// Delay before the first redelivery of a request whose session was busy;
+/// doubles on each further delivery up to [`BUSY_REDELIVER_MAX_DELAY`].
 pub const BUSY_REDELIVER_DELAY: Duration = Duration::from_secs(5);
+
+/// Cap of the busy redelivery delay.
+pub const BUSY_REDELIVER_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// Delay before a request whose handler failed (e.g. the response could not be
+/// published) is redelivered.
+pub const ERROR_REDELIVER_DELAY: Duration = Duration::from_secs(2);
+
+/// Session-lock wait the runtime uses per attempt (see `acquire_lock`).
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Margin added to an agent's step timeout when sizing the handler bound.
+const HANDLE_MARGIN: Duration = Duration::from_secs(30);
+
+/// Hard ceiling of the derived handler bound.
+const HANDLE_TIMEOUT_CEILING: Duration = Duration::from_secs(30 * 60);
+
+/// Busy redelivery delay after `delivered` deliveries: 5s, 10s, 20s, 40s, 60s.
+///
+/// Exponential so the total busy budget (delays plus the per-attempt lock
+/// wait) outlasts a legitimate turn (default step timeout 60s) that is still
+/// running when the user's next message arrives.
+#[must_use]
+pub fn busy_redeliver_delay(delivered: i64) -> Duration {
+    let exp = u32::try_from(delivered.saturating_sub(1).clamp(0, 16)).unwrap_or(16);
+    BUSY_REDELIVER_DELAY
+        .saturating_mul(1u32.checked_shl(exp).unwrap_or(u32::MAX))
+        .min(BUSY_REDELIVER_MAX_DELAY)
+}
+
+/// Per-message handler bound: [`HANDLE_TIMEOUT`], raised when the agent's own
+/// `limits.timeout` (+ lock wait + margin) needs longer, up to a ceiling.
+/// `ack_wait` is not a limit here: in-progress acks keep the message alive.
+#[must_use]
+pub fn handle_timeout_for(step_timeout: Option<Duration>) -> Duration {
+    match step_timeout {
+        Some(step) => step
+            .saturating_add(LOCK_WAIT)
+            .saturating_add(HANDLE_MARGIN)
+            .clamp(HANDLE_TIMEOUT, HANDLE_TIMEOUT_CEILING),
+        None => HANDLE_TIMEOUT,
+    }
+}
 
 /// Upper bound on handling ONE message (step timeout + session-lock wait +
 /// margin). The default agent step timeout is 60s and the lock wait 5s; agents
@@ -144,23 +190,26 @@ pub fn should_ack(handle_result: &Result<()>) -> bool {
     handle_result.is_ok()
 }
 
-/// The JetStream settlement for a handled message: `None` leaves it un-acked
-/// (redelivery), `Term` stops redelivery of a request that can never succeed.
+/// The JetStream settlement for a handled message after `delivered` deliveries.
+/// `Term` stops redelivery of a request that can never succeed (or has no
+/// delivery left). A handler error is Nak'd with a short delay rather than left
+/// to wait out `ack_wait`.
 #[must_use]
-pub fn settlement(result: &Result<Disposition>) -> Option<AckKind> {
+pub fn settlement(result: &Result<Disposition>, delivered: i64) -> AckKind {
     match result {
-        Ok(Disposition::Handled) => Some(AckKind::Ack),
+        Ok(Disposition::Handled) => AckKind::Ack,
         // Session busy and no response sent: redeliver later, never ack.
-        Ok(Disposition::Busy) => Some(AckKind::Nak(Some(BUSY_REDELIVER_DELAY))),
-        Ok(Disposition::Rejected) => Some(AckKind::Term),
-        Err(_) => None,
+        Ok(Disposition::Busy) => AckKind::Nak(Some(busy_redeliver_delay(delivered))),
+        Ok(Disposition::Rejected) => AckKind::Term,
+        Err(_) if delivered >= MAX_DELIVER => AckKind::Term,
+        Err(_) => AckKind::Nak(Some(ERROR_REDELIVER_DELAY)),
     }
 }
 
 /// Pull messages from the `agentic-workers` durable consumer, dispatch each
 /// via [`crate::handle_message_outcome`], and settle it (ack / term).
 ///
-/// Un-acked messages are redelivered up to `max_deliver` times (5) before
+/// Un-acked messages are redelivered up to `max_deliver` times (6) before
 /// JetStream marks them as dead-lettered.  Each message is processed in its
 /// own `tokio::spawn` so one slow agent does not stall the pull loop, with
 /// `in_progress` acks sent while it runs. A stream error is logged and the
@@ -212,8 +261,9 @@ async fn handle_one(
     // busy session must be answered instead of Nak'd into the void.
     let delivered = js_msg.info().map(|info| info.delivered).unwrap_or(1);
     let busy = busy_policy(delivered);
+    let handle_timeout = handle_timeout_for(step_timeout_of(&invoker, &core).await);
     let handling = tokio::time::timeout(
-        HANDLE_TIMEOUT,
+        handle_timeout,
         crate::handle_message_outcome(&client, invoker, core.clone(), busy),
     );
     tokio::pin!(handling);
@@ -233,14 +283,14 @@ async fn handle_one(
         Ok(result) => result,
         Err(_elapsed) => {
             tracing::error!(
-                timeout = ?HANDLE_TIMEOUT,
+                timeout = ?handle_timeout,
                 "agentic handler exceeded its time bound; terminating the request"
             );
             if let Err(error) = crate::publish_error_for_message(
                 &client,
                 &core,
                 "timeout",
-                format!("agent request handling exceeded {HANDLE_TIMEOUT:?}"),
+                format!("agent request handling exceeded {handle_timeout:?}"),
             )
             .await
             {
@@ -250,21 +300,63 @@ async fn handle_one(
             Ok(Disposition::Rejected)
         }
     };
-    match settlement(&result) {
-        Some(kind) => {
-            if let Err(ack_err) = js_msg.ack_with(kind).await {
-                tracing::error!(error = %ack_err, "jetstream ack failed");
-            }
+    let kind = settlement(&result, delivered);
+    if let Err(handle_err) = &result {
+        tracing::error!(
+            error = %handle_err,
+            delivered,
+            "agentic handler failed; settling for redelivery"
+        );
+        if delivered >= MAX_DELIVER {
+            // Last delivery: nothing will retry, so do not leave the caller
+            // waiting for a response that never comes.
+            publish_final_error(&client, &core, &handle_err.to_string()).await;
         }
-        None => {
-            if let Err(handle_err) = result {
-                tracing::error!(
-                    error = %handle_err,
-                    "agentic handler failed; leaving unacked for redelivery"
-                );
+    }
+    if let Err(ack_err) = js_msg.ack_with(kind).await {
+        tracing::error!(error = %ack_err, "jetstream ack failed");
+    }
+}
+
+/// Best-effort error response on the last delivery, retried once.
+async fn publish_final_error(client: &async_nats::Client, core: &async_nats::Message, why: &str) {
+    for attempt in 0..2u8 {
+        match crate::publish_error_for_message(
+            client,
+            core,
+            "invoke_failed",
+            format!("agent request could not be completed: {why}"),
+        )
+        .await
+        {
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(%error, attempt, "could not publish final error response");
+                tokio::time::sleep(ERROR_REDELIVER_DELAY).await;
             }
         }
     }
+}
+
+/// The agent's configured step timeout for the request in `core`, if the
+/// invoker knows it. An unparsable request yields `None` (default bound).
+async fn step_timeout_of(
+    invoker: &Arc<dyn AgentDispatchInvoker>,
+    core: &async_nats::Message,
+) -> Option<Duration> {
+    let headers = core.headers.as_ref();
+    let parsed = crate::parse_request(
+        |name| {
+            headers
+                .and_then(|h| h.get(name))
+                .map(|v| v.as_str().to_string())
+        },
+        &core.payload,
+    )
+    .ok()?;
+    invoker
+        .step_timeout(&parsed.tenant, &parsed.env, &parsed.request.target)
+        .await
 }
 
 #[cfg(test)]
@@ -319,8 +411,8 @@ mod tests {
     fn consumer_config_caps_max_deliver() {
         let cfg = agentic_consumer_config();
         assert_eq!(
-            cfg.max_deliver, 5,
-            "max_deliver should be 5 to prevent poison-pill loops"
+            cfg.max_deliver, MAX_DELIVER,
+            "max_deliver must stay bounded to prevent poison-pill loops"
         );
     }
 
@@ -332,21 +424,67 @@ mod tests {
     }
 
     #[test]
-    fn settlement_acks_naks_and_terms_but_never_acks_errors() {
+    fn settlement_acks_naks_and_terms() {
         assert!(matches!(
-            settlement(&Ok(Disposition::Handled)),
-            Some(AckKind::Ack)
+            settlement(&Ok(Disposition::Handled), 1),
+            AckKind::Ack
         ));
-        // Lock contention: redelivered with a delay, never acked.
+        // Lock contention: redelivered with a growing delay, never acked.
         assert!(matches!(
-            settlement(&Ok(Disposition::Busy)),
-            Some(AckKind::Nak(Some(delay))) if delay == BUSY_REDELIVER_DELAY
+            settlement(&Ok(Disposition::Busy), 1),
+            AckKind::Nak(Some(delay)) if delay == BUSY_REDELIVER_DELAY
         ));
         assert!(matches!(
-            settlement(&Ok(Disposition::Rejected)),
-            Some(AckKind::Term)
+            settlement(&Ok(Disposition::Busy), 2),
+            AckKind::Nak(Some(delay)) if delay == BUSY_REDELIVER_DELAY * 2
         ));
-        assert!(settlement(&Err(anyhow::anyhow!("publish failed"))).is_none());
+        assert!(matches!(
+            settlement(&Ok(Disposition::Rejected), 1),
+            AckKind::Term
+        ));
+    }
+
+    #[test]
+    fn handler_errors_are_nakd_quickly_then_termed_on_the_last_delivery() {
+        let err = || Err(anyhow::anyhow!("publish failed"));
+        assert!(matches!(
+            settlement(&err(), 1),
+            AckKind::Nak(Some(d)) if d == ERROR_REDELIVER_DELAY
+        ));
+        assert!(matches!(settlement(&err(), MAX_DELIVER), AckKind::Term));
+    }
+
+    #[test]
+    fn busy_delay_schedule_is_exponential_and_capped() {
+        let secs: Vec<u64> = (1..=8).map(|d| busy_redeliver_delay(d).as_secs()).collect();
+        assert_eq!(secs, vec![5, 10, 20, 40, 60, 60, 60, 60]);
+        assert_eq!(busy_redeliver_delay(0), BUSY_REDELIVER_DELAY);
+        assert_eq!(busy_redeliver_delay(i64::MAX), BUSY_REDELIVER_MAX_DELAY);
+    }
+
+    #[test]
+    fn busy_budget_outlasts_the_default_step_timeout() {
+        // Delays between deliveries 1..MAX_DELIVER, plus a lock wait per attempt.
+        let delays: Duration = (1..MAX_DELIVER).map(busy_redeliver_delay).sum();
+        let total = delays + LOCK_WAIT * u32::try_from(MAX_DELIVER).unwrap_or(1);
+        assert!(total > Duration::from_secs(60 + 30), "got {total:?}");
+    }
+
+    #[test]
+    fn handle_timeout_follows_the_agent_step_timeout() {
+        assert_eq!(handle_timeout_for(None), HANDLE_TIMEOUT);
+        assert_eq!(
+            handle_timeout_for(Some(Duration::from_secs(30))),
+            HANDLE_TIMEOUT
+        );
+        assert_eq!(
+            handle_timeout_for(Some(Duration::from_secs(600))),
+            Duration::from_secs(635)
+        );
+        assert_eq!(
+            handle_timeout_for(Some(Duration::from_secs(86_400))),
+            HANDLE_TIMEOUT_CEILING
+        );
     }
 
     #[test]

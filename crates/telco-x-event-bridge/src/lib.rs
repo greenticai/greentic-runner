@@ -39,6 +39,9 @@ pub struct InvokeOutcome {
     pub output: Value,
     /// Optional runtime-emitted events (empty today).
     pub events: Vec<Value>,
+    /// Why `ok` is false (`{code, message}`); `None` for a success. `output`
+    /// may still carry partial results.
+    pub error: Option<DispatchError>,
 }
 
 /// Seam over the actual Telco-X invocation. A production impl wraps the Telco-X
@@ -95,6 +98,7 @@ impl TelcoXDispatchInvoker for EchoInvoker {
                 "input": input,
             }),
             events: vec![],
+            error: None,
         })
     }
 }
@@ -176,6 +180,21 @@ pub fn validate_scope_id(kind: &str, value: &str) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// The `(tenant, env)` pair to stamp on a response, from the request's own
+/// scope headers (`env` defaults to `default` like [`parse_request`]). `None`
+/// when an id is absent or fails [`validate_scope_id`]. The host's listener
+/// drops a response with no tenant/env headers.
+#[must_use]
+pub fn response_scope(tenant: Option<&str>, env: Option<&str>) -> Option<(String, String)> {
+    let tenant = tenant?;
+    let env = env.unwrap_or("default");
+    if validate_scope_id("tenant", tenant).is_ok() && validate_scope_id("env", env).is_ok() {
+        Some((tenant.to_string(), env.to_string()))
+    } else {
+        None
+    }
+}
+
 /// Validate headers and decode the payload (pure; no I/O).
 pub fn parse_request(
     get_header: impl Fn(&str) -> Option<String>,
@@ -252,7 +271,7 @@ async fn dispatch(
         ok: outcome.ok,
         output: outcome.output,
         events: outcome.events,
-        error: None,
+        error: outcome.error,
     })
 }
 
@@ -321,7 +340,16 @@ pub async fn handle_message_outcome(
             tracing::warn!(code = rejection.code, message = %rejection.message, "rejecting dispatch request");
             if let Some(correlation) = get_header("Greentic-Correlation-Id") {
                 let resp = error_response(rejection.code, rejection.message);
-                publish_response(client, Some(&correlation), None, &resp).await?;
+                let tenant = get_header("Greentic-Tenant");
+                let env = get_header("Greentic-Env");
+                let scope = response_scope(tenant.as_deref(), env.as_deref());
+                publish_response(
+                    client,
+                    Some(&correlation),
+                    scope.as_ref().map(|(t, e)| (t.as_str(), e.as_str())),
+                    &resp,
+                )
+                .await?;
             }
             return Ok(Disposition::Rejected);
         }
@@ -424,6 +452,7 @@ mod tests {
                 ok: true,
                 output: json!({"done": true}),
                 events: vec![],
+                error: None,
             })
         }
     }
@@ -588,6 +617,55 @@ mod tests {
             other.error.map(|e| e.code).as_deref(),
             Some("invoke_failed")
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_outcome_forwards_its_error() {
+        struct Failing;
+
+        #[async_trait]
+        impl TelcoXDispatchInvoker for Failing {
+            async fn invoke(
+                &self,
+                _tenant: &str,
+                _env: &str,
+                _target: &str,
+                _operation: &str,
+                _input: Value,
+                _idempotency_key: Option<&str>,
+            ) -> Result<InvokeOutcome> {
+                Ok(InvokeOutcome {
+                    ok: false,
+                    output: Value::Null,
+                    events: vec![],
+                    error: Some(DispatchError {
+                        code: "line_busy".into(),
+                        message: "line is busy".into(),
+                    }),
+                })
+            }
+        }
+
+        let resp = build_response(Arc::new(Failing), "acme", "prod", None, sample_request()).await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error.map(|e| (e.code, e.message)),
+            Some(("line_busy".to_string(), "line is busy".to_string()))
+        );
+    }
+
+    #[test]
+    fn response_scope_is_kept_for_valid_ids_and_dropped_for_invalid_ones() {
+        assert_eq!(
+            response_scope(Some("acme"), Some("prod")),
+            Some(("acme".into(), "prod".into()))
+        );
+        assert_eq!(
+            response_scope(Some("acme"), None),
+            Some(("acme".into(), "default".into()))
+        );
+        assert_eq!(response_scope(None, Some("prod")), None);
+        assert_eq!(response_scope(Some("a/b"), Some("prod")), None);
     }
 
     #[test]

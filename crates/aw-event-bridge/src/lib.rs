@@ -73,6 +73,19 @@ pub trait AgentDispatchInvoker: Send + Sync {
         input: Value,
         idempotency_key: Option<&str>,
     ) -> Result<InvokeOutcome>;
+
+    /// The wall-clock limit one step on `target` is configured with, when the
+    /// invoker knows it. A durable consumer sizes its per-message time bound
+    /// from this so an agent with a long `limits.timeout` is not cut off by a
+    /// fixed constant. `None` (the default) means "use the consumer's default".
+    async fn step_timeout(
+        &self,
+        _tenant: &str,
+        _env: &str,
+        _target: &str,
+    ) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// Longest tenant / env id the bridge accepts from a request header.
@@ -170,6 +183,24 @@ pub fn validate_scope_id(kind: &str, value: &str) -> Result<(), Rejection> {
         });
     }
     Ok(())
+}
+
+/// The `(tenant, env)` pair to stamp on a response, from the request's own
+/// scope headers. `env` defaults to `default` exactly as [`parse_request`]
+/// does. `None` when either id fails [`validate_scope_id`] (or tenant is
+/// absent): an unvalidated id is never echoed into a header.
+///
+/// The host's listener drops a response with no tenant/env headers, so every
+/// error response whose scope is valid must carry them.
+#[must_use]
+pub fn response_scope(tenant: Option<&str>, env: Option<&str>) -> Option<(String, String)> {
+    let tenant = tenant?;
+    let env = env.unwrap_or("default");
+    if validate_scope_id("tenant", tenant).is_ok() && validate_scope_id("env", env).is_ok() {
+        Some((tenant.to_string(), env.to_string()))
+    } else {
+        None
+    }
 }
 
 /// Validate headers and decode the payload (pure; no I/O).
@@ -315,7 +346,16 @@ pub async fn handle_message_outcome(
             tracing::warn!(code = rejection.code, message = %rejection.message, "rejecting dispatch request");
             if let Some(correlation) = get_header("Greentic-Correlation-Id") {
                 let resp = error_response(rejection.code, rejection.message);
-                publish_response(client, Some(&correlation), None, &resp).await?;
+                let tenant = get_header("Greentic-Tenant");
+                let env = get_header("Greentic-Env");
+                let scope = response_scope(tenant.as_deref(), env.as_deref());
+                publish_response(
+                    client,
+                    Some(&correlation),
+                    scope.as_ref().map(|(t, e)| (t.as_str(), e.as_str())),
+                    &resp,
+                )
+                .await?;
             }
             return Ok(Disposition::Rejected);
         }
@@ -380,19 +420,11 @@ pub async fn publish_error_for_message(
     };
     let tenant = header("Greentic-Tenant");
     let env = header("Greentic-Env");
-    let scope = match (tenant.as_deref(), env.as_deref()) {
-        (Some(tenant), Some(env))
-            if validate_scope_id("tenant", tenant).is_ok()
-                && validate_scope_id("env", env).is_ok() =>
-        {
-            Some((tenant, env))
-        }
-        _ => None,
-    };
+    let scope = response_scope(tenant.as_deref(), env.as_deref());
     publish_response(
         client,
         Some(&correlation),
-        scope,
+        scope.as_ref().map(|(t, e)| (t.as_str(), e.as_str())),
         &error_response(code, message),
     )
     .await?;
@@ -669,6 +701,22 @@ mod tests {
             .context("agent step failed");
         assert!(is_lock_contention(&wrapped));
         assert!(!is_lock_contention(&anyhow::anyhow!("boom")));
+    }
+
+    #[test]
+    fn response_scope_is_kept_for_valid_ids_and_dropped_for_invalid_ones() {
+        assert_eq!(
+            response_scope(Some("acme"), Some("prod")),
+            Some(("acme".into(), "prod".into()))
+        );
+        // Missing env defaults like `parse_request`.
+        assert_eq!(
+            response_scope(Some("acme"), None),
+            Some(("acme".into(), "default".into()))
+        );
+        assert_eq!(response_scope(None, Some("prod")), None);
+        assert_eq!(response_scope(Some("a:b"), Some("prod")), None);
+        assert_eq!(response_scope(Some("acme"), Some("../x")), None);
     }
 
     #[test]
