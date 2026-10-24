@@ -75,12 +75,17 @@ impl SessionStoreHost {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
             Arc::clone(entry.value())
         };
-        let guard = mutex.lock_owned().await;
-        Ok(SessionLockGuard {
+        // Build the guard BEFORE awaiting: if this future is cancelled while
+        // waiting (after the holder released, so the holder's own sweep saw the
+        // waiter's Arc and kept the entry), dropping the still-empty guard
+        // sweeps the entry instead of leaking it until the next op on this id.
+        let mut guard = SessionLockGuard {
             locks: &self.locks,
             id,
-            guard: Some(guard),
-        })
+            guard: None,
+        };
+        guard.guard = Some(mutex.lock_owned().await);
+        Ok(guard)
     }
 
     async fn lookup_entry(&self, key: &SessionKey) -> GResult<Option<StoreEntry>> {
@@ -984,6 +989,28 @@ mod host_tests {
                 assert_ne!(a, b);
             }
         }
+        Ok(())
+    }
+
+    /// A waiter cancelled after the holder released (but before it ran) must
+    /// not leave the lock-map entry behind.
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_leak_its_lock_entry() -> Result<()> {
+        let host = SessionStoreHost::new(Arc::new(PerUserStore::default()));
+        let key = key_for("cancel");
+        let holder = host.lock_session(&key).await?;
+        assert_eq!(host.locks.len(), 1);
+
+        let mut waiter = Box::pin(host.lock_session(&key));
+        tokio::select! {
+            biased;
+            _ = &mut waiter => anyhow::bail!("lock is held, waiter must pend"),
+            () = async move { drop(holder) } => {}
+        }
+        // The holder's sweep saw the waiter's Arc and kept the entry.
+        assert_eq!(host.locks.len(), 1);
+        drop(waiter);
+        assert_eq!(host.locks.len(), 0, "cancelled waiter leaked its entry");
         Ok(())
     }
 
