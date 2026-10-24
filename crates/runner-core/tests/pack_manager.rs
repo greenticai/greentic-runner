@@ -215,6 +215,7 @@ fn strict_requires_signature_and_accepts_any_rotated_key() -> Result<()> {
     let policy = PackPolicy {
         verify_strict: true,
         fs_allowed_roots: Some(vec![temp.path().to_path_buf()]),
+        allow_legacy_signatures: false,
     };
     let manager = PackManager::with_policy(config.clone(), policy)?;
 
@@ -268,5 +269,45 @@ fn strict_confines_absolute_fs_locators() -> Result<()> {
     let index = Index::load(&IndexLocation::File(index_path))?;
     let err = manager.resolve_all_for_index(&index).expect_err("rejected");
     assert!(format!("{err:#}").contains("outside the allowed"));
+    Ok(())
+}
+
+#[test]
+fn strict_rejects_legacy_digest_only_signature_unless_allowed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pack_path = build_test_pack(temp.path())?;
+    let digest = compute_digest(&pack_path)?;
+    let index_path = temp.path().join("index.json");
+    let locator = pack_path.to_str().unwrap();
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    let legacy = STANDARD.encode(key.sign(digest.as_str().as_bytes()).to_bytes());
+    write_signed_index(&index_path, locator, &digest, Some(&legacy));
+
+    let mut config = build_config(&index_path, &temp.path().join("cache"), PackSource::Fs);
+    config.public_key = Some(pub_value(&key));
+    let index = Index::load(&config.index_location)?;
+    let roots = Some(vec![temp.path().to_path_buf()]);
+
+    let strict = PackPolicy {
+        verify_strict: true,
+        fs_allowed_roots: roots.clone(),
+        allow_legacy_signatures: false,
+    };
+    let manager = PackManager::with_policy(config.clone(), strict)?;
+    assert!(manager.resolve_all_for_index(&index).is_err());
+
+    let allowed = PackPolicy {
+        verify_strict: true,
+        fs_allowed_roots: roots.clone(),
+        allow_legacy_signatures: true,
+    };
+    PackManager::with_policy(config.clone(), allowed)?.resolve_all_for_index(&index)?;
+
+    let lax = PackPolicy {
+        verify_strict: false,
+        fs_allowed_roots: roots,
+        allow_legacy_signatures: false,
+    };
+    PackManager::with_policy(config, lax)?.resolve_all_for_index(&index)?;
     Ok(())
 }

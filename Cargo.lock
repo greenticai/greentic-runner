@@ -6437,6 +6437,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tiny_http",
+ "tracing",
  "url",
 ]
 

@@ -44,7 +44,7 @@ impl FsResolver {
             .any(|root| canonical.starts_with(&root));
         if !allowed {
             anyhow::bail!(
-                "fs resolver: {} is outside the allowed pack roots",
+                "fs resolver: {} is outside the allowed pack roots (working directory plus PACK_FS_ALLOWED_ROOTS)",
                 canonical.display()
             );
         }

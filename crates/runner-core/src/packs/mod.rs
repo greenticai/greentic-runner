@@ -169,6 +169,10 @@ pub struct PackPolicy {
     /// or when `verify_strict` is set; otherwise absolute paths are
     /// unrestricted (dev behaviour).
     pub fs_allowed_roots: Option<Vec<PathBuf>>,
+    /// Accept legacy digest-only signatures while `verify_strict` is set.
+    /// Those signatures do not bind the pack name/version, so strict mode
+    /// rejects them unless this is enabled (`PACK_ALLOW_LEGACY_SIGNATURES`).
+    pub allow_legacy_signatures: bool,
 }
 
 impl PackPolicy {
@@ -179,9 +183,13 @@ impl PackPolicy {
             .unwrap_or(false);
         let fs_allowed_roots = std::env::var_os("PACK_FS_ALLOWED_ROOTS")
             .map(|raw| std::env::split_paths(&raw).collect::<Vec<_>>());
+        let allow_legacy_signatures = std::env::var("PACK_ALLOW_LEGACY_SIGNATURES")
+            .map(|value| is_truthy(&value))
+            .unwrap_or(false);
         Self {
             verify_strict,
             fs_allowed_roots,
+            allow_legacy_signatures,
         }
     }
 
@@ -267,8 +275,19 @@ impl PackManager {
                 .verify(digest.as_str().as_bytes(), signature)
                 .is_ok()
             {
-                // Legacy digest-only signature: still accepted so existing
-                // signed indexes keep working.
+                // Legacy digest-only signature: it does not bind name/version,
+                // so strict mode refuses it unless explicitly allowed.
+                if self.policy.verify_strict && !self.policy.allow_legacy_signatures {
+                    bail!(
+                        "pack {} carries a legacy digest-only signature; re-sign with the canonical \
+                         {{name, version, digest}} message or set PACK_ALLOW_LEGACY_SIGNATURES=1",
+                        entry.reference.name
+                    );
+                }
+                tracing::warn!(
+                    pack = %entry.reference.name,
+                    "accepting legacy digest-only pack signature"
+                );
                 return Ok(());
             }
         }
