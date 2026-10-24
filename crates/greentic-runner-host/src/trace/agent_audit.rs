@@ -86,6 +86,93 @@ fn is_sensitive_key(key: &str) -> bool {
     .any(|needle| key.contains(needle))
 }
 
+/// Scanner state of [`redact_string`].
+#[derive(Clone, Copy, PartialEq)]
+enum Scan {
+    /// Nothing pending.
+    Idle,
+    /// A bare credential-ish word was seen; redact only if `:`/`=` follows.
+    MaybeKey,
+    /// The next value token is a credential.
+    Secret,
+}
+
+fn is_scan_separator(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\'' | '&' | '?' | ',' | ';' | '{' | '}' | '[' | ']' | '(' | ')'
+        )
+}
+
+fn redact_token(token: &str, state: &mut Scan) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+    // A lone `:` / `=` sits between a key and its value.
+    if token.chars().all(|c| c == ':' || c == '=') {
+        if *state == Scan::MaybeKey {
+            *state = Scan::Secret;
+        }
+        return token.to_string();
+    }
+    let lower = token.to_ascii_lowercase();
+    let is_scheme = lower == "bearer" || lower == "basic";
+    if *state == Scan::Secret {
+        if is_scheme {
+            return token.to_string();
+        }
+        *state = Scan::Idle;
+        return "[redacted]".to_string();
+    }
+    *state = Scan::Idle;
+    if is_scheme {
+        *state = Scan::Secret;
+        return token.to_string();
+    }
+    match token.find([':', '=']) {
+        Some(idx) if !token[idx..].starts_with("://") => {
+            let (key, rest) = token.split_at(idx);
+            let (sep, value) = rest.split_at(1);
+            if !is_sensitive_key(key) {
+                return token.to_string();
+            }
+            if value.is_empty() {
+                *state = Scan::Secret;
+                token.to_string()
+            } else {
+                format!("{key}{sep}[redacted]")
+            }
+        }
+        _ => {
+            if is_sensitive_key(token) {
+                *state = Scan::MaybeKey;
+            }
+            token.to_string()
+        }
+    }
+}
+
+/// Mask credentials embedded in free text: `Bearer`/`Basic` tokens and the
+/// value of `key=value` / `key: value` pairs whose key is sensitive (headers,
+/// query strings, log lines). Over-redacts rather than under-redacts.
+fn redact_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut token = String::new();
+    let mut state = Scan::Idle;
+    for c in input.chars() {
+        if is_scan_separator(c) {
+            out.push_str(&redact_token(&token, &mut state));
+            token.clear();
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    out.push_str(&redact_token(&token, &mut state));
+    out
+}
+
 fn redact(value: &Value, depth: usize) -> Value {
     if depth >= REDACT_MAX_DEPTH {
         return Value::String("[truncated]".to_string());
@@ -104,6 +191,7 @@ fn redact(value: &Value, depth: usize) -> Value {
                 .collect(),
         ),
         Value::Array(items) => Value::Array(items.iter().map(|v| redact(v, depth + 1)).collect()),
+        Value::String(text) => Value::String(redact_string(text)),
         other => other.clone(),
     }
 }

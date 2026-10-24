@@ -305,8 +305,27 @@ fn pg_cell_to_json(row: &sqlx::postgres::PgRow, index: usize) -> Value {
                 .map(Value::String)
                 .unwrap_or_else(|| unsupported("NUMERIC"))
         }),
-        other => unsupported(other),
+        // Enums, XML and similar types travel as plain UTF-8 in the binary
+        // protocol. Anything else (arrays, INTERVAL, INET, MONEY, ...) is
+        // binary and fails the printable-text check, so it still surfaces as
+        // the unsupported marker rather than as garbage.
+        other => decode_cell_unchecked::<_, Vec<u8>>(row, index, |v| {
+            printable_text(&v)
+                .map(Value::String)
+                .unwrap_or_else(|| unsupported(other))
+        }),
     }
+}
+
+/// `bytes` as a string when they are valid UTF-8 without control characters
+/// (tab, newline and carriage return excepted); `None` for binary payloads.
+fn printable_text(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if text.is_empty() || text.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// Hyphenated lowercase UUID from its 16-byte binary form.
@@ -482,6 +501,18 @@ mod tests {
     async fn collect_capped_propagates_errors() {
         let stream = futures::stream::iter(vec![Ok(1u32), Err("boom".to_string())]);
         assert_eq!(collect_capped(stream, 10).await.unwrap_err(), "boom");
+    }
+
+    #[test]
+    fn printable_text_accepts_text_and_rejects_binary_payloads() {
+        assert_eq!(printable_text(b"happy").as_deref(), Some("happy"));
+        assert_eq!(printable_text("naïve\tlabel".as_bytes()).as_deref(), Some("naïve\tlabel"));
+        // INET (family 2, /32, not cidr, 4 bytes), array header, INTERVAL, empty.
+        assert!(printable_text(&[2, 32, 0, 4, 10, 0, 0, 1]).is_none());
+        assert!(printable_text(&[0, 0, 0, 1, 0, 0, 0, 0]).is_none());
+        assert!(printable_text(&[0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        assert!(printable_text(&[0xff, 0xfe]).is_none());
+        assert!(printable_text(b"").is_none());
     }
 
     // ── pg wire decoders ─────────────────────────────────────────────────────

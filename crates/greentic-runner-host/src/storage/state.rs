@@ -111,8 +111,25 @@ impl StateHost for StateStoreHost {
     async fn get_json(&self, key: &SessionKey) -> GResult<Option<Value>> {
         let tenant = tenant_ctx_from_key(key)?;
         let state_key = derive_state_key(key);
+        let legacy_key = legacy_state_key(key);
+        let ttl_secs = self.ttl_secs;
         self.store
-            .call(move |store| store.get_json(&tenant, STATE_PREFIX, &state_key, None))
+            .call(move |store| {
+                if let Some(value) = store.get_json(&tenant, STATE_PREFIX, &state_key, None)? {
+                    return Ok(Some(value));
+                }
+                // Ids containing `%` or `/` were stored under an unescaped key
+                // before escaping was introduced: migrate on read.
+                let Some(legacy_key) = legacy_key else {
+                    return Ok(None);
+                };
+                let Some(value) = store.get_json(&tenant, STATE_PREFIX, &legacy_key, None)? else {
+                    return Ok(None);
+                };
+                store.set_json(&tenant, STATE_PREFIX, &state_key, None, &value, ttl_secs)?;
+                store.del(&tenant, STATE_PREFIX, &legacy_key)?;
+                Ok(Some(value))
+            })
             .await
             .map_err(map_state_error)
     }
@@ -132,8 +149,14 @@ impl StateHost for StateStoreHost {
     async fn del(&self, key: &SessionKey) -> GResult<()> {
         let tenant = tenant_ctx_from_key(key)?;
         let state_key = derive_state_key(key);
+        let legacy_key = legacy_state_key(key);
         self.store
-            .call(move |store| store.del(&tenant, STATE_PREFIX, &state_key))
+            .call(move |store| {
+                if let Some(legacy_key) = &legacy_key {
+                    store.del(&tenant, STATE_PREFIX, legacy_key)?;
+                }
+                store.del(&tenant, STATE_PREFIX, &state_key)
+            })
             .await
             .map_err(map_state_error)?;
         Ok(())
@@ -187,7 +210,9 @@ fn escape_segment(segment: &str) -> String {
 /// produced by a different `(pack, flow, hint)` triple. `-` is the marker for
 /// "no hint"; a literal `-` hint is escaped to `%2D` so the two cannot alias.
 /// Keys without `%`, `/` or a bare `-` hint are identical to the historical
-/// format, so existing state stays addressable.
+/// format, so existing state stays addressable; for ids that DO contain `%` or
+/// `/` the historical (unescaped) key is [`legacy_state_key`], which
+/// `get_json` falls back to and migrates from.
 fn derive_state_key(key: &SessionKey) -> StoreStateKey {
     let hint = match key.session_hint.as_deref() {
         None => "-".to_string(),
@@ -199,6 +224,22 @@ fn derive_state_key(key: &SessionKey) -> StoreStateKey {
         escape_segment(&key.pack_id),
         escape_segment(&key.flow_id),
     ))
+}
+
+/// The pre-escaping key for `key`, when it differs from [`derive_state_key`].
+///
+/// `None` for a literal `-` hint: its historical key is the "no hint" key, so
+/// reading it back would hand one session another's state.
+fn legacy_state_key(key: &SessionKey) -> Option<StoreStateKey> {
+    if key.session_hint.as_deref() == Some("-") {
+        return None;
+    }
+    let hint = key.session_hint.as_deref().unwrap_or("-");
+    let legacy = StoreStateKey::from(format!(
+        "pack/{}/flow/{}/session/{hint}",
+        key.pack_id, key.flow_id
+    ));
+    (legacy != derive_state_key(key)).then_some(legacy)
 }
 
 fn map_state_error(err: greentic_types::GreenticError) -> RunnerError {
@@ -415,6 +456,44 @@ mod tests {
             .expect("set");
         let seen = store.0.lock().map(|v| v.clone()).unwrap_or_default();
         assert_eq!(seen, vec![Some(90), None, None]);
+    }
+
+    #[tokio::test]
+    async fn state_under_a_pre_escaping_key_is_found_and_migrated() {
+        let store = Arc::new(InMemoryStateStore::new());
+        let host = StateStoreHost::new(store.clone());
+        let mut key = sample_key();
+        key.flow_id = "flow/main%x".into();
+        let tenant = tenant_ctx_from_key(&key).expect("tenant");
+        let legacy = legacy_state_key(&key).expect("differs from current key");
+        assert_ne!(legacy, derive_state_key(&key));
+        let value = serde_json::json!({"n": 1});
+        store
+            .set_json(&tenant, STATE_PREFIX, &legacy, None, &value, None)
+            .expect("seed");
+
+        assert_eq!(host.get_json(&key).await.expect("get"), Some(value.clone()));
+        // Migrated: legacy key gone, current key populated.
+        assert!(
+            store
+                .get_json(&tenant, STATE_PREFIX, &legacy, None)
+                .expect("legacy")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_json(&tenant, STATE_PREFIX, &derive_state_key(&key), None)
+                .expect("current"),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn plain_ids_and_a_dash_hint_have_no_legacy_key() {
+        let mut key = sample_key();
+        assert!(legacy_state_key(&key).is_none());
+        key.session_hint = Some("-".into());
+        assert!(legacy_state_key(&key).is_none());
     }
 
     /// The in-memory default must still be reachable with no configuration.
