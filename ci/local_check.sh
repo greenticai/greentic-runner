@@ -169,9 +169,23 @@ run_host_smoke() {
   fi
 }
 
+# Tests such as host_wasi_p2_roundtrip build their fixture component with
+# `wasm-tools`. Fail up front with a clear message instead of deep inside a test.
+require_wasm_tools() {
+  if ! command -v wasm-tools >/dev/null 2>&1; then
+    echo "error: wasm-tools not found on PATH; required by step '$1' (e.g. host_wasi_p2_roundtrip)." >&2
+    echo "install it with: cargo install wasm-tools --locked" >&2
+    exit 1
+  fi
+}
+
 run_crate_tests() {
   echo "==> crate tests"
   cargo test -p greentic-runner
+  if [[ "${GREENTIC_HEAVY_WASM:-0}" == "1" ]]; then
+    echo "==> heavy wasm: ignored contract mismatch test"
+    cargo test -p greentic-runner --test contract_cli contract_pack_rejects_mismatched_artifact -- --ignored
+  fi
   # The agentic-worker unit tests need `test-mock` (the mock LLM/billing/state
   # doubles live behind it), so a bare `cargo test -p greentic-aw-runtime`
   # silently reports 0 tests. `workspace_tests` covers them via --all-features,
@@ -185,6 +199,7 @@ run_crate_tests() {
 
 run_workspace_tests() {
   echo "==> workspace tests"
+  require_wasm_tools workspace_tests
   cargo test --workspace --all-targets --all-features
 }
 

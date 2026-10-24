@@ -37,6 +37,8 @@ GREENTIC_HEAVY_WASM=1 cargo test --workspace
 LOCAL_CHECK_STEPS=fmt,clippy ci/local_check.sh
 ```
 
+The `workspace_tests` step (and `host_wasi_p2_roundtrip`) needs `wasm-tools` on PATH (`cargo install wasm-tools --locked`); `ci/local_check.sh` fails early without it. With `GREENTIC_HEAVY_WASM=1` it also runs the `#[ignore]`d `contract_pack_rejects_mismatched_artifact`.
+
 `ci/local_check.sh` steps: `fmt`, `dependency_sanity`, `clippy`, `host_smoke`, `crate_tests`, `workspace_tests`, `conformance`, `package`.
 
 The `dependency_sanity` step detects multiple wasmtime versions in the dependency tree (local workspace crates vs published greentic-* version skew) and fails early before clippy/tests hit confusing trait-mismatch errors.

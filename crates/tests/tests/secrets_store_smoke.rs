@@ -33,16 +33,11 @@ fn secrets_store_is_blocked_in_provider_core_only_mode() -> Result<()> {
     Ok(())
 }
 
-// KNOWN FAILING (found by the audit, previously masked because CI's
-// provider-core-only flag made the old test return before this path ran): the
-// host now resolves secrets at pack-scoped URIs, so a bare `TEST_API_KEY` env
-// var is no longer found by the component. The fixture/seed needs updating to
-// the scoped env name; tracked for the host-secrets owner.
 #[test]
 #[serial]
-#[ignore = "known failing: host reads pack-scoped secret URIs, plain TEST_API_KEY env is not found (audit finding 18)"]
 fn secrets_store_end_to_end_missing_and_success() -> Result<()> {
     let _core_only = EnvGuard::set("GREENTIC_PROVIDER_CORE_ONLY", "0");
+    let _env = EnvGuard::set("GREENTIC_ENV", "local");
     let wasm = build_fixture_component()?;
     let config = write_minimal_config()?;
 
@@ -51,8 +46,12 @@ fn secrets_store_end_to_end_missing_and_success() -> Result<()> {
     assert_eq!(missing_json["ok"], Value::Bool(false));
     assert_eq!(missing_json["error"], Value::String("missing".into()));
 
-    // Provide TEST_API_KEY via env -> component observes it.
-    let _secret = EnvGuard::set("TEST_API_KEY", "super-secret");
+    // The host resolves the secret at its pack-scoped URI, and the env-backed
+    // store reads the variable named by the full URI.
+    let _secret = EnvGuard::set(
+        "secrets://local/demo/_/secrets-store-smoke/test_api_key",
+        "super-secret",
+    );
     let success = invoke_component(&wasm, config)?;
     let success_json: Value = serde_json::from_str(&success)?;
     assert_eq!(success_json["ok"], Value::Bool(true));
