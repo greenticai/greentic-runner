@@ -346,8 +346,11 @@ fn build_blocking_client() -> Result<BlockingClient, String> {
     // Built on a scratch thread: the blocking client must not be constructed
     // inside an async context.
     std::thread::spawn(|| {
+        let guard = crate::http_guard::HttpGuard::from_env();
         BlockingClient::builder()
             .no_proxy()
+            .dns_resolver(Arc::new(crate::http_guard::GuardedResolver { guard }))
+            .redirect(crate::http_guard::redirect_policy(guard))
             .build()
             .map_err(|err| format!("failed to build blocking http client: {err}"))
     })
@@ -906,6 +909,16 @@ impl HostState {
             }
         }
 
+        let guard = crate::http_guard::HttpGuard::from_env();
+        if let Ok(parsed) = url::Url::parse(&req.url)
+            && let Err(reason) = guard.check_url_literal(&parsed)
+        {
+            return Err(HttpClientError {
+                code: "denied".into(),
+                message: reason,
+            });
+        }
+
         let method = req.method.parse().unwrap_or(reqwest::Method::GET);
         let mut builder = self.http_client.request(method, &req.url);
         for (key, value) in req.headers {
@@ -938,6 +951,12 @@ impl HostState {
             Ok(resp) => resp,
             Err(err) => {
                 warn!(url = %req.url, error = %err, "http client request failed");
+                if crate::http_guard::is_blocked_error(&err) {
+                    return Err(HttpClientError {
+                        code: "denied".into(),
+                        message: crate::http_guard::BLOCKED_MARKER.to_string(),
+                    });
+                }
                 return Err(HttpClientError {
                     code: "unavailable".into(),
                     message: err.to_string(),
@@ -956,16 +975,17 @@ impl HostState {
                 )
             })
             .collect::<Vec<_>>();
-        let body_bytes = match response.bytes() {
-            Ok(bytes) => Some(bytes.to_vec()),
-            Err(err) => {
-                warn!(url = %req.url, error = %err, "http response body read failed");
-                return Err(HttpClientError {
-                    code: "unavailable".into(),
-                    message: format!("failed to read response body: {err}"),
-                });
-            }
-        };
+        let body_bytes =
+            match crate::http_guard::read_capped_body(response, guard.max_response_bytes) {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    warn!(url = %req.url, error = %err, "http response body read failed");
+                    return Err(HttpClientError {
+                        code: "unavailable".into(),
+                        message: format!("failed to read response body: {err}"),
+                    });
+                }
+            };
 
         if let Some((meta, true)) = mock_state.take()
             && let Some(mock) = &self.mocks
@@ -1884,8 +1904,20 @@ pub struct ComponentState {
     wasi_ctx: WasiCtx,
     wasi_tls_ctx: WasiTlsCtx,
     wasi_http_ctx: WasiHttpCtx,
-    http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks,
+    http_timeout_hooks: crate::http_guard::GuardedHooks,
     resource_table: ResourceTable,
+    wasm_limits: crate::wasm_limits::WasmLimits,
+    store_limits: wasmtime::StoreLimits,
+}
+
+/// Create the per-invocation store: memory/table/instance limiter plus a fresh
+/// epoch deadline (see [`crate::wasm_limits`]).
+fn new_limited_store(engine: &Engine, state: ComponentState) -> wasmtime::Store<ComponentState> {
+    let limits = state.wasm_limits;
+    let mut store = wasmtime::Store::new(engine, state);
+    store.limiter(|state| &mut state.store_limits);
+    crate::wasm_limits::arm_deadline(&mut store, &limits);
+    store
 }
 
 /// Install the process-default rustls [`rustls::crypto::CryptoProvider`] exactly once.
@@ -1913,13 +1945,17 @@ impl ComponentState {
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
+        let wasm_limits = crate::wasm_limits::WasmLimits::from_env();
+        let http_enabled = host.config.http_enabled;
         Ok(Self {
             host,
             wasi_ctx,
             wasi_tls_ctx: WasiTlsCtxBuilder::new().build(),
             wasi_http_ctx: WasiHttpCtx::new(),
-            http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks::from_env(),
+            http_timeout_hooks: crate::http_guard::GuardedHooks::from_env(http_enabled),
             resource_table: ResourceTable::new(),
+            wasm_limits,
+            store_limits: wasm_limits.store_limits(),
         })
     }
 
@@ -2353,9 +2389,12 @@ impl PackRuntime {
                 tracing::debug!("skipping archive verification (no archive source)");
             }
         }
-        let engine = Engine::default();
-        let engine_profile =
-            EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+        let engine = crate::wasm_limits::build_engine()?;
+        let engine_profile = EngineProfile::from_engine(
+            &engine,
+            CpuPolicy::Native,
+            crate::wasm_limits::ENGINE_FINGERPRINT.to_string(),
+        );
         let cache = CacheManager::new(CacheConfig::default(), engine_profile);
         let mut metadata = PackMetadata::fallback(&safe_path);
         let mut manifest = None;
@@ -2583,7 +2622,9 @@ impl PackRuntime {
                 component_manifests.insert(component.id.as_str().to_string(), component.clone());
             }
         }
-        let mut pack_policy = (*wasi_policy).clone();
+        let mut pack_policy = wasi_policy
+            .for_tenant(&config.tenant, &config.env_passthrough)
+            .with_context(|| format!("failed to build WASI policy for tenant {}", config.tenant))?;
         if let Some(dir) = pack_assets_dir {
             tracing::debug!(path = %dir.display(), "preopening pack assets directory for WASI /assets");
             pack_policy =
@@ -3035,7 +3076,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
 
             let invoke_result = HostState::instantiate_component_result(
                 &mut linker,
@@ -3219,7 +3260,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
 
             // Extension-provider worlds (greentic:extension-provider@0.2.0 /
             // @0.1.0) are introspection surfaces (list-channels,
@@ -3373,7 +3414,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
 
             let pre_instance = linker.instantiate_pre(component.as_ref())?;
             let pre = match InstanceIdentityPre::<ComponentState>::new(pre_instance) {
@@ -3457,7 +3498,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
 
             let pre_instance = linker.instantiate_pre(component.as_ref())?;
             let pre = match InstanceIdentityDescribePre::<ComponentState>::new(pre_instance) {
@@ -4212,7 +4253,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
             let pre_instance = linker.instantiate_pre(&component)?;
             let pre = match component_api::v0_6_descriptor::ComponentV0V6V0Pre::new(pre_instance) {
                 Ok(pre) => pre,

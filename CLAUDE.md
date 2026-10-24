@@ -740,6 +740,10 @@ Known gap, not closed here: `tenant_ctx_from_v1` lets a component override `team
 - Components run on dedicated threads via `tokio::task::block_in_place` to avoid blocking the async runtime
 - Two-tier cache: memory LRU + disk, keyed by `EngineProfile`
 
+### Guest sandbox, limits and outbound guard
+
+Each tenant's packs get `/state`, `/cache`, `/logs` backed by `<host dir>/tenants/<tenant>` (`RunnerWasiPolicy::for_tenant`; tenant ids must be `[A-Za-z0-9._-]{1,128}`, not `.`/`..`), and `env_allow` is only that tenant's `env_passthrough`. The pack-artifact cache (`<cache>/packs`) is never visible to guests. Data under the old host-wide dirs is not migrated. Execution limits live in `wasm_limits.rs`; the outbound SSRF/size guard in `http_guard.rs` (host `http-client`: checked in the client's DNS resolver, so it covers the connect address and redirects; `wasi:http`: the name is resolved and validated just before the upstream connector re-resolves it, so a DNS-rebinding race remains — egress-filter at the network layer if that matters).
+
 ### Pack Hot-Reload
 
 Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 30s). On change: resolve locators → verify digest/signature → cache artifacts → atomically swap `TenantRuntime` via `ArcSwap`. Overlays independently deployable per tenant.
@@ -886,6 +890,12 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_SESSION_REDIS_URL` | Opt-in (default unset = in-memory): Redis URL for the parked-flow SESSION store. Needs a keyspace: `GREENTIC_RUNNER_SESSION_NAMESPACE` or `GREENTIC_ENV` (-> `greentic:session:<env>`); wait TTL `GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS` (default 24h, `0` = none). Independent of the state var. Connect failure or missing keyspace is a hard startup error, never a memory fallback. An embedder's `HostBuilder::with_storage` wins over env. **Multi-replica deployments need this (and the state var) for `session.wait` to resume on a different pod.** |
 | `GREENTIC_STATE_REDIS_URL` | Opt-in (default unset = in-memory): Redis URL for the flow STATE store (keys already scoped by env/tenant by greentic-state). Independent of the session var; same hard-error and embedder-wins rules. |
 | `GREENTIC_PRESENT_PROVIDER_AS_USER` | Opt-in (default OFF): restore the legacy presentation in which a component invoked by a flow with no verified caller is told the PROVIDER id as its `user` / `user_id`. See "What a component is told about its caller" above. Truthy = `1`/`true`/`yes`/`on`. |
+| `GREENTIC_WASM_MAX_EXEC_SECS` | Per-invocation wall-clock deadline for a guest component (epoch interruption, 1s granularity). Default `300`; `0` disables. A trap surfaces as an ordinary invocation error. |
+| `GREENTIC_WASM_MAX_MEMORY_MB` | Cap on any one guest linear memory. Default `1024`; `0` disables. Table/instance counts are always capped at generous fixed values. |
+| `GREENTIC_HTTP_ALLOW_METADATA` | Truthy disables the default outbound block on link-local (`169.254/16`, `fe80::/10`) and cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`). |
+| `GREENTIC_HTTP_DENY_PRIVATE` | Opt-in (default OFF): also block loopback, `0.0.0.0/8`, RFC1918, CGNAT and ULA destinations. |
+| `GREENTIC_HTTP_MAX_RESPONSE_MB` | Cap on an outbound response body (host `http-client` and `wasi:http`). Default `64`; `0` disables. |
+| `GREENTIC_WASI_HTTP_ENFORCE_POLICY` | Opt-in (default OFF): make `wasi:http` honour a tenant's `http_enabled = false` (that flag is true only when the tenant has a `messaging` binding, so default enforcement would break other tenants' wasi-http components). |
 
 **Auth hardening.** `POST /operator/op/invoke` is guarded by a route layer (`http/auth.rs::require_operator`) that demands `Authorization: Bearer` equal to `OPERATOR_TOKEN`, else the admin token (constant-time compare, 401 otherwise); with no token it stays open for backward compatibility and `HostServer::serve` logs a warning. `TENANT_RESOLVER=jwt` now verifies HS256 tokens when `TENANT_JWT_SECRET` is set (`TenantResolver::JwtVerified`); with no key it fails startup (`RoutingConfig::startup_check`) unless `TENANT_JWT_TRUST_GATEWAY=1` keeps the legacy decode-only `TenantResolver::Jwt`.
 
