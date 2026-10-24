@@ -570,14 +570,22 @@ mod tests {
         for k in ["HTTP_PROXY", "HTTPS_PROXY"] {
             unsafe { std::env::set_var(k, proxy.uri()) };
         }
-        let reader = reader_for(&door).await;
-        let got = reader.get(&aid('a')).await;
+        // reqwest reads the proxy env only while a client is built, so the
+        // window is closed straight after the synchronous constructor and
+        // before any await. Every other test in this crate builds clients too
+        // (and `#[serial]` only orders against other `#[serial]` tests), so
+        // holding the poisoned env across the request made them route their
+        // loopback mocks through this proxy.
+        let reader =
+            HttpArtifactReader::new(format!("{}/artifacts", door.uri()), "gtm_secret".into())
+                .unwrap();
         for (k, v) in saved {
             match v {
                 Some(v) => unsafe { std::env::set_var(k, v) },
                 None => unsafe { std::env::remove_var(k) },
             }
         }
+        let got = reader.get(&aid('a')).await;
         assert!(
             proxy.received_requests().await.unwrap().is_empty(),
             "the bearer request went through the proxy"
