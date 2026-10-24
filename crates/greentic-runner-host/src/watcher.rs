@@ -23,6 +23,21 @@ use crate::wasi::RunnerWasiPolicy;
 /// Digests (main + overlays) last applied per tenant, used to skip rebuilding
 /// tenants whose packs did not change.
 type AppliedDigests = Arc<Mutex<HashMap<String, Vec<String>>>>;
+/// Per tenant, the pack digests whose runtime build last failed. A tick that
+/// resolves the same digests again skips the rebuild (and its repeated error
+/// logs) until the digests change.
+type FailedDigests = Arc<Mutex<HashMap<String, Vec<String>>>>;
+
+/// Whether a rebuild of `digests` for `tenant` already failed and nothing changed.
+fn rebuild_already_failed(
+    failed: &HashMap<String, Vec<String>>,
+    tenant: &str,
+    digests: &[String],
+) -> bool {
+    failed
+        .get(tenant)
+        .is_some_and(|known| known.as_slice() == digests)
+}
 
 pub struct PackWatcher {
     handle: tokio::task::JoinHandle<()>,
@@ -90,11 +105,13 @@ pub async fn start_pack_watcher_with_policy(
     let stream_observers = host.stream_observers();
 
     let applied: AppliedDigests = Arc::new(Mutex::new(HashMap::new()));
+    let failed_digests: FailedDigests = Arc::new(Mutex::new(HashMap::new()));
     reload_once(
         configs.as_ref(),
         &manager,
         &cfg,
         &applied,
+        &failed_digests,
         &active,
         &health,
         session_host.clone(),
@@ -120,6 +137,7 @@ pub async fn start_pack_watcher_with_policy(
     let index_cfg = cfg.clone();
     let manager_clone = Arc::clone(&manager);
     let applied_clone = Arc::clone(&applied);
+    let failed_clone = Arc::clone(&failed_digests);
     let health_clone = Arc::clone(&health);
     let active_clone = Arc::clone(&active);
     let configs_clone = Arc::clone(&configs);
@@ -155,6 +173,7 @@ pub async fn start_pack_watcher_with_policy(
                 &manager_clone,
                 &index_cfg,
                 &applied_clone,
+                &failed_clone,
                 &active_clone,
                 &health_clone,
                 session_host.clone(),
@@ -193,6 +212,7 @@ async fn reload_once(
     manager: &Arc<PackManager>,
     cfg: &PackConfig,
     applied: &AppliedDigests,
+    failed_digests: &FailedDigests,
     active: &Arc<ActivePacks>,
     health: &Arc<HealthState>,
     session_host: Arc<dyn SessionHost>,
@@ -253,6 +273,19 @@ async fn reload_once(
             tracing::debug!(tenant = %tenant, "packs unchanged; keeping runtime");
             next.insert(RuntimeKey::legacy(tenant.clone()), prev);
             new_applied.insert(tenant.clone(), digests);
+            continue;
+        }
+        if rebuild_already_failed(&failed_digests.lock(), &tenant, &digests) {
+            tracing::debug!(tenant = %tenant, "pack digests unchanged since failed rebuild; skipping");
+            failures.push(format!(
+                "{tenant}: rebuild previously failed for these pack digests"
+            ));
+            if let Some(prev) = previous {
+                next.insert(RuntimeKey::legacy(tenant.clone()), prev);
+                if let Some(old) = applied.lock().get(&tenant).cloned() {
+                    new_applied.insert(tenant.clone(), old);
+                }
+            }
             continue;
         }
         let built: Result<Arc<TenantRuntime>> = async {
@@ -335,12 +368,16 @@ async fn reload_once(
         .await;
         match built {
             Ok(runtime) => {
+                failed_digests.lock().remove(&tenant);
                 next.insert(RuntimeKey::legacy(tenant.clone()), runtime);
                 new_applied.insert(tenant.clone(), digests);
             }
             Err(err) => {
                 tracing::error!(tenant = %tenant, error = %format!("{err:#}"), "tenant reload failed; keeping previous runtime");
                 failures.push(format!("{tenant}: {err:#}"));
+                failed_digests
+                    .lock()
+                    .insert(tenant.clone(), digests.clone());
                 if let Some(prev) = previous {
                     next.insert(RuntimeKey::legacy(tenant.clone()), prev);
                     if let Some(old) = applied.lock().get(&tenant).cloned() {
@@ -362,4 +399,24 @@ async fn reload_once(
     health.record_reload_success();
     tracing::info!("pack reload completed successfully");
     Ok(())
+}
+
+#[cfg(test)]
+mod failed_digest_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_rebuild_is_skipped_until_the_digests_change() {
+        let mut failed = HashMap::new();
+        let digests = vec!["sha256:a".to_string()];
+        assert!(!rebuild_already_failed(&failed, "t", &digests));
+        failed.insert("t".to_string(), digests.clone());
+        assert!(rebuild_already_failed(&failed, "t", &digests));
+        assert!(!rebuild_already_failed(
+            &failed,
+            "t",
+            &["sha256:b".to_string()]
+        ));
+        assert!(!rebuild_already_failed(&failed, "other", &digests));
+    }
 }
