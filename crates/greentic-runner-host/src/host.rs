@@ -254,6 +254,13 @@ impl HostBuilder {
         if self.configs.is_empty() {
             bail!("at least one tenant configuration is required");
         }
+        // Fail at startup on a tenant/env that is not a valid identifier,
+        // rather than letting `tenant_ctx()` silently fall back to `local`.
+        for config in self.configs.values() {
+            config
+                .try_tenant_ctx()
+                .with_context(|| format!("invalid host config for tenant `{}`", config.tenant))?;
+        }
         let wasi_policy = Arc::new(self.wasi_policy);
         #[cfg(all(feature = "agentic-worker", feature = "greentic-llm-backend"))]
         let artifact_reader = host_artifact_reader(
@@ -2196,6 +2203,27 @@ mod fast2flow_tests {
         assert_eq!(
             routed.payload()["fast2flow"]["entities"][0]["formats"]["iso"],
             "2026-06-11"
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_validation_tests {
+    use super::*;
+    use crate::gtbind::TenantBindings;
+
+    #[test]
+    fn build_rejects_a_tenant_that_is_not_a_valid_identifier() {
+        let config = HostConfig::from_gtbind(TenantBindings {
+            tenant: "bad tenant!".into(),
+            packs: Vec::new(),
+            env_passthrough: Vec::new(),
+        });
+        let result = HostBuilder::new().with_config(config).build();
+        let message = result.err().map(|err| format!("{err:#}"));
+        assert!(
+            message.is_some_and(|m| m.contains("bad tenant!")),
+            "build must fail naming the invalid tenant"
         );
     }
 }
