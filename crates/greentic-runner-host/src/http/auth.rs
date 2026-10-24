@@ -16,6 +16,9 @@ use crate::runner::ServerState;
 #[derive(Clone, Default)]
 pub struct AdminAuth {
     token: Option<String>,
+    /// Dedicated `OPERATOR_TOKEN`; takes precedence over `token` for
+    /// `/operator/op/invoke` only.
+    operator_token: Option<String>,
 }
 
 impl AdminAuth {
@@ -33,7 +36,46 @@ impl AdminAuth {
                  a local reverse proxy would bypass this check, set ADMIN_TOKEN to require a bearer token"
             );
         }
-        Self { token }
+        let operator_token = std::env::var("OPERATOR_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty());
+        Self {
+            token,
+            operator_token,
+        }
+    }
+
+    /// Override the dedicated operator token (`OPERATOR_TOKEN`).
+    pub fn with_operator_token(mut self, token: Option<String>) -> Self {
+        self.operator_token = token.filter(|v| !v.is_empty());
+        self
+    }
+
+    /// Token guarding `/operator/op/invoke`: `OPERATOR_TOKEN` if set, else the
+    /// admin token. `None` keeps the route open (backward compatible).
+    fn effective_operator_token(&self) -> Option<&str> {
+        self.operator_token.as_deref().or(self.token.as_deref())
+    }
+
+    /// Whether `/operator/op/invoke` requires a bearer token.
+    pub fn operator_protected(&self) -> bool {
+        self.effective_operator_token().is_some()
+    }
+
+    /// Check a bearer against the operator token. `Ok` when no token is
+    /// configured (open route).
+    fn authorize_operator(&self, bearer: Option<&str>) -> Result<(), StatusCode> {
+        match self.effective_operator_token() {
+            None => Ok(()),
+            Some(expected) => {
+                let token = bearer.ok_or(StatusCode::UNAUTHORIZED)?;
+                if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+                    Ok(())
+                } else {
+                    Err(StatusCode::UNAUTHORIZED)
+                }
+            }
+        }
     }
 
     fn authorize(&self, addr: SocketAddr, bearer: Option<&str>) -> Result<(), StatusCode> {
@@ -48,6 +90,23 @@ impl AdminAuth {
             Ok(())
         } else {
             Err(StatusCode::FORBIDDEN)
+        }
+    }
+}
+
+/// Route layer for `/operator/op/invoke`: 401 unless the request carries the
+/// configured operator/admin bearer token. Open when no token is configured.
+pub(crate) async fn require_operator(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let bearer = bearer_from_headers(request.headers(), &AUTHORIZATION);
+    match state.admin.authorize_operator(bearer.as_deref()) {
+        Ok(()) => next.run(request).await,
+        Err(status) => {
+            (status, Json(json!({ "error": "operator token required" }))).into_response()
         }
     }
 }
@@ -166,6 +225,41 @@ mod tests {
     }
 
     #[test]
+    fn operator_open_without_token() {
+        let auth = AdminAuth::default();
+        assert!(!auth.operator_protected());
+        assert!(auth.authorize_operator(None).is_ok());
+    }
+
+    #[test]
+    fn operator_requires_admin_token_when_set() {
+        let auth = AdminAuth {
+            token: Some("admin".into()),
+            ..AdminAuth::default()
+        };
+        assert_eq!(auth.authorize_operator(None), Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(
+            auth.authorize_operator(Some("nope")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert!(auth.authorize_operator(Some("admin")).is_ok());
+    }
+
+    #[test]
+    fn operator_token_takes_precedence_over_admin_token() {
+        let auth = AdminAuth {
+            token: Some("admin".into()),
+            ..AdminAuth::default()
+        }
+        .with_operator_token(Some("op".into()));
+        assert!(auth.authorize_operator(Some("op")).is_ok());
+        assert_eq!(
+            auth.authorize_operator(Some("admin")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
     fn loopback_without_token_is_allowed() {
         let auth = AdminAuth::new(None);
         assert!(auth.authorize("127.0.0.1:0".parse().unwrap(), None).is_ok());
@@ -184,6 +278,7 @@ mod tests {
     fn token_requires_bearer() {
         let auth = AdminAuth {
             token: Some("secret".into()),
+            ..AdminAuth::default()
         };
         assert_eq!(
             auth.authorize("127.0.0.1:0".parse().unwrap(), None),
