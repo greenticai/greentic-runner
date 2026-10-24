@@ -7,8 +7,10 @@ use axum::http::request::Parts;
 use axum::http::{HeaderName, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use serde_json::json;
+use sha2::Sha256;
 
 use crate::http::auth::bearer_from_headers;
 use crate::runner::ServerState;
@@ -55,6 +57,15 @@ impl RoutingConfig {
         }
     }
 
+    /// Fail startup on a configuration that must not run: `jwt` mode with no
+    /// verification key and no explicit gateway opt-in.
+    pub fn startup_check(&self) -> Result<()> {
+        if let TenantResolver::JwtUnconfigured(reason) = &self.resolver {
+            bail!("{reason}");
+        }
+        Ok(())
+    }
+
     /// Strict variant of [`Self::from_env_with_default`]: an invalid
     /// `TENANT_RESOLVER` value is returned as an error.
     pub fn try_from_env_with_default(default_tenant: String) -> Result<Self> {
@@ -84,9 +95,11 @@ impl Default for RoutingConfig {
 /// * `Header` trusts the tenant header verbatim. It is only safe behind a
 ///   gateway that strips client-supplied copies and injects the header itself.
 /// * `Jwt` decodes the token payload WITHOUT verifying the signature, expiry or
-///   audience. Signature verification is expected to be performed by an
-///   upstream gateway / API manager; do not expose this mode to untrusted
-///   networks directly. (Native JWKS verification is a deferred item.)
+///   audience. It is what `TENANT_JWT_TRUST_GATEWAY=1` selects (and what
+///   embedders constructing it directly get): verification is then the
+///   upstream gateway's job.
+/// * `JwtVerified` (selected from the environment when `TENANT_JWT_SECRET` is
+///   set) verifies an HS256 signature, `exp`, `nbf` and optionally `iss`.
 /// * `Host` trusts the `Host` header.
 #[derive(Clone)]
 pub enum TenantResolver {
@@ -96,20 +109,146 @@ pub enum TenantResolver {
         header: HeaderName,
         claim: String,
     },
+    /// Verified JWT mode: HS256 signature + `exp`/`nbf`/`iss` checks.
+    JwtVerified {
+        header: HeaderName,
+        claim: String,
+        verifier: JwtVerifier,
+    },
+    /// `TENANT_RESOLVER=jwt` with neither a verification key nor the explicit
+    /// `TENANT_JWT_TRUST_GATEWAY=1` opt-in. Startup fails via
+    /// [`RoutingConfig::startup_check`]; requests are rejected meanwhile.
+    JwtUnconfigured(String),
     Env,
     /// `TENANT_RESOLVER` held an unsupported value; every request is rejected.
     Invalid(String),
 }
 
+/// Clock leeway applied to `exp` / `nbf`.
+const JWT_LEEWAY_SECS: f64 = 60.0;
+
+/// HS256 verifier for the `jwt` tenant resolver.
+#[derive(Clone)]
+pub struct JwtVerifier {
+    secret: Vec<u8>,
+    issuer: Option<String>,
+}
+
+impl JwtVerifier {
+    pub fn new(secret: impl Into<Vec<u8>>, issuer: Option<String>) -> Self {
+        Self {
+            secret: secret.into(),
+            issuer: issuer.filter(|v| !v.is_empty()),
+        }
+    }
+
+    /// Verify `token` and return its claims. `now` is unix seconds.
+    fn verify(&self, token: &str, now: f64) -> Result<Value> {
+        let mut parts = token.split('.');
+        let (header_b64, payload_b64, sig_b64) =
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some(h), Some(p), Some(s), None) => (h, p, s),
+                _ => bail!("invalid jwt structure"),
+            };
+        let header: Value = serde_json::from_slice(&b64url(header_b64)?)?;
+        // The configured algorithm is the only one accepted: `none`, RS256
+        // (alg confusion against a shared secret) and anything else fail here.
+        if header.get("alg").and_then(Value::as_str) != Some("HS256") {
+            bail!("unsupported jwt alg");
+        }
+        let signature = b64url(sig_b64)?;
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.secret)
+            .map_err(|_| anyhow!("invalid jwt secret"))?;
+        mac.update(header_b64.as_bytes());
+        mac.update(b".");
+        mac.update(payload_b64.as_bytes());
+        // `verify_slice` compares in constant time.
+        mac.verify_slice(&signature)
+            .map_err(|_| anyhow!("jwt signature mismatch"))?;
+
+        let claims: Value = serde_json::from_slice(&b64url(payload_b64)?)?;
+        if let Some(exp) = claims.get("exp") {
+            let exp = exp
+                .as_f64()
+                .ok_or_else(|| anyhow!("jwt exp is not a number"))?;
+            if now > exp + JWT_LEEWAY_SECS {
+                bail!("jwt expired");
+            }
+        }
+        if let Some(nbf) = claims.get("nbf") {
+            let nbf = nbf
+                .as_f64()
+                .ok_or_else(|| anyhow!("jwt nbf is not a number"))?;
+            if now + JWT_LEEWAY_SECS < nbf {
+                bail!("jwt not yet valid");
+            }
+        }
+        if let Some(expected) = &self.issuer
+            && claims.get("iss").and_then(Value::as_str) != Some(expected.as_str())
+        {
+            bail!("jwt issuer mismatch");
+        }
+        Ok(claims)
+    }
+}
+
+fn b64url(segment: &str) -> Result<Vec<u8>> {
+    Ok(URL_SAFE_NO_PAD.decode(segment.trim_end_matches('=').as_bytes())?)
+}
+
+fn now_unix() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 impl TenantResolver {
+    /// Build the `jwt` resolver from explicit settings (testable without env).
+    fn jwt(secret: Option<String>, issuer: Option<String>, trust_gateway: bool) -> Self {
+        let header = AUTHORIZATION;
+        let claim = "tenant".to_string();
+        if let Some(secret) = secret.filter(|v| !v.is_empty()) {
+            return Self::JwtVerified {
+                header,
+                claim,
+                verifier: JwtVerifier::new(secret.into_bytes(), issuer),
+            };
+        }
+        if trust_gateway {
+            tracing::warn!(
+                "TENANT_RESOLVER=jwt with TENANT_JWT_TRUST_GATEWAY=1: bearer tokens are decoded \
+                 WITHOUT signature verification; an upstream gateway must verify them"
+            );
+            return Self::Jwt { header, claim };
+        }
+        Self::JwtUnconfigured(
+            "TENANT_RESOLVER=jwt requires TENANT_JWT_SECRET (HS256) to verify tokens, or \
+             TENANT_JWT_TRUST_GATEWAY=1 to explicitly accept tokens already verified upstream"
+                .into(),
+        )
+    }
+
     fn from_str(value: &str, _default: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "host" => Ok(Self::Host),
             "header" => Ok(Self::Header(HeaderName::from_static("x-greentic-tenant"))),
-            "jwt" => Ok(Self::Jwt {
-                header: AUTHORIZATION,
-                claim: "tenant".into(),
-            }),
+            "jwt" => Ok(Self::jwt(
+                env_nonempty("TENANT_JWT_SECRET"),
+                env_nonempty("TENANT_JWT_ISSUER"),
+                env_truthy("TENANT_JWT_TRUST_GATEWAY"),
+            )),
             "env" => Ok(Self::Env),
             other => bail!("unsupported TENANT_RESOLVER `{other}`"),
         }
@@ -167,6 +306,26 @@ impl TenantRouting {
                     })?
                     .ok_or_else(|| anyhow!("bearer token has no `{claim}` claim"))?;
                 Ok(tenant)
+            }
+            TenantResolver::JwtVerified {
+                header,
+                claim,
+                verifier,
+            } => {
+                let token = bearer_from_headers(&parts.headers, header)
+                    .ok_or_else(|| anyhow!("authorization header missing or not a bearer token"))?;
+                let claims = verifier.verify(&token, now_unix()).map_err(|err| {
+                    tracing::warn!(error = %err, "jwt verification failed");
+                    anyhow!("invalid bearer token")
+                })?;
+                claims
+                    .get(claim)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("bearer token has no `{claim}` claim"))
+            }
+            TenantResolver::JwtUnconfigured(reason) => {
+                bail!("tenant resolver misconfigured: {reason}")
             }
             TenantResolver::Invalid(reason) => bail!("tenant resolver misconfigured: {reason}"),
         }
@@ -361,6 +520,136 @@ mod tests {
             .unwrap()
             .into_parts();
         assert!(routing.resolve(&parts).is_err());
+    }
+
+    const SECRET: &str = "test-secret";
+    const NOW: f64 = 1_800_000_000.0;
+
+    fn sign(header: &str, payload: &str, secret: &str) -> String {
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{h}.{p}").as_bytes());
+        let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{h}.{p}.{sig}")
+    }
+
+    fn hs256(payload: &str) -> String {
+        sign(r#"{"alg":"HS256","typ":"JWT"}"#, payload, SECRET)
+    }
+
+    fn verifier(issuer: Option<&str>) -> JwtVerifier {
+        JwtVerifier::new(SECRET.as_bytes().to_vec(), issuer.map(str::to_string))
+    }
+
+    #[test]
+    fn jwt_verified_accepts_valid_token() {
+        let token = hs256(r#"{"tenant":"acme","exp":1800000600,"nbf":1799999000}"#);
+        let claims = verifier(None).verify(&token, NOW).unwrap();
+        assert_eq!(claims["tenant"], "acme");
+    }
+
+    #[test]
+    fn jwt_verified_rejects_bad_signature() {
+        let token = sign(r#"{"alg":"HS256"}"#, r#"{"tenant":"acme"}"#, "other-secret");
+        assert!(verifier(None).verify(&token, NOW).is_err());
+    }
+
+    #[test]
+    fn jwt_verified_rejects_expired_beyond_leeway() {
+        let token = hs256(r#"{"tenant":"acme","exp":1799999000}"#);
+        assert!(verifier(None).verify(&token, NOW).is_err());
+        // Within the 60s leeway it is still accepted.
+        let token = hs256(r#"{"tenant":"acme","exp":1799999950}"#);
+        assert!(verifier(None).verify(&token, NOW).is_ok());
+    }
+
+    #[test]
+    fn jwt_verified_rejects_not_yet_valid() {
+        let token = hs256(r#"{"tenant":"acme","nbf":1800001000}"#);
+        assert!(verifier(None).verify(&token, NOW).is_err());
+    }
+
+    #[test]
+    fn jwt_verified_rejects_wrong_issuer() {
+        let token = hs256(r#"{"tenant":"acme","iss":"evil"}"#);
+        assert!(verifier(Some("good")).verify(&token, NOW).is_err());
+        let token = hs256(r#"{"tenant":"acme"}"#);
+        assert!(verifier(Some("good")).verify(&token, NOW).is_err());
+        let token = hs256(r#"{"tenant":"acme","iss":"good"}"#);
+        assert!(verifier(Some("good")).verify(&token, NOW).is_ok());
+    }
+
+    #[test]
+    fn jwt_verified_rejects_alg_none() {
+        let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let p = URL_SAFE_NO_PAD.encode(br#"{"tenant":"acme"}"#);
+        assert!(verifier(None).verify(&format!("{h}.{p}."), NOW).is_err());
+        // alg=none with a (valid HS256) signature is rejected too.
+        let token = sign(r#"{"alg":"none"}"#, r#"{"tenant":"acme"}"#, SECRET);
+        assert!(verifier(None).verify(&token, NOW).is_err());
+    }
+
+    #[test]
+    fn jwt_verified_rejects_alg_confusion() {
+        let token = sign(r#"{"alg":"RS256"}"#, r#"{"tenant":"acme"}"#, SECRET);
+        assert!(verifier(None).verify(&token, NOW).is_err());
+        let token = sign(r#"{"alg":"HS512"}"#, r#"{"tenant":"acme"}"#, SECRET);
+        assert!(verifier(None).verify(&token, NOW).is_err());
+    }
+
+    #[test]
+    fn jwt_resolver_without_key_fails_startup() {
+        let resolver = TenantResolver::jwt(None, None, false);
+        assert!(matches!(resolver, TenantResolver::JwtUnconfigured(_)));
+        let cfg = RoutingConfig {
+            resolver,
+            default_tenant: "demo".into(),
+        };
+        assert!(cfg.startup_check().is_err());
+        let routing = TenantRouting::new(cfg);
+        let (parts, _) = Request::builder().body(()).unwrap().into_parts();
+        assert!(routing.resolve(&parts).is_err());
+    }
+
+    #[test]
+    fn jwt_resolver_trust_gateway_opt_in_decodes_only() {
+        let resolver = TenantResolver::jwt(None, None, true);
+        assert!(matches!(resolver, TenantResolver::Jwt { .. }));
+        let cfg = RoutingConfig {
+            resolver,
+            default_tenant: "demo".into(),
+        };
+        assert!(cfg.startup_check().is_ok());
+        let routing = TenantRouting::new(cfg);
+        let token = sign(r#"{"alg":"none"}"#, r#"{"tenant":"gw"}"#, "anything");
+        let (parts, _) = Request::builder()
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(routing.resolve(&parts).unwrap(), "gw");
+    }
+
+    #[test]
+    fn jwt_resolver_with_secret_verifies_end_to_end() {
+        let resolver = TenantResolver::jwt(Some(SECRET.into()), None, false);
+        let routing = TenantRouting::new(RoutingConfig {
+            resolver,
+            default_tenant: "demo".into(),
+        });
+        let good = hs256(r#"{"tenant":"acme"}"#);
+        let forged = sign(r#"{"alg":"HS256"}"#, r#"{"tenant":"acme"}"#, "bad");
+        let req = |t: &str| {
+            Request::builder()
+                .header(AUTHORIZATION, format!("Bearer {t}"))
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        assert_eq!(routing.resolve(&req(&good)).unwrap(), "acme");
+        assert!(routing.resolve(&req(&forged)).is_err());
     }
 
     #[test]
