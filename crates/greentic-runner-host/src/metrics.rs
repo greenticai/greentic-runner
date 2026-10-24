@@ -38,6 +38,8 @@ const LABEL_MAX_DISTINCT: usize = 256;
 
 static SEEN_PROVIDERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static SEEN_OPS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SEEN_TENANTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SEEN_FLOWS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// Normalise an unbounded identifier into a safe, bounded metric label:
 /// restricted charset, capped length, `"unknown"` when empty, and `"other"`
@@ -117,8 +119,8 @@ fn provider_op_duration() -> &'static Histogram<f64> {
 /// duration sample. `status` is `"ok"` or `"err"`.
 pub fn record_flow_execution(tenant: &str, flow_id: &str, status: &str, duration_ms: f64) {
     let attrs = [
-        KeyValue::new("tenant", tenant.to_string()),
-        KeyValue::new("flow_id", flow_id.to_string()),
+        KeyValue::new("tenant", bounded_label(&SEEN_TENANTS, tenant)),
+        KeyValue::new("flow_id", bounded_label(&SEEN_FLOWS, flow_id)),
         KeyValue::new("status", status.to_string()),
     ];
     flow_count().add(1, &attrs);
@@ -137,7 +139,7 @@ pub fn record_provider_invocation(
     duration_ms: f64,
 ) {
     let attrs = [
-        KeyValue::new("tenant", tenant.to_string()),
+        KeyValue::new("tenant", bounded_label(&SEEN_TENANTS, tenant)),
         KeyValue::new("provider", bounded_label(&SEEN_PROVIDERS, provider)),
         KeyValue::new("op", bounded_label(&SEEN_OPS, op)),
         KeyValue::new("status", status.to_string()),
@@ -170,6 +172,16 @@ mod tests {
         assert_eq!(bounded_label(&seen, "brand-new"), "other");
         // Already-seen values keep their own series.
         assert_eq!(bounded_label(&seen, "p0"), "p0");
+    }
+
+    #[test]
+    fn flow_and_tenant_labels_go_through_the_bounded_helper() {
+        assert_eq!(bounded_label(&SEEN_FLOWS, "my flow/1"), "my_flow_1");
+        assert_eq!(bounded_label(&SEEN_TENANTS, "acme"), "acme");
+        assert_eq!(
+            bounded_label(&SEEN_FLOWS, &"f".repeat(500)).len(),
+            LABEL_MAX_CHARS
+        );
     }
 
     #[test]
