@@ -23,6 +23,31 @@ pub struct ResumeInput {
 #[async_trait]
 pub trait SessionResumer: Send + Sync {
     async fn resume(&self, tenant: TenantCtx, correlation_id: &str, output: Value) -> Result<()>;
+
+    /// [`Self::resume`], reporting whether the response was ADMITTED (handed to
+    /// the runtime) or dropped by an admission check (wrong gate, bad token).
+    /// The listener cancels the deadline watchdog only for an admitted
+    /// response, so a forged or stale one cannot retire the real watchdog.
+    /// The default treats every `Ok` as admitted.
+    async fn resume_checked(
+        &self,
+        tenant: TenantCtx,
+        correlation_id: &str,
+        output: Value,
+    ) -> Result<ResumeOutcome> {
+        self.resume(tenant, correlation_id, output)
+            .await
+            .map(|()| ResumeOutcome::Admitted)
+    }
+}
+
+/// What a resumer did with a response it did not fail on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// Handed to the runtime.
+    Admitted,
+    /// Refused by an admission check; nothing was resumed.
+    Dropped,
 }
 
 /// Pure: turn response headers + JSON body into a `ResumeInput`. No I/O.
@@ -73,15 +98,74 @@ pub fn decode_response(
 
 /// Forward a decoded input to the resumer, logging failures.
 pub async fn dispatch_to_resumer(resumer: Arc<dyn SessionResumer>, input: ResumeInput) {
-    if let Err(error) = resumer
-        .resume(input.tenant, &input.correlation_id, input.output)
+    match resumer
+        .resume_checked(input.tenant, &input.correlation_id, input.output)
         .await
     {
-        tracing::error!(
+        // Retire the deadline watchdog only once the response was admitted: a
+        // forged or wrong-token response must not cancel the real one.
+        Ok(ResumeOutcome::Admitted) => {
+            crate::runner::remote_dispatch::cancel_watchdog(&input.correlation_id);
+        }
+        Ok(ResumeOutcome::Dropped) => {}
+        Err(error) => tracing::error!(
             %error,
             correlation_id = %input.correlation_id,
             "failed to resume session on dispatch response"
-        );
+        ),
+    }
+}
+
+type Job = futures::future::BoxFuture<'static, ()>;
+
+/// Runs jobs submitted under the same key strictly in submission order, while
+/// jobs under different keys run concurrently. A key's queue exists only while
+/// it has work, so the map does not grow with finished conversations.
+#[derive(Clone, Default)]
+pub struct KeyedSerializer {
+    queues: Arc<
+        parking_lot::Mutex<std::collections::HashMap<String, std::collections::VecDeque<Job>>>,
+    >,
+}
+
+impl KeyedSerializer {
+    /// Queue `job` behind any pending work for `key`, or start a worker for it.
+    pub fn submit(&self, key: String, job: Job) {
+        {
+            let mut queues = self.queues.lock();
+            if let Some(queue) = queues.get_mut(&key) {
+                queue.push_back(job);
+                return;
+            }
+            queues.insert(key.clone(), std::collections::VecDeque::new());
+        }
+        let queues = Arc::clone(&self.queues);
+        tokio::spawn(async move {
+            let mut current = job;
+            loop {
+                current.await;
+                // Pop-or-remove under one lock so a concurrent `submit` either
+                // sees the queue (and is picked up here) or sees no key (and
+                // starts its own worker).
+                let next = {
+                    let mut guard = queues.lock();
+                    match guard.get_mut(&key).and_then(|queue| queue.pop_front()) {
+                        Some(next) => next,
+                        None => {
+                            guard.remove(&key);
+                            return;
+                        }
+                    }
+                };
+                current = next;
+            }
+        });
+    }
+
+    /// Number of keys with pending or running work (test hook).
+    #[cfg(test)]
+    fn active_keys(&self) -> usize {
+        self.queues.lock().len()
     }
 }
 
@@ -99,12 +183,16 @@ pub struct ListenerScope {
 }
 
 /// Pure: should a listener scoped to `scope_tenant` handle a message whose
-/// `Greentic-Tenant` header is `header_tenant`? A missing header is handled
-/// (the decoder applies its own default), a mismatching one is not.
+/// `Greentic-Tenant` header is `header_tenant`? An unscoped listener handles
+/// everything (the decoder applies its own default tenant). A tenant-scoped one
+/// handles only a message that names its tenant: with per-tenant queue groups a
+/// headerless message would otherwise reach every tenant's listener.
 pub fn tenant_matches(scope_tenant: Option<&str>, header_tenant: Option<&str>) -> bool {
-    match (scope_tenant, header_tenant) {
-        (Some(scope), Some(header)) if !header.is_empty() => scope == header,
-        _ => true,
+    match scope_tenant {
+        None => true,
+        Some(scope) => {
+            matches!(header_tenant, Some(header) if !header.is_empty() && header == scope)
+        }
     }
 }
 
@@ -124,8 +212,9 @@ pub async fn run_response_listener(
 }
 
 /// [`run_response_listener`] with an explicit [`ListenerScope`]. Each message is
-/// handled on its own task (bounded by [`MAX_CONCURRENT_RESUMES`]) so one slow
-/// resume cannot stall every other conversation's response.
+/// handled off the receive loop (bounded by [`MAX_CONCURRENT_RESUMES`]) so one
+/// slow resume cannot stall every other conversation's response; responses for
+/// the SAME correlation id are serialised in arrival order.
 pub async fn run_response_listener_scoped(
     client: async_nats::Client,
     runtime: String,
@@ -138,16 +227,19 @@ pub async fn run_response_listener_scoped(
         None => client.subscribe(subject).await?,
     };
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESUMES));
+    let serializer = KeyedSerializer::default();
     while let Some(msg) = subscription.next().await {
         let headers = msg.headers.as_ref();
         let get_header = |name: &str| headers.and_then(|h| h.get(name)).map(|v| v.as_str());
         if !tenant_matches(scope.tenant.as_deref(), get_header("Greentic-Tenant")) {
+            if scope.tenant.is_some()
+                && get_header("Greentic-Tenant").is_none_or(|header| header.is_empty())
+            {
+                tracing::warn!(
+                    "dropping dispatch response without a Greentic-Tenant header on a tenant-scoped listener"
+                );
+            }
             continue;
-        }
-        // Any response (including the watchdog's own) retires the deadline
-        // watchdog for this id, so a completed call never times out late.
-        if let Some(correlation) = get_header("Greentic-Correlation-Id") {
-            crate::runner::remote_dispatch::cancel_watchdog(correlation);
         }
         match decode_response(
             get_header("Greentic-Correlation-Id"),
@@ -160,10 +252,16 @@ pub async fn run_response_listener_scoped(
                     break;
                 };
                 let resumer = Arc::clone(&resumer);
-                tokio::spawn(async move {
-                    dispatch_to_resumer(resumer, input).await;
-                    drop(permit);
-                });
+                // Per-conversation order: responses sharing a correlation id
+                // are handled one at a time, in arrival order.
+                let key = input.correlation_id.clone();
+                serializer.submit(
+                    key,
+                    Box::pin(async move {
+                        dispatch_to_resumer(resumer, input).await;
+                        drop(permit);
+                    }),
+                );
             }
             Err(error) => tracing::warn!(%error, "bad dispatch response; dropping"),
         }
@@ -183,8 +281,89 @@ mod tests {
         assert!(tenant_matches(None, Some("acme")));
         assert!(tenant_matches(Some("acme"), Some("acme")));
         assert!(!tenant_matches(Some("acme"), Some("other")));
-        assert!(tenant_matches(Some("acme"), None));
-        assert!(tenant_matches(Some("acme"), Some("")));
+        assert!(!tenant_matches(Some("acme"), None));
+        assert!(!tenant_matches(Some("acme"), Some("")));
+        assert!(tenant_matches(None, None));
+    }
+
+    #[tokio::test]
+    async fn keyed_serializer_orders_per_key_and_cleans_up() {
+        let serializer = KeyedSerializer::default();
+        let log = Arc::new(Mutex::new(Vec::<(String, u32)>::new()));
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        for (key, n, delay) in [("a", 1u32, 40u64), ("a", 2, 0), ("b", 1, 0), ("a", 3, 0)] {
+            let log = Arc::clone(&log);
+            let done_tx = done_tx.clone();
+            serializer.submit(
+                key.to_string(),
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    if let Ok(mut log) = log.lock() {
+                        log.push((key.to_string(), n));
+                    }
+                    let _ = done_tx.send(());
+                }),
+            );
+        }
+        for _ in 0..4 {
+            done_rx.recv().await;
+        }
+        let log = log.lock().unwrap().clone();
+        let a: Vec<u32> = log
+            .iter()
+            .filter(|(k, _)| k == "a")
+            .map(|(_, n)| *n)
+            .collect();
+        assert_eq!(a, vec![1, 2, 3], "same key keeps submission order");
+        assert_eq!(log[0], ("b".to_string(), 1), "other keys are not blocked");
+        for _ in 0..50 {
+            if serializer.active_keys() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(serializer.active_keys(), 0);
+    }
+
+    struct DroppingResumer;
+
+    #[async_trait]
+    impl SessionResumer for DroppingResumer {
+        async fn resume(&self, _: TenantCtx, _: &str, _: Value) -> Result<()> {
+            Ok(())
+        }
+        async fn resume_checked(&self, _: TenantCtx, _: &str, _: Value) -> Result<ResumeOutcome> {
+            Ok(ResumeOutcome::Dropped)
+        }
+    }
+
+    #[tokio::test]
+    async fn only_an_admitted_response_cancels_the_watchdog() {
+        let body = serde_json::to_vec(&RuntimeDispatchResponse {
+            ok: true,
+            output: json!(null),
+            events: vec![],
+            error: None,
+        })
+        .unwrap();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        crate::runner::remote_dispatch::register_watchdog_for_test("corr-admit", handle);
+        let input =
+            decode_response(Some("corr-admit"), Some("t1"), Some("default"), &body).unwrap();
+        dispatch_to_resumer(Arc::new(DroppingResumer), input).await;
+        assert!(
+            crate::runner::remote_dispatch::watchdog_pending("corr-admit"),
+            "a dropped response leaves the watchdog armed"
+        );
+        let input =
+            decode_response(Some("corr-admit"), Some("t1"), Some("default"), &body).unwrap();
+        let resumer = Arc::new(RecordingResumer {
+            seen: Mutex::new(vec![]),
+        });
+        dispatch_to_resumer(resumer, input).await;
+        assert!(!crate::runner::remote_dispatch::watchdog_pending(
+            "corr-admit"
+        ));
     }
 
     // -----------------------------------------------------------------------

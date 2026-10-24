@@ -3043,6 +3043,25 @@ fn branch_target(
         .or_else(|| default.cloned())
 }
 
+#[cfg(feature = "agentic-worker")]
+use crate::runner::media_node::MAX_CREATED_PER_TURN;
+
+/// Mirrors `media_node::MAX_CREATED_PER_TURN`; no node creates files without
+/// the `agentic-worker` feature, so the list stays empty there.
+#[cfg(not(feature = "agentic-worker"))]
+const MAX_CREATED_PER_TURN: usize = 20;
+
+#[cfg(feature = "agentic-worker")]
+fn attach_created_files(reply: Value, created: Vec<Value>) -> Value {
+    crate::runner::media_node::attach_created(reply, created)
+}
+
+/// Without `media.create` nothing is ever created; the reply is unchanged.
+#[cfg(not(feature = "agentic-worker"))]
+fn attach_created_files(reply: Value, _created: Vec<Value>) -> Value {
+    reply
+}
+
 /// Deepest `flow.call` nesting allowed before the call is refused.
 const MAX_FLOW_CALL_DEPTH: u32 = 16;
 
@@ -3984,7 +4003,7 @@ impl ExecutionState {
     /// and bounded, so a looping flow cannot grow the list without limit.
     fn note_created_artifacts(&mut self, created: Vec<Value>) {
         for file in created {
-            if self.created_artifacts.len() >= crate::runner::media_node::MAX_CREATED_PER_TURN {
+            if self.created_artifacts.len() >= MAX_CREATED_PER_TURN {
                 break;
             }
             let id = file.get("id").and_then(Value::as_str);
@@ -4096,7 +4115,7 @@ impl ExecutionState {
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
         let created = std::mem::take(&mut self.created_artifacts);
         let reply = self.finalize_reply(final_payload);
-        crate::runner::media_node::attach_created(reply, created)
+        attach_created_files(reply, created)
     }
 
     fn finalize_reply(mut self, final_payload: Option<Value>) -> Value {
