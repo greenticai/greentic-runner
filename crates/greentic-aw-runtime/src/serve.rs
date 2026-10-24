@@ -111,6 +111,25 @@ fn step_succeeded(reason: &TerminationReason) -> bool {
     )
 }
 
+/// The structured error for a step that ended without a usable reply: code is
+/// the `terminated_by` reason (`timeout`, `max_iterations`, ...), so the engine
+/// can say why instead of a generic fallback. The partial reply stays in
+/// `output`. `None` when the step succeeded.
+fn step_failure(ok: bool, output: &Value) -> Option<aw_event_bridge::DispatchError> {
+    if ok {
+        return None;
+    }
+    let code = output
+        .get("terminated_by")
+        .and_then(Value::as_str)
+        .unwrap_or("error")
+        .to_string();
+    Some(aw_event_bridge::DispatchError {
+        message: format!("agent step ended without a reply: {code}"),
+        code,
+    })
+}
+
 /// Resolve the session id for the step.
 ///
 /// Prefers an explicit `session_id` field in the input; otherwise falls back to
@@ -149,6 +168,7 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
                         ok: true,
                         output: cached,
                         events: vec![],
+                        error: None,
                     });
                 }
                 Ok(None) => {}
@@ -210,10 +230,12 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
             tracing::warn!(key, error = %e, "dispatch ledger record failed; redelivery will re-run step");
         }
 
+        let error = step_failure(ok, &outcome_output);
         Ok(InvokeOutcome {
             ok,
             output: outcome_output,
             events: vec![],
+            error,
         })
     }
 }
@@ -461,6 +483,16 @@ mod tests {
         assert!(!step_succeeded(&TerminationReason::Timeout));
         assert!(!step_succeeded(&TerminationReason::MaxIterations));
         assert!(!step_succeeded(&TerminationReason::Error));
+    }
+
+    #[test]
+    fn failed_step_carries_terminated_by_as_error_code_and_keeps_partial_reply() {
+        let output = json!({"reply": "partial", "trail": [], "terminated_by": "timeout"});
+        let error = step_failure(false, &output).expect("failed step has an error");
+        assert_eq!(error.code, "timeout");
+        assert!(error.message.contains("timeout"));
+        assert_eq!(output["reply"], json!("partial"));
+        assert!(step_failure(true, &output).is_none());
     }
 
     #[test]

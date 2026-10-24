@@ -91,6 +91,14 @@ pub trait LlmBackend: Send + Sync {
             Ok(resp)
         })
     }
+
+    /// Whether this backend already retries transient errors itself (it is, or
+    /// forwards to, a [`RetryingLlmBackend`]). The loop then does not stack its
+    /// own retry decorator on top, which would multiply the attempts
+    /// (`N * N`) with nested backoff. Defaults to `false`.
+    fn is_retrying(&self) -> bool {
+        false
+    }
 }
 
 /// Wraps any [`LlmBackend`] with exponential-backoff retry on transient
@@ -113,10 +121,18 @@ impl<B: LlmBackend> RetryingLlmBackend<B> {
 }
 
 impl<B: LlmBackend + Send + Sync> LlmBackend for RetryingLlmBackend<B> {
+    fn is_retrying(&self) -> bool {
+        true
+    }
+
     fn complete<'a>(
         &'a self,
         request: LlmRequest,
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        // Already retried below us: one attempt here, not N * N.
+        if self.inner.is_retrying() {
+            return self.inner.complete(request);
+        }
         Box::pin(async move {
             let mut delay = self.backoff;
             let mut last_err = None;
@@ -142,6 +158,10 @@ impl<B: LlmBackend + Send + Sync> LlmBackend for RetryingLlmBackend<B> {
         request: LlmRequest,
         on_delta: OnDelta,
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        // Already retried below us: one attempt here, not N * N.
+        if self.inner.is_retrying() {
+            return self.inner.complete_streaming(request, on_delta);
+        }
         Box::pin(async move {
             // Shared flag tracking whether any delta has reached the
             // consumer. Wrap the caller's callback so we observe emission.
@@ -189,6 +209,10 @@ impl<B: LlmBackend + Send + Sync> LlmBackend for RetryingLlmBackend<B> {
 pub(crate) struct SharedLlm(pub(crate) Arc<dyn LlmBackend>);
 
 impl LlmBackend for SharedLlm {
+    fn is_retrying(&self) -> bool {
+        self.0.is_retrying()
+    }
+
     fn complete<'a>(
         &'a self,
         request: LlmRequest,
@@ -257,6 +281,52 @@ mod tests {
 
     struct ScriptedBackend {
         responses: Mutex<Vec<Result<LlmResponse, LlmError>>>,
+    }
+
+    /// Always fails with a retryable error and counts the attempts it sees.
+    struct CountingFail {
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl LlmBackend for CountingFail {
+        fn complete<'a>(
+            &'a self,
+            _r: LlmRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(LlmError::ServiceUnavailable) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pre_wrapped_backend_is_attempted_n_times_not_n_squared() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // The host wraps its backend (3 attempts); the loop wraps again.
+        let host_wrapped: Arc<dyn LlmBackend> = Arc::new(RetryingLlmBackend::new(
+            CountingFail {
+                calls: calls.clone(),
+            },
+            3,
+            Duration::from_millis(1),
+        ));
+        let limits = crate::config::AgentLimits {
+            llm_retry_attempts: 3,
+            llm_retry_backoff: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let r = retrying_for(&host_wrapped, &limits);
+        assert!(r.complete(req()).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // An unwrapped backend still gets the loop's retry decorator.
+        calls.store(0, Ordering::SeqCst);
+        let bare: Arc<dyn LlmBackend> = Arc::new(CountingFail {
+            calls: calls.clone(),
+        });
+        let r = retrying_for(&bare, &limits);
+        assert!(!bare.is_retrying());
+        assert!(r.complete(req()).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     impl LlmBackend for ScriptedBackend {

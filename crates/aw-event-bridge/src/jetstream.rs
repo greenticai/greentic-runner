@@ -10,7 +10,7 @@ use greentic_types::request_topic;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{AgentDispatchInvoker, Disposition, RUNTIME_NAME};
+use crate::{AgentDispatchInvoker, BusyPolicy, Disposition, RUNTIME_NAME};
 
 pub const STREAM_NAME: &str = "greentic-agentic";
 pub const DURABLE_CONSUMER: &str = "agentic-workers";
@@ -35,7 +35,7 @@ pub fn agentic_consumer_config() -> consumer::pull::Config {
     consumer::pull::Config {
         durable_name: Some(DURABLE_CONSUMER.to_string()),
         ack_policy: consumer::AckPolicy::Explicit,
-        max_deliver: 5,
+        max_deliver: MAX_DELIVER,
         ack_wait: ACK_WAIT,
         ..Default::default()
     }
@@ -60,21 +60,49 @@ pub async fn ensure_consumer(
     {
         Ok(consumer) => consumer,
         Err(create_err) => {
-            // A durable created by an older build (default 30s ack_wait) has a
-            // differing config; `ack_wait` is updatable in place.
+            // The server refused because the existing durable's config differs.
             tracing::warn!(error = %create_err, "agentic-workers consumer config differs; updating");
-            stream
+            return stream
                 .update_consumer(agentic_consumer_config())
                 .await
-                .context("update agentic-workers consumer")?;
-            stream
-                .get_consumer(DURABLE_CONSUMER)
-                .await
-                .map_err(|e| anyhow::anyhow!("get agentic-workers consumer: {e}"))?
+                .context("update agentic-workers consumer");
         }
     };
+    // `get_or_create_consumer` can hand back an existing durable unchanged: one
+    // created by an older build keeps its 30s `ack_wait`, which is shorter than
+    // a turn and would redeliver (and double-run) it. Converge it in place.
+    if ack_wait_is_stale(consumer.cached_info().config.ack_wait) {
+        tracing::warn!(
+            existing = ?consumer.cached_info().config.ack_wait,
+            wanted = ?ACK_WAIT,
+            "agentic-workers consumer ack_wait is stale; updating"
+        );
+        return stream
+            .update_consumer(agentic_consumer_config())
+            .await
+            .context("update agentic-workers consumer ack_wait");
+    }
     Ok(consumer)
 }
+
+/// Whether an existing durable's `ack_wait` differs from the one we require.
+#[must_use]
+pub fn ack_wait_is_stale(existing: Duration) -> bool {
+    existing != ACK_WAIT
+}
+
+/// Redelivery cap of the durable consumer (poison-pill guard).
+pub const MAX_DELIVER: i64 = 5;
+
+/// Delay before a request whose session was busy is redelivered.
+pub const BUSY_REDELIVER_DELAY: Duration = Duration::from_secs(5);
+
+/// Upper bound on handling ONE message (step timeout + session-lock wait +
+/// margin). The default agent step timeout is 60s and the lock wait 5s; agents
+/// configured with a longer `limits.timeout` up to ~3 minutes still fit. Kept
+/// under [`ACK_WAIT`]. Without it a hung handler would be `in_progress`
+/// heartbeated forever.
+pub const HANDLE_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// JetStream `ack_wait`: how long the server waits for an ack before
 /// redelivering. Must exceed the agent step timeout (default 60s) plus the
@@ -84,7 +112,7 @@ pub const ACK_WAIT: Duration = Duration::from_secs(300);
 
 /// Interval of `in_progress` acks while a message is being handled; a fraction
 /// of [`ACK_WAIT`] so a turn longer than `ack_wait` is still not redelivered.
-pub const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+pub const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 
 /// Backoff bounds for re-opening the message stream after an error.
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
@@ -96,6 +124,17 @@ pub fn backoff_delay(attempt: u32) -> Duration {
     BACKOFF_BASE
         .saturating_mul(1u32.checked_shl(attempt.min(16)).unwrap_or(u32::MAX))
         .min(BACKOFF_MAX)
+}
+
+/// Busy policy for a delivery: redeliver while attempts remain, answer on the
+/// last one.
+#[must_use]
+pub fn busy_policy(delivered: i64) -> BusyPolicy {
+    if delivered >= MAX_DELIVER {
+        BusyPolicy::Respond
+    } else {
+        BusyPolicy::Redeliver
+    }
 }
 
 /// Whether a handled message should be acked.  Errors are left un-acked so
@@ -110,7 +149,9 @@ pub fn should_ack(handle_result: &Result<()>) -> bool {
 #[must_use]
 pub fn settlement(result: &Result<Disposition>) -> Option<AckKind> {
     match result {
-        Ok(Disposition::Handled | Disposition::Skipped) => Some(AckKind::Ack),
+        Ok(Disposition::Handled) => Some(AckKind::Ack),
+        // Session busy and no response sent: redeliver later, never ack.
+        Ok(Disposition::Busy) => Some(AckKind::Nak(Some(BUSY_REDELIVER_DELAY))),
         Ok(Disposition::Rejected) => Some(AckKind::Term),
         Err(_) => None,
     }
@@ -167,7 +208,14 @@ async fn handle_one(
     // inner core message via the public `.message` field so that
     // handle_message receives the owned async_nats::Message it expects.
     let core = js_msg.message.clone();
-    let handling = crate::handle_message_outcome(&client, invoker, core);
+    // On the last allowed delivery there is no redelivery left to lean on, so a
+    // busy session must be answered instead of Nak'd into the void.
+    let delivered = js_msg.info().map(|info| info.delivered).unwrap_or(1);
+    let busy = busy_policy(delivered);
+    let handling = tokio::time::timeout(
+        HANDLE_TIMEOUT,
+        crate::handle_message_outcome(&client, invoker, core.clone(), busy),
+    );
     tokio::pin!(handling);
     let mut ticker = tokio::time::interval(PROGRESS_EVERY);
     ticker.tick().await; // first tick fires immediately
@@ -179,6 +227,27 @@ async fn handle_one(
                     tracing::warn!(%error, "jetstream in-progress ack failed");
                 }
             }
+        }
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            tracing::error!(
+                timeout = ?HANDLE_TIMEOUT,
+                "agentic handler exceeded its time bound; terminating the request"
+            );
+            if let Err(error) = crate::publish_error_for_message(
+                &client,
+                &core,
+                "timeout",
+                format!("agent request handling exceeded {HANDLE_TIMEOUT:?}"),
+            )
+            .await
+            {
+                tracing::warn!(%error, "could not publish timeout response");
+            }
+            // The step may have side effects; do not run it again.
+            Ok(Disposition::Rejected)
         }
     };
     match settlement(&result) {
@@ -263,21 +332,42 @@ mod tests {
     }
 
     #[test]
-    fn settlement_acks_skips_and_terms_but_never_acks_errors() {
+    fn settlement_acks_naks_and_terms_but_never_acks_errors() {
         assert!(matches!(
             settlement(&Ok(Disposition::Handled)),
             Some(AckKind::Ack)
         ));
-        // Lock contention: acked, no failure response published.
+        // Lock contention: redelivered with a delay, never acked.
         assert!(matches!(
-            settlement(&Ok(Disposition::Skipped)),
-            Some(AckKind::Ack)
+            settlement(&Ok(Disposition::Busy)),
+            Some(AckKind::Nak(Some(delay))) if delay == BUSY_REDELIVER_DELAY
         ));
         assert!(matches!(
             settlement(&Ok(Disposition::Rejected)),
             Some(AckKind::Term)
         ));
         assert!(settlement(&Err(anyhow::anyhow!("publish failed"))).is_none());
+    }
+
+    #[test]
+    fn busy_is_redelivered_until_the_last_delivery_then_answered() {
+        assert_eq!(busy_policy(1), BusyPolicy::Redeliver);
+        assert_eq!(busy_policy(MAX_DELIVER - 1), BusyPolicy::Redeliver);
+        assert_eq!(busy_policy(MAX_DELIVER), BusyPolicy::Respond);
+        assert_eq!(busy_policy(MAX_DELIVER + 1), BusyPolicy::Respond);
+    }
+
+    #[test]
+    fn stale_ack_wait_is_detected() {
+        assert!(ack_wait_is_stale(Duration::from_secs(30)));
+        assert!(!ack_wait_is_stale(ACK_WAIT));
+    }
+
+    #[test]
+    fn handle_timeout_fits_inside_ack_wait_and_covers_a_default_step() {
+        assert!(HANDLE_TIMEOUT < ACK_WAIT);
+        assert!(HANDLE_TIMEOUT > Duration::from_secs(60 + 5));
+        assert!(PROGRESS_EVERY <= Duration::from_secs(10));
     }
 
     #[test]

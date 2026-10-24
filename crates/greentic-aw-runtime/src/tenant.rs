@@ -169,18 +169,24 @@ pub fn validate_scope_id(kind: &str, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reject a session id that is empty, over-long, or could traverse a path or
-/// carry a control character. Unlike tenant/env ids a session id MAY contain
-/// `:` (dispatch correlation ids use `::` markers) because it is always the
-/// LAST variable segment of a key.
+/// Longest session id accepted from an untrusted source.
+const MAX_SESSION_ID_LEN: usize = 512;
+
+/// Reject a session id that is empty, over-long, or carries a control
+/// character. Unlike tenant/env ids a session id MAY contain `:`, `/` and `..`:
+/// it derives from dispatch correlation ids that embed provider thread / reply
+/// ids (base64, email Message-IDs), and it is only ever the LAST variable
+/// segment of a key (`aw:{tenant}:{env}:{session}:...`), so it cannot alias
+/// another tenant's keys. Rejecting those characters made legitimate messages
+/// fail permanently.
 pub fn validate_session_id(id: &str) -> Result<(), String> {
     if id.is_empty() {
         return Err("session id is empty".to_string());
     }
-    if id.len() > MAX_ID_LEN * 4 {
+    if id.len() > MAX_SESSION_ID_LEN {
         return Err("session id is too long".to_string());
     }
-    if id.contains(['/', '\\']) || id.contains("..") || id.chars().any(char::is_control) {
+    if id.chars().any(char::is_control) {
         return Err("session id contains a forbidden character".to_string());
     }
     Ok(())
@@ -214,11 +220,15 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_allow_correlation_colons_but_not_traversal() {
+    fn session_ids_allow_provider_ids_but_not_controls_or_oversize() {
         assert!(validate_session_id("s1::pack=p::flow=f").is_ok());
-        for bad in ["", "a/b", "..", "a\u{0}b"] {
+        // Provider thread / reply ids: base64 and email Message-IDs.
+        assert!(validate_session_id("s::thread=YWJj/ZGVm+==::reply=<a..b@mail.example>").is_ok());
+        for bad in ["", "a\u{0}b", "a\nb"] {
             assert!(validate_session_id(bad).is_err(), "{bad:?}");
         }
+        assert!(validate_session_id(&"x".repeat(513)).is_err());
+        assert!(validate_session_id(&"x".repeat(512)).is_ok());
     }
 
     #[test]
