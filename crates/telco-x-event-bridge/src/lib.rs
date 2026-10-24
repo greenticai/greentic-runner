@@ -107,9 +107,9 @@ const MAX_SCOPE_ID_LEN: usize = 128;
 const LOCK_CONTENTION_MARKER: &str = "session lock could not be acquired";
 
 /// Error an invoker can return when the target session is busy (another turn
-/// holds its lock). The bridge acks the message WITHOUT publishing a failure
-/// response: the in-flight turn owns the conversation, and a spurious error
-/// response would resume the caller's flow with a failure.
+/// holds its lock). A busy session is never dropped silently: the bridge
+/// publishes a `session_busy` error response so the parked caller is not left
+/// waiting (this bridge is core NATS, so there is no redelivery to lean on).
 #[derive(Debug)]
 pub struct LockContention(pub String);
 
@@ -136,8 +136,6 @@ pub fn is_lock_contention(error: &anyhow::Error) -> bool {
 pub enum Disposition {
     /// A response was published (success or error); ack.
     Handled,
-    /// Session lock busy: no response published; ack so it is not redelivered.
-    Skipped,
     /// The request can never succeed (malformed / invalid ids); terminate it
     /// (an error response was published when a correlation id existed).
     Rejected,
@@ -206,6 +204,9 @@ pub fn parse_request(
     })
 }
 
+/// Error code published when the target session stayed locked.
+pub const SESSION_BUSY_CODE: &str = "session_busy";
+
 fn error_response(code: &str, message: String) -> RuntimeDispatchResponse {
     RuntimeDispatchResponse {
         ok: false,
@@ -216,6 +217,17 @@ fn error_response(code: &str, message: String) -> RuntimeDispatchResponse {
             message,
         }),
     }
+}
+
+/// Map an invoker failure to its error response: a busy session is
+/// `session_busy` (the caller may retry), anything else `invoke_failed`.
+fn failure_response(error: &anyhow::Error) -> RuntimeDispatchResponse {
+    let code = if is_lock_contention(error) {
+        SESSION_BUSY_CODE
+    } else {
+        "invoke_failed"
+    };
+    error_response(code, error.to_string())
 }
 
 /// Invoke; `Err` carries the invoker error so the caller can classify it.
@@ -254,7 +266,7 @@ pub async fn build_response(
 ) -> RuntimeDispatchResponse {
     match dispatch(invoker, tenant, env, idempotency_key, req).await {
         Ok(resp) => resp,
-        Err(error) => error_response("invoke_failed", error.to_string()),
+        Err(error) => failure_response(&error),
     }
 }
 
@@ -325,11 +337,12 @@ pub async fn handle_message_outcome(
     .await
     {
         Ok(resp) => resp,
-        Err(error) if is_lock_contention(&error) => {
-            tracing::warn!(%error, "session busy; acking without a response");
-            return Ok(Disposition::Skipped);
+        Err(error) => {
+            if is_lock_contention(&error) {
+                tracing::warn!(%error, "session busy; answering with session_busy");
+            }
+            failure_response(&error)
         }
-        Err(error) => error_response("invoke_failed", error.to_string()),
     };
     publish_response(
         client,
@@ -563,6 +576,18 @@ mod tests {
             .context("agent step failed");
         assert!(is_lock_contention(&wrapped));
         assert!(!is_lock_contention(&anyhow::anyhow!("boom")));
+    }
+
+    #[test]
+    fn lock_contention_answers_session_busy_instead_of_dropping() {
+        let busy = failure_response(&anyhow::Error::new(LockContention("s".into())));
+        assert!(!busy.ok);
+        assert_eq!(busy.error.map(|e| e.code).as_deref(), Some("session_busy"));
+        let other = failure_response(&anyhow::anyhow!("boom"));
+        assert_eq!(
+            other.error.map(|e| e.code).as_deref(),
+            Some("invoke_failed")
+        );
     }
 
     #[test]

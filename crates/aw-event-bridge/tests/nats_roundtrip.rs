@@ -47,6 +47,7 @@ impl AgentDispatchInvoker for CannedReplyInvoker {
                 "terminated_by": "final_reply",
             }),
             events: vec![],
+            error: None,
         })
     }
 }

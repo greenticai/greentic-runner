@@ -1089,6 +1089,11 @@ async fn run_step_scoped(
                     }
                 } else {
                     let remaining = config.limits.timeout.saturating_sub(started.elapsed());
+                    // At-least-once caveat: when the timeout fires, this future is
+                    // dropped mid-flight. The tool may already have produced a
+                    // remote side effect that is NOT recorded in any ledger, so
+                    // a retried turn can perform it again. Tools with side
+                    // effects must be idempotent.
                     match tokio::time::timeout(
                         remaining,
                         catalogs.dispatch(

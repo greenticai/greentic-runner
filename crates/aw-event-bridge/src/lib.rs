@@ -21,12 +21,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_nats::HeaderMap;
 use async_trait::async_trait;
-use greentic_types::{DispatchError, RuntimeDispatchRequest, RuntimeDispatchResponse};
+use greentic_types::{RuntimeDispatchRequest, RuntimeDispatchResponse};
 use serde_json::Value;
 
 // Re-export the shared subject helpers so serve-mode callers can name the
 // agentic subjects without an extra greentic-types dependency.
-pub use greentic_types::{request_topic, response_topic};
+pub use greentic_types::{DispatchError, request_topic, response_topic};
 
 /// Runtime name for the agentic worker; selects the request/response subjects
 /// `greentic.agentic.request.v1` / `greentic.agentic.response.v1`.
@@ -40,6 +40,10 @@ pub struct InvokeOutcome {
     pub output: Value,
     /// Optional runtime-emitted events (empty for the agentic worker today).
     pub events: Vec<Value>,
+    /// Why `ok` is false, when the step ended without a usable reply
+    /// (timeout, iteration cap, token budget). `output` still carries the
+    /// partial `{reply, trail, terminated_by}` so a consumer can use it.
+    pub error: Option<DispatchError>,
 }
 
 /// Seam over the actual agentic-worker invocation. The production impl wraps
@@ -79,9 +83,9 @@ const MAX_SCOPE_ID_LEN: usize = 128;
 const LOCK_CONTENTION_MARKER: &str = "session lock could not be acquired";
 
 /// Error an invoker can return when the target session is busy (another turn
-/// holds its lock). The bridge acks the message WITHOUT publishing a failure
-/// response: the in-flight turn owns the conversation, and a spurious error
-/// response would resume the caller's flow with a failure.
+/// holds its lock). A busy session is never acked silently: depending on the
+/// [`BusyPolicy`] the message is redelivered later or answered with a
+/// `session_busy` error response, so the parked caller is never left waiting.
 #[derive(Debug)]
 pub struct LockContention(pub String);
 
@@ -103,13 +107,31 @@ pub fn is_lock_contention(error: &anyhow::Error) -> bool {
             .any(|cause| cause.to_string().contains(LOCK_CONTENTION_MARKER))
 }
 
+/// What to do when the target session stays locked for the whole wait window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusyPolicy {
+    /// Publish nothing and return [`Disposition::Busy`] so a durable consumer
+    /// can Nak with a delay and have the request redelivered. Publishing a
+    /// failure here would resume the caller's flow while the first run is
+    /// still genuinely in progress.
+    Redeliver,
+    /// Publish a `session_busy` error response (core NATS has no redelivery,
+    /// and the last JetStream delivery has none left either).
+    Respond,
+}
+
+/// Error code published when the target session stayed locked.
+pub const SESSION_BUSY_CODE: &str = "session_busy";
+
 /// What became of one request message; drives the JetStream ack decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disposition {
     /// A response was published (success or error); ack.
     Handled,
-    /// Session lock busy: no response published; ack so it is not redelivered.
-    Skipped,
+    /// Session lock busy under [`BusyPolicy::Redeliver`]: no response was
+    /// published; the durable consumer must Nak with a delay so the request is
+    /// redelivered (bounded by `max_deliver`). Never ack this.
+    Busy,
     /// The request can never succeed (malformed / invalid ids); terminate it
     /// (an error response was published when a correlation id existed).
     Rejected,
@@ -190,6 +212,17 @@ fn error_response(code: &str, message: String) -> RuntimeDispatchResponse {
     }
 }
 
+/// Map an invoker failure to its error response: a busy session is
+/// `session_busy` (the caller may retry), anything else `invoke_failed`.
+fn failure_response(error: &anyhow::Error) -> RuntimeDispatchResponse {
+    let code = if is_lock_contention(error) {
+        SESSION_BUSY_CODE
+    } else {
+        "invoke_failed"
+    };
+    error_response(code, error.to_string())
+}
+
 /// Invoke; `Err` carries the invoker error so the caller can classify it.
 async fn dispatch(
     invoker: Arc<dyn AgentDispatchInvoker>,
@@ -212,7 +245,7 @@ async fn dispatch(
         ok: outcome.ok,
         output: outcome.output,
         events: outcome.events,
-        error: None,
+        error: outcome.error,
     })
 }
 
@@ -226,7 +259,7 @@ pub async fn build_response(
 ) -> RuntimeDispatchResponse {
     match dispatch(invoker, tenant, env, idempotency_key, req).await {
         Ok(resp) => resp,
-        Err(error) => error_response("invoke_failed", error.to_string()),
+        Err(error) => failure_response(&error),
     }
 }
 
@@ -267,6 +300,7 @@ pub async fn handle_message_outcome(
     client: &async_nats::Client,
     invoker: Arc<dyn AgentDispatchInvoker>,
     msg: async_nats::Message,
+    busy: BusyPolicy,
 ) -> Result<Disposition> {
     let headers = msg.headers.as_ref();
     let get_header = |name: &str| -> Option<String> {
@@ -297,11 +331,11 @@ pub async fn handle_message_outcome(
     .await
     {
         Ok(resp) => resp,
-        Err(error) if is_lock_contention(&error) => {
-            tracing::warn!(%error, "session busy; acking without a response");
-            return Ok(Disposition::Skipped);
+        Err(error) if is_lock_contention(&error) && busy == BusyPolicy::Redeliver => {
+            tracing::warn!(%error, "session busy; requesting redelivery");
+            return Ok(Disposition::Busy);
         }
-        Err(error) => error_response("invoke_failed", error.to_string()),
+        Err(error) => failure_response(&error),
     };
     publish_response(
         client,
@@ -319,9 +353,50 @@ pub async fn handle_message(
     invoker: Arc<dyn AgentDispatchInvoker>,
     msg: async_nats::Message,
 ) -> Result<()> {
-    handle_message_outcome(client, invoker, msg)
+    // Core NATS has no redelivery: answer a busy session instead of dropping it.
+    handle_message_outcome(client, invoker, msg, BusyPolicy::Respond)
         .await
         .map(|_| ())
+}
+
+/// Publish an error response for an already-received request message, echoing
+/// its correlation id and scope headers. Returns `Ok(false)` without
+/// publishing when the message carries no correlation id, since nobody is
+/// waiting for it then.
+pub async fn publish_error_for_message(
+    client: &async_nats::Client,
+    msg: &async_nats::Message,
+    code: &str,
+    message: String,
+) -> Result<bool> {
+    let header = |name: &str| -> Option<String> {
+        msg.headers
+            .as_ref()
+            .and_then(|header_map| header_map.get(name))
+            .map(|value| value.as_str().to_string())
+    };
+    let Some(correlation) = header("Greentic-Correlation-Id") else {
+        return Ok(false);
+    };
+    let tenant = header("Greentic-Tenant");
+    let env = header("Greentic-Env");
+    let scope = match (tenant.as_deref(), env.as_deref()) {
+        (Some(tenant), Some(env))
+            if validate_scope_id("tenant", tenant).is_ok()
+                && validate_scope_id("env", env).is_ok() =>
+        {
+            Some((tenant, env))
+        }
+        _ => None,
+    };
+    publish_response(
+        client,
+        Some(&correlation),
+        scope,
+        &error_response(code, message),
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Queue group shared by all bridge replicas, so a request is delivered to ONE
@@ -385,6 +460,7 @@ mod tests {
                 ok: true,
                 output: json!({"reply": "pong", "trail": [], "terminated_by": "reply"}),
                 events: vec![],
+                error: None,
             })
         }
     }
@@ -514,6 +590,74 @@ mod tests {
         let headers = [("Greentic-Tenant", "acme")];
         let rejection = parse_request(header_fn(&headers), b"not json").unwrap_err();
         assert_eq!(rejection.code, "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn lock_contention_answers_session_busy_instead_of_dropping() {
+        struct BusyInvoker;
+
+        #[async_trait]
+        impl AgentDispatchInvoker for BusyInvoker {
+            async fn invoke(
+                &self,
+                _tenant: &str,
+                _env: &str,
+                _target: &str,
+                _operation: &str,
+                _input: Value,
+                _idempotency_key: Option<&str>,
+            ) -> Result<InvokeOutcome> {
+                Err(anyhow::Error::new(LockContention("s".into())))
+            }
+        }
+
+        let resp = build_response(
+            Arc::new(BusyInvoker),
+            "acme",
+            "prod",
+            Some("c"),
+            sample_request(),
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error.map(|e| e.code).as_deref(),
+            Some(SESSION_BUSY_CODE)
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_failure_outcome_error_is_forwarded() {
+        struct FailedStep;
+
+        #[async_trait]
+        impl AgentDispatchInvoker for FailedStep {
+            async fn invoke(
+                &self,
+                _tenant: &str,
+                _env: &str,
+                _target: &str,
+                _operation: &str,
+                _input: Value,
+                _idempotency_key: Option<&str>,
+            ) -> Result<InvokeOutcome> {
+                Ok(InvokeOutcome {
+                    ok: false,
+                    output: json!({"reply": "partial", "trail": [], "terminated_by": "timeout"}),
+                    events: vec![],
+                    error: Some(DispatchError {
+                        code: "timeout".into(),
+                        message: "agent step ended: timeout".into(),
+                    }),
+                })
+            }
+        }
+
+        let resp =
+            build_response(Arc::new(FailedStep), "acme", "prod", None, sample_request()).await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.map(|e| e.code).as_deref(), Some("timeout"));
+        assert_eq!(resp.output["reply"], json!("partial"));
     }
 
     #[test]
