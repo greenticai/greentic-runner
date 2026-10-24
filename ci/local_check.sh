@@ -110,7 +110,16 @@ pack_id: runner.components
 pack_ref: runner.components@0.1.0
 pack_locator: fs://${REPO_ROOT}/examples/packs/demo.gtpack
 GTBIND
-  local port="${HOST_SMOKE_PORT:-18080}"
+  # Pick a free port unless the caller pinned one.
+  local port="${HOST_SMOKE_PORT:-}"
+  if [[ -z "$port" ]]; then
+    port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])' 2>/dev/null || true)"
+    port="${port:-18080}"
+  fi
+  # Throwaway greentic root: the host writes packs/gtbind.index.json under it,
+  # which must never rewrite tracked files in the repo.
+  local greentic_root
+  greentic_root="$(mktemp -d)"
   local timeout_secs="${HOST_SMOKE_TIMEOUT_SECS:-300}"
   local log
   log="$(mktemp)"
@@ -125,7 +134,8 @@ GTBIND
   local target_dir="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
   local bin="${target_dir}/debug/greentic-runner"
 
-  "$bin" --bindings-dir "$bindings_dir" --port "$port" >"$log" 2>&1 &
+  GREENTIC_PATHS_GREENTIC_ROOT="$greentic_root" \
+    "$bin" --bindings-dir "$bindings_dir" --port "$port" >"$log" 2>&1 &
   local pid=$!
   local ok=1
   local waited=0

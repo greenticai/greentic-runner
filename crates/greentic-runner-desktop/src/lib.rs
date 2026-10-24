@@ -585,11 +585,20 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         opts.session_state_dir.as_deref(),
         resolved_profile.session_id.as_str(),
     );
+    let session_id_str = resolved_profile.session_id.as_str();
+    let mut loaded_from_legacy = false;
     let resume_snapshot = match session_snapshot_path.as_deref() {
         Some(path) => {
             // Snapshots saved before the escaping scheme changed live under
             // the legacy name; fall back to it so those parks still resume.
-            load_session_snapshot(snapshot_load_path(path, legacy_snapshot_path.as_deref()))?
+            let load_path = snapshot_load_path(path, legacy_snapshot_path.as_deref());
+            if load_path != path {
+                let loaded = load_legacy_session_snapshot(load_path, session_id_str);
+                loaded_from_legacy = loaded.is_some();
+                loaded
+            } else {
+                load_session_snapshot(load_path, session_id_str)?
+            }
         }
         None => None,
     };
@@ -618,12 +627,17 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             greentic_runner_host::runner::engine::FlowStatus::Completed => {
                 // Flow ran to a real terminator — discard any stale resume
                 // snapshot so the next activity starts fresh at the entry.
-                for path in [
-                    session_snapshot_path.as_deref(),
-                    legacy_snapshot_path.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
+                // The legacy path is only ours when this session actually
+                // resumed from it; otherwise it may be another session's
+                // live snapshot (`a/b` legacy-maps onto `a_b`).
+                let legacy_to_remove = if loaded_from_legacy {
+                    legacy_snapshot_path.as_deref()
+                } else {
+                    None
+                };
+                for path in [session_snapshot_path.as_deref(), legacy_to_remove]
+                    .into_iter()
+                    .flatten()
                 {
                     let _ = std::fs::remove_file(path);
                 }
@@ -635,7 +649,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                     .clone()
                     .unwrap_or_else(|| "flow paused unexpectedly".to_string());
                 if let Some(path) = session_snapshot_path.as_deref() {
-                    if let Err(err) = save_session_snapshot(path, &wait.snapshot) {
+                    if let Err(err) = save_session_snapshot(path, session_id_str, &wait.snapshot) {
                         // Persisting the snapshot is best-effort — losing
                         // it just means the next activity restarts at the
                         // entry, which is the pre-fix behaviour. Surface
@@ -740,15 +754,63 @@ fn legacy_session_snapshot_file(
             }
         })
         .collect();
+    // An id made only of safe characters has a legacy name equal to its
+    // current name; there is nothing to fall back to, and the "legacy" file
+    // would really be the current one.
+    if safe_id == session_id {
+        return None;
+    }
     Some(dir.join(format!("{safe_id}.snapshot.json")))
 }
 
-/// Load a persisted `FlowSnapshot` from disk if one exists. A missing file
-/// means "no parked run" (`Ok(None)`); an unreadable or corrupt file is an
-/// error, since silently restarting at the flow entry would drop the user's
-/// parked state.
+/// On-disk wrapper that records which session a snapshot belongs to, so a
+/// file reached through a lossy name (hash-truncated, or the legacy `_`
+/// mapping) is never resumed by a different session.
+#[derive(serde::Deserialize)]
+struct SnapshotFile {
+    session_id: String,
+    snapshot: greentic_runner_host::runner::engine::FlowSnapshot,
+}
+
+#[derive(serde::Serialize)]
+struct SnapshotFileRef<'a> {
+    session_id: &'a str,
+    snapshot: &'a greentic_runner_host::runner::engine::FlowSnapshot,
+}
+
+/// Parse snapshot bytes. Returns the snapshot plus the recorded session id
+/// (`None` for a bare snapshot written before ids were recorded).
+fn parse_snapshot_bytes(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(
+    greentic_runner_host::runner::engine::FlowSnapshot,
+    Option<String>,
+)> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .with_context(|| format!("corrupt session snapshot {}", path.display()))?;
+    let wrapped = value
+        .as_object()
+        .is_some_and(|o| o.contains_key("session_id") && o.contains_key("snapshot"));
+    if wrapped {
+        let file: SnapshotFile = serde_json::from_value(value)
+            .with_context(|| format!("corrupt session snapshot {}", path.display()))?;
+        Ok((file.snapshot, Some(file.session_id)))
+    } else {
+        let snapshot = serde_json::from_value(value)
+            .with_context(|| format!("corrupt session snapshot {}", path.display()))?;
+        Ok((snapshot, None))
+    }
+}
+
+/// Load a persisted `FlowSnapshot` from its current-scheme path. A missing
+/// file means "no parked run" (`Ok(None)`); an unreadable or corrupt file is
+/// an error, since silently restarting at the flow entry would drop the
+/// user's parked state. A snapshot that records a different session id is
+/// refused (error), never resumed.
 fn load_session_snapshot(
     path: &Path,
+    session_id: &str,
 ) -> Result<Option<greentic_runner_host::runner::engine::FlowSnapshot>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -757,24 +819,62 @@ fn load_session_snapshot(
             return Err(err).with_context(|| format!("read session snapshot {}", path.display()));
         }
     };
-    let snapshot = serde_json::from_slice(&bytes)
-        .with_context(|| format!("corrupt session snapshot {}", path.display()))?;
+    let (snapshot, recorded) = parse_snapshot_bytes(&bytes, path)?;
+    if let Some(recorded) = recorded
+        && recorded != session_id
+    {
+        anyhow::bail!(
+            "session snapshot {} belongs to a different session; refusing to load it",
+            path.display()
+        );
+    }
     Ok(Some(snapshot))
 }
 
-/// Persist a `FlowSnapshot` to disk for later resume. Errors propagate to
-/// the caller so the run can surface "we paused but lost the snapshot" as
-/// a hard error rather than silently looping back to the flow entry.
+/// Load a snapshot from the LEGACY lossy name. That name is shared with other
+/// sessions (`a/b` and `a_b` both map to `a_b`), so anything we cannot prove
+/// is ours (unreadable, corrupt, or recording another session id) is treated
+/// as "not ours" rather than aborting or resuming it. A bare snapshot with no
+/// recorded id predates id recording and is accepted: the caller only reaches
+/// here for ids containing unsafe characters.
+fn load_legacy_session_snapshot(
+    path: &Path,
+    session_id: &str,
+) -> Option<greentic_runner_host::runner::engine::FlowSnapshot> {
+    let bytes = fs::read(path).ok()?;
+    match parse_snapshot_bytes(&bytes, path) {
+        Ok((snapshot, None)) => Some(snapshot),
+        Ok((snapshot, Some(recorded))) if recorded == session_id => Some(snapshot),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "ignoring unreadable legacy session snapshot"
+            );
+            None
+        }
+    }
+}
+
+/// Persist a `FlowSnapshot` to disk for later resume, recording the owning
+/// session id. Errors propagate to the caller so the run can surface "we
+/// paused but lost the snapshot" as a hard error rather than silently
+/// looping back to the flow entry.
 fn save_session_snapshot(
     path: &Path,
+    session_id: &str,
     snapshot: &greentic_runner_host::runner::engine::FlowSnapshot,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create session snapshot dir {}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec_pretty(snapshot)
-        .with_context(|| "serialize session snapshot for persistence")?;
+    let bytes = serde_json::to_vec_pretty(&SnapshotFileRef {
+        session_id,
+        snapshot,
+    })
+    .with_context(|| "serialize session snapshot for persistence")?;
     fs::write(path, bytes).with_context(|| format!("write session snapshot {}", path.display()))?;
     Ok(())
 }
@@ -2023,8 +2123,8 @@ mod tests {
         let original: greentic_runner_host::runner::engine::FlowSnapshot =
             serde_json::from_value(snapshot_json.clone()).expect("deserialize seed snapshot");
 
-        save_session_snapshot(&snapshot_path, &original).expect("save snapshot");
-        let reloaded = load_session_snapshot(&snapshot_path)
+        save_session_snapshot(&snapshot_path, "session-1", &original).expect("save snapshot");
+        let reloaded = load_session_snapshot(&snapshot_path, "session-1")
             .expect("load snapshot")
             .expect("snapshot present");
 
@@ -2100,18 +2200,73 @@ mod tests {
         assert_eq!(snapshot_load_path(&current, Some(&legacy)), current);
     }
 
+    fn seed_snapshot() -> greentic_runner_host::runner::engine::FlowSnapshot {
+        serde_json::from_value(json!({
+            "pack_id": "pack.demo",
+            "flow_id": "flow.welcome",
+            "next_node": "card-confirm",
+            "state": {
+                "entry": {}, "input": {}, "nodes": {}, "egress": [], "redirect_count": 0
+            }
+        }))
+        .expect("seed snapshot")
+    }
+
+    #[test]
+    fn safe_id_has_no_legacy_fallback() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert!(legacy_session_snapshot_file(Some(tmp.path()), "a_b").is_none());
+        assert!(legacy_session_snapshot_file(Some(tmp.path()), "a/b").is_some());
+    }
+
+    #[test]
+    fn lookalike_sessions_do_not_cross_read() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let safe = session_snapshot_file(Some(tmp.path()), "a_b").expect("path");
+        let legacy_of_slash = legacy_session_snapshot_file(Some(tmp.path()), "a/b").expect("path");
+        assert_eq!(safe, legacy_of_slash, "the collision this guards against");
+
+        // a_b parks; its file records its own id.
+        save_session_snapshot(&safe, "a_b", &seed_snapshot()).expect("save");
+        // a/b must not resume it, via legacy or direct load.
+        assert!(load_legacy_session_snapshot(&legacy_of_slash, "a/b").is_none());
+        assert!(load_session_snapshot(&legacy_of_slash, "a/b").is_err());
+        // a_b still resumes its own.
+        assert!(load_session_snapshot(&safe, "a_b").expect("load").is_some());
+        // The file was never touched (no cross-delete: removal is gated on
+        // having actually loaded from the legacy path, which returned None).
+        assert!(safe.exists());
+    }
+
+    #[test]
+    fn corrupt_neighbour_does_not_abort_legacy_load() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("a_b.snapshot.json");
+        std::fs::write(&path, b"not json").expect("write");
+        assert!(load_legacy_session_snapshot(&path, "a/b").is_none());
+    }
+
+    #[test]
+    fn bare_legacy_snapshot_still_resumes_for_unsafe_id() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("a_b.snapshot.json");
+        let bytes = serde_json::to_vec(&seed_snapshot()).expect("ser");
+        std::fs::write(&path, bytes).expect("write");
+        assert!(load_legacy_session_snapshot(&path, "a/b").is_some());
+    }
+
     #[test]
     fn corrupt_session_snapshot_is_an_error_and_missing_is_none() {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let missing = tmp.path().join("missing.snapshot.json");
         assert!(
-            load_session_snapshot(&missing)
+            load_session_snapshot(&missing, "x")
                 .expect("missing ok")
                 .is_none()
         );
         let corrupt = tmp.path().join("corrupt.snapshot.json");
         std::fs::write(&corrupt, b"{not json").expect("write corrupt");
-        let err = load_session_snapshot(&corrupt).expect_err("corrupt must error");
+        let err = load_session_snapshot(&corrupt, "x").expect_err("corrupt must error");
         assert!(
             err.to_string().contains("corrupt session snapshot"),
             "{err}"
