@@ -234,6 +234,17 @@ fn legacy_state_key(key: &SessionKey) -> Option<StoreStateKey> {
     if key.session_hint.as_deref() == Some("-") {
         return None;
     }
+    // Only a raw `/` makes the legacy key distinguishable: it then has more
+    // than five slashes, so it can never equal any escaped (current) key. A
+    // `%`-only id's legacy key can equal ANOTHER session's current key
+    // (`a/b` escapes to `a%2Fb`, which is the raw hint `a%2Fb`'s legacy key),
+    // so falling back to it would read, migrate and delete that session's state.
+    let has_slash = key.pack_id.contains('/')
+        || key.flow_id.contains('/')
+        || key.session_hint.as_deref().is_some_and(|h| h.contains('/'));
+    if !has_slash {
+        return None;
+    }
     let hint = key.session_hint.as_deref().unwrap_or("-");
     let legacy = StoreStateKey::from(format!(
         "pack/{}/flow/{}/session/{hint}",
@@ -486,6 +497,23 @@ mod tests {
                 .expect("current"),
             Some(value)
         );
+    }
+
+    #[tokio::test]
+    async fn percent_only_ids_never_touch_another_sessions_current_key() {
+        let store = Arc::new(InMemoryStateStore::new());
+        let host = StateStoreHost::new(store.clone());
+        let mut a = sample_key();
+        a.session_hint = Some("a/b".into());
+        let mut b = sample_key();
+        b.session_hint = Some("a%2Fb".into());
+        assert!(legacy_state_key(&b).is_none());
+        let value = serde_json::json!({"owner": "a"});
+        host.set_json(&a, value.clone()).await.expect("set a");
+
+        assert_eq!(host.get_json(&b).await.expect("get b"), None);
+        host.del(&b).await.expect("del b");
+        assert_eq!(host.get_json(&a).await.expect("get a"), Some(value));
     }
 
     #[test]
