@@ -1,8 +1,8 @@
 {
-  "acme": {
+  "dev.local.hello2-pack": {
     "main_pack": {
-      "locator": "fs:///home/bima-pangestu/projects/Works/greentic/greentic-runner/.claude/worktrees/agent-a4e8d4dd17bc72549/examples/packs/demo.gtpack",
-      "name": "runner.components",
+      "locator": "fs:///projects/ai/greentic-ng/tests/hello2-pack/dist/hello2.gtpack",
+      "name": "dev.local.hello2-pack",
       "version": "0.1.0"
     },
     "overlays": []
