@@ -121,6 +121,17 @@ impl SessionLockInner for KvSessionLock {
                 .compare_refresh(&self.key, self.token.as_bytes(), LOCK_TTL)
                 .await?;
             if ok {
+                return Ok(());
+            }
+            // The key is absent (TTL lapsed during a long LLM call) or held by
+            // another owner. Absent and unclaimed: take it back, nobody else
+            // ran in the gap. `set_nx` failing means another owner holds it.
+            if self
+                .kv
+                .set_nx(&self.key, self.token.clone().into_bytes(), LOCK_TTL)
+                .await?
+            {
+                tracing::warn!("session lock had lapsed unclaimed; re-acquired");
                 Ok(())
             } else {
                 Err(StateError::LockLost)
@@ -187,6 +198,40 @@ mod tests {
             .unwrap();
         let err = s.acquire_lock(&t, "sess", Duration::from_millis(20)).await;
         assert!(matches!(err, Err(StateError::LockTimeout(_))));
+    }
+
+    #[tokio::test]
+    async fn refresh_reacquires_a_lapsed_unclaimed_lock() {
+        let kv: Arc<dyn AwKv> = Arc::new(MemoryKv::new());
+        let s = KvAgentStateStore::new(kv.clone());
+        let t = TenantContext::new("acme", "prod");
+        let held = s
+            .acquire_lock(&t, "sess", Duration::from_millis(10))
+            .await
+            .unwrap();
+        // Simulate the TTL lapsing.
+        kv.del(&lock_key(&t, "sess")).await.unwrap();
+        held.refresh().await.unwrap();
+        // The lock is ours again: a second taker must time out.
+        let err = s.acquire_lock(&t, "sess", Duration::from_millis(20)).await;
+        assert!(matches!(err, Err(StateError::LockTimeout(_))));
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_lock_lost_when_another_owner_holds_it() {
+        let kv: Arc<dyn AwKv> = Arc::new(MemoryKv::new());
+        let s = KvAgentStateStore::new(kv.clone());
+        let t = TenantContext::new("acme", "prod");
+        let held = s
+            .acquire_lock(&t, "sess", Duration::from_millis(10))
+            .await
+            .unwrap();
+        kv.del(&lock_key(&t, "sess")).await.unwrap();
+        let _other = s
+            .acquire_lock(&t, "sess", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(matches!(held.refresh().await, Err(StateError::LockLost)));
     }
 
     #[tokio::test]

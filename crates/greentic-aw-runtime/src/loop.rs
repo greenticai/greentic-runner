@@ -728,7 +728,18 @@ async fn run_step_scoped(
                 retrying.complete(request).await
             }
         };
-        let llm_result = match tokio::time::timeout(remaining, llm_call).await {
+        // The call can outlast the 90 s lock TTL (retries, long streams), so
+        // the lock is kept alive while it is pending.
+        let llm_result = match tokio::time::timeout(
+            remaining,
+            crate::lock_keepalive::keep_alive(
+                &lock,
+                crate::lock_keepalive::LOCK_KEEPALIVE_INTERVAL,
+                llm_call,
+            ),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => {
                 warn!(agent_id = %agent_id, "llm call exceeded the step timeout");

@@ -239,3 +239,48 @@ async fn an_oversized_history_is_truncated_before_the_llm_call() {
         Some(ChatMessage::User { .. })
     ));
 }
+
+/// An LLM that takes `SLOW_LLM` and records how many lock refreshes happened
+/// while the call was pending.
+struct SlowLlm {
+    store: Arc<MockAgentStateStore>,
+    refreshes_while_pending: std::sync::Mutex<Vec<usize>>,
+}
+
+const SLOW_LLM: Duration = Duration::from_secs(100);
+
+impl LlmBackend for SlowLlm {
+    fn complete<'a>(
+        &'a self,
+        _r: LlmRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            let before = self.store.lock_refreshes();
+            tokio::time::sleep(SLOW_LLM).await;
+            let after = self.store.lock_refreshes();
+            self.refreshes_while_pending
+                .lock()
+                .unwrap()
+                .push(after - before);
+            reply("slow answer")
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_lock_is_kept_alive_while_a_slow_llm_call_is_pending() {
+    let store = Arc::new(MockAgentStateStore::new());
+    let llm = Arc::new(SlowLlm {
+        store: store.clone(),
+        refreshes_while_pending: std::sync::Mutex::new(Vec::new()),
+    });
+    let limits = AgentLimits {
+        timeout: Duration::from_secs(600),
+        ..AgentLimits::default()
+    };
+    let (rt, tc, _telemetry) = runtime(llm.clone(), store, limits);
+    let out = rt.step(tc, "s", "a", hi()).await.unwrap();
+    assert_eq!(out.reply, "slow answer");
+    // 100 s call, 30 s interval: refreshes at 30, 60 and 90 s.
+    assert_eq!(*llm.refreshes_while_pending.lock().unwrap(), vec![3]);
+}

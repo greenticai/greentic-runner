@@ -23,10 +23,16 @@ const STATE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 const LOCK_TTL_SECS: i64 = 90;
 const LOCK_POLL_MS: u64 = 50;
 
-/// Lua: refresh the lock TTL only if we still own it (value matches).
+/// Lua: refresh the lock TTL if we still own it (value matches). If the key
+/// has lapsed and nobody took it, re-acquire it; if another owner holds it,
+/// return 0 (lock lost).
 const REFRESH_LUA: &str = r#"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
+local cur = redis.call('GET', KEYS[1])
+if cur == ARGV[1] then
   return redis.call('EXPIRE', KEYS[1], ARGV[2])
+elseif not cur then
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+  return 1
 else
   return 0
 end
