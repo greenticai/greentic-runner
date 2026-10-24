@@ -891,14 +891,22 @@ mod caller_stamp_tests {
 }
 
 /// Idempotency ledger entry stored under
-/// `aw:{tenant}:{env}:{session}:tool_calls:{call_id}` (TTL 7 days).
+/// `aw:{tenant}:{env}:{session_len}.{session}:tool_calls:{call_len}.{call_id}`
+/// (TTL 7 days). The session and call ids are length-prefixed because either
+/// may contain `:`, which made plain concatenation ambiguous (two different
+/// `(session, call)` pairs could build the same key).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ToolLedgerEntry {
     pub result: serde_json::Value,
 }
 
 pub fn ledger_key(tenant: &TenantContext, session_id: &str, call_id: &str) -> String {
-    format!("{}:{session_id}:tool_calls:{call_id}", tenant.key_prefix())
+    format!(
+        "{}:{}.{session_id}:tool_calls:{}.{call_id}",
+        tenant.key_prefix(),
+        session_id.len(),
+        call_id.len()
+    )
 }
 
 /// Give every call in a batch a non-empty id that is unique within the batch.
@@ -1213,7 +1221,17 @@ mod tests {
     fn ledger_key_includes_tenant_env_session_callid() {
         let tc = TenantContext::new("acme", "prod");
         let key = ledger_key(&tc, "sess-1", "call-abc");
-        assert_eq!(key, "aw:acme:prod:sess-1:tool_calls:call-abc");
+        assert_eq!(key, "aw:acme:prod:6.sess-1:tool_calls:8.call-abc");
+    }
+
+    #[test]
+    fn ledger_key_is_unambiguous_with_colons_in_ids() {
+        let tc = TenantContext::new("acme", "prod");
+        // Plain concatenation made these two collide.
+        let a = ledger_key(&tc, "s:tool_calls:x", "y");
+        let b = ledger_key(&tc, "s", "x:y");
+        assert_ne!(a, b);
+        assert_ne!(ledger_key(&tc, "a:b", "c"), ledger_key(&tc, "a", "b:c"));
     }
 
     #[test]

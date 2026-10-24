@@ -232,6 +232,14 @@ impl LlmBackend for SharedLlm {
 /// The runtime's shared backend wrapped with the retry policy an agent's
 /// [`crate::config::AgentLimits`] declares (`llm_retry_attempts` /
 /// `llm_retry_backoff`).
+///
+/// **Precedence:** when the shared backend already retries
+/// ([`LlmBackend::is_retrying`], true for every backend the host wraps in
+/// production), the per-agent `llm_retry_attempts` / `llm_retry_backoff` are
+/// NOT applied: the backend's own policy is the only one in effect, so the
+/// attempts are never multiplied. The agent limits take effect only for a bare
+/// backend (tests, embedders that do not wrap). Changing an agent's retry
+/// limits therefore has no effect behind a host-wrapped backend.
 pub(crate) fn retrying_for(
     llm: &Arc<dyn LlmBackend>,
     limits: &crate::config::AgentLimits,
@@ -327,6 +335,27 @@ mod tests {
         assert!(!bare.is_retrying());
         assert!(r.complete(req()).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn host_retry_policy_wins_over_the_agent_limits() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // Host policy: 2 attempts. Agent limits ask for 5; they are ignored.
+        let host_wrapped: Arc<dyn LlmBackend> = Arc::new(RetryingLlmBackend::new(
+            CountingFail {
+                calls: calls.clone(),
+            },
+            2,
+            Duration::from_millis(1),
+        ));
+        let limits = crate::config::AgentLimits {
+            llm_retry_attempts: 5,
+            llm_retry_backoff: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let r = retrying_for(&host_wrapped, &limits);
+        assert!(r.complete(req()).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     impl LlmBackend for ScriptedBackend {
