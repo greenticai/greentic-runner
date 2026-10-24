@@ -592,6 +592,30 @@ fn trace_flags_only_override_env_when_given() {
 }
 
 #[test]
+fn trace_out_alone_enables_tracing_but_explicit_off_wins() {
+    let base = TraceConfig {
+        mode: TraceMode::Off,
+        out_path: PathBuf::from("trace.json"),
+        buffer_size: 8,
+        capture_inputs: false,
+    };
+    let enabled = build_trace_config(base.clone(), None, Some(PathBuf::from("foo.json")), None);
+    assert_eq!(enabled.mode, TraceMode::On);
+    assert_eq!(enabled.out_path, PathBuf::from("foo.json"));
+
+    let off = build_trace_config(
+        base.clone(),
+        Some(TraceArg::Off),
+        Some(PathBuf::from("foo.json")),
+        None,
+    );
+    assert_eq!(off.mode, TraceMode::Off);
+
+    let neither = build_trace_config(base, None, None, None);
+    assert_eq!(neither.mode, TraceMode::Off);
+}
+
+#[test]
 fn component_digest_is_verified_before_caching() {
     let bytes = b"component-bytes";
     let good = sha256_prefixed(bytes);
@@ -601,4 +625,16 @@ fn component_digest_is_verified_before_caching() {
     let err = verify_component_digest("c", &good, b"tampered").expect_err("mismatch");
     assert!(err.to_string().contains("digest mismatch"), "got: {err}");
     assert!(verify_component_digest("c", "md5:abc", bytes).is_err());
+}
+
+#[test]
+fn non_authoritative_lock_digest_mismatch_is_skipped_not_fatal() {
+    let bytes = b"component-bytes";
+    // An OCI manifest digest does not hash the wasm bytes.
+    let manifest_digest = sha256_prefixed(b"some oci manifest json");
+    assert!(check_lock_digest("c", &manifest_digest, bytes, false).is_ok());
+    assert!(check_lock_digest("c", "md5:abc", bytes, false).is_ok());
+    // wasm_sha256 is authoritative: a mismatch still rejects.
+    assert!(check_lock_digest("c", &manifest_digest, bytes, true).is_err());
+    assert!(check_lock_digest("c", &sha256_prefixed(bytes), bytes, true).is_ok());
 }

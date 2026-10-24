@@ -350,6 +350,9 @@ fn build_trace_config(
         Some(TraceArg::Off) => TraceMode::Off,
         Some(TraceArg::On) => TraceMode::On,
         Some(TraceArg::Always) => TraceMode::Always,
+        // `--trace-out` alone is an explicit request for a trace file; without
+        // this the path would be stored while the mode stayed Off, silently.
+        None if out_path.is_some() && base.mode == TraceMode::Off => TraceMode::On,
         None => base.mode,
     };
     let capture = match capture_inputs {
@@ -495,6 +498,11 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
 
     for entry in lock.components {
         let source_ref = entry.source_ref()?;
+        // `wasm_sha256` is, by definition, the hash of the wasm bytes. The
+        // `resolved_digest` / `digest` fallbacks are what the OCI distributor
+        // recorded, which is the OCI *manifest* digest when the registry
+        // returned one, so it is not necessarily a hash of the bytes.
+        let authoritative = entry.wasm_digest().is_some();
         let wasm_digest = entry
             .wasm_digest()
             .or_else(|| entry.resolved_digest.clone())
@@ -503,7 +511,7 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
         let wasm_digest = normalize_digest(&wasm_digest);
         let key = ArtifactKey::new(cache.engine_profile_id().to_string(), wasm_digest.clone());
         let bytes = resolve_component_bytes(&root, &entry, source_ref, &dist_client).await?;
-        verify_component_digest(&entry.name, &wasm_digest, &bytes)?;
+        check_lock_digest(&entry.name, &wasm_digest, &bytes, authoritative)?;
         let _ = cache
             .get_component(&engine, &key, || Ok(bytes))
             .await
@@ -660,6 +668,26 @@ fn verify_component_digest(name: &str, digest: &str, bytes: &[u8]) -> Result<()>
         );
     }
     Ok(())
+}
+
+/// Verify `bytes` against a pack.lock digest. A mismatch is fatal only when the
+/// digest is an authoritative hash of the wasm (`wasm_sha256`). A
+/// `resolved_digest` may be an OCI manifest digest, which can never equal the
+/// hash of the component bytes, so there a mismatch (or an unknown scheme) is
+/// logged and skipped rather than rejecting a valid component.
+fn check_lock_digest(name: &str, digest: &str, bytes: &[u8], authoritative: bool) -> Result<()> {
+    match verify_component_digest(name, digest, bytes) {
+        Ok(()) => Ok(()),
+        Err(err) if authoritative => Err(err),
+        Err(err) => {
+            tracing::warn!(
+                component = %name,
+                digest = %digest,
+                "skipping digest verification: lock digest is not verifiable against the component bytes ({err})"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn normalize_digest(digest: &str) -> String {

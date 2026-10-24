@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use runner_core::normalize_under_root;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, File};
@@ -580,8 +581,16 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         opts.session_state_dir.as_deref(),
         resolved_profile.session_id.as_str(),
     );
+    let legacy_snapshot_path = legacy_session_snapshot_file(
+        opts.session_state_dir.as_deref(),
+        resolved_profile.session_id.as_str(),
+    );
     let resume_snapshot = match session_snapshot_path.as_deref() {
-        Some(path) => load_session_snapshot(path)?,
+        Some(path) => {
+            // Snapshots saved before the escaping scheme changed live under
+            // the legacy name; fall back to it so those parks still resume.
+            load_session_snapshot(snapshot_load_path(path, legacy_snapshot_path.as_deref()))?
+        }
         None => None,
     };
 
@@ -609,7 +618,13 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             greentic_runner_host::runner::engine::FlowStatus::Completed => {
                 // Flow ran to a real terminator — discard any stale resume
                 // snapshot so the next activity starts fresh at the entry.
-                if let Some(path) = session_snapshot_path.as_deref() {
+                for path in [
+                    session_snapshot_path.as_deref(),
+                    legacy_snapshot_path.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     let _ = std::fs::remove_file(path);
                 }
                 RunCompletion::Ok
@@ -679,6 +694,52 @@ fn session_snapshot_file(session_state_dir: Option<&Path>, session_id: &str) -> 
             safe_id.push_str(&format!("%{byte:02x}"));
         }
     }
+    // Escaping can triple the length (non-ASCII bytes become `%xx`), and most
+    // filesystems cap a name at 255 bytes. Keep a readable prefix and append a
+    // digest of the FULL id so long ids stay distinct. `~` never appears in an
+    // escaped id, so a hashed name cannot collide with an unhashed one.
+    if safe_id.len() > MAX_SNAPSHOT_STEM_LEN {
+        let digest = Sha256::digest(session_id.as_bytes());
+        let hash: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        // `safe_id` is ASCII by construction, so byte slicing is char-safe.
+        safe_id = format!("{}~{hash}", &safe_id[..MAX_SNAPSHOT_STEM_LEN - 33]);
+    }
+    Some(dir.join(format!("{safe_id}.snapshot.json")))
+}
+
+/// Prefer the current snapshot name; use the legacy one only when it is the
+/// only file present.
+fn snapshot_load_path<'a>(current: &'a Path, legacy: Option<&'a Path>) -> &'a Path {
+    match legacy {
+        Some(legacy) if !current.exists() && legacy.exists() => legacy,
+        _ => current,
+    }
+}
+
+/// Longest snapshot file stem. Leaves room for `.snapshot.json` (14 bytes)
+/// under the common 255-byte filename limit.
+const MAX_SNAPSHOT_STEM_LEN: usize = 200;
+
+/// The snapshot path used before `%xx` escaping (every byte outside the safe
+/// set became `_`). Only ever read, so parks saved by an older build resume.
+fn legacy_session_snapshot_file(
+    session_state_dir: Option<&Path>,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let dir = session_state_dir?;
+    if session_id.is_empty() {
+        return None;
+    }
+    let safe_id: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     Some(dir.join(format!("{safe_id}.snapshot.json")))
 }
 
@@ -1998,6 +2059,45 @@ mod tests {
         let escaped = session_snapshot_file(Some(tmp.path()), "a%2fb").expect("path");
         assert_ne!(slash, underscore);
         assert_ne!(slash, escaped);
+    }
+
+    #[test]
+    fn long_and_non_ascii_session_ids_stay_within_filename_limit_and_distinct() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let long_a = format!("{}a", "é".repeat(300));
+        let long_b = format!("{}b", "é".repeat(300));
+        let a = session_snapshot_file(Some(tmp.path()), &long_a).expect("path");
+        let b = session_snapshot_file(Some(tmp.path()), &long_b).expect("path");
+        assert_ne!(a, b);
+        for path in [&a, &b] {
+            let name = path.file_name().and_then(|n| n.to_str()).expect("name");
+            assert!(name.len() <= 255, "{} bytes", name.len());
+            // The OS must actually accept it.
+            std::fs::write(path, b"{}").expect("write long-named snapshot");
+        }
+        assert_eq!(
+            a,
+            session_snapshot_file(Some(tmp.path()), &long_a).expect("path"),
+            "hashed name must be deterministic"
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_name_matches_pre_escaping_scheme() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let legacy = legacy_session_snapshot_file(Some(tmp.path()), "a/b:c d").expect("path");
+        assert_eq!(
+            legacy.file_name().and_then(|n| n.to_str()),
+            Some("a_b:c_d.snapshot.json")
+        );
+        assert!(legacy_session_snapshot_file(None, "x").is_none());
+
+        let current = session_snapshot_file(Some(tmp.path()), "a/b:c d").expect("path");
+        assert_eq!(snapshot_load_path(&current, Some(&legacy)), current);
+        std::fs::write(&legacy, b"{}").expect("write legacy");
+        assert_eq!(snapshot_load_path(&current, Some(&legacy)), legacy);
+        std::fs::write(&current, b"{}").expect("write current");
+        assert_eq!(snapshot_load_path(&current, Some(&legacy)), current);
     }
 
     #[test]
