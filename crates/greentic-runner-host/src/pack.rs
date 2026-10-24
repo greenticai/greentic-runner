@@ -2583,7 +2583,9 @@ impl PackRuntime {
                 component_manifests.insert(component.id.as_str().to_string(), component.clone());
             }
         }
-        let mut pack_policy = (*wasi_policy).clone();
+        let mut pack_policy = wasi_policy
+            .for_tenant(&config.tenant, &config.env_passthrough)
+            .with_context(|| format!("failed to build WASI policy for tenant {}", config.tenant))?;
         if let Some(dir) = pack_assets_dir {
             tracing::debug!(path = %dir.display(), "preopening pack assets directory for WASI /assets");
             pack_policy =

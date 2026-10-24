@@ -6,7 +6,7 @@
 //! `greentic-runner` CLI. Downstream crates embed it either through
 //! [`RunnerConfig`] + [`run`] (HTTP host) or [`HostBuilder`] (direct API access).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -219,14 +219,10 @@ impl RunnerConfig {
         let routing = RoutingConfig::from_env_with_default(default_tenant);
         let paths = &resolved_config.config.paths;
         ensure_paths_exist(paths)?;
-        let mut wasi_policy = default_wasi_policy(paths);
-        let mut env_allow = HashSet::new();
-        for binding in tenant_bindings.values() {
-            env_allow.extend(binding.env_passthrough.iter().cloned());
-        }
-        for key in env_allow {
-            wasi_policy = wasi_policy.allow_env(key);
-        }
+        // The env allowlist is intentionally NOT the union of every tenant's
+        // `env_passthrough`: `PackRuntime::load` adds only the owning tenant's
+        // keys via `RunnerWasiPolicy::for_tenant`.
+        let wasi_policy = default_wasi_policy(paths);
 
         let config_admin_token = resolved_config.config.services.as_ref().and_then(|s| {
             s.events
