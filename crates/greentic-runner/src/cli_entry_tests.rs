@@ -384,7 +384,7 @@ async fn warmup_rejects_unsupported_digest_algorithm() {
     .await
     .expect_err("unsupported algorithm");
     assert!(
-        err.to_string().contains("unsupported digest algorithm"),
+        format!("{err:#}").contains("unsupported digest algorithm"),
         "got: {err:#}"
     );
 }
