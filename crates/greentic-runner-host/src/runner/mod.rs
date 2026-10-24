@@ -182,6 +182,14 @@ impl HostServer {
 
     pub async fn serve(self) -> Result<()> {
         tracing::info!(addr = %self.addr, "starting host server");
+        if !self._state.admin.operator_protected() {
+            tracing::warn!(
+                addr = %self.addr,
+                "POST /operator/op/invoke is UNAUTHENTICATED and bound to {}: set OPERATOR_TOKEN \
+                 (or ADMIN_TOKEN) to require a bearer token",
+                self.addr
+            );
+        }
         let listener = TcpListener::bind(self.addr).await?;
         serve(
             listener,
@@ -199,8 +207,16 @@ impl HostServer {
 /// router — route registration included — without binding a socket. Mirrors the
 /// `sql::routes::router` precedent.
 pub(crate) fn router(state: ServerState) -> Router {
-    let router = Router::new()
+    // `/operator/op/invoke` is guarded by the operator/admin bearer token when
+    // one is configured; with none it stays open (see `warn_if_operator_open`).
+    let operator_routes = Router::new()
         .route("/operator/op/invoke", post(operator::invoke))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::http::auth::require_operator,
+        ));
+    let router = Router::new()
+        .merge(operator_routes)
         .route("/healthz", get(http::health::handler))
         .route("/admin/packs/status", get(admin::status))
         .route("/admin/packs/reload", post(admin::reload))
@@ -313,6 +329,53 @@ mod router_tests {
     /// `AdminGuard` 500s without `ConnectInfo`; `oneshot` does not supply it.
     fn loopback() -> ConnectInfo<SocketAddr> {
         ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap())
+    }
+
+    async fn operator_status(
+        admin: crate::http::auth::AdminAuth,
+        bearer: Option<&str>,
+    ) -> StatusCode {
+        let mut state = ServerState::for_test();
+        state.admin = admin;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/operator/op/invoke")
+            .extension(loopback());
+        if let Some(b) = bearer {
+            req = req.header("authorization", format!("Bearer {b}"));
+        }
+        router(state)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn operator_invoke_requires_token_when_configured() {
+        let admin =
+            crate::http::auth::AdminAuth::default().with_operator_token(Some("op-secret".into()));
+        assert_eq!(
+            operator_status(admin.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            operator_status(admin.clone(), Some("wrong")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Right token passes the layer; the handler then answers (not 401).
+        assert_ne!(
+            operator_status(admin, Some("op-secret")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_invoke_open_without_token() {
+        assert_ne!(
+            operator_status(crate::http::auth::AdminAuth::default(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

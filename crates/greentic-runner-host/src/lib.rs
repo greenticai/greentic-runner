@@ -217,6 +217,7 @@ impl RunnerConfig {
             .map(|dev| dev.default_tenant.clone())
             .unwrap_or_else(|| crate::routing::DEFAULT_TENANT.into());
         let routing = RoutingConfig::from_env_with_default(default_tenant);
+        routing.startup_check()?;
         let paths = &resolved_config.config.paths;
         ensure_paths_exist(paths)?;
         let mut wasi_policy = default_wasi_policy(paths);
