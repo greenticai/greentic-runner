@@ -23,7 +23,9 @@ pub(crate) fn tenant_dir_segment(tenant: &str) -> Result<&str> {
     if ok {
         Ok(tenant)
     } else {
-        Err(anyhow!("tenant id {tenant:?} is not safe to use as a directory name"))
+        Err(anyhow!(
+            "tenant id {tenant:?} is not safe to use as a directory name"
+        ))
     }
 }
 

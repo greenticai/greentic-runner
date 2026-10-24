@@ -62,6 +62,7 @@ pub mod trace;
 pub mod validate;
 pub mod verify;
 pub mod wasi;
+mod wasm_limits;
 pub mod watcher;
 
 mod activity;
