@@ -1759,19 +1759,14 @@ impl FlowEngine {
                                     // fresh-dispatch branch below), but this also
                                     // handles a `{ok:false}` envelope from any other
                                     // source (e.g. a flow-authored deadline) the same way.
-                                    let message = state
-                                        .entry
-                                        .get("error")
-                                        .and_then(|e| e.get("message"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("the agent could not respond");
+                                    let (message, payload) =
+                                        agent_error_envelope_reply(&state.entry);
                                     tracing::warn!(
                                         agent_id = %agent_id,
                                         error = %message,
                                         "conversational dw.agent (nats) response was an error/timeout envelope; surfacing and re-parking without bumping the park-loop cap"
                                     );
-                                    let output =
-                                        NodeOutput::new(serde_json::json!({ "reply": message }));
+                                    let output = NodeOutput::new(payload);
                                     Ok(DispatchOutcome::with_control(
                                         output,
                                         NodeControl::LoopHere {
@@ -4829,6 +4824,42 @@ fn component_error(value: &Value) -> Option<(String, String)> {
         .and_then(Value::as_str)
         .unwrap_or("component reported error");
     Some((code.to_string(), message.to_string()))
+}
+
+/// Reply and node payload for an `{ok:false}` agent response envelope.
+///
+/// The agentic bridge reports a turn that ended without a final reply
+/// (timeout, max iterations) as `ok:false` with `error.message` set to a
+/// machine string while keeping the partial reply in `output.reply`. A
+/// non-empty `output.reply` is what the user should see; the error (and the
+/// trail, when present) stay on the payload for operators and routing. Without
+/// one, the error message is the reply, as before.
+#[cfg(feature = "agentic-worker")]
+fn agent_error_envelope_reply(entry: &Value) -> (String, Value) {
+    let error = entry.get("error").filter(|e| !e.is_null());
+    let output = entry.get("output");
+    let partial = output
+        .and_then(|o| o.get("reply"))
+        .and_then(Value::as_str)
+        .filter(|reply| !reply.trim().is_empty());
+    let message = partial.map(str::to_string).unwrap_or_else(|| {
+        error
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("the agent could not respond")
+            .to_string()
+    });
+    let mut payload = serde_json::Map::new();
+    payload.insert("reply".to_string(), Value::String(message.clone()));
+    if partial.is_some() {
+        if let Some(error) = error {
+            payload.insert("error".to_string(), error.clone());
+        }
+        if let Some(trail) = output.and_then(|o| o.get("trail")) {
+            payload.insert("trail".to_string(), trail.clone());
+        }
+    }
+    (message, Value::Object(payload))
 }
 
 /// MCP tool-error wire shape from greentic-mcp-generator's `tool_error_with_status`:
@@ -14332,6 +14363,41 @@ mod tests {
             "events": [],
             "error": { "code": code, "message": message },
         })
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn error_envelope_prefers_the_partial_reply_over_the_machine_string() {
+        let entry = json!({
+            "ok": false,
+            "output": { "reply": "Here is what I found so far", "trail": [1] },
+            "error": { "code": "timeout", "message": "agent step ended without a reply: timeout" },
+        });
+        let (message, payload) = agent_error_envelope_reply(&entry);
+        assert_eq!(message, "Here is what I found so far");
+        assert_eq!(payload["reply"], "Here is what I found so far");
+        assert_eq!(payload["error"]["code"], "timeout", "error info is kept");
+        assert_eq!(payload["trail"], json!([1]));
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn error_envelope_without_a_usable_reply_falls_back_to_the_error_message() {
+        for output in [
+            Value::Null,
+            json!({ "reply": "" }),
+            json!({ "reply": "  " }),
+        ] {
+            let entry = json!({
+                "ok": false, "output": output,
+                "error": { "message": "boom" },
+            });
+            let (message, payload) = agent_error_envelope_reply(&entry);
+            assert_eq!(message, "boom");
+            assert_eq!(payload, json!({ "reply": "boom" }));
+        }
+        let (message, _) = agent_error_envelope_reply(&json!({ "ok": false }));
+        assert_eq!(message, "the agent could not respond");
     }
 
     /// Fix A (interleave guard): a user message arriving before the agent's
