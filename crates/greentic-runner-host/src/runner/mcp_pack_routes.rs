@@ -72,6 +72,7 @@ pub struct PackMcpRoute {
 
 impl PackMcpRoute {
     /// The non-secret OAuth parameters of this record.
+    #[cfg(feature = "agentic-worker")]
     pub fn auth_spec(&self) -> greentic_aw_runtime::oauth::RouteAuthSpec<'_> {
         greentic_aw_runtime::oauth::RouteAuthSpec {
             auth_mode: self.auth_mode.as_deref(),

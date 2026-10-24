@@ -43,11 +43,17 @@ pub fn render_template_value(
 fn render_template_string(raw: &str, ctx: &Value, options: TemplateOptions) -> Result<Value> {
     if options.allow_pointer && raw.starts_with('/') && !raw.contains("{{") {
         // A literal string that merely starts with `/` (a URL path, a route)
-        // is not an error: fall back to the literal when no such pointer exists.
-        return Ok(match ctx.pointer(raw) {
-            Some(value) => value.clone(),
-            None => Value::String(raw.to_string()),
-        });
+        // is not an error: fall back to the literal when no such pointer exists
+        // AND its first segment is not a context root. A missing path under a
+        // known root (`/node/x/output/typo`) is a mistake, not a literal, and
+        // must fail rather than send that text on to a provider.
+        return match ctx.pointer(raw) {
+            Some(value) => Ok(value.clone()),
+            None if pointer_root_is_known(raw, ctx) => Err(anyhow!(
+                "template pointer `{raw}` not found in the render context"
+            )),
+            None => Ok(Value::String(raw.to_string())),
+        };
     }
 
     if let Some(expr) = extract_exact_expression(raw)
@@ -73,6 +79,26 @@ fn render_template_string(raw: &str, ctx: &Value, options: TemplateOptions) -> R
     }
 
     Ok(Value::String(raw.to_string()))
+}
+
+/// Context roots a pointer may address even when the context does not carry
+/// them (flow templates and the provider `in_map`/`out_map` contexts).
+const KNOWN_POINTER_ROOTS: [&str; 10] = [
+    "entry", "in", "prev", "node", "state", "vars", "now", "input", "result", "response",
+];
+
+/// Is the first segment of JSON pointer `raw` a context root: a top-level key
+/// of `ctx`, or one of [`KNOWN_POINTER_ROOTS`]?
+fn pointer_root_is_known(raw: &str, ctx: &Value) -> bool {
+    let first = raw.trim_start_matches('/').split('/').next().unwrap_or("");
+    if first.is_empty() {
+        return false;
+    }
+    let first = first.replace("~1", "/").replace("~0", "~");
+    KNOWN_POINTER_ROOTS.contains(&first.as_str())
+        || ctx
+            .as_object()
+            .is_some_and(|map| map.contains_key(first.as_str()))
 }
 
 fn extract_exact_expression(raw: &str) -> Option<&str> {
@@ -265,6 +291,25 @@ mod tests {
             render_template_value(&Value::String("/api/v1/items".to_string()), &ctx, options)
                 .unwrap();
         assert_eq!(literal, json!("/api/v1/items"));
+    }
+
+    #[test]
+    fn pointer_mode_errors_on_a_missing_path_under_a_known_root() {
+        let ctx = json!({ "node": { "x": { "output": { "ok": 1 } } }, "vars": {} });
+        let options = TemplateOptions {
+            allow_pointer: true,
+        };
+        for typo in ["/node/x/output/typo", "/vars/missing", "/entry/anything"] {
+            let result = render_template_value(&Value::String(typo.to_string()), &ctx, options);
+            assert!(result.is_err(), "`{typo}` must fail, not render literally");
+        }
+        let found = render_template_value(
+            &Value::String("/node/x/output/ok".to_string()),
+            &ctx,
+            options,
+        )
+        .unwrap();
+        assert_eq!(found, json!(1));
     }
 
     #[test]

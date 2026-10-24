@@ -11,29 +11,76 @@ use greentic_types::{
 };
 use serde_json::Value;
 
-/// Deadline watchdogs in flight, keyed by correlation id.
+/// Deadline watchdogs in flight, keyed by correlation id. Each entry carries the
+/// generation it was registered under, so a task removes only its OWN entry and
+/// never a newer watchdog registered under the same (deterministic) id.
 ///
 /// Process-global because the task that publishes a request
 /// ([`NatsDispatcher`]) and the task that receives its response
-/// (`dispatch_listener`) are separate objects. A response cancels the matching
-/// watchdog so a call that already completed never publishes a late `timeout`.
+/// (`dispatch_listener`) are separate objects. An ADMITTED response cancels the
+/// matching watchdog so a call that already completed never publishes a late
+/// `timeout`.
 static WATCHDOGS: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+    parking_lot::Mutex<std::collections::HashMap<String, (u64, tokio::task::JoinHandle<()>)>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-/// Register `handle` as the watchdog for `correlation_id`, aborting any
-/// previous one registered under the same id.
-fn register_watchdog(correlation_id: String, handle: tokio::task::JoinHandle<()>) {
-    if let Some(previous) = WATCHDOGS.lock().insert(correlation_id, handle) {
+static WATCHDOG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_watchdog_generation() -> u64 {
+    WATCHDOG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Register `handle` as the watchdog for `correlation_id` under `generation`,
+/// aborting any previous one registered under the same id.
+fn register_watchdog(
+    correlation_id: String,
+    generation: u64,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    if let Some((_, previous)) = WATCHDOGS
+        .lock()
+        .insert(correlation_id, (generation, handle))
+    {
         previous.abort();
     }
+}
+
+/// Remove the entry for `correlation_id` only if it is still `generation`'s.
+fn deregister_watchdog(correlation_id: &str, generation: u64) {
+    let mut watchdogs = WATCHDOGS.lock();
+    if watchdogs
+        .get(correlation_id)
+        .is_some_and(|(current, _)| *current == generation)
+    {
+        watchdogs.remove(correlation_id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn register_watchdog_for_test(
+    correlation_id: &str,
+    handle: tokio::task::JoinHandle<()>,
+) -> u64 {
+    let generation = next_watchdog_generation();
+    register_watchdog(correlation_id.to_string(), generation, handle);
+    generation
+}
+
+#[cfg(test)]
+pub(crate) fn deregister_watchdog_for_test(correlation_id: &str, generation: u64) {
+    deregister_watchdog(correlation_id, generation);
+}
+
+#[cfg(test)]
+pub(crate) fn watchdog_pending(correlation_id: &str) -> bool {
+    WATCHDOGS.lock().contains_key(correlation_id)
 }
 
 /// Cancel the deadline watchdog for `correlation_id`, if one is pending.
 /// Returns whether one was cancelled. Called when a response arrives.
 pub fn cancel_watchdog(correlation_id: &str) -> bool {
     match WATCHDOGS.lock().remove(correlation_id) {
-        Some(handle) => {
+        Some((_, handle)) => {
             handle.abort();
             true
         }
@@ -244,11 +291,12 @@ impl RemoteDispatchHandler for NatsDispatcher {
         {
             let timeout_client = self.client.clone();
             let watchdog_key = correlation_id.clone();
+            let generation = next_watchdog_generation();
             let handle = tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_millis(deadline_ms)).await;
                 // Deregister before publishing so the timeout's own echo through
                 // the listener does not try to abort this (running) task.
-                WATCHDOGS.lock().remove(&correlation_id);
+                deregister_watchdog(&correlation_id, generation);
                 let (subject, headers, body) = build_timeout_response_message_with_token(
                     &runtime,
                     &correlation_id,
@@ -269,7 +317,7 @@ impl RemoteDispatchHandler for NatsDispatcher {
                     );
                 }
             });
-            register_watchdog(watchdog_key, handle);
+            register_watchdog(watchdog_key, generation, handle);
         }
 
         Ok(built.action)
@@ -298,6 +346,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_expiring_watchdog_never_removes_a_newer_one() {
+        let old = register_watchdog_for_test("corr-gen", tokio::spawn(std::future::pending::<()>()));
+        let newer =
+            register_watchdog_for_test("corr-gen", tokio::spawn(std::future::pending::<()>()));
+        assert_ne!(old, newer);
+        deregister_watchdog_for_test("corr-gen", old);
+        assert!(watchdog_pending("corr-gen"), "stale generation is a no-op");
+        deregister_watchdog_for_test("corr-gen", newer);
+        assert!(!watchdog_pending("corr-gen"));
+    }
+
+    #[tokio::test]
     async fn a_response_cancels_the_pending_watchdog() {
         let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = std::sync::Arc::clone(&fired);
@@ -305,7 +365,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        register_watchdog("corr-cancel".to_string(), handle);
+        register_watchdog_for_test("corr-cancel", handle);
         assert!(cancel_watchdog("corr-cancel"));
         assert!(!cancel_watchdog("corr-cancel"), "second cancel is a no-op");
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;

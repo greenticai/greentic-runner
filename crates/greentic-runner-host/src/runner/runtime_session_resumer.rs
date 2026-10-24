@@ -75,7 +75,7 @@ use greentic_types::{ReplyScope, TenantCtx};
 use serde_json::Value;
 use std::sync::Arc;
 
-use super::dispatch_listener::SessionResumer;
+use super::dispatch_listener::{ResumeOutcome, SessionResumer};
 use crate::engine::runtime::{IngressEnvelope, StateMachineRuntime};
 use crate::runner::engine::{ParkedApproval, response_authenticates};
 
@@ -386,6 +386,17 @@ impl RuntimeSessionResumer {
 #[async_trait]
 impl SessionResumer for RuntimeSessionResumer {
     async fn resume(&self, tenant: TenantCtx, correlation_id: &str, output: Value) -> Result<()> {
+        self.resume_checked(tenant, correlation_id, output)
+            .await
+            .map(|_| ())
+    }
+
+    async fn resume_checked(
+        &self,
+        tenant: TenantCtx,
+        correlation_id: &str,
+        output: Value,
+    ) -> Result<ResumeOutcome> {
         let nonced = split_dispatch_nonce(correlation_id).1.is_some();
         let envelope = Self::build_resume_envelope(&tenant, correlation_id, output.clone());
         // Read for EVERY response, not only nonced ones: a sender that omits
@@ -412,7 +423,7 @@ impl SessionResumer for RuntimeSessionResumer {
                     %correlation_id,
                     "dropping approval response: it does not match the approval this conversation is parked on"
                 );
-                return Ok(());
+                return Ok(ResumeOutcome::Dropped);
             }
             Admission::BadToken => {
                 // A security event: whoever sent this does not hold the token
@@ -422,10 +433,13 @@ impl SessionResumer for RuntimeSessionResumer {
                     %correlation_id,
                     "dropping approval response: its decision_token is missing or does not match the one the parked approval was issued"
                 );
-                return Ok(());
+                return Ok(ResumeOutcome::Dropped);
             }
         }
-        self.runtime.handle(envelope).await.map(|_| ())
+        self.runtime
+            .handle(envelope)
+            .await
+            .map(|_| ResumeOutcome::Admitted)
     }
 }
 
