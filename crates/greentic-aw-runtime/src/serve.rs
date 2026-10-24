@@ -10,6 +10,7 @@
 //! Gated behind the `serve` feature so the core library has no NATS dependency.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -237,6 +238,19 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
             events: vec![],
             error,
         })
+    }
+
+    async fn step_timeout(&self, tenant: &str, env: &str, target: &str) -> Option<Duration> {
+        let tenant_ctx = TenantContext::new(tenant, env);
+        match self
+            .runtime
+            .config_provider
+            .agent_config(&tenant_ctx, target)
+            .await
+        {
+            Ok(config) => Some(config.limits.timeout),
+            Err(_) => None,
+        }
     }
 }
 
