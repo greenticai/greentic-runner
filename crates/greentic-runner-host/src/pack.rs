@@ -97,7 +97,7 @@ use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
 use crate::config::HostConfig;
 use crate::fault;
 use crate::secrets::{
-    DynSecretsManager, canonicalize_secret_key, read_pack_secret_blocking,
+    DynSecretsManager, PackSecretError, canonicalize_secret_key, read_pack_secret_blocking,
     write_pack_secret_blocking,
 };
 use crate::storage::state::STATE_PREFIX;
@@ -550,7 +550,11 @@ impl HostState {
     /// shared pack scope. THE single read path for every `SecretsStoreHost` /
     /// `RuntimeConfigHost` entry point on this type — four call sites used to
     /// spell the same address inline, which is how one of them would be missed.
-    fn read_pack_secret(&self, ctx: &TypesTenantCtx, canonical_key: &str) -> Result<Vec<u8>> {
+    fn read_pack_secret(
+        &self,
+        ctx: &TypesTenantCtx,
+        canonical_key: &str,
+    ) -> std::result::Result<Vec<u8>, PackSecretError> {
         read_pack_secret_blocking(
             &self.secrets,
             ctx,
@@ -682,8 +686,7 @@ impl HostState {
             let runtime = bindings.greentic_component_component_runtime();
 
             // Encode input as CBOR — the component's run() expects CBOR bytes.
-            let input_value: Value =
-                serde_json::from_str(input_json).context("component input is not valid JSON")?;
+            let input_value = parse_v06_input(input_json);
             let input_cbor =
                 serde_cbor::to_vec(&input_value).context("encode input as CBOR for v0.6")?;
             let empty_state = serde_cbor::to_vec(&Value::Object(Default::default()))
@@ -1011,12 +1014,10 @@ mod canonicalize_tests {
     }
 }
 
-/// Whether a secrets read failure means "no such secret" (as opposed to a
-/// backend failure such as an outage or permission error, which must not be
-/// reported to the guest as an absent secret).
-fn secret_error_is_not_found(err: &anyhow::Error) -> bool {
-    let message = format!("{err:#}").to_ascii_lowercase();
-    message.contains("not found") || message.contains("no such") || message.contains("missing")
+/// Parse the invocation input for a v0.6 component. Non-JSON input is passed
+/// through as a string rather than failing (or being silently nulled).
+fn parse_v06_input(input_json: &str) -> Value {
+    serde_json::from_str(input_json).unwrap_or_else(|_| Value::String(input_json.to_string()))
 }
 
 impl SecretsStoreHost for HostState {
@@ -1039,11 +1040,11 @@ impl SecretsStoreHost for HostState {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
                 warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
-                if secret_error_is_not_found(&err) {
-                    Err(SecretsError::NotFound)
-                } else {
-                    Err(SecretsError::Internal)
-                }
+                Err(match err {
+                    PackSecretError::NotFound(_) => SecretsError::NotFound,
+                    PackSecretError::Denied(_) => SecretsError::Denied,
+                    PackSecretError::Backend(_) => SecretsError::Internal,
+                })
             }
         }
     }
@@ -1069,11 +1070,11 @@ impl SecretsStoreHostV1_1 for HostState {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
                 warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
-                if secret_error_is_not_found(&err) {
-                    Err(SecretsErrorV1_1::NotFound)
-                } else {
-                    Err(SecretsErrorV1_1::Internal)
-                }
+                Err(match err {
+                    PackSecretError::NotFound(_) => SecretsErrorV1_1::NotFound,
+                    PackSecretError::Denied(_) => SecretsErrorV1_1::Denied,
+                    PackSecretError::Backend(_) => SecretsErrorV1_1::Internal,
+                })
             }
         }
     }
@@ -7408,13 +7409,12 @@ mod audit_hardening_tests {
     }
 
     #[test]
-    fn secret_not_found_is_distinguished_from_backend_errors() {
-        assert!(secret_error_is_not_found(&anyhow!(
-            "no secret at secrets://a/b (secret not found: x)"
-        )));
-        assert!(!secret_error_is_not_found(&anyhow!(
-            "no secret at secrets://a/b (connection refused)"
-        )));
+    fn v06_input_falls_back_to_a_string_for_non_json() {
+        assert_eq!(parse_v06_input("{\"a\":1}"), serde_json::json!({"a": 1}));
+        assert_eq!(
+            parse_v06_input("hello there"),
+            Value::String("hello there".into())
+        );
     }
 
     #[test]

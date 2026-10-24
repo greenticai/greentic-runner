@@ -426,19 +426,61 @@ pub fn read_pack_secret_blocking(
     pack_id: &str,
     unit_id: Option<&str>,
     key: &str,
-) -> Result<Vec<u8>> {
-    let candidates = pack_secret_path_candidates(ctx, pack_id, unit_id, key)?;
-    let mut last_error = anyhow!("no scope tried");
+) -> std::result::Result<Vec<u8>, PackSecretError> {
+    let candidates = pack_secret_path_candidates(ctx, pack_id, unit_id, key)
+        .map_err(|err| PackSecretError::Backend(err.to_string()))?;
+    let mut failures = Vec::new();
     for candidate in &candidates {
         match block_on(manager.read(candidate.as_str())) {
             Ok(bytes) => return Ok(bytes),
-            Err(err) => last_error = anyhow!(err.to_string()),
+            Err(err) => failures.push(err),
         }
     }
-    Err(anyhow!(
-        "no secret at {} ({last_error})",
-        candidates.join(" or ")
-    ))
+    Err(classify_pack_secret_failures(&candidates, failures))
+}
+
+/// Why [`read_pack_secret_blocking`] failed. Typed so callers can tell a real
+/// miss from a permission or backend failure without parsing a message.
+#[derive(Debug, thiserror::Error)]
+pub enum PackSecretError {
+    /// Every scope tried reported the secret as absent.
+    #[error("no secret at {0}")]
+    NotFound(String),
+    /// At least one scope refused the read.
+    #[error("secret read denied: {0}")]
+    Denied(String),
+    /// At least one scope failed for a reason other than absence or denial.
+    #[error("secret backend error: {0}")]
+    Backend(String),
+}
+
+/// A miss is only a miss when EVERY scope said so: a denied or failing scope
+/// says nothing about whether a value exists there, so it must not be folded
+/// into "not found" by whichever scope happened to be tried last.
+fn classify_pack_secret_failures(
+    candidates: &[String],
+    failures: Vec<greentic_secrets_lib::SecretError>,
+) -> PackSecretError {
+    let mut denied: Option<String> = None;
+    let mut backend: Option<String> = None;
+    for failure in failures {
+        match failure {
+            greentic_secrets_lib::SecretError::NotFound(_) => {}
+            greentic_secrets_lib::SecretError::Permission(detail) => {
+                denied.get_or_insert(detail);
+            }
+            other => {
+                backend.get_or_insert(other.to_string());
+            }
+        }
+    }
+    if let Some(detail) = denied {
+        return PackSecretError::Denied(detail);
+    }
+    if let Some(detail) = backend {
+        return PackSecretError::Backend(detail);
+    }
+    PackSecretError::NotFound(candidates.join(" or "))
 }
 
 /// Write a pack secret for one deployed unit.
@@ -1355,5 +1397,51 @@ mod tests {
         let ptr_after = Arc::as_ptr(&wrapped);
         // When TTL is 0, wrap should return the same Arc (no caching layer).
         assert_eq!(ptr_before, ptr_after);
+    }
+}
+
+#[cfg(test)]
+mod pack_secret_error_tests {
+    use super::*;
+    use greentic_secrets_lib::SecretError;
+
+    fn candidates() -> Vec<String> {
+        vec!["secrets://a".to_string(), "secrets://b".to_string()]
+    }
+
+    #[test]
+    fn not_found_only_when_every_scope_is_not_found() {
+        let err = classify_pack_secret_failures(
+            &candidates(),
+            vec![
+                SecretError::NotFound("a".into()),
+                SecretError::NotFound("b".into()),
+            ],
+        );
+        assert!(matches!(err, PackSecretError::NotFound(_)));
+    }
+
+    #[test]
+    fn permission_error_is_not_masked_by_a_later_not_found() {
+        let err = classify_pack_secret_failures(
+            &candidates(),
+            vec![
+                SecretError::Permission("no".into()),
+                SecretError::NotFound("b".into()),
+            ],
+        );
+        assert!(matches!(err, PackSecretError::Denied(_)));
+    }
+
+    #[test]
+    fn words_like_missing_in_a_backend_message_do_not_become_not_found() {
+        let err = classify_pack_secret_failures(
+            &candidates(),
+            vec![
+                SecretError::Backend("config missing".into()),
+                SecretError::NotFound("b".into()),
+            ],
+        );
+        assert!(matches!(err, PackSecretError::Backend(_)));
     }
 }
