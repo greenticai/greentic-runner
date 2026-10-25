@@ -58,9 +58,24 @@ pub fn validate_json_instance(
     issues
 }
 
+/// Refuses every external `$ref`. Pack-supplied schemas are untrusted: the
+/// default retriever would fetch `http(s)://` (bypassing `http_guard`) and read
+/// `file://` from the host. Only in-document (`#...`) references resolve.
+struct DenyExternalRefs;
+
+impl jsonschema::Retrieve for DenyExternalRefs {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Err(format!("external schema reference `{uri}` is not allowed").into())
+    }
+}
+
 fn compile_validator(schema: &Value) -> Result<Validator, String> {
     jsonschema::options()
         .with_draft(Draft::Draft7)
+        .with_retriever(DenyExternalRefs)
         .build(schema)
         .map_err(|err| err.to_string())
 }
@@ -112,6 +127,30 @@ fn path_or_root(path: &str) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn external_file_refs_are_not_resolved() {
+        let path = std::env::temp_dir().join(format!(
+            "greentic-schema-ref-{}-{}.json",
+            std::process::id(),
+            "z3"
+        ));
+        let _ = std::fs::write(&path, r#"{"type":"integer"}"#);
+        let schema = json!({ "$ref": format!("file://{}", path.display()) });
+        let issues = validate_json_instance(&schema, &json!(5), false);
+        let _ = std::fs::remove_file(&path);
+        assert!(!issues.is_empty(), "file:// $ref must fail to compile");
+    }
+
+    #[test]
+    fn internal_refs_still_resolve() {
+        let schema = json!({
+            "$defs": { "n": { "type": "integer" } },
+            "properties": { "a": { "$ref": "#/$defs/n" } }
+        });
+        assert!(validate_json_instance(&schema, &json!({ "a": 1 }), false).is_empty());
+        assert!(!validate_json_instance(&schema, &json!({ "a": "x" }), false).is_empty());
+    }
 
     #[test]
     fn properties_named_like_keywords_are_not_flagged() {
