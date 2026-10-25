@@ -180,6 +180,14 @@ impl FlowResumeStore {
         Ok(reply_scope)
     }
 
+    /// The key of the in-process turn lock for the session `envelope`
+    /// addresses: the same tenant/env and derived user id the park is stored
+    /// under, so two envelopes that address one park share one lock.
+    pub(crate) fn turn_key(envelope: &IngressEnvelope) -> GResult<String> {
+        let (ctx, user, _, _) = build_store_ctx(envelope)?;
+        Ok(format!("{}:{}:{}", ctx.env, ctx.tenant_id, user.as_str()))
+    }
+
     pub async fn clear(&self, envelope: &IngressEnvelope) -> GResult<()> {
         let (ctx, user, _, scope) = build_store_ctx(envelope)?;
         let mut scopes = vec![scope.clone()];
@@ -860,6 +868,29 @@ impl StateMachineRuntime {
         Ok(snapshot.map(|snapshot| snapshot.state.pending_approvals()))
     }
 
+    /// The turn-lock key of the session `envelope` addresses, or `None` when
+    /// this runtime never parks (no resume store) or the envelope carries no
+    /// session identity.
+    pub(crate) fn turn_lock_key(&self, envelope: &IngressEnvelope) -> Option<String> {
+        self.resume.as_ref()?;
+        FlowResumeStore::turn_key(&envelope.clone().canonicalize()).ok()
+    }
+
+    /// Run `fut` under the turn lock `key` (see [`super::turn_lock`]). Used by
+    /// the dispatch resumer so its admission-check-then-resume sequence
+    /// excludes a concurrent user turn; the nested `handle` inside `fut`
+    /// skips the lock (same task).
+    pub(crate) async fn with_turn_lock<F: std::future::Future>(
+        &self,
+        key: Option<String>,
+        fut: F,
+    ) -> F::Output {
+        match key {
+            Some(key) => super::turn_lock::global().run(key, fut).await,
+            None => fut.await,
+        }
+    }
+
     /// Execute the flow associated with the provided ingress event.
     pub async fn handle(&self, envelope: IngressEnvelope) -> Result<Value> {
         let result = self.run_flow_result(envelope).await?;
@@ -1037,6 +1068,29 @@ impl Adapter for PackFlowAdapter {
     }
 
     async fn call_traced(
+        &self,
+        call: &AdapterCall,
+    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
+        // One turn per session at a time: `fetch` does not consume the parked
+        // snapshot, so without this two concurrent messages both resume it.
+        // A payload that does not parse (or has no session identity) is left
+        // to the body, which reports the same error it always did.
+        let key = serde_json::from_value::<IngressEnvelope>(call.payload.clone())
+            .ok()
+            .and_then(|envelope| FlowResumeStore::turn_key(&envelope.canonicalize()).ok());
+        match key {
+            Some(key) => {
+                super::turn_lock::global()
+                    .run(key, self.call_traced_unlocked(call))
+                    .await
+            }
+            None => self.call_traced_unlocked(call).await,
+        }
+    }
+}
+
+impl PackFlowAdapter {
+    async fn call_traced_unlocked(
         &self,
         call: &AdapterCall,
     ) -> GResult<(Value, serde_json::Map<String, Value>)> {

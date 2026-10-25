@@ -418,51 +418,62 @@ impl SessionResumer for RuntimeSessionResumer {
         // a nonced (approval) response, as before; for any other response it
         // falls through to the runtime, where the approval gate re-checks the
         // token itself before deciding anything.
-        let parked = match self.runtime.parked_approvals(&envelope).await {
-            Ok(parked) => parked,
-            Err(error) if !nonced => {
-                tracing::warn!(%error, correlation_id = %crate::log_safe::log_safe(correlation_id), "could not read the parked flow before resuming; the gate re-checks the response itself");
-                None
+        // Check-then-resume under the session's turn lock: the park read for
+        // admission and the resume that consumes it must be one unit, or a
+        // user turn (or a duplicate response) can resume the same snapshot in
+        // between. The nested `handle` re-enters the lock on this task and
+        // skips it.
+        let runtime = &self.runtime;
+        let lock_key = runtime.turn_lock_key(&envelope);
+        runtime
+            .with_turn_lock(lock_key, async {
+            let parked = match self.runtime.parked_approvals(&envelope).await {
+                Ok(parked) => parked,
+                Err(error) if !nonced => {
+                    tracing::warn!(%error, correlation_id = %crate::log_safe::log_safe(correlation_id), "could not read the parked flow before resuming; the gate re-checks the response itself");
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            match admit_response_with(self.mode, correlation_id, &output, parked.as_deref()) {
+                Admission::Resume => {
+                    // Retire the deadline watchdog at admission, BEFORE the resumed
+                    // flow runs: `handle` runs it until it next parks, and that
+                    // park may register a new watchdog under this same
+                    // (deterministic) id which a later cancel would kill.
+                    crate::runner::dispatch_listener::retire_watchdog_on_admission(
+                        self.watchdog_notifier.as_ref(),
+                        correlation_id,
+                    );
+                }
+                Admission::WrongGate => {
+                    // Not an error: the response is real, it just no longer has a
+                    // gate to land on. Resuming would hand an earlier gate's
+                    // decision (or its watchdog's late `timeout`) to a different
+                    // gate — or to whatever the conversation is parked on now.
+                    tracing::warn!(
+                        correlation_id = %crate::log_safe::log_safe(correlation_id),
+                        "dropping approval response: it does not match the approval this conversation is parked on"
+                    );
+                    return Ok(ResumeOutcome::Dropped);
+                }
+                Admission::BadToken => {
+                    // A security event: whoever sent this does not hold the token
+                    // the gate was issued (or is replaying a spent one). The gate
+                    // stays parked. The token is never logged.
+                    tracing::warn!(
+                        correlation_id = %crate::log_safe::log_safe(correlation_id),
+                        "dropping approval response: its decision_token is missing or does not match the one the parked approval was issued"
+                    );
+                    return Ok(ResumeOutcome::Dropped);
+                }
             }
-            Err(error) => return Err(error),
-        };
-        match admit_response_with(self.mode, correlation_id, &output, parked.as_deref()) {
-            Admission::Resume => {
-                // Retire the deadline watchdog at admission, BEFORE the resumed
-                // flow runs: `handle` runs it until it next parks, and that
-                // park may register a new watchdog under this same
-                // (deterministic) id which a later cancel would kill.
-                crate::runner::dispatch_listener::retire_watchdog_on_admission(
-                    self.watchdog_notifier.as_ref(),
-                    correlation_id,
-                );
-            }
-            Admission::WrongGate => {
-                // Not an error: the response is real, it just no longer has a
-                // gate to land on. Resuming would hand an earlier gate's
-                // decision (or its watchdog's late `timeout`) to a different
-                // gate — or to whatever the conversation is parked on now.
-                tracing::warn!(
-                    correlation_id = %crate::log_safe::log_safe(correlation_id),
-                    "dropping approval response: it does not match the approval this conversation is parked on"
-                );
-                return Ok(ResumeOutcome::Dropped);
-            }
-            Admission::BadToken => {
-                // A security event: whoever sent this does not hold the token
-                // the gate was issued (or is replaying a spent one). The gate
-                // stays parked. The token is never logged.
-                tracing::warn!(
-                    correlation_id = %crate::log_safe::log_safe(correlation_id),
-                    "dropping approval response: its decision_token is missing or does not match the one the parked approval was issued"
-                );
-                return Ok(ResumeOutcome::Dropped);
-            }
-        }
-        self.runtime
-            .handle(envelope)
+            self.runtime
+                .handle(envelope)
+                .await
+                .map(|_| ResumeOutcome::Admitted)
+            })
             .await
-            .map(|_| ResumeOutcome::Admitted)
     }
 }
 
