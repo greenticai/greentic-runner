@@ -764,18 +764,70 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         Arc::clone(&host),
     )?;
 
-    tokio::select! {
-        result = server.serve() => {
-            result?;
-        }
-        _ = shutdown_signal() => {
-            tracing::info!("received shutdown signal");
-        }
-    }
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn(server.serve_with_shutdown(async move {
+        let _ = stop_rx.await;
+    }));
+    let serve_result = drive_until_shutdown(
+        serve_task,
+        stop_tx,
+        shutdown_signal(),
+        shutdown_grace_from_raw(std::env::var(SHUTDOWN_GRACE_ENV).ok().as_deref()),
+    )
+    .await;
 
+    // Runs on EVERY exit path, including a failed `serve`, so timers, NATS
+    // listeners and the watcher are always stopped.
     drop(watcher);
-    host.stop().await?;
+    let stop_result = host.stop().await;
+    serve_result?;
+    stop_result?;
     Ok(())
+}
+
+/// Env var: seconds in-flight requests get to drain after a shutdown signal.
+const SHUTDOWN_GRACE_ENV: &str = "GREENTIC_SHUTDOWN_GRACE_SECS";
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
+
+/// Parse the drain deadline: unset/invalid -> 30s; `0` -> no drain (abort at once).
+fn shutdown_grace_from_raw(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Wait for the serve task to end on its own or for `signal`. On a signal,
+/// trigger graceful shutdown and give the task `grace` to drain before it is
+/// aborted. Returns the serve outcome (a panic becomes an error).
+async fn drive_until_shutdown<S>(
+    mut serve_task: tokio::task::JoinHandle<Result<()>>,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    signal: S,
+    grace: Duration,
+) -> Result<()>
+where
+    S: std::future::Future<Output = ()>,
+{
+    let joined = tokio::select! {
+        joined = &mut serve_task => joined,
+        _ = signal => {
+            tracing::info!(grace_secs = grace.as_secs(), "received shutdown signal; draining");
+            let _ = stop_tx.send(());
+            match tokio::time::timeout(grace, &mut serve_task).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    tracing::warn!("drain deadline exceeded; aborting in-flight requests");
+                    serve_task.abort();
+                    return Ok(());
+                }
+            }
+        }
+    };
+    match joined {
+        Ok(result) => result,
+        Err(err) => Err(anyhow!("host server task failed: {err}")),
+    }
 }
 
 #[cfg(test)]
@@ -986,5 +1038,70 @@ mod tests {
             telemetry_from_env(&enabled(), Some("this-has-no-equals-sign".into()), None)
                 .expect("malformed headers must not disable telemetry");
         assert!(malformed.export.headers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn grace_defaults_and_parses() {
+        assert_eq!(shutdown_grace_from_raw(None), Duration::from_secs(30));
+        assert_eq!(
+            shutdown_grace_from_raw(Some("junk")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(shutdown_grace_from_raw(Some(" 5 ")), Duration::from_secs(5));
+        assert_eq!(shutdown_grace_from_raw(Some("0")), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn signal_triggers_graceful_stop_and_waits_for_drain() {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = stop_rx.await;
+            tokio::time::sleep(Duration::from_millis(50)).await; // in-flight work
+            Ok(())
+        });
+        let out = drive_until_shutdown(
+            task,
+            stop_tx,
+            std::future::ready(()),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(out.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stuck_drain_is_aborted_after_grace() {
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let out = drive_until_shutdown(
+            task,
+            stop_tx,
+            std::future::ready(()),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(out.is_ok());
+    }
+
+    #[tokio::test]
+    async fn serve_error_is_returned_not_swallowed() {
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async { Err(anyhow!("bind failed")) });
+        let out = drive_until_shutdown(
+            task,
+            stop_tx,
+            std::future::pending(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(out.is_err_and(|e| e.to_string().contains("bind failed")));
     }
 }

@@ -182,6 +182,15 @@ impl HostServer {
     }
 
     pub async fn serve(self) -> Result<()> {
+        self.serve_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    /// Like [`serve`](Self::serve), but stops accepting connections and lets
+    /// in-flight requests finish once `shutdown` resolves.
+    pub async fn serve_with_shutdown<F>(self, shutdown: F) -> Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         tracing::info!(addr = %self.addr, "starting host server");
         if !self._state.admin.operator_protected() {
             tracing::warn!(
@@ -197,6 +206,7 @@ impl HostServer {
             self.router
                 .into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown)
         .await?;
         Ok(())
     }
