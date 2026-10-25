@@ -167,6 +167,51 @@ fn resolves_http_pack() -> Result<()> {
     Ok(())
 }
 
+/// The server answers exactly one request. A pinned-digest pack that is already
+/// cached must resolve again without a second download.
+#[test]
+fn pinned_http_pack_is_not_downloaded_again_once_cached() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pack_path = build_test_pack(temp.path())?;
+    let digest = compute_digest(&pack_path)?;
+    let bytes = fs::read(&pack_path)?;
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipping http cache test: {err}");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let addr = listener.local_addr()?;
+    let server =
+        Server::from_listener(listener, None).map_err(|err| anyhow!("server error: {err}"))?;
+    let handle = thread::spawn(move || {
+        if let Ok(request) = server.recv() {
+            let _ = request.respond(Response::from_data(bytes));
+        }
+        // `server` drops here: any further request is refused.
+    });
+
+    let locator = format!("http://{}/pack.gtpack", addr);
+    let index_path = temp.path().join("index.json");
+    write_index(&index_path, &locator, &digest)?;
+    let config = build_config(&index_path, &temp.path().join("cache"), PackSource::Http);
+    let index = Index::load(&config.index_location)?;
+    let manager = PackManager::new(config)?;
+    let first = manager.resolve_all_for_index(&index)?;
+    handle
+        .join()
+        .map_err(|_| anyhow!("server thread panicked"))?;
+    let second = manager.resolve_all_for_index(&index)?;
+    let first_main = &first.tenants().get("demo").expect("tenant").main;
+    let second_main = &second.tenants().get("demo").expect("tenant").main;
+    assert_eq!(first_main.path, second_main.path);
+    assert_eq!(second_main.digest.as_str(), digest.as_str());
+    Ok(())
+}
+
 fn write_signed_index(path: &Path, locator: &str, digest: &PackDigest, signature: Option<&str>) {
     let index = json!({
         "demo": {
