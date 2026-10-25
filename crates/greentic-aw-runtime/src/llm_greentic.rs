@@ -152,9 +152,8 @@ impl LlmBackend for GreenticLlmBackend {
             // Built from the list the model is shown: a sanitised wire name
             // cannot be split back apart by string surgery.
             let codec = ToolNameCodec::for_tools(&request.tools);
-            // greentic-llm errors are auth/config/transport-class; surface as
-            // BadRequest so `RetryingLlmBackend` does not loop on a
-            // deterministic failure.
+            // Errors keep their retry class (see `map_provider_error`) so
+            // `RetryingLlmBackend` retries transient ones and not the rest.
             let response = match provider.chat(chat_request).await {
                 Ok(response) => response,
                 Err(first) if image_count > 0 && refuses_images(&first) => {
@@ -179,12 +178,7 @@ impl LlmBackend for GreenticLlmBackend {
                         .await
                         .map_err(|_| LlmError::BadRequest(first.to_string()))?
                 }
-                // A 429 is transient; every other greentic-llm error stays
-                // deterministic (auth/config) so the retry decorator skips it.
-                Err(e @ greentic_llm::LlmError::Status { status: 429, .. }) => {
-                    return Err(LlmError::RateLimited(e.to_string()));
-                }
-                Err(e) => return Err(LlmError::BadRequest(e.to_string())),
+                Err(e) => return Err(map_provider_error(&e)),
             };
             Ok(map_response(response, &codec))
         })
@@ -253,6 +247,27 @@ impl GreenticLlmBackend {
             attachments.clear();
         }
         images
+    }
+}
+
+/// greentic-llm error -> AW error, preserving whether a retry can succeed:
+/// 429 is rate limiting, 5xx and 408 are a provider that is down or slow,
+/// transport failures (connect, timeout, reset) are transient, an unparsable
+/// reply is a decode error, and everything else (4xx auth/validation, config,
+/// unsupported capability) is deterministic and stays `BadRequest`.
+fn map_provider_error(e: &greentic_llm::LlmError) -> LlmError {
+    match e {
+        greentic_llm::LlmError::Status { status: 429, .. } => LlmError::RateLimited(e.to_string()),
+        greentic_llm::LlmError::Status { status, .. } if *status >= 500 || *status == 408 => {
+            tracing::warn!(
+                status = *status,
+                "provider returned a transient error status"
+            );
+            LlmError::ServiceUnavailable
+        }
+        greentic_llm::LlmError::Transport(_) => LlmError::Transport(e.to_string()),
+        greentic_llm::LlmError::Parse(_) => LlmError::Decode(e.to_string()),
+        _ => LlmError::BadRequest(e.to_string()),
     }
 }
 
@@ -546,6 +561,46 @@ mod tests {
         );
         assert_eq!(resp.tokens_in, 42);
         assert_eq!(resp.tokens_out, 17);
+    }
+
+    fn status_err(status: u16) -> greentic_llm::LlmError {
+        greentic_llm::LlmError::Status {
+            status,
+            body: "x".into(),
+        }
+    }
+
+    #[test]
+    fn provider_errors_keep_their_retry_class() {
+        assert!(matches!(
+            map_provider_error(&status_err(429)),
+            LlmError::RateLimited(_)
+        ));
+        for code in [408, 500, 502, 503, 504] {
+            assert!(
+                matches!(
+                    map_provider_error(&status_err(code)),
+                    LlmError::ServiceUnavailable
+                ),
+                "{code}"
+            );
+        }
+        let transport = map_provider_error(&greentic_llm::LlmError::Transport("timed out".into()));
+        assert!(matches!(transport, LlmError::Transport(_)));
+        assert!(transport.is_retryable());
+        for code in [400, 401, 403, 404, 422] {
+            let mapped = map_provider_error(&status_err(code));
+            assert!(matches!(mapped, LlmError::BadRequest(_)), "{code}");
+            assert!(!mapped.is_retryable());
+        }
+        assert!(matches!(
+            map_provider_error(&greentic_llm::LlmError::Config("no key".into())),
+            LlmError::BadRequest(_)
+        ));
+        assert!(matches!(
+            map_provider_error(&greentic_llm::LlmError::Parse("bad".into())),
+            LlmError::Decode(_)
+        ));
     }
 }
 
