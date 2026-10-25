@@ -434,10 +434,10 @@ fn resolve_admin_token(
     env_token: Option<String>,
     config_token: Option<String>,
 ) -> (Option<String>, AdminTokenSource) {
-    if let Some(token) = env_token.filter(|value| !value.is_empty()) {
+    if let Some(token) = http::auth::normalize_token(env_token) {
         return (Some(token), AdminTokenSource::Env);
     }
-    if let Some(token) = config_token.filter(|value| !value.is_empty()) {
+    if let Some(token) = http::auth::normalize_token(config_token) {
         return (Some(token), AdminTokenSource::Config);
     }
     (None, AdminTokenSource::None)
@@ -871,7 +871,7 @@ mod tests {
             (token.as_deref(), source),
             (Some("env"), AdminTokenSource::Env)
         );
-        let (token, source) = resolve_admin_token(Some(String::new()), Some("cfg".into()));
+        let (token, source) = resolve_admin_token(Some(" \n".into()), Some(" cfg\n".into()));
         assert_eq!(
             (token.as_deref(), source),
             (Some("cfg"), AdminTokenSource::Config)
