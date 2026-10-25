@@ -385,7 +385,10 @@ fn local_fallback_ctx() -> greentic_types::TenantCtx {
 
 fn tenant_ctx_for(tenant: &str, env: Option<&str>) -> Result<greentic_types::TenantCtx> {
     // An empty `GREENTIC_ENV` is "not configured", like an unset one.
-    let env = env.map(str::trim).filter(|v| !v.is_empty()).unwrap_or("local");
+    let env = env
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("local");
     let env_id = greentic_types::EnvId::from_str(env)
         .map_err(|err| anyhow::anyhow!("invalid GREENTIC_ENV `{env}`: {err}"))?;
     let tenant_id = greentic_types::TenantId::from_str(tenant)

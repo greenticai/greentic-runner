@@ -14398,7 +14398,10 @@ mod tests {
             );
             assert!(message.starts_with("Maaf"), "localized via i18n: {message}");
             assert_eq!(payload["reply"], message.as_str());
-            assert_eq!(payload["error"]["code"], "timeout", "operators keep the code");
+            assert_eq!(
+                payload["error"]["code"], "timeout",
+                "operators keep the code"
+            );
             assert_eq!(
                 payload["error"]["message"],
                 "agent step ended without a reply: timeout"
