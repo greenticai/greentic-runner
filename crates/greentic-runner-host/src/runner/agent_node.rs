@@ -1178,17 +1178,35 @@ mod aw {
     fn blackhole_proxy_url() -> Option<String> {
         use std::sync::OnceLock;
         static URL: OnceLock<Option<String>> = OnceLock::new();
+        // Initialised once, so every failure below is logged once: a `None` here
+        // means the tool HTTP client is never built (see
+        // `shared_blocking_http_client`), which fails every extension HTTP call.
         URL.get_or_init(|| {
-            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
-            let addr = listener.local_addr().ok()?;
-            std::thread::Builder::new()
+            let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::error!(%error, "tool http blackhole listener could not bind 127.0.0.1; extension tool HTTP calls will fail for the life of this process");
+                    return None;
+                }
+            };
+            let addr = match listener.local_addr() {
+                Ok(addr) => addr,
+                Err(error) => {
+                    tracing::error!(%error, "tool http blackhole listener has no local address; extension tool HTTP calls will fail for the life of this process");
+                    return None;
+                }
+            };
+            let spawned = std::thread::Builder::new()
                 .name("tool-http-blackhole".into())
                 .spawn(move || {
                     for stream in listener.incoming() {
                         drop(stream);
                     }
-                })
-                .ok()?;
+                });
+            if let Err(error) = spawned {
+                tracing::error!(%error, "tool http blackhole thread could not start; extension tool HTTP calls will fail for the life of this process");
+                return None;
+            }
             Some(format!("http://{addr}"))
         })
         .clone()
@@ -1228,6 +1246,9 @@ mod aw {
             }))
             .dns_resolver(std::sync::Arc::new(ToolGuardedResolver { guard }))
             .build()
+            .inspect_err(|error| {
+                tracing::error!(%error, "tool http client could not be built; extension tool HTTP calls will fail for the life of this process");
+            })
             .ok()
     }
 
@@ -1239,10 +1260,18 @@ mod aw {
             .get_or_init(|| {
                 // Build on a plain OS thread so reqwest's internal runtime is
                 // not constructed inside a tokio context.
-                std::thread::spawn(build_tool_http_client)
+                let client = std::thread::spawn(build_tool_http_client)
                     .join()
+                    .inspect_err(|_| {
+                        tracing::error!("tool http client builder thread panicked; extension tool HTTP calls will fail for the life of this process");
+                    })
                     .ok()
-                    .flatten()
+                    .flatten();
+                if client.is_none() {
+                    // Cached as `None` for the process: say so loudly, once.
+                    tracing::error!("tool http client unavailable; every extension tool HTTP call will fail until the process restarts");
+                }
+                client
             })
             .clone()
     }
