@@ -71,7 +71,9 @@ impl WasmLimits {
             // cannot overflow.
             u64::MAX / 2
         } else {
-            self.exec_secs
+            // wasmtime computes `current_epoch + delta` unsaturated, so an
+            // enormous configured value must be clamped as well.
+            self.exec_secs.min(u64::MAX / 2)
         }
     }
 
@@ -160,6 +162,10 @@ mod tests {
     fn deadline_ticks_zero_means_effectively_unbounded() {
         assert_eq!(WasmLimits::from_raw(Some("5"), None).deadline_ticks(), 5);
         assert!(WasmLimits::from_raw(Some("0"), None).deadline_ticks() > 1 << 40);
+        assert_eq!(
+            WasmLimits::from_raw(Some("18446744073709551615"), None).deadline_ticks(),
+            u64::MAX / 2
+        );
     }
 
     #[test]
