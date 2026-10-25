@@ -260,6 +260,24 @@ in ONE place, `approval_http/wire.rs`. Four things fail silently if changed:
   resumer → runtime → engine → dispatcher cycle). A restart loses pending polls even when the
   park survives in a durable store.
 
+### `secrets://` URIs are never built by hand from config values
+
+Every segment of a `secrets://` URI built from config/pack-controlled input goes through
+`greentic_aw_runtime::scoped_secrets::secret_uri` (or, where the `agentic-worker` feature is
+off, `secrets_broker::is_safe_secret_segment`): only `[A-Za-z0-9._-]`, no leading dot, no
+`..`. That includes `AgentConfig.llm.credential_ref` (category `llm`), the provider/key of
+`agent_tool_secret_uri` (unsafe -> `None`) and env/tenant/team in `scoped_secret_path_for_pack`
+(unsafe -> `Err`; the pack id is normalised to `[a-z0-9_-]` there). A `credential_ref` such as
+`vault://acme/x` or `../other` is therefore REJECTED, not looked up. In
+`secret_uri_candidates` an unsafe unit candidate (e.g. a key ending in `.`) is skipped and the
+team/tenant candidates still apply.
+
+### Broker URLs are logged redacted
+
+`GREENTIC_EVENTS_NATS_URL` may carry `user:pass@`. Anything that logs it or puts it in an error
+context goes through `greentic_aw_runtime::url_redact::redact_url` (masks userinfo, handles
+comma-separated lists); see `serve::serve_with_ledger` and `maybe_spawn_inproc_agentic_serve`.
+
 ### Knowledge retrieval backends
 
 An agent's `Knowledge` implementation is a chain of wrappers around whatever is

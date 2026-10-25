@@ -639,7 +639,7 @@ fn maybe_spawn_inproc_agentic_serve() {
     let agent_count = agents.len();
     tracing::info!(
         agent_count,
-        nats_url = %nats_url,
+        nats_url = %greentic_aw_runtime::url_redact::redact_url(&nats_url),
         "starting in-process agentic serve (GREENTIC_AGENTIC_SERVE_INPROC)"
     );
     tokio::spawn(async move {

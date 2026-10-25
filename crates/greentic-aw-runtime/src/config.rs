@@ -531,7 +531,7 @@ mod tests {
                     "provider": "chronicle",
                     "capability": "cap://memory/long-term",
                     "params": { "backend": "surrealdb" },
-                    "credential_ref": "vault://acme/surreal"
+                    "credential_ref": "acme-surreal"
                 }
             }
         }"#;
@@ -540,7 +540,7 @@ mod tests {
         let long = mem.long_term.expect("long_term present");
         assert_eq!(long.provider, "chronicle");
         assert_eq!(long.capability, "cap://memory/long-term");
-        assert_eq!(long.credential_ref.as_deref(), Some("vault://acme/surreal"));
+        assert_eq!(long.credential_ref.as_deref(), Some("acme-surreal"));
         assert_eq!(
             mem.short_term.expect("short_term present").provider,
             "redis"
