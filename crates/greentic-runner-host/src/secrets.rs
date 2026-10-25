@@ -327,14 +327,14 @@ fn short_hash(raw: &str) -> String {
 ///    a 40-byte prefix) still get different segments — and so no two
 ///    `(pack, unit)` pairs can produce one string by splitting at a different
 ///    `_unit_`;
-/// 2b. the pack id likewise carries a `sha256` suffix of the RAW id whenever
+/// 3. the pack id likewise carries a `sha256` suffix of the RAW id whenever
 ///    its slug is lossy (differs from the id: case, punctuation, collapsed or
 ///    truncated), so `my.pack` / `my_pack` cannot share an address. A pack id
 ///    that is already its own slug is left unhashed. BREAKING for lossy pack
 ///    ids' existing per-unit secrets (they must be re-staged); see
 ///    `docs/audit-breaking-changes.md`. No read fallback to the old address:
 ///    it is exactly the address the colliding ids share;
-/// 3. a pack id whose slug is empty (punctuation only) falls back to
+/// 4. a pack id whose slug is empty (punctuation only) falls back to
 ///    `pack_<hash>` rather than an empty leading segment, which would put a
 ///    leading `_` in the output and break the fixed point.
 ///
