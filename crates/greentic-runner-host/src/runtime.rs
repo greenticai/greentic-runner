@@ -174,11 +174,18 @@ impl ActivePacks {
 
     /// Insert (or replace) a single tenant-only runtime, preserving all other
     /// entries — including revision-keyed ones.
+    ///
+    /// A runtime this replaces has its cron timers stopped
+    /// ([`TenantRuntime::abort_timers`]): it can stay referenced by an embedder
+    /// or in-flight work, and without this its timers kept firing alongside the
+    /// replacement's (a double fire per tick). Re-inserting the SAME runtime is
+    /// not a replacement and cancels nothing.
     pub fn insert_pack(&self, tenant: &str, runtime: Arc<TenantRuntime>) {
         let _guard = self.write_lock.lock();
         let mut next = (*self.inner.load_full()).clone();
-        next.insert(RuntimeKey::legacy(tenant), runtime);
+        let replaced = next.insert(RuntimeKey::legacy(tenant), Arc::clone(&runtime));
         self.inner.store(Arc::new(next));
+        retire_replaced(replaced, &runtime);
     }
 
     /// Insert (or replace) a single revision-keyed runtime, preserving every
@@ -227,8 +234,11 @@ impl ActivePacks {
         }
         let _guard = self.write_lock.lock();
         let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
-        let next = insert_keyed_entry(&self.inner.load_full(), key, runtime);
+        let prev = self.inner.load_full();
+        let replaced = prev.get(&key).cloned();
+        let next = insert_keyed_entry(&prev, key, Arc::clone(&runtime));
         self.inner.store(Arc::new(next));
+        retire_replaced(replaced, &runtime);
         Ok(())
     }
 
@@ -259,6 +269,9 @@ impl ActivePacks {
         let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
         let (next, removed) = remove_keyed_entry(&prev, &key)?;
         self.inner.store(Arc::new(next));
+        // Retired for good: stop its cron timers even though the caller (and
+        // in-flight work) may keep the returned `Arc` alive for a while.
+        removed.abort_timers();
         Some(removed)
     }
 
@@ -275,6 +288,16 @@ impl ActivePacks {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Stop the timers of a runtime that was just replaced by `current`, unless it
+/// IS `current` (re-inserting the same runtime must not cancel its own timers).
+fn retire_replaced(replaced: Option<Arc<TenantRuntime>>, current: &Arc<TenantRuntime>) {
+    if let Some(old) = replaced
+        && !Arc::ptr_eq(&old, current)
+    {
+        old.abort_timers();
     }
 }
 
@@ -2126,6 +2149,69 @@ impl Drop for TenantRuntime {
         if let Some(inbox) = &self.approval_inbox {
             inbox.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod timer_retirement_tests {
+    use super::*;
+
+    const CRON: &str = r#"[{ flow_id: "flow.main", cron: "0 0 1 1 *" }]"#;
+
+    async fn runtime_with_timers() -> (impl Sized, Arc<TenantRuntime>) {
+        let (workspace, runtime) = crate::test_support::build_test_runtime_with_timers(CRON)
+            .await
+            .expect("runtime");
+        let timers = crate::runner::adapt_timer::spawn_timers(Arc::clone(&runtime)).expect("spawn");
+        runtime.register_timers(timers);
+        (workspace, runtime)
+    }
+
+    #[tokio::test]
+    async fn insert_pack_stops_the_timers_of_the_runtime_it_replaces() {
+        let (_w1, old) = runtime_with_timers().await;
+        let (_w2, new) = runtime_with_timers().await;
+        let active = ActivePacks::new();
+        active.insert_pack("demo", Arc::clone(&old));
+        assert!(!old.timer_cancel_token().is_cancelled());
+
+        active.insert_pack("demo", Arc::clone(&new));
+        assert!(
+            old.timer_cancel_token().is_cancelled(),
+            "the replaced runtime must stop firing"
+        );
+        assert!(
+            !new.timer_cancel_token().is_cancelled(),
+            "the replacement keeps its timers"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_inserting_the_same_runtime_keeps_its_timers() {
+        let (_w, runtime) = runtime_with_timers().await;
+        let active = ActivePacks::new();
+        active.insert_pack("demo", Arc::clone(&runtime));
+        active.insert_pack("demo", Arc::clone(&runtime));
+        assert!(!runtime.timer_cancel_token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn remove_revision_stops_the_timers_of_the_removed_runtime() {
+        let (_w, runtime) = runtime_with_timers().await;
+        let (deployment, bundle, revision) =
+            (DeploymentId::new(), BundleId::from("bundle-a"), RevisionId::new());
+        let active = ActivePacks::new();
+        // Install under a revision key directly: building a runtime whose
+        // rollout identity matches is covered by `insert_revision`'s own tests.
+        let mut map = HashMap::new();
+        map.insert(
+            RuntimeKey::revision("demo", deployment.clone(), bundle.clone(), revision.clone()),
+            Arc::clone(&runtime),
+        );
+        active.replace(map);
+        let removed = active.remove_revision("demo", deployment, bundle, revision);
+        assert!(removed.is_some());
+        assert!(runtime.timer_cancel_token().is_cancelled());
     }
 }
 
