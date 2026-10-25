@@ -368,10 +368,10 @@ impl TelemetryLineSink {
             let line = match std::str::from_utf8(raw) {
                 Ok(s) => s,
                 Err(_) => {
-                    // Binary chunk; forward verbatim and move on.
+                    // Binary chunk: not a telemetry line, but still guest
+                    // output, so it is forwarded sanitised like any other.
                     if self.forward_unmatched.load(Ordering::Relaxed) {
-                        forward_bytes(self.kind, raw);
-                        forward_bytes(self.kind, b"\n");
+                        forward_bytes(self.kind, &forwardable_line(raw));
                     }
                     continue;
                 }
@@ -379,11 +379,26 @@ impl TelemetryLineSink {
             if let Some(parsed) = parse_line(line) {
                 emit_as_tracing(&parsed);
             } else if self.forward_unmatched.load(Ordering::Relaxed) {
-                forward_bytes(self.kind, raw);
-                forward_bytes(self.kind, b"\n");
+                forward_bytes(self.kind, &forwardable_line(raw));
             }
         }
     }
+}
+
+/// Longest guest line, in characters, forwarded to the host's stdout/stderr.
+const MAX_FORWARD_CHARS: usize = 8 * 1024;
+
+/// A guest line that is not telemetry, made safe for the host's own
+/// stdout/stderr (control and bidi characters replaced, length bounded) and
+/// terminated with its newline, so it can be written in ONE call: two writes
+/// let another thread's output land between the line and its newline.
+fn forwardable_line(raw: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = crate::log_safe::log_safe_max(&text, MAX_FORWARD_CHARS)
+        .into_owned()
+        .into_bytes();
+    out.push(b'\n');
+    out
 }
 
 fn forward_bytes(kind: StreamKind, bytes: &[u8]) {
@@ -456,6 +471,26 @@ mod tests {
     use futures::task::noop_waker;
     use std::pin::Pin;
     use std::task::Context;
+
+    #[test]
+    fn forwarded_guest_lines_are_sanitised_and_newline_terminated() {
+        let out = forwardable_line(b"plain text");
+        assert_eq!(out, b"plain text\n");
+
+        // An ANSI escape and a bidi override are neutralised; the line stays a
+        // single line.
+        let out = forwardable_line("a\x1b[31mb\u{202E}c".as_bytes());
+        assert_eq!(out, b"a [31mb c\n");
+
+        // Binary garbage is lossily decoded, not passed through raw.
+        let out = forwardable_line(&[0xff, 0xfe, b'x']);
+        assert_eq!(out.last(), Some(&b'\n'));
+        assert_eq!(out.iter().filter(|b| **b == b'\n').count(), 1);
+
+        // Length is bounded.
+        let out = forwardable_line("y".repeat(MAX_FORWARD_CHARS * 2).as_bytes());
+        assert_eq!(out.len(), MAX_FORWARD_CHARS + 1);
+    }
 
     #[test]
     fn sanitize_attr_strips_control_chars_and_bounds_length() {

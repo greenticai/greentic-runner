@@ -2572,7 +2572,17 @@ impl PackRuntime {
                     flows = Some(cache);
                 }
                 Err(err) => {
-                    warn!(error = %err, pack = %root.display(), "failed to parse materialized pack manifest");
+                    if archive_hint.is_none() {
+                        // No archive to fall back to: continuing would hand
+                        // back an empty pack that looks successfully loaded.
+                        return Err(err).with_context(|| {
+                            format!(
+                                "failed to load materialized pack manifest from {}",
+                                root.display()
+                            )
+                        });
+                    }
+                    warn!(error = %err, pack = %root.display(), "failed to parse materialized pack manifest; falling back to the archive");
                 }
             }
         }
@@ -2619,7 +2629,14 @@ impl PackRuntime {
         }
         let mut pack_lock = None;
         for root in find_pack_lock_roots(&safe_path, is_dir, archive_hint) {
-            pack_lock = load_pack_lock(&root)?;
+            // A lock that cannot be read or parsed is skipped, not fatal: the
+            // manifest's own component sources remain authoritative.
+            match load_pack_lock(&root) {
+                Ok(found) => pack_lock = found,
+                Err(error) => {
+                    warn!(error = %error, root = %root.display(), "ignoring unusable pack.lock");
+                }
+            }
             if pack_lock.is_some() {
                 break;
             }
@@ -2932,27 +2949,45 @@ impl PackRuntime {
         Ok(pack.effective_wasi_policy())
     }
 
+    /// The unit id and non-secret runtime config a direct flow run's pack
+    /// carries. Must equal this pack's; exposed so a test can pin that.
+    #[doc(hidden)]
+    pub async fn nested_load_scope(
+        &self,
+    ) -> Result<(Option<String>, Option<Arc<BTreeMap<String, Value>>>)> {
+        let (pack, _engine) = self.load_flow_engine().await?;
+        Ok((
+            pack.unit_id().map(str::to_string),
+            pack.runtime_config_non_secret().cloned(),
+        ))
+    }
+
     /// Load a fresh engine over this pack, the way every direct flow run here
     /// does. Shared by [`Self::execute_flow_inner`] and
     /// [`Self::resume_flow_for_tool`], so a resumed tool flow runs on exactly
     /// the pack and engine configuration its first leg did.
     async fn load_flow_engine(&self) -> Result<(Arc<PackRuntime>, FlowEngine)> {
-        let pack = Arc::new(
-            PackRuntime::load(
-                &self.path,
-                Arc::clone(&self.config),
-                self.mocks.clone(),
-                self.archive_path.as_deref(),
-                self.session_store.clone(),
-                self.state_store.clone(),
-                Arc::clone(&self.base_wasi_policy),
-                self.secrets.clone(),
-                self.oauth_config.clone(),
-                false,
-                ComponentResolution::default(),
-            )
-            .await?,
-        );
+        let mut loaded = PackRuntime::load(
+            &self.path,
+            Arc::clone(&self.config),
+            self.mocks.clone(),
+            self.archive_path.as_deref(),
+            self.session_store.clone(),
+            self.state_store.clone(),
+            Arc::clone(&self.base_wasi_policy),
+            self.secrets.clone(),
+            self.oauth_config.clone(),
+            false,
+            ComponentResolution::default(),
+        )
+        .await?;
+        // A freshly loaded pack carries none of the producer-injected scope.
+        // Without these a nested `component.exec` would read the secret scope
+        // shared by every unit and see an empty runtime config.
+        loaded.set_unit_id(self.unit_id.clone());
+        loaded.set_runtime_config_non_secret(self.runtime_config_non_secret.clone());
+        loaded.set_runtime_refs(self.runtime_refs.clone());
+        let pack = Arc::new(loaded);
         let mut engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
         // Read from `self` (the pack the host built its agent runtime over),
         // not from the freshly loaded `pack`, whose slot is empty.
@@ -4290,8 +4325,19 @@ impl PackRuntime {
     pub fn read_pack_file(&self, name: &str) -> Option<Vec<u8>> {
         // Materialized pack directory (root holds manifest.cbor + sidecars/assets).
         if self.path.is_dir() {
-            let candidate = self.path.join(name);
-            if candidate.exists() {
+            // `name` can come from pack-authored content (a corpus sidecar's
+            // asset paths), so it must not leave the pack directory.
+            let confined = match confined_asset_path(&self.path, name) {
+                Ok(found) => found,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "refusing to read {name} from pack directory"
+                    );
+                    return None;
+                }
+            };
+            if let Some(candidate) = confined {
                 match std::fs::read(&candidate) {
                     Ok(bytes) => return Some(bytes),
                     Err(error) => {
@@ -5447,21 +5493,14 @@ fn find_pack_lock_roots(
     if is_dir {
         return vec![pack_path.to_path_buf()];
     }
-    let mut roots = Vec::new();
-    if let Some(archive_path) = archive_hint {
-        if let Some(parent) = archive_path.parent() {
-            roots.push(parent.to_path_buf());
-            if let Some(grandparent) = parent.parent() {
-                roots.push(grandparent.to_path_buf());
-            }
-        }
-    } else if let Some(parent) = pack_path.parent() {
-        roots.push(parent.to_path_buf());
-        if let Some(grandparent) = parent.parent() {
-            roots.push(grandparent.to_path_buf());
-        }
-    }
-    roots
+    // Only the archive's own directory: a `pack.lock` further up the tree
+    // belongs to whatever else happens to live there (another pack, a shared
+    // cache dir) and would silently replace this pack's component table.
+    let archive = archive_hint.unwrap_or(pack_path);
+    archive
+        .parent()
+        .map(|parent| vec![parent.to_path_buf()])
+        .unwrap_or_default()
 }
 
 fn normalize_sha256(digest: &str) -> Result<String> {
@@ -5626,11 +5665,16 @@ fn component_sources_table_from_pack_lock(
     Ok(table)
 }
 
-fn component_path_for_spec(root: &Path, spec: &ComponentSpec) -> PathBuf {
-    if let Some(path) = &spec.legacy_path {
-        return root.join(path);
-    }
-    root.join("components").join(format!("{}.wasm", spec.id))
+/// Where a materialized component lives under `root`, or `Ok(None)` when it is
+/// not there. The relative path comes from pack-authored content (a legacy
+/// manifest's `legacy_path`, or the component id), so it is confined to `root`
+/// the same way asset paths are: normal components only, symlinks resolved.
+fn component_path_for_spec(root: &Path, spec: &ComponentSpec) -> Result<Option<PathBuf>> {
+    let relative = match &spec.legacy_path {
+        Some(path) => path.clone(),
+        None => format!("components/{}.wasm", spec.id),
+    };
+    confined_asset_path(root, &relative)
 }
 
 fn normalize_digest(digest: &str) -> String {
@@ -6374,8 +6418,12 @@ async fn load_components_from_sources(
         let bytes = match &source.artifact {
             ComponentArtifactLocation::Inline { wasm_path } => {
                 if let Some(root) = materialized_root {
-                    let path = root.join(wasm_path);
-                    if path.exists() {
+                    // `wasm_path` is pack-authored: confine it to the pack root.
+                    let confined = confined_asset_path(root, wasm_path).with_context(|| {
+                        format!("inline component {} has an unusable path", spec.id)
+                    })?;
+                    let path = confined.clone().unwrap_or_else(|| root.join(wasm_path));
+                    if confined.is_some() {
                         std::fs::read(&path).with_context(|| {
                             format!(
                                 "failed to read inline component {} from {}",
@@ -6595,11 +6643,12 @@ async fn load_components_from_dir(
         if !missing.contains(&spec.id) {
             continue;
         }
-        let path = component_path_for_spec(root, spec);
-        if !path.exists() {
-            tracing::debug!(component = %spec.id, path = %path.display(), "materialized component missing; will try other sources");
+        let Some(path) = component_path_for_spec(root, spec)
+            .with_context(|| format!("component {} has an unusable path", spec.id))?
+        else {
+            tracing::debug!(component = %spec.id, root = %root.display(), "materialized component missing; will try other sources");
             continue;
-        }
+        };
         let bytes = std::fs::read(&path)
             .with_context(|| format!("failed to read component {}", path.display()))?;
         let component = compile_component_with_cache(cache, engine, None, bytes)
@@ -7498,6 +7547,7 @@ impl PackMetadata {
 
 #[cfg(test)]
 mod audit_hardening_tests {
+    use super::tests::pack_runtime_for_dir;
     use super::*;
     use std::io::Write;
 
@@ -7579,6 +7629,76 @@ mod audit_hardening_tests {
             std::os::unix::fs::symlink(dir.path().join("secret.txt"), root.join("link.txt"))
                 .expect("symlink");
             assert!(confined_asset_path(&root, "link.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn pack_lock_is_searched_only_beside_the_archive() {
+        let archive = Path::new("/a/b/c.gtpack");
+        assert_eq!(
+            find_pack_lock_roots(archive, false, None),
+            vec![PathBuf::from("/a/b")]
+        );
+        assert_eq!(
+            find_pack_lock_roots(Path::new("/x/y.gtpack"), false, Some(archive)),
+            vec![PathBuf::from("/a/b")]
+        );
+    }
+
+    #[test]
+    fn a_corrupt_pack_lock_is_an_error_for_the_loader_to_skip() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(dir.path().join("pack.lock"), b"not json").expect("write");
+        assert!(load_pack_lock(dir.path()).is_err());
+    }
+
+    #[test]
+    fn component_paths_are_confined_to_the_pack_root() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("pack");
+        std::fs::create_dir_all(root.join("components")).expect("mkdir");
+        std::fs::write(root.join("components/ok.wasm"), b"\0asm").expect("write");
+        std::fs::write(dir.path().join("outside.wasm"), b"\0asm").expect("write");
+        let spec = |id: &str, legacy: Option<&str>| ComponentSpec {
+            id: id.to_string(),
+            version: "0.0.0".to_string(),
+            legacy_path: legacy.map(str::to_string),
+        };
+        assert!(
+            component_path_for_spec(&root, &spec("ok", None))
+                .expect("ok")
+                .is_some()
+        );
+        assert!(
+            component_path_for_spec(&root, &spec("gone", None))
+                .expect("ok")
+                .is_none()
+        );
+        assert!(component_path_for_spec(&root, &spec("x", Some("../outside.wasm"))).is_err());
+        let absolute = dir.path().join("outside.wasm").display().to_string();
+        assert!(component_path_for_spec(&root, &spec("x", Some(&absolute))).is_err());
+        assert!(component_path_for_spec(&root, &spec("../outside", None)).is_err());
+    }
+
+    #[test]
+    fn read_pack_file_is_confined_to_the_pack_directory() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("pack");
+        std::fs::create_dir_all(root.join("assets")).expect("mkdir");
+        std::fs::write(root.join("assets/ok.txt"), b"fine").expect("write");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"top-secret").expect("write secret");
+        let pack = pack_runtime_for_dir(&root);
+
+        assert_eq!(pack.read_pack_file("assets/ok.txt"), Some(b"fine".to_vec()));
+        assert_eq!(pack.read_pack_file("../secret.txt"), None);
+        assert_eq!(pack.read_pack_file("assets/../../secret.txt"), None);
+        assert_eq!(pack.read_pack_file(&secret.display().to_string()), None);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, root.join("assets/link.txt")).expect("symlink");
+            assert_eq!(pack.read_pack_file("assets/link.txt"), None);
         }
     }
 

@@ -8,6 +8,19 @@ use greentic_runner_host::cache::{CpuPolicy, EngineProfile};
 use serde_json::json;
 use tempfile::TempDir;
 
+#[test]
+fn warmup_key_is_the_sha256_of_the_bytes_not_a_lock_claim() {
+    let bytes = b"\0asm\x01\0\0\0";
+    let key = warmup_artifact_key("profile", bytes);
+    assert_eq!(key.engine_profile_id, "profile");
+    assert_eq!(key.wasm_digest, sha256_prefixed(bytes));
+    // Different bytes can never share a key, whatever a lock says about them.
+    assert_ne!(
+        key.wasm_digest,
+        warmup_artifact_key("profile", b"other").wasm_digest
+    );
+}
+
 fn parse(args: &[&str]) -> Cli {
     let mut argv = vec!["greentic-runner"];
     argv.extend_from_slice(args);

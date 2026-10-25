@@ -335,19 +335,12 @@ impl PackManager {
             .locator
             .with_fallback(self.cfg.source)
             .context("pack locator missing scheme")?;
-        let response = self
-            .registry
-            .fetch(&locator)
-            .with_context(|| format!("resolver failed for {}", locator))?;
-
-        let fetched_digest = compute_digest(response.path())?;
-        let has_pinned_digest = entry
+        let pinned = entry
             .content_digest
             .as_ref()
-            .or_else(|| entry.reference.version.as_digest())
-            .is_some();
+            .or_else(|| entry.reference.version.as_digest());
         if self.policy.verify_strict
-            && !has_pinned_digest
+            && pinned.is_none()
             && !locator.to_ascii_lowercase().starts_with("fs://")
         {
             bail!(
@@ -355,6 +348,23 @@ impl PackManager {
                 entry.reference.name
             );
         }
+
+        // A pinned digest names the bytes exactly, so a cached file that
+        // hashes to it needs no download. Without this every watcher refresh
+        // re-downloaded every remote pack.
+        if let Some(pinned) = pinned
+            && let Some(cached) = self.cache.lookup(&entry.reference, pinned)?
+        {
+            self.verify_signature(entry, pinned)?;
+            return self.open_resolved(entry, locator, cached, pinned.clone());
+        }
+
+        let response = self
+            .registry
+            .fetch(&locator)
+            .with_context(|| format!("resolver failed for {}", locator))?;
+
+        let fetched_digest = compute_digest(response.path())?;
         if entry
             .content_digest
             .as_ref()
@@ -383,6 +393,16 @@ impl PackManager {
         self.verify_signature(entry, &fetched_digest)?;
 
         let cached = self.cache.store(entry, response.path(), &fetched_digest)?;
+        self.open_resolved(entry, locator, cached, fetched_digest)
+    }
+
+    fn open_resolved(
+        &self,
+        entry: &PackEntry,
+        locator: String,
+        cached: PathBuf,
+        fetched_digest: PackDigest,
+    ) -> Result<ResolvedPack> {
         let PackLoad {
             manifest, report, ..
         } = open_pack(&cached, SigningPolicy::DevOk).map_err(|err| {

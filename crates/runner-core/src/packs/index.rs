@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::env::{IndexLocation, PackSource};
 
+use super::resolver::{DEFAULT_MAX_INDEX_DOWNLOAD_MB, copy_capped, env_cap_bytes};
 use super::{PackDigest, PackRef, PackVersion};
 
 #[derive(Debug, Clone)]
@@ -31,15 +32,24 @@ impl Index {
                 Self::from_reader_with_base(BufReader::new(file), base_dir.as_deref())
             }
             IndexLocation::Remote(url) => {
-                let client = Client::builder().build()?;
-                let response = client
+                let client = Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()?;
+                let mut response = client
                     .get(url.clone())
                     .send()
                     .with_context(|| format!("failed to fetch index {}", url))?
                     .error_for_status()
                     .with_context(|| format!("index download failed {}", url))?;
-                let bytes = response
-                    .bytes()
+                let cap =
+                    env_cap_bytes("GREENTIC_PACK_INDEX_MAX_MB", DEFAULT_MAX_INDEX_DOWNLOAD_MB);
+                if let (Some(cap), Some(len)) = (cap, response.content_length())
+                    && len > cap
+                {
+                    bail!("index {url} is {len} bytes, over the {cap} byte limit");
+                }
+                let mut bytes = Vec::new();
+                copy_capped(&mut response, &mut bytes, cap, "index")
                     .context("failed to read index response body")?;
                 Self::from_slice_with_base(&bytes, None)
             }
