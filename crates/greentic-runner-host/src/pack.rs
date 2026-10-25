@@ -804,14 +804,14 @@ impl HostState {
             if !guest.tenant.is_empty() && guest.tenant != tenant_raw {
                 warn!(
                     pack_id = %self.pack_id,
-                    guest_tenant = %guest.tenant,
+                    guest_tenant = %crate::log_safe::log_safe(&guest.tenant),
                     "ignoring guest-supplied tenant in state ctx; using host-bound tenant"
                 );
             }
             if !guest.env.is_empty() && guest.env != env_raw {
                 warn!(
                     pack_id = %self.pack_id,
-                    guest_env = %guest.env,
+                    guest_env = %crate::log_safe::log_safe(&guest.env),
                     "ignoring guest-supplied env in state ctx; using host-bound env"
                 );
             }
@@ -883,6 +883,19 @@ impl HostState {
             });
         }
 
+        if let Some(body) = req.body.as_deref()
+            && let Err(message) = crate::wasm_limits::check_size(
+                "request body",
+                body.len(),
+                crate::wasm_limits::http_max_request_bytes(),
+            )
+        {
+            return Err(HttpClientError {
+                code: "too-large".into(),
+                message,
+            });
+        }
+
         let mut mock_state = None;
         let raw_body = req.body.clone();
         if let Some(mock) = &self.mocks
@@ -938,23 +951,25 @@ impl HostState {
         }
 
         if let Some(opts) = opts {
-            if let Some(timeout_ms) = opts.timeout_ms {
-                builder = builder.timeout(Duration::from_millis(timeout_ms as u64));
+            if let Some(timeout) =
+                guest_timeout(opts.timeout_ms, crate::http_timeout_hooks::ceiling())
+            {
+                builder = builder.timeout(timeout);
             }
             if opts.allow_insecure == Some(true) {
-                warn!(url = %req.url, "allow-insecure not supported; using default TLS validation");
+                warn!(url = %crate::log_safe::log_safe_url(&req.url), "allow-insecure not supported; using default TLS validation");
             }
             if let Some(follow_redirects) = opts.follow_redirects
                 && !follow_redirects
             {
-                warn!(url = %req.url, "follow-redirects=false not supported; using default client behaviour");
+                warn!(url = %crate::log_safe::log_safe_url(&req.url), "follow-redirects=false not supported; using default client behaviour");
             }
         }
 
         let response = match builder.send() {
             Ok(resp) => resp,
             Err(err) => {
-                warn!(url = %req.url, error = %err, "http client request failed");
+                warn!(url = %crate::log_safe::log_safe_url(&req.url), error = %err, "http client request failed");
                 if crate::http_guard::is_blocked_error(&err) {
                     return Err(HttpClientError {
                         code: "denied".into(),
@@ -979,17 +994,19 @@ impl HostState {
                 )
             })
             .collect::<Vec<_>>();
-        let body_bytes =
-            match crate::http_guard::read_capped_body(response, guard.max_response_bytes) {
-                Ok(bytes) => Some(bytes),
-                Err(err) => {
-                    warn!(url = %req.url, error = %err, "http response body read failed");
-                    return Err(HttpClientError {
-                        code: "unavailable".into(),
-                        message: format!("failed to read response body: {err}"),
-                    });
-                }
-            };
+        let body_bytes = match crate::http_guard::read_capped_body(
+            response,
+            guard.max_response_bytes,
+        ) {
+            Ok(bytes) => Some(bytes),
+            Err(err) => {
+                warn!(url = %crate::log_safe::log_safe_url(&req.url), error = %err, "http response body read failed");
+                return Err(HttpClientError {
+                    code: "unavailable".into(),
+                    message: format!("failed to read response body: {err}"),
+                });
+            }
+        };
 
         if let Some((meta, true)) = mock_state.take()
             && let Some(mock) = &self.mocks
@@ -1047,7 +1064,7 @@ fn parse_v06_input(input_json: &str) -> Value {
 impl SecretsStoreHost for HostState {
     fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, SecretsError> {
         if provider_core_only::is_enabled() {
-            warn!(secret = %key, "provider-core only mode enabled; blocking secrets store");
+            warn!(secret = %crate::log_safe::log_safe(&key), "provider-core only mode enabled; blocking secrets store");
             return Err(SecretsError::Denied);
         }
         if !self.config.secrets_policy.is_allowed(&key) {
@@ -1063,7 +1080,7 @@ impl SecretsStoreHost for HostState {
         match self.read_pack_secret(&ctx, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
-                warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
+                warn!(secret = %crate::log_safe::log_safe(&key), canonical = %crate::log_safe::log_safe(&canonical_key), error = %err, "secret lookup failed");
                 Err(match err {
                     PackSecretError::NotFound(_) => SecretsError::NotFound,
                     PackSecretError::Denied(_) => SecretsError::Denied,
@@ -1077,7 +1094,7 @@ impl SecretsStoreHost for HostState {
 impl SecretsStoreHostV1_1 for HostState {
     fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, SecretsErrorV1_1> {
         if provider_core_only::is_enabled() {
-            warn!(secret = %key, "provider-core only mode enabled; blocking secrets store");
+            warn!(secret = %crate::log_safe::log_safe(&key), "provider-core only mode enabled; blocking secrets store");
             return Err(SecretsErrorV1_1::Denied);
         }
         if !self.config.secrets_policy.is_allowed(&key) {
@@ -1093,7 +1110,7 @@ impl SecretsStoreHostV1_1 for HostState {
         match self.read_pack_secret(&ctx, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
-                warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
+                warn!(secret = %crate::log_safe::log_safe(&key), canonical = %crate::log_safe::log_safe(&canonical_key), error = %err, "secret lookup failed");
                 Err(match err {
                     PackSecretError::NotFound(_) => SecretsErrorV1_1::NotFound,
                     PackSecretError::Denied(_) => SecretsErrorV1_1::Denied,
@@ -1103,30 +1120,106 @@ impl SecretsStoreHostV1_1 for HostState {
         }
     }
 
+    /// The WIT `put` returns nothing, so a refusal cannot be reported through
+    /// this trait method; it is logged and dropped. The linker does not route
+    /// guest calls here: [`add_secrets_store_to_linker`] calls
+    /// [`HostState::try_put_secret`] and turns a refusal into a guest trap.
     fn put(&mut self, key: String, value: Vec<u8>) {
+        if let Err(err) = self.try_put_secret(&key, &value) {
+            warn!(error = %err, "secret write refused");
+        }
+    }
+}
+
+/// Why a guest `secrets-store.put` was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum SecretPutError {
+    #[error("secret write denied for key {0}: invalid key")]
+    InvalidKey(String),
+    #[error("secret write denied for key {0}: provider-core-only mode")]
+    ProviderCoreOnly(String),
+    #[error("secret write denied for key {0}: policy")]
+    Policy(String),
+    #[error("secret write failed for key {0}")]
+    WriteFailed(String),
+}
+
+impl HostState {
+    /// Fallible secret write. Never panics; guest-reachable refusals come back
+    /// as [`SecretPutError`] (the key in the message is log-safe and bounded).
+    pub fn try_put_secret(&mut self, key: &str, value: &[u8]) -> Result<(), SecretPutError> {
+        let safe_key = crate::log_safe::log_safe(key).into_owned();
         if key.trim().is_empty() {
-            warn!(secret = %key, "secret write blocked: empty key");
-            panic!("secret write denied for key {key}: invalid key");
+            warn!(secret = %safe_key, "secret write blocked: empty key");
+            return Err(SecretPutError::InvalidKey(safe_key));
         }
         if provider_core_only::is_enabled() && !self.allows_secret_write_in_provider_core_only() {
             warn!(
-                secret = %key,
+                secret = %safe_key,
                 component = self.component_ref.as_deref().unwrap_or("<pack>"),
                 "provider-core only mode enabled; blocking secrets store write"
             );
-            panic!("secret write denied for key {key}: provider-core-only mode");
+            return Err(SecretPutError::ProviderCoreOnly(safe_key));
         }
-        if !self.config.secrets_policy.is_allowed(&key) {
-            warn!(secret = %key, "secret write denied by bindings policy");
-            panic!("secret write denied for key {key}: policy");
+        if !self.config.secrets_policy.is_allowed(key) {
+            warn!(secret = %safe_key, "secret write denied by bindings policy");
+            return Err(SecretPutError::Policy(safe_key));
         }
         let ctx = self.secrets_tenant_ctx();
-        let canonical_key = canonicalize_secret_key(&key);
-        if let Err(err) = self.write_pack_secret(&ctx, &canonical_key, &value) {
-            warn!(secret = %key, canonical = %canonical_key, error = %err, "secret write failed");
-            panic!("secret write failed for key {key}");
+        let canonical_key = canonicalize_secret_key(key);
+        if let Err(err) = self.write_pack_secret(&ctx, &canonical_key, value) {
+            warn!(
+                secret = %safe_key,
+                canonical = %crate::log_safe::log_safe(&canonical_key),
+                error = %err,
+                "secret write failed"
+            );
+            return Err(SecretPutError::WriteFailed(safe_key));
         }
+        Ok(())
     }
+}
+
+fn v1_1_error_to_v1_0(err: SecretsErrorV1_1) -> SecretsError {
+    match err {
+        SecretsErrorV1_1::NotFound => SecretsError::NotFound,
+        SecretsErrorV1_1::Denied => SecretsError::Denied,
+        SecretsErrorV1_1::InvalidKey => SecretsError::InvalidKey,
+        SecretsErrorV1_1::Internal => SecretsError::Internal,
+    }
+}
+
+/// Register `secrets-store` `@1.1.0` and `@1.0.0` on the linker. Replaces the
+/// library's `add_secrets_store_compat_to_linker` so a refused `put` surfaces
+/// as an ordinary guest trap (an invocation error) instead of a host panic;
+/// the WIT `put` has no result type to carry the error.
+fn add_secrets_store_to_linker(linker: &mut Linker<ComponentState>) -> Result<()> {
+    let mut v1_1 = linker.instance("greentic:secrets-store/secrets-store@1.1.0")?;
+    v1_1.func_wrap(
+        "get",
+        |mut caller: StoreContextMut<'_, ComponentState>, (key,): (String,)| {
+            let host = caller.data_mut().host_mut();
+            Ok((SecretsStoreHostV1_1::get(host, key),))
+        },
+    )?;
+    v1_1.func_wrap(
+        "put",
+        |mut caller: StoreContextMut<'_, ComponentState>, (key, value): (String, Vec<u8>)| {
+            let host = caller.data_mut().host_mut();
+            host.try_put_secret(&key, &value)
+                .map_err(wasmtime::Error::new)
+        },
+    )?;
+    let mut v1_0 = linker.instance("greentic:secrets-store/secrets-store@1.0.0")?;
+    v1_0.func_wrap(
+        "get",
+        |mut caller: StoreContextMut<'_, ComponentState>, (key,): (String,)| {
+            let host = caller.data_mut().host_mut();
+            let result = SecretsStoreHostV1_1::get(host, key).map_err(v1_1_error_to_v1_0);
+            Ok((result,))
+        },
+    )?;
+    Ok(())
 }
 
 /// Process-global set of `pack-config.v1` keys for which the compat shim has
@@ -1139,7 +1232,7 @@ fn warn_compat_fallback_once(key: &str) {
     let mut warned = WARNED_COMPAT_KEYS.lock();
     if warned.insert(key.to_string()) {
         warn!(
-            key = %key,
+            key = %crate::log_safe::log_safe(key),
             "runtime-config key resolved via secrets-store compat fallback; \
              move this value into pack-config.v1.non_secret"
         );
@@ -1159,7 +1252,7 @@ impl RuntimeConfigHost for HostState {
             && let Some(value) = map.get(&key)
         {
             return serde_json::to_string(value).map(Some).map_err(|err| {
-                warn!(key = %key, error = %err, "runtime-config value JSON-encode failed");
+                warn!(key = %crate::log_safe::log_safe(&key), error = %err, "runtime-config value JSON-encode failed");
                 ConfigError::Internal
             });
         }
@@ -1174,16 +1267,16 @@ impl RuntimeConfigHost for HostState {
             use crate::runtime_refs::RuntimeRefResolverError;
             return match injection.resolver.resolve(uri) {
                 Ok(Some(value)) => serde_json::to_string(&value).map(Some).map_err(|err| {
-                    warn!(key = %key, error = %err, "runtime-ref value JSON-encode failed");
+                    warn!(key = %crate::log_safe::log_safe(&key), error = %err, "runtime-ref value JSON-encode failed");
                     ConfigError::Internal
                 }),
                 Ok(None) => Ok(None),
                 Err(err @ RuntimeRefResolverError::Invalid(_)) => {
-                    warn!(key = %key, error = %err, "runtime-ref rejected");
+                    warn!(key = %crate::log_safe::log_safe(&key), error = %err, "runtime-ref rejected");
                     Err(ConfigError::InvalidKey)
                 }
                 Err(err @ RuntimeRefResolverError::Internal(_)) => {
-                    warn!(key = %key, error = %err, "runtime-ref resolution failed");
+                    warn!(key = %crate::log_safe::log_safe(&key), error = %err, "runtime-ref resolution failed");
                     Err(ConfigError::Internal)
                 }
             };
@@ -1199,7 +1292,7 @@ impl RuntimeConfigHost for HostState {
                 }
                 Err(_) => {
                     warn!(
-                        key = %key,
+                        key = %crate::log_safe::log_safe(&key),
                         "runtime-config compat fallback found non-UTF-8 secret bytes; \
                          returning not-found"
                     );
@@ -1344,6 +1437,16 @@ impl StateStoreHost for HostState {
         bytes: Vec<u8>,
         ctx: Option<StateTenantCtx>,
     ) -> Result<StateOpAck, StateError> {
+        if let Err(message) = crate::wasm_limits::check_size(
+            "state value",
+            bytes.len(),
+            crate::wasm_limits::state_max_value_bytes(),
+        ) {
+            return Err(StateError {
+                code: "too-large".into(),
+                message,
+            });
+        }
         let store = match self.state_store.as_ref() {
             Some(store) => store.clone(),
             None => {
@@ -1498,6 +1601,16 @@ impl HostState {
         bytes: Vec<u8>,
         ctx: Option<StateTenantCtx>,
     ) -> Result<bool, StateError> {
+        if let Err(message) = crate::wasm_limits::check_size(
+            "state value",
+            bytes.len(),
+            crate::wasm_limits::state_max_value_bytes(),
+        ) {
+            return Err(StateError {
+                code: "too-large".into(),
+                message,
+            });
+        }
         let store = match self.state_store.as_ref() {
             Some(store) => store.clone(),
             None => {
@@ -1625,6 +1738,9 @@ impl StateStoreHostV1_1 for HostState {
     }
 }
 
+/// Cap on guest telemetry fields re-emitted per log call.
+const MAX_TELEMETRY_FIELDS: usize = 64;
+
 impl TelemetryLoggerHost for HostState {
     fn log(
         &mut self,
@@ -1637,16 +1753,22 @@ impl TelemetryLoggerHost for HostState {
         {
             return Ok(TelemetryAck::Ok);
         }
+        // Everything in `span` and `fields` is guest-claimed. The tenant the
+        // host actually bound is logged beside it; guest text is sanitised
+        // and bounded so it cannot forge log lines or flood the log.
         let mut map = serde_json::Map::new();
-        for (k, v) in fields {
+        for (k, v) in fields.into_iter().take(MAX_TELEMETRY_FIELDS) {
+            let k = crate::log_safe::log_safe_max(&k, 128).into_owned();
+            let v = crate::log_safe::log_safe_max(&v, 1024).into_owned();
             map.insert(k, Value::String(v));
         }
         tracing::info!(
-            tenant = %span.tenant,
-            flow_id = %span.flow_id,
-            node = ?span.node_id,
-            provider = %span.provider,
-            fields = %serde_json::Value::Object(map.clone()),
+            host_tenant = %self.config.tenant,
+            guest_tenant = %crate::log_safe::log_safe(&span.tenant),
+            flow_id = %crate::log_safe::log_safe(&span.flow_id),
+            node = ?span.node_id.as_deref().map(crate::log_safe::log_safe),
+            provider = %crate::log_safe::log_safe(&span.provider),
+            fields = %serde_json::Value::Object(map),
             "telemetry log from pack"
         );
         Ok(TelemetryAck::Ok)
@@ -1911,7 +2033,17 @@ pub struct ComponentState {
     http_timeout_hooks: crate::http_guard::GuardedHooks,
     resource_table: ResourceTable,
     wasm_limits: crate::wasm_limits::WasmLimits,
-    store_limits: wasmtime::StoreLimits,
+    store_limits: crate::wasm_limits::GuestLimiter,
+}
+
+/// Resolve the guest's requested `timeout-ms` against the host ceiling.
+/// Absent or zero keeps the client default (`None`); anything else is
+/// clamped so a guest cannot extend the default into an unbounded host call.
+pub(crate) fn guest_timeout(requested_ms: Option<u32>, ceiling: Duration) -> Option<Duration> {
+    match requested_ms {
+        None | Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(u64::from(ms)).min(ceiling)),
+    }
 }
 
 /// Create the per-invocation store: memory/table/instance limiter plus a fresh
@@ -2131,11 +2263,14 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             state_store_v1_1: allow_state_store
                 .then_some(|state: &mut ComponentState| state.host_mut()),
             state_store: None,
-            secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
+            // Registered below by `add_secrets_store_to_linker` so a refused
+            // `put` traps the guest instead of panicking the host.
+            secrets_store_v1_1: None,
             secrets_store: None,
             runtime_config: Some(|state: &mut ComponentState| state.host_mut()),
         },
     )?;
+    add_secrets_store_to_linker(linker)?;
     add_http_client_client_world_aliases(linker)?;
     add_telemetry_logging_stub(linker)?;
     Ok(())
@@ -7505,5 +7640,33 @@ mod audit_hardening_tests {
             .await
             .expect("ok");
         assert_eq!(ok, 42);
+    }
+}
+
+#[cfg(test)]
+mod guest_http_timeout_tests {
+    use super::guest_timeout;
+    use std::time::Duration;
+
+    const CEILING: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn absent_or_zero_keeps_the_default() {
+        assert_eq!(guest_timeout(None, CEILING), None);
+        assert_eq!(guest_timeout(Some(0), CEILING), None);
+    }
+
+    #[test]
+    fn value_under_the_ceiling_is_honoured() {
+        assert_eq!(
+            guest_timeout(Some(5_000), CEILING),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn value_over_the_ceiling_is_clamped() {
+        assert_eq!(guest_timeout(Some(u32::MAX), CEILING), Some(CEILING));
+        assert_eq!(guest_timeout(Some(30_001), CEILING), Some(CEILING));
     }
 }

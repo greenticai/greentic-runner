@@ -95,18 +95,27 @@ fn secrets_store_put_denies_when_policy_blocks() -> Result<()> {
         None,
     )?;
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        SecretsStoreHostV1_1::put(&mut host_state, "blocked".to_string(), b"nope".to_vec())
-    }));
-    let msg = result.expect_err("put should be denied");
-    let msg = msg
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| msg.downcast_ref::<&str>().copied())
-        .unwrap_or("<non-string panic>");
+    // The trait `put` has no result type: a refusal must be dropped, never a
+    // panic. The fallible entry point reports it.
+    SecretsStoreHostV1_1::put(&mut host_state, "blocked".to_string(), b"nope".to_vec());
+    let err = host_state
+        .try_put_secret("blocked", b"nope")
+        .expect_err("put should be denied");
+    let msg = err.to_string();
     assert!(msg.contains("blocked"));
     assert!(msg.contains("denied"));
     assert!(!msg.contains("nope"));
+
+    // Guest-reachable refusals are errors, not panics: empty key, and a key
+    // carrying a newline is sanitised in the message.
+    let err = host_state
+        .try_put_secret("   ", b"x")
+        .expect_err("empty key refused");
+    assert!(err.to_string().contains("invalid key"));
+    let err = host_state
+        .try_put_secret("evil\nWARN forged", b"x")
+        .expect_err("policy refused");
+    assert!(!err.to_string().contains('\n'));
 
     let writes = manager.writes.lock().expect("writes lock");
     assert_eq!(writes.len(), 0);
