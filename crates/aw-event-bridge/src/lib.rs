@@ -253,12 +253,31 @@ pub fn validate_scope_id(kind: &str, value: &str) -> Result<(), Rejection> {
 #[must_use]
 pub fn response_scope(tenant: Option<&str>, env: Option<&str>) -> Option<(String, String)> {
     let tenant = tenant?;
-    let env = env.unwrap_or("default");
-    if validate_scope_id("tenant", tenant).is_ok() && validate_scope_id("env", env).is_ok() {
+    // A blank env header is "absent", exactly as in `parse_request`.
+    let env = env.filter(|value| !value.trim().is_empty()).unwrap_or("default");
+    if is_echoable_scope_id(tenant) && is_echoable_scope_id(env) {
         Some((tenant.to_string(), env.to_string()))
     } else {
         None
     }
+}
+
+/// Whether a tenant / env id may be ECHOED into a response header.
+///
+/// This is the runner's own id charset (`[A-Za-z0-9._-]`, which includes `..`
+/// inside a name such as `a..b`), capped at [`MAX_SCOPE_ID_LEN`]. It is
+/// deliberately looser than [`validate_scope_id`], which also rejects `..`
+/// because THAT check guards ids used to build keys and paths. Echoing only
+/// stamps a header: if the response were not stamped for an id the runner
+/// accepted, its tenant-scoped listener would drop the rejection and the
+/// awaiting flow would wait out its watchdog (forever with no deadline).
+#[must_use]
+pub fn is_echoable_scope_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SCOPE_ID_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Validate headers and decode the payload (pure; no I/O).
@@ -273,7 +292,11 @@ pub fn parse_request(
     let idempotency = get_header("Greentic-Idempotency-Key").or_else(|| correlation.clone());
     let dispatch_id = get_header(DISPATCH_ID_HEADER).filter(|id| valid_dispatch_id(id));
     let tenant = get_header("Greentic-Tenant").unwrap_or_default();
-    let env = get_header("Greentic-Env").unwrap_or_else(|| "default".to_string());
+    // A blank `Greentic-Env` is treated as absent (the runner's own decoder
+    // does the same), not as an invalid id.
+    let env = get_header("Greentic-Env")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
     validate_scope_id("tenant", &tenant)?;
     validate_scope_id("env", &env)?;
     let request: RuntimeDispatchRequest =
@@ -896,6 +919,51 @@ mod tests {
     fn state_load_failures_other_than_a_blip_are_not_retryable() {
         let decode = anyhow::anyhow!("agent state load failed: decode error: bad");
         assert!(!is_lock_contention(&decode));
+    }
+
+    #[test]
+    fn a_blank_env_header_is_absent_not_invalid() {
+        for blank in ["", "   "] {
+            let parsed = parse_request(
+                |name| match name {
+                    "Greentic-Tenant" => Some("acme".to_string()),
+                    "Greentic-Env" => Some(blank.to_string()),
+                    _ => None,
+                },
+                &payload(),
+            )
+            .expect("blank env falls back to default");
+            assert_eq!(parsed.env, "default");
+            assert_eq!(
+                response_scope(Some("acme"), Some(blank)),
+                Some(("acme".into(), "default".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_replies_echo_ids_the_runner_accepts_even_with_dots() {
+        // `a..b` is valid for the runner ([A-Za-z0-9._-]) but rejected here for
+        // key-building; its rejection must still be stamped so the runner's
+        // tenant-scoped listener does not drop it.
+        let rejection = parse_request(
+            |name| match name {
+                "Greentic-Tenant" => Some("a..b".to_string()),
+                _ => None,
+            },
+            &payload(),
+        );
+        assert!(rejection.is_err(), "key-building keeps rejecting `..`");
+        assert!(validate_scope_id("tenant", "a..b").is_err());
+        assert_eq!(
+            response_scope(Some("a..b"), Some("e..1")),
+            Some(("a..b".into(), "e..1".into()))
+        );
+        // Anything outside the runner charset is still never echoed.
+        assert_eq!(response_scope(Some("a b"), None), None);
+        assert_eq!(response_scope(Some("acme"), Some("x/y")), None);
+        assert_eq!(response_scope(Some(""), None), None);
+        assert!(!is_echoable_scope_id(&"a".repeat(MAX_SCOPE_ID_LEN + 1)));
     }
 
     #[test]
