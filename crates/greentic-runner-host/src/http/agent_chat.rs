@@ -197,6 +197,18 @@ async fn execute_chat(
     }
 }
 
+/// Run `fut` on its own task and wait for it. If the caller's future is
+/// dropped (client disconnect, request timeout) the task keeps running to
+/// completion, so a turn is never cancelled between its work and its state
+/// save / lock release. A panic in `fut` comes back as a `JoinError`.
+pub(crate) async fn run_detached<T, F>(fut: F) -> Result<T, tokio::task::JoinError>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(fut).await
+}
+
 /// Failure modes of one chat turn, mapped to a status and a stable client body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatError {
@@ -226,7 +238,15 @@ pub async fn agent_chat(
     State(state): State<ServerState>,
     Json(req): Json<AgentChatRequest>,
 ) -> impl IntoResponse {
-    match execute_chat(&state.host, state.routing.default_tenant(), req).await {
+    let host = state.host.clone();
+    let default_tenant = state.routing.default_tenant().to_string();
+    let outcome = run_detached(async move { execute_chat(&host, &default_tenant, req).await })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "agent chat turn task panicked or was cancelled");
+            Err(ChatError::Internal.into_response_parts())
+        });
+    match outcome {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err((code, body)) => (code, Json(body)).into_response(),
     }
@@ -381,7 +401,8 @@ pub fn agent_chat_stream_core(
     let default_tenant = state.routing.default_tenant().to_string();
     let registry: StreamObserverRegistry = state.stream_observers.clone();
 
-    tokio::spawn(async move {
+    let panic_tx = frame_tx.clone();
+    let turn = tokio::spawn(async move {
         // See `Cleanup`'s doc comment for why this guard is ptr_eq-protected.
         let _cleanup = Cleanup {
             registry,
@@ -409,6 +430,16 @@ pub fn agent_chat_stream_core(
                     message: "agent chat failed".to_string(),
                 });
             }
+        }
+    });
+    // A panic inside the turn would otherwise close the stream with no
+    // terminal frame; surface it as an `Error` frame.
+    tokio::spawn(async move {
+        if let Err(e) = turn.await {
+            tracing::error!(error = %e, "agent chat stream turn task panicked");
+            let _ = panic_tx.send(StreamFrame::Error {
+                message: "agent chat failed".to_string(),
+            });
         }
     });
 
@@ -508,6 +539,27 @@ mod tests {
             .expect_err("unknown tenant should fail");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert_eq!(err.1["error"], "tenant_not_loaded");
+    }
+
+    #[tokio::test]
+    async fn run_detached_survives_dropped_caller() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let caller = run_detached(async move {
+            let _ = go_rx.await;
+            let _ = done_tx.send(());
+        });
+        // Poll the caller briefly then drop it (simulates client disconnect).
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(20), caller).await;
+        let _ = go_tx.send(());
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), done_rx).await;
+        assert!(matches!(finished, Ok(Ok(()))), "task must outlive caller");
+    }
+
+    #[tokio::test]
+    async fn run_detached_reports_panics_as_join_error() {
+        let res = run_detached(async { panic!("boom") }).await;
+        assert!(res.is_err_and(|e| e.is_panic()));
     }
 
     #[test]
