@@ -722,7 +722,14 @@ mirroring) and exposes an `AgentDispatchInvoker` seam + `run_bridge`. The
 production invoker (`greentic_aw_runtime::serve::RuntimeAgentDispatchInvoker`)
 maps `target` → agent id, `input.user_text` → `AgentInput`, the correlation hint
 → session id, and serialises `AgentOutput` to `{reply, trail, terminated_by}`
-(identical to the in-process `dw.agent` node output). Serve entries:
+(identical to the in-process `dw.agent` node output). **Session id length:** the
+runner's `::cnv64=` / `::thr64=` / `::rpl64=` markers lengthen the correlation
+hint, and `validate_session_id` caps a session id at 512 bytes. `resolve_session_id`
+therefore replaces an over-long id with `h:` + sha256 hex (66 chars, deterministic,
+so one conversation keeps one memory); an id with a control character is still
+rejected. Ids at or under the cap are unchanged. Conversations whose id was over
+the cap were rejected every turn before, so none has memory to lose; see
+`docs/audit-breaking-changes.md`. Serve entries:
 `greentic_aw_runtime::serve::serve(nats_url, runtime)` and the host-level
 `agent_node::serve_agentic(nats_url, merged_agents)` (reuses the shared
 `build_agent_runtime` so in-process and serve paths build an identical runtime).
