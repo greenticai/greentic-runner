@@ -1298,12 +1298,15 @@ impl Adapter for PackFlowAdapter {
                 if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
                     reporter.record(turn.completed(&observed, &output));
                 }
-                self.resume.clear(&envelope).await?;
+                persist_after_effects(|| self.resume.clear(&envelope)).await?;
                 Ok((output, node_outputs))
             }
             FlowStatus::Waiting(wait) => {
                 let marker = turn.as_ref().map(|turn| turn.marker_after(&observed));
-                let reply_scope = self.resume.save_with_run(&envelope, &wait, marker).await?;
+                let reply_scope = persist_after_effects(|| {
+                    self.resume.save_with_run(&envelope, &wait, marker.clone())
+                })
+                .await?;
                 if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
                     reporter.record(turn.waiting(&observed, &wait));
                 }
@@ -1318,6 +1321,22 @@ impl Adapter for PackFlowAdapter {
             }
         }
     }
+}
+
+/// Run an idempotent resume-store write that happens AFTER a flow's side
+/// effects, retrying the write itself (never the flow) and reporting a final
+/// failure as the non-retryable `PostEffectPersistence`.
+async fn persist_after_effects<F, Fut, T>(op: F) -> GResult<T>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = GResult<T>> + Send,
+    T: Send,
+{
+    super::policy::retry_with_jitter(&super::policy::RetryPolicy::default(), op)
+        .await
+        .map_err(|err| RunnerError::PostEffectPersistence {
+            reason: err.to_string(),
+        })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

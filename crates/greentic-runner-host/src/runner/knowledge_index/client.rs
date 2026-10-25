@@ -80,8 +80,7 @@ pub(super) async fn embed(
     if !status.is_success() {
         return Err(embed_error(format!("status {}", status.as_u16())));
     }
-    let body: EmbeddingResponse = response
-        .json()
+    let body: EmbeddingResponse = read_json_capped(response, MAX_RESPONSE_BYTES)
         .await
         .map_err(|_| embed_error("the response body is not an embeddings list"))?;
     body.data
@@ -90,6 +89,33 @@ pub(super) async fn embed(
         .map(|item| item.embedding)
         .filter(|vector| !vector.is_empty())
         .ok_or_else(|| embed_error("the response carries no embedding"))
+}
+
+/// Largest response body (embedding or search) read into memory. A server that
+/// streams more is treated as a malformed answer, not buffered.
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Decode a JSON body, refusing to buffer more than `limit` bytes. A declared
+/// `Content-Length` over the limit fails before any byte is read.
+async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<T, String> {
+    if response.content_length().is_some_and(|len| len > limit) {
+        return Err("response body too large".to_string());
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| transport_reason(&e).to_string())?
+    {
+        if buf.len() as u64 + chunk.len() as u64 > limit {
+            return Err("response body too large".to_string());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|_| "malformed response body".to_string())
 }
 
 /// Standard base64 of the vector's little-endian `f32` bytes.
@@ -185,10 +211,9 @@ async fn search_one(
     if !status.is_success() {
         return Err(status.as_u16().to_string());
     }
-    let body: SearchResponse = response
-        .json()
+    let body: SearchResponse = read_json_capped(response, MAX_RESPONSE_BYTES)
         .await
-        .map_err(|_| "malformed response body".to_string())?;
+        .map_err(|_| "malformed or oversized response body".to_string())?;
     Ok(body.chunks)
 }
 
@@ -237,6 +262,34 @@ fn transport_reason(error: &reqwest::Error) -> &'static str {
         "could not connect"
     } else {
         "transport error"
+    }
+}
+
+#[cfg(test)]
+mod capped_body_tests {
+    use super::read_json_capped;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn fetch(body: &str, limit: u64) -> Result<serde_json::Value, String> {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+            .mount(&server)
+            .await;
+        let response = reqwest::Client::new()
+            .get(server.uri())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        read_json_capped(response, limit).await
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_cap_decodes_and_one_over_it_is_refused() {
+        let body = r#"{"a":"0123456789"}"#;
+        assert!(fetch(body, body.len() as u64).await.is_ok());
+        assert!(fetch(body, body.len() as u64 - 1).await.is_err());
     }
 }
 

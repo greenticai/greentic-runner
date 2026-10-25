@@ -1203,6 +1203,10 @@ impl FlowEngine {
         let resumed_at = resumed_card_node(&snapshot);
         let mut state = snapshot.state;
         state.resumed_at = resumed_at;
+        // `redirect_limit` guards a loop inside ONE inbound turn. A new inbound
+        // message is a new turn, so gotos from earlier parked turns must not
+        // count against it (the 4th goto across turns used to fail).
+        state.reset_redirect_count();
         // Replace BOTH `input` AND `entry` with the new activity. The
         // routing context (built by `build_routing_context`) reads
         // `entry.input.metadata.*` for the synthesised `response.*` fields
@@ -1270,7 +1274,10 @@ impl FlowEngine {
                 .with_context(|| format!("flow {} has no start node", flow_ir.id))?,
         };
 
+        let mut steps_run: usize = 0;
         loop {
+            steps_run += 1;
+            check_step_budget(steps_run, flow_ir.id.as_str())?;
             let step_ctx = FlowContext {
                 tenant: ctx.tenant,
                 pack_id: ctx.pack_id,
@@ -4022,6 +4029,10 @@ impl ExecutionState {
         self.redirect_count
     }
 
+    fn reset_redirect_count(&mut self) {
+        self.redirect_count = 0;
+    }
+
     fn increment_redirect_count(&mut self) {
         self.redirect_count = self.redirect_count.saturating_add(1);
     }
@@ -6388,40 +6399,54 @@ fn evaluate_custom_routing(
 ///   `f64`, and a non-numeric operand makes the condition false (never a panic).
 /// - `contains` — case-insensitive substring of the resolved string.
 fn evaluate_simple_condition(condition: &str, ctx: &Value) -> bool {
-    if let Some((path, expected)) = split_condition(condition, "==") {
-        return string_eq(ctx, path, expected, false);
+    let Some((op, path, expected)) = split_at_first_operator(condition) else {
+        return false;
+    };
+    match op {
+        "==" => string_eq(ctx, path, expected, false),
+        "!=" => string_eq(ctx, path, expected, true),
+        ">=" => numeric_cmp(ctx, path, expected, |a, b| a >= b),
+        "<=" => numeric_cmp(ctx, path, expected, |a, b| a <= b),
+        ">" => numeric_cmp(ctx, path, expected, |a, b| a > b),
+        "<" => numeric_cmp(ctx, path, expected, |a, b| a < b),
+        " contains " => {
+            let needle = expected.to_lowercase();
+            resolve_dotted_path(ctx, path)
+                .is_some_and(|actual| actual.to_lowercase().contains(&needle))
+        }
+        _ => false,
     }
-    if let Some((path, expected)) = split_condition(condition, "!=") {
-        return string_eq(ctx, path, expected, true);
-    }
-    if let Some((path, expected)) = split_condition(condition, ">=") {
-        return numeric_cmp(ctx, path, expected, |a, b| a >= b);
-    }
-    if let Some((path, expected)) = split_condition(condition, "<=") {
-        return numeric_cmp(ctx, path, expected, |a, b| a <= b);
-    }
-    if let Some((path, expected)) = split_condition(condition, ">") {
-        return numeric_cmp(ctx, path, expected, |a, b| a > b);
-    }
-    if let Some((path, expected)) = split_condition(condition, "<") {
-        return numeric_cmp(ctx, path, expected, |a, b| a < b);
-    }
-    if let Some((path, expected)) = split_condition(condition, " contains ") {
-        let needle = expected.to_lowercase();
-        return resolve_dotted_path(ctx, path)
-            .is_some_and(|actual| actual.to_lowercase().contains(&needle));
-    }
-    false
 }
 
-/// Split a condition on the first occurrence of `op` into a trimmed
-/// `(path, value)`, with surrounding quotes stripped from the value.
-/// `None` when `op` is absent.
-fn split_condition<'a>(condition: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
-    let idx = condition.find(op)?;
-    let path = condition[..idx].trim();
-    let value = condition[idx + op.len()..].trim().trim_matches('"');
-    Some((path, value))
+/// Operators in the order they are tried at one position: longer tokens first
+/// so `>=`/`<=` win over `>`/`<`.
+const CONDITION_OPERATORS: [&str; 7] = ["==", "!=", ">=", "<=", ">", "<", " contains "];
+
+/// Split a condition at its FIRST operator that is not inside double quotes,
+/// into `(operator, trimmed path, trimmed value)` with the value's surrounding
+/// quotes stripped.
+///
+/// "First" is by position, not by operator priority: a value that itself
+/// contains another operator (`x > "a==b"`) must split at the real operator,
+/// not at the one inside the literal. `None` when there is no operator.
+fn split_at_first_operator(condition: &str) -> Option<(&'static str, &str, &str)> {
+    let mut in_quotes = false;
+    for (idx, ch) in condition.char_indices() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if in_quotes {
+            continue;
+        }
+        let rest = &condition[idx..];
+        if let Some(op) = CONDITION_OPERATORS.iter().find(|op| rest.starts_with(**op)) {
+            let path = condition[..idx].trim();
+            let value = condition[idx + op.len()..].trim().trim_matches('"');
+            return Some((op, path, value));
+        }
+    }
+    None
 }
 
 /// Case-insensitive string equality of the resolved path against `expected`,
@@ -6459,6 +6484,24 @@ fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
         Value::Number(n) => Some(n.to_string()),
         _ => Some(current.to_string()),
     }
+}
+
+/// Upper bound on nodes executed by ONE `drive_flow` call (one inbound turn).
+/// Pausing nodes end the call, so only a flow that loops without ever waiting
+/// (a routing cycle, a self-`flow.goto` chain) can reach it; generous enough
+/// that no legitimate graph does.
+const MAX_STEPS_PER_TURN: usize = 10_000;
+
+/// Fail a runaway turn with a clear error instead of spinning forever. The
+/// message deliberately avoids `should_retry`'s trigger words: re-running a
+/// cycle just burns another full budget.
+fn check_step_budget(steps_run: usize, flow_id: &str) -> Result<()> {
+    if steps_run > MAX_STEPS_PER_TURN {
+        bail!(
+            "flow_step_limit_exceeded: flow `{flow_id}` ran more than {MAX_STEPS_PER_TURN} nodes in one turn (routing cycle?)"
+        );
+    }
+    Ok(())
 }
 
 /// Success-family outcome ports, in the priority order used to pick the default
@@ -6728,28 +6771,33 @@ fn approval_requires_human(input: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("always");
     match mode {
-        "above_risk" => {
-            let risk = input.get("risk").and_then(Value::as_f64).unwrap_or(0.0);
-            let threshold = input
-                .get("risk_threshold")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            risk >= threshold
-        }
-        "above_confidence" => {
-            let confidence = input
-                .get("confidence")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let threshold = input
-                .get("confidence_threshold")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            confidence < threshold
-        }
+        // Fail closed: a missing, null, string or non-finite value (or
+        // threshold) can never auto-approve; it goes to a human.
+        "above_risk" => match (
+            finite_number(input, "risk"),
+            finite_number(input, "risk_threshold"),
+        ) {
+            (Some(risk), Some(threshold)) => risk >= threshold,
+            _ => true,
+        },
+        "above_confidence" => match (
+            finite_number(input, "confidence"),
+            finite_number(input, "confidence_threshold"),
+        ) {
+            (Some(confidence), Some(threshold)) => confidence < threshold,
+            _ => true,
+        },
         // "always" and any unknown mode fail safe: require a human.
         _ => true,
     }
+}
+
+/// A JSON number under `key`, or `None` when absent, non-numeric or non-finite.
+fn finite_number(input: &Value, key: &str) -> Option<f64> {
+    input
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite())
 }
 
 /// True when `entry` is a runtime-dispatch response envelope rather than a user
@@ -6835,6 +6883,35 @@ mod approval_gate_tests {
         let input =
             json!({ "confidence": 0.4, "mode": "above_confidence", "confidence_threshold": 0.8 });
         assert!(approval_requires_human(&input));
+    }
+
+    #[test]
+    fn above_risk_fails_closed_on_missing_or_non_numeric_values() {
+        for input in [
+            json!({ "mode": "above_risk", "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": null, "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": "0.1", "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": 0.1 }),
+            json!({ "mode": "above_risk", "risk": 0.1, "risk_threshold": "high" }),
+            json!({ "mode": "above_risk" }),
+        ] {
+            assert!(approval_requires_human(&input), "{input}");
+        }
+    }
+
+    #[test]
+    fn above_confidence_fails_closed_on_missing_or_non_numeric_values() {
+        for input in [
+            json!({ "mode": "above_confidence", "confidence_threshold": 0.5 }),
+            json!({ "mode": "above_confidence", "confidence": "0.99", "confidence_threshold": 0.5 }),
+            json!({ "mode": "above_confidence", "confidence": 0.99 }),
+            json!({ "mode": "above_confidence", "confidence": null, "confidence_threshold": null }),
+        ] {
+            assert!(approval_requires_human(&input), "{input}");
+        }
+        let ok =
+            json!({ "mode": "above_confidence", "confidence": 0.9, "confidence_threshold": 0.5 });
+        assert!(!approval_requires_human(&ok));
     }
 
     #[test]
@@ -9880,6 +9957,37 @@ mod tests {
             .expect("jump target");
         assert_eq!(target.flow_id, "flow.target");
         assert_eq!(target.node_id.as_str(), "node-a");
+    }
+
+    #[test]
+    fn condition_values_containing_another_operator_split_at_the_real_one() {
+        let ctx = json!({ "x": "5", "msg": { "text": "a>=b" }, "n": 7 });
+        assert!(evaluate_simple_condition(r#"msg.text == "a>=b""#, &ctx));
+        assert!(!evaluate_simple_condition(r#"msg.text != "a>=b""#, &ctx));
+        // `>` is the operator; the `==` lives inside the quoted literal.
+        assert!(evaluate_simple_condition(r#"n > "3""#, &ctx));
+        assert!(!evaluate_simple_condition(r#"n > "a==b""#, &ctx));
+        assert!(evaluate_simple_condition(r#"x >= 5"#, &ctx));
+        assert!(evaluate_simple_condition(r#"msg.text contains "=b""#, &ctx));
+        assert!(!evaluate_simple_condition("no operator here", &ctx));
+    }
+
+    #[test]
+    fn step_budget_trips_only_past_the_cap() {
+        assert!(check_step_budget(MAX_STEPS_PER_TURN, "f").is_ok());
+        let err = check_step_budget(MAX_STEPS_PER_TURN + 1, "f").unwrap_err();
+        assert!(err.to_string().contains("flow_step_limit_exceeded"));
+        assert!(!should_retry(&err));
+    }
+
+    #[test]
+    fn redirect_count_resets_for_a_resumed_turn() {
+        let mut state = ExecutionState::new(Value::Null);
+        state.increment_redirect_count();
+        state.increment_redirect_count();
+        assert_eq!(state.redirect_count(), 2);
+        state.reset_redirect_count();
+        assert_eq!(state.redirect_count(), 0);
     }
 
     #[test]
