@@ -53,16 +53,41 @@ pub type DynSessionStore = Arc<dyn SessionStore>;
 /// within one process. The `SessionStore` trait offers no atomic
 /// compare-and-swap, so across processes sharing a Redis store this is still
 /// last-writer-wins; closing that needs a CAS primitive in `greentic-session`.
+///
+/// Each locked operation runs to completion on its own task (see
+/// [`SessionStoreHost::run_detached`]): the lock guard lives inside that task,
+/// so a caller timeout or cancellation can neither abandon the operation
+/// half-way nor release the lock while its `spawn_blocking` write is still
+/// running (which would let a later `update_cas` read stale state and lose an
+/// update).
+#[derive(Clone)]
 pub struct SessionStoreHost {
     store: Offloaded<dyn SessionStore>,
-    locks: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionStoreHost {
     pub fn new(store: DynSessionStore) -> Self {
         Self {
             store: Offloaded::new(store, StoreKind::Session),
-            locks: dashmap::DashMap::new(),
+            locks: Arc::new(dashmap::DashMap::new()),
+        }
+    }
+
+    /// Run one locked read-modify-write as a non-cancellable unit: spawn it and
+    /// await the handle. Dropping the returned future leaves the task running.
+    async fn run_detached<T, F, Fut>(&self, op: F) -> GResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(SessionStoreHost) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = GResult<T>> + Send + 'static,
+    {
+        let this = self.clone();
+        match tokio::spawn(op(this)).await {
+            Ok(result) => result,
+            Err(err) => Err(RunnerError::Session {
+                reason: format!("session operation panicked or was cancelled: {err}"),
+            }),
         }
     }
 
@@ -299,6 +324,32 @@ impl SessionHost for SessionStoreHost {
     }
 
     async fn put(&self, snapshot: SessionSnapshot) -> GResult<()> {
+        self.run_detached(move |this| async move { this.put_locked(snapshot).await })
+            .await
+    }
+
+    async fn update_cas(&self, snapshot: SessionSnapshot, expected_revision: u64) -> GResult<bool> {
+        self.run_detached(move |this| async move {
+            this.update_cas_locked(snapshot, expected_revision).await
+        })
+        .await
+    }
+
+    async fn delete(&self, key: &SessionKey) -> GResult<()> {
+        let key = key.clone();
+        self.run_detached(move |this| async move { this.delete_locked(&key).await })
+            .await
+    }
+
+    async fn touch(&self, key: &SessionKey, ttl: Duration) -> GResult<()> {
+        let key = key.clone();
+        self.run_detached(move |this| async move { this.touch_locked(&key, ttl).await })
+            .await
+    }
+}
+
+impl SessionStoreHost {
+    async fn put_locked(&self, snapshot: SessionSnapshot) -> GResult<()> {
         let _guard = self.lock_session(&snapshot.key).await?;
         let base_ctx = tenant_ctx_from_key(&snapshot.key)?;
         let user = user_id_from_key(&snapshot.key)?;
@@ -309,7 +360,7 @@ impl SessionHost for SessionStoreHost {
         Ok(())
     }
 
-    async fn update_cas(
+    async fn update_cas_locked(
         &self,
         mut snapshot: SessionSnapshot,
         expected_revision: u64,
@@ -326,7 +377,7 @@ impl SessionHost for SessionStoreHost {
         Ok(true)
     }
 
-    async fn delete(&self, key: &SessionKey) -> GResult<()> {
+    async fn delete_locked(&self, key: &SessionKey) -> GResult<()> {
         let _guard = self.lock_session(key).await?;
         if let Some(entry) = self.lookup_entry_for(key, user_id_from_key(key)?).await? {
             self.store
@@ -338,7 +389,7 @@ impl SessionHost for SessionStoreHost {
         Ok(())
     }
 
-    async fn touch(&self, key: &SessionKey, ttl: Duration) -> GResult<()> {
+    async fn touch_locked(&self, key: &SessionKey, ttl: Duration) -> GResult<()> {
         let _guard = self.lock_session(key).await?;
         if let Some(mut entry) = self.lookup_entry(key).await? {
             entry.snapshot.ttl = ttl;
@@ -829,6 +880,8 @@ mod host_tests {
         /// Monotonic slot ids: deriving the id from `slots.len()` reused the id
         /// of a live slot after a removal, so a later remove took both.
         next_slot: std::sync::atomic::AtomicUsize,
+        /// Test knob: how long `update_session` blocks before writing.
+        update_delay_ms: std::sync::atomic::AtomicU64,
     }
 
     impl PerUserStore {
@@ -868,6 +921,12 @@ mod host_tests {
         }
 
         fn update_session(&self, key: &StoreSessionKey, data: SessionData) -> SessionResult<()> {
+            let delay = self
+                .update_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
             if let Some(slot) = self.slots().iter_mut().find(|(_, k, _)| k == key) {
                 slot.2 = data;
             }
@@ -1017,6 +1076,33 @@ mod host_tests {
         assert_eq!(host.locks.len(), 1);
         drop(waiter);
         assert_eq!(host.locks.len(), 0, "cancelled waiter leaked its entry");
+        Ok(())
+    }
+
+    /// A caller that gives up (timeout / client disconnect) mid-`update_cas`
+    /// must not release the session lock while the write is still running: the
+    /// next `update_cas` with the same expected revision has to see the bump
+    /// and lose, not read stale state and clobber it.
+    #[tokio::test]
+    async fn cancelled_update_cas_keeps_the_lock_until_its_write_lands() -> Result<()> {
+        let store = Arc::new(PerUserStore::default());
+        let host = Arc::new(SessionStoreHost::new(store.clone()));
+        let key = key_for("cancel-cas");
+        host.put(SessionSnapshot::new(key.clone(), "sid".into()))
+            .await?;
+        store
+            .update_delay_ms
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+
+        let first = host.update_cas(SessionSnapshot::new(key.clone(), "sid".into()), 0);
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), first).await;
+        assert!(timed_out.is_err(), "first update must still be in flight");
+
+        let second = host
+            .update_cas(SessionSnapshot::new(key.clone(), "sid".into()), 0)
+            .await?;
+        assert!(!second, "second writer must observe the first one's bump");
+        assert_eq!(host.get(&key).await?.map(|s| s.revision), Some(1));
         Ok(())
     }
 
