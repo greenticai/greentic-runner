@@ -119,7 +119,11 @@ async fn running_without_bindings_is_refused() {
 }
 
 #[tokio::test]
-async fn config_explain_prints_and_returns_before_loading_bindings() {
+async fn config_explain_needs_no_bindings() {
+    run_with_cli(parse(&["--config-explain"]))
+        .await
+        .expect("config explain without bindings");
+    // Bindings that are given are still never read in explain mode.
     run_with_cli(parse(&[
         "--bindings",
         "never-read.gtbind",
