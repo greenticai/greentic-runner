@@ -6,9 +6,7 @@ use crate::cli;
 use crate::info;
 use clap::{Parser, Subcommand, ValueEnum};
 use greentic_config::{ConfigFileFormat, ConfigLayer, ConfigResolver};
-use greentic_runner_host::cache::{
-    ArtifactKey, CacheConfig, CacheManager, CpuPolicy, EngineProfile,
-};
+use greentic_runner_host::cache::{ArtifactKey, CacheConfig, CacheManager};
 use greentic_runner_host::config::{
     FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
     WebhookPolicy,
@@ -495,8 +493,7 @@ async fn run_cache(cmd: CacheCommand) -> Result<()> {
 
 async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
     let (root, lock) = read_pack_lock(&args.pack).await?;
-    let engine = wasmtime::Engine::default();
-    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let (engine, profile) = greentic_runner_host::runtime_cache_engine_and_profile()?;
     let config = CacheConfig {
         memory_enabled: matches!(args.mode, CacheWarmupMode::Memory),
         ..CacheConfig::default()
@@ -540,8 +537,7 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
 }
 
 async fn doctor_cache() -> Result<()> {
-    let engine = wasmtime::Engine::default();
-    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let (_engine, profile) = greentic_runner_host::runtime_cache_engine_and_profile()?;
     let cache = CacheManager::new(CacheConfig::default(), profile);
     let metrics = cache.metrics();
     let memory = cache.memory_stats();
@@ -560,8 +556,7 @@ async fn doctor_cache() -> Result<()> {
 }
 
 async fn prune_cache(args: CachePruneArgs) -> Result<()> {
-    let engine = wasmtime::Engine::default();
-    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let (_engine, profile) = greentic_runner_host::runtime_cache_engine_and_profile()?;
     let cache = CacheManager::new(CacheConfig::default(), profile);
     let report = cache.prune_disk(args.dry_run).await?;
     if args.dry_run {

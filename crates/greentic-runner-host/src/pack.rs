@@ -2393,12 +2393,7 @@ impl PackRuntime {
                 tracing::debug!("skipping archive verification (no archive source)");
             }
         }
-        let engine = crate::wasm_limits::build_engine()?;
-        let engine_profile = EngineProfile::from_engine(
-            &engine,
-            CpuPolicy::Native,
-            crate::wasm_limits::ENGINE_FINGERPRINT.to_string(),
-        );
+        let (engine, engine_profile) = crate::runtime_cache_engine_and_profile()?;
         let cache = CacheManager::new(CacheConfig::default(), engine_profile);
         let mut metadata = PackMetadata::fallback(&safe_path);
         let mut manifest = None;

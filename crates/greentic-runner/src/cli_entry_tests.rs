@@ -4,6 +4,7 @@
 //! covered without spawning one.
 
 use super::*;
+use greentic_runner_host::cache::{CpuPolicy, EngineProfile};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -725,4 +726,21 @@ fn non_authoritative_lock_digest_mismatch_is_skipped_not_fatal() {
     // wasm_sha256 is authoritative: a mismatch still rejects.
     assert!(check_lock_digest("c", &manifest_digest, bytes, true).is_err());
     assert!(check_lock_digest("c", &sha256_prefixed(bytes), bytes, true).is_ok());
+}
+
+#[test]
+fn cache_cli_profile_matches_the_runtime_profile_not_a_default_engine() -> anyhow::Result<()> {
+    let (_engine, profile) = greentic_runner_host::runtime_cache_engine_and_profile()?;
+    let (_engine2, again) = greentic_runner_host::runtime_cache_engine_and_profile()?;
+    assert_eq!(profile.id(), again.id(), "profile id is deterministic");
+
+    // The old CLI behaviour: a default engine under the "default" fingerprint.
+    let default_engine = wasmtime::Engine::default();
+    let legacy = EngineProfile::from_engine(&default_engine, CpuPolicy::Native, "default".into());
+    assert_ne!(
+        profile.id(),
+        legacy.id(),
+        "cache tools must not act on the default-engine cache dir"
+    );
+    Ok(())
 }

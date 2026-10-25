@@ -245,6 +245,7 @@ pub fn split_dispatch_nonce(correlation_id: &str) -> (&str, Option<&str>) {
 pub struct RuntimeSessionResumer {
     runtime: Arc<StateMachineRuntime>,
     mode: AdmissionMode,
+    watchdog_notifier: Option<crate::runner::dispatch_listener::WatchdogNotifier>,
 }
 
 /// How strictly a NONCED response must match the park before it resumes.
@@ -272,7 +273,19 @@ impl RuntimeSessionResumer {
         Self {
             runtime,
             mode: AdmissionMode::Lenient,
+            watchdog_notifier: None,
         }
+    }
+
+    /// Announce every admitted response to other replicas (so they retire
+    /// their watchdog for it) at admission, before the resumed flow runs.
+    #[must_use]
+    pub fn with_watchdog_notifier(
+        mut self,
+        notifier: crate::runner::dispatch_listener::WatchdogNotifier,
+    ) -> Self {
+        self.watchdog_notifier = Some(notifier);
+        self
     }
 
     /// A resumer for the HTTP approval inbox: a nonced response resumes only
@@ -282,6 +295,7 @@ impl RuntimeSessionResumer {
         Self {
             runtime,
             mode: AdmissionMode::Strict,
+            watchdog_notifier: None,
         }
     }
 
@@ -418,7 +432,10 @@ impl SessionResumer for RuntimeSessionResumer {
                 // flow runs: `handle` runs it until it next parks, and that
                 // park may register a new watchdog under this same
                 // (deterministic) id which a later cancel would kill.
-                crate::runner::remote_dispatch::cancel_watchdog(correlation_id);
+                crate::runner::dispatch_listener::retire_watchdog_on_admission(
+                    self.watchdog_notifier.as_ref(),
+                    correlation_id,
+                );
             }
             Admission::WrongGate => {
                 // Not an error: the response is real, it just no longer has a

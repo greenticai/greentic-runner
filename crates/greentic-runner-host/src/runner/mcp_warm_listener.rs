@@ -50,6 +50,15 @@ fn release_warm(key: &str) {
     WARMED.lock().remove(key);
 }
 
+/// Releases the in-flight claim for its key when dropped.
+struct WarmClaim<'a>(&'a str);
+
+impl Drop for WarmClaim<'_> {
+    fn drop(&mut self) {
+        release_warm(self.0);
+    }
+}
+
 /// Run `pull` under the in-flight claim for `key`, then ALWAYS release it.
 ///
 /// The claim only dedupes listeners racing on the same event while a pull is
@@ -66,9 +75,10 @@ where
     if !claim_warm(key) {
         return None;
     }
-    let result = pull().await;
-    release_warm(key);
-    Some(result)
+    // RAII: the claim is released on every exit, including the future being
+    // dropped mid-pull (task abort / runtime shutdown) or `pull` panicking.
+    let _claim = WarmClaim(key);
+    Some(pull().await)
 }
 
 /// Subscribe to `greentic.mcp.warm.v1` and eagerly pull each pinned component
@@ -155,6 +165,32 @@ mod tests {
         assert_eq!(inner, Some("first"));
         // After success the claim is gone: a later event (cache evicted) pulls.
         assert_eq!(warm_once(key, || async { "again" }).await, Some("again"));
+    }
+
+    #[tokio::test]
+    async fn an_aborted_pull_releases_its_claim() {
+        let key = "test-ref\u{1f}1.0.0\u{1f}digest-abort";
+        let handle = tokio::spawn(async move {
+            warm_once(key, std::future::pending::<()>).await;
+        });
+        // Let the task claim and start the (never-finishing) pull.
+        while claim_probe(key) {
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+        let _ = handle.await;
+        assert!(claim_warm(key), "abort must release the claim");
+        release_warm(key);
+    }
+
+    /// `true` while nobody holds the claim (and leaves it unclaimed).
+    fn claim_probe(key: &str) -> bool {
+        if claim_warm(key) {
+            release_warm(key);
+            true
+        } else {
+            false
+        }
     }
 
     #[test]
