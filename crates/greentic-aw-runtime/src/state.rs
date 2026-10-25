@@ -174,12 +174,25 @@ pub fn cap_tool_result_for(result: serde_json::Value, tool_name: &str) -> serde_
     if text.len() <= MAX_TOOL_RESULT_BYTES {
         return result;
     }
-    tracing::warn!(
-        tool = %tool_name,
-        original_bytes = text.len(),
-        limit_bytes = MAX_TOOL_RESULT_BYTES,
-        "tool result exceeds the history cap; the model receives a truncated preview"
-    );
+    // A chatty tool would otherwise log at warn on every oversize call. Warn at
+    // most once per `OVERSIZE_WARN_INTERVAL_SECS` per process; the rest are debug.
+    let tool = log_safe_tool_name(tool_name);
+    if oversize_warn_due(now_epoch_secs()) {
+        tracing::warn!(
+            tool = %tool,
+            original_bytes = text.len(),
+            limit_bytes = MAX_TOOL_RESULT_BYTES,
+            "tool result exceeds the history cap; the model receives a truncated preview \
+             (warned at most once a minute; further occurrences are logged at debug)"
+        );
+    } else {
+        tracing::debug!(
+            tool = %tool,
+            original_bytes = text.len(),
+            limit_bytes = MAX_TOOL_RESULT_BYTES,
+            "tool result exceeds the history cap; truncated"
+        );
+    }
     let mut cut = MAX_TOOL_RESULT_BYTES;
     while !text.is_char_boundary(cut) {
         cut -= 1;
@@ -189,6 +202,54 @@ pub fn cap_tool_result_for(result: serde_json::Value, tool_name: &str) -> serde_
         "original_bytes": text.len(),
         "preview": &text[..cut],
     })
+}
+
+/// Minimum spacing of the oversize-tool-result `warn` (per process).
+const OVERSIZE_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Epoch second of the last oversize warning; `0` = never.
+static LAST_OVERSIZE_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether the oversize warning may be emitted at `now`; claims the slot when so.
+fn oversize_warn_due(now: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let last = LAST_OVERSIZE_WARN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < OVERSIZE_WARN_INTERVAL_SECS {
+        return false;
+    }
+    LAST_OVERSIZE_WARN
+        .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// A tool name (model- or pack-chosen) made safe for a log line: control and
+/// bidi characters become spaces, at most 128 characters.
+fn log_safe_tool_name(raw: &str) -> String {
+    raw.chars()
+        .take(128)
+        .map(|c| {
+            if c.is_control()
+                || matches!(
+                    c,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{FEFF}'
+                )
+            {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// How long a parked flow tool waits for the user before the next turn
@@ -382,6 +443,24 @@ pub trait SessionLockInner: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oversize_warning_is_rate_limited() {
+        // Serialise against the other test touching the static.
+        let base = 1_000_000;
+        super::LAST_OVERSIZE_WARN.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(super::oversize_warn_due(base), "first is due");
+        assert!(!super::oversize_warn_due(base + 1), "inside the interval");
+        assert!(!super::oversize_warn_due(base + 59));
+        assert!(super::oversize_warn_due(base + 60), "interval elapsed");
+    }
+
+    #[test]
+    fn tool_name_is_made_log_safe() {
+        assert_eq!(super::log_safe_tool_name("ext/tool"), "ext/tool");
+        assert_eq!(super::log_safe_tool_name("a\nb\u{202E}c"), "a b c");
+        assert_eq!(super::log_safe_tool_name(&"x".repeat(500)).len(), 128);
+    }
+
     use super::*;
 
     #[allow(clippy::unwrap_used, clippy::expect_used)]

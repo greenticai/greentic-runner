@@ -262,8 +262,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 }
 
 /// Whether an env value is truthy: `1`/`true`/`yes`/`on`, case-insensitively and
-/// ignoring surrounding whitespace (like every other boolean env parser in the
-/// host, so `TRUE` / `On` are not silently rejected).
+/// ignoring surrounding whitespace, so `TRUE` / `On` are not silently rejected.
+/// This is NOT shared with the other boolean env parsers: some are stricter
+/// (e.g. `GREENTIC_NO_CACHE` matches `1`/`true`/`TRUE`/`yes`/`YES` exactly), so
+/// check the variable's own docs.
 fn is_truthy_value(value: Option<&str>) -> bool {
     matches!(
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),

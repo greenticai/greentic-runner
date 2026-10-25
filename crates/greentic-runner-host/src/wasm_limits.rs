@@ -120,19 +120,34 @@ pub(crate) struct GuestLimiter {
     warned: bool,
 }
 
+/// Whether a denied grow was already logged at `warn` by this process.
+static PROCESS_DENIAL_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl GuestLimiter {
-    /// Log the first denied grow of this store (once, so a guest retrying a
-    /// failing allocation cannot flood the log).
+    /// Record the first denied grow of this store. Only the first denial of the
+    /// whole PROCESS is a `warn` (a store lives for one invocation, so a
+    /// per-store warn is one line per call for a workload that always hits the
+    /// cap); later stores log it at `debug`.
     fn note_denied(&mut self, what: &str, current: usize, desired: usize) {
         if !self.warned {
             self.warned = true;
+            if PROCESS_DENIAL_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!(
+                    resource = what,
+                    current,
+                    desired,
+                    "guest grow denied by the wasm resource limits"
+                );
+                return;
+            }
             tracing::warn!(
                 resource = what,
                 current,
                 desired,
                 memory_cap_bytes = ?self.total_cap,
                 "guest {what} grow denied by the wasm resource limits; the guest sees a failed grow (-1). \
-                 Raise GREENTIC_WASM_MAX_MEMORY_MB if this is a legitimate workload (logged once per store)"
+                 Raise GREENTIC_WASM_MAX_MEMORY_MB if this is a legitimate workload (warned once per process, later denials at debug)"
             );
         }
     }
