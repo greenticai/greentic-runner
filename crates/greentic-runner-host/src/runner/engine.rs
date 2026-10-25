@@ -443,6 +443,60 @@ enum NodeKind {
     MediaCreate,
 }
 
+impl NodeKind {
+    /// Whether a SUCCESSFUL run of this node may already have changed something
+    /// outside the turn (a dispatched request, a tool call, an uploaded file, a
+    /// nested flow's own effects), so re-running the turn from the start would
+    /// repeat it.
+    ///
+    /// Deliberately NOT included:
+    /// - `emit.*`: it only appends to the turn's egress, which is dropped when
+    ///   the turn fails, so a re-run re-appends into a fresh state;
+    /// - `var.set`, `state.get`, `session.wait`, `flow.goto`: no external write
+    ///   or idempotent;
+    /// - `state.set`: a plain overwrite is idempotent (a read-modify-write
+    ///   counter is not; that gap is documented in CLAUDE.md);
+    /// - generic component nodes (`Exec` / `PackComponent`): opaque to the host,
+    ///   so the host cannot tell a pure formatter from an HTTP writer. Treating
+    ///   them all as effectful would turn the whole-turn retry into a no-op for
+    ///   almost every flow. Known limitation, documented in CLAUDE.md.
+    fn performs_external_effect(&self) -> bool {
+        matches!(
+            self,
+            NodeKind::ProviderInvoke
+                | NodeKind::FlowCall
+                | NodeKind::DwAgent { .. }
+                | NodeKind::DwAgentGraph { .. }
+                | NodeKind::SorlaCall { .. }
+                | NodeKind::OperalaCall { .. }
+                | NodeKind::AgenticCall { .. }
+                | NodeKind::TelcoXCall { .. }
+                | NodeKind::ApprovalCall { .. }
+                | NodeKind::Mcp { .. }
+                | NodeKind::A2a { .. }
+                | NodeKind::MediaCreate
+        )
+    }
+}
+
+/// Make a failure terminal when an earlier node of the turn already performed
+/// an external effect: re-running the turn would repeat it (a second SoR write,
+/// a second approval request, a second upload). Failures before any effect keep
+/// their classification, so a transient failure there still retries.
+///
+/// The message (`to_string()`) is preserved; the full cause chain is logged
+/// here because the rebuilt error no longer carries it.
+fn terminal_after_effects(err: anyhow::Error, effects_performed: bool) -> anyhow::Error {
+    if !effects_performed || is_terminal_flow_error(&err) {
+        return err;
+    }
+    tracing::warn!(
+        error = %format!("{err:#}"),
+        "flow failed after an earlier node performed an external effect; the turn is not re-run"
+    );
+    terminal_flow_error(err.to_string())
+}
+
 #[derive(Clone, Debug)]
 enum EmitKind {
     Log,
@@ -954,7 +1008,11 @@ impl FlowEngine {
         let pack_idx = *self
             .flow_sources
             .get(&key)
-            .with_context(|| format!("flow {pack_id}:{flow_id} not registered"))?;
+            // Deterministic: re-running cannot register the flow. (A
+            // `load_flow` I/O failure below stays retryable.)
+            .ok_or_else(|| {
+                terminal_flow_error(format!("flow {pack_id}:{flow_id} not registered"))
+            })?;
         let pack = Arc::clone(&self.packs[pack_idx]);
         let flow_id_owned = flow_id.to_string();
         let task_flow_id = flow_id_owned.clone();
@@ -1258,13 +1316,42 @@ impl FlowEngine {
             .await
     }
 
+    /// Drive the flow, making any failure terminal once a node of THIS run has
+    /// performed an external effect (see [`terminal_after_effects`]). Both retry
+    /// layers (the engine's own and the state machine's whole-turn retry) read
+    /// that classification, so neither re-runs the effects.
     async fn drive_flow(
+        &self,
+        ctx: &FlowContext<'_>,
+        flow_ir: HostFlow,
+        state: ExecutionState,
+        resume_from: Option<String>,
+        current_flow_id: String,
+    ) -> Result<FlowExecution, FlowFailure> {
+        let mut effects_performed = false;
+        self.drive_flow_tracked(
+            ctx,
+            flow_ir,
+            state,
+            resume_from,
+            current_flow_id,
+            &mut effects_performed,
+        )
+        .await
+        .map_err(|failure| FlowFailure {
+            error: terminal_after_effects(failure.error, effects_performed),
+            node_outputs: failure.node_outputs,
+        })
+    }
+
+    async fn drive_flow_tracked(
         &self,
         ctx: &FlowContext<'_>,
         mut flow_ir: HostFlow,
         mut state: ExecutionState,
         resume_from: Option<String>,
         mut current_flow_id: String,
+        effects_performed: &mut bool,
     ) -> Result<FlowExecution, FlowFailure> {
         let mut current = match resume_from {
             Some(node) => NodeId::from_str(&node)
@@ -1273,7 +1360,9 @@ impl FlowEngine {
                 .start
                 .clone()
                 .or_else(|| flow_ir.nodes.keys().next().cloned())
-                .with_context(|| format!("flow {} has no start node", flow_ir.id))?,
+                .ok_or_else(|| {
+                    terminal_flow_error(format!("flow {} has no start node", flow_ir.id))
+                })?,
         };
 
         let mut steps_run: usize = 0;
@@ -1378,6 +1467,9 @@ impl FlowEngine {
                 }
             };
 
+            if node.kind.performs_external_effect() {
+                *effects_performed = true;
+            }
             let owned_the_submit =
                 attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.note_created_artifacts(std::mem::take(&mut output.created));
@@ -2916,7 +3008,8 @@ impl FlowEngine {
             .with_context(|| format!("unknown_flow:{target_flow}"))?;
 
         let target_node = if let Some(node) = jump.node.as_deref() {
-            let parsed = NodeId::from_str(node).with_context(|| format!("unknown_node:{node}"))?;
+            let parsed = NodeId::from_str(node)
+                .map_err(|err| terminal_flow_error(format!("unknown_node:{node}: {err}")))?;
             if !flow.nodes.contains_key(&parsed) {
                 return Err(terminal_flow_error(format!("unknown_node:{node}")));
             }
@@ -2925,7 +3018,11 @@ impl FlowEngine {
             flow.start
                 .clone()
                 .or_else(|| flow.nodes.keys().next().cloned())
-                .ok_or_else(|| anyhow!("jump_failed: flow {target_flow} has no start node"))?
+                .ok_or_else(|| {
+                    terminal_flow_error(format!(
+                        "jump_failed: flow {target_flow} has no start node"
+                    ))
+                })?
         };
 
         let max_redirects = jump.max_redirects.unwrap_or(3);
@@ -5167,7 +5264,15 @@ fn component_dispatch_outcome(output: NodeOutput) -> Result<DispatchOutcome> {
     Ok(DispatchOutcome::complete(output))
 }
 
+/// Parse a component's `greentic_control` block. A malformed block is a
+/// deterministic output of the component, so the failure is terminal: re-running
+/// the turn would produce the same block.
 fn parse_component_control(payload: &Value) -> Result<Option<NodeControl>> {
+    parse_component_control_inner(payload)
+        .map_err(|err| terminal_flow_error(format!("{err:#}")))
+}
+
+fn parse_component_control_inner(payload: &Value) -> Result<Option<NodeControl>> {
     let Value::Object(map) = payload else {
         return Ok(None);
     };
@@ -9918,6 +10023,202 @@ mod tests {
             err.to_string().contains("unknown_flow"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn deterministic_jump_failures_are_terminal_not_retried() {
+        let rt = Runtime::new().unwrap();
+        let jump = |flow: &str, node: Option<&str>| JumpControl {
+            flow: flow.into(),
+            node: node.map(str::to_string),
+            payload: json!({ "ok": true }),
+            hints: Value::Null,
+            max_redirects: None,
+            reason: None,
+        };
+
+        // unknown_flow: the flow is not registered at all.
+        let engine = minimal_engine();
+        let mut state = ExecutionState::new(Value::Null);
+        let err = rt
+            .block_on(engine.apply_jump(
+                &jump_ctx("flow.source"),
+                &mut state,
+                jump("flow.missing", None),
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown_flow"), "{err}");
+        assert!(is_terminal_flow_error(&err), "unknown_flow must be terminal");
+        assert!(!should_retry(&err));
+
+        // unknown_node: a node that does not exist, and one that is not even a
+        // valid node id.
+        let engine = jump_test_engine();
+        for node in ["node-missing", "not a valid id!"] {
+            let mut state = ExecutionState::new(Value::Null);
+            let err = rt
+                .block_on(engine.apply_jump(
+                    &jump_ctx("flow.source"),
+                    &mut state,
+                    jump("flow.target", Some(node)),
+                ))
+                .unwrap_err();
+            assert!(err.to_string().contains("unknown_node"), "{err}");
+            assert!(is_terminal_flow_error(&err), "unknown_node {node:?}");
+        }
+
+        // A flow with no start node and no nodes.
+        let empty = host_flow_for_test("flow.empty", &[], None);
+        engine.flow_cache.write().insert(
+            FlowKey {
+                pack_id: "test-pack".to_string(),
+                flow_id: "flow.empty".to_string(),
+            },
+            empty,
+        );
+        let mut state = ExecutionState::new(Value::Null);
+        let err = rt
+            .block_on(engine.apply_jump(&jump_ctx("flow.source"), &mut state, jump("flow.empty", None)))
+            .unwrap_err();
+        assert!(err.to_string().contains("no start node"), "{err}");
+        assert!(is_terminal_flow_error(&err));
+    }
+
+    #[test]
+    fn external_effect_classification_is_narrow_and_explicit() {
+        assert!(NodeKind::SorlaCall { target: "t".into() }.performs_external_effect());
+        assert!(NodeKind::AgenticCall { target: "t".into() }.performs_external_effect());
+        assert!(NodeKind::ApprovalCall { target: "t".into() }.performs_external_effect());
+        assert!(NodeKind::MediaCreate.performs_external_effect());
+        assert!(NodeKind::FlowCall.performs_external_effect());
+        assert!(
+            !NodeKind::BuiltinEmit {
+                kind: EmitKind::Response
+            }
+            .performs_external_effect()
+        );
+        assert!(!NodeKind::BuiltinStateGet.performs_external_effect());
+        assert!(!NodeKind::Wait.performs_external_effect());
+    }
+
+    #[test]
+    fn terminal_after_effects_only_changes_failures_that_follow_an_effect() {
+        let transient = || anyhow!("internal timeout: unavailable");
+        // Before any effect: untouched, a transient failure still retries.
+        let before = terminal_after_effects(transient(), false);
+        assert!(!is_terminal_flow_error(&before));
+        assert!(should_retry(&before));
+        // After an effect: terminal, message preserved.
+        let after = terminal_after_effects(transient(), true);
+        assert!(is_terminal_flow_error(&after));
+        assert!(!should_retry(&after));
+        assert_eq!(after.to_string(), "internal timeout: unavailable");
+    }
+
+    fn chain_flow(flow_id: &str, nodes: &[(&str, &str, Value)]) -> HostFlow {
+        let mut map = indexmap::IndexMap::default();
+        for (index, (node_id, component, input)) in nodes.iter().enumerate() {
+            let id = NodeId::from_str(node_id).unwrap();
+            let routing = match nodes.get(index + 1) {
+                Some((next, _, _)) => Routing::Next {
+                    node_id: NodeId::from_str(next).unwrap(),
+                },
+                None => Routing::End,
+            };
+            map.insert(
+                id.clone(),
+                Node {
+                    id,
+                    component: FlowComponentRef {
+                        id: component.parse().unwrap(),
+                        pack_alias: None,
+                        operation: None,
+                    },
+                    input: InputMapping {
+                        mapping: input.clone(),
+                    },
+                    output: OutputMapping {
+                        mapping: Value::Null,
+                    },
+                    err_map: None,
+                    routing,
+                    telemetry: TelemetryHints::default(),
+                    conversational: false,
+                },
+            );
+        }
+        HostFlow::from(Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str(flow_id).unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(nodes[0].0.to_string()),
+            )]),
+            nodes: map,
+            metadata: Default::default(),
+        })
+    }
+
+    /// Drive `chain.flow` (first node, then a `flow.call` that fails because it
+    /// names no flow) and return the failure.
+    fn drive_chain_failure(first_component: &str, first_input: Value) -> anyhow::Error {
+        let engine = jump_test_engine();
+        let flow = chain_flow(
+            "chain.flow",
+            &[
+                ("first", first_component, first_input),
+                ("boom", "flow.call", json!({})),
+            ],
+        );
+        let rt = Runtime::new().unwrap();
+        let ctx = jump_ctx("chain.flow");
+        let failure = match rt.block_on(engine.drive_flow(
+            &ctx,
+            flow,
+            ExecutionState::new(Value::Null),
+            None,
+            "chain.flow".to_string(),
+        )) {
+            Ok(_) => panic!("the flow.call node must fail"),
+            Err(failure) => failure,
+        };
+        failure.error
+    }
+
+    #[test]
+    fn a_failure_after_an_effectful_node_is_terminal() {
+        // `flow.call` into a registered flow succeeds and counts as an effect.
+        let err = drive_chain_failure("flow.call", json!({ "flow": "flow.target" }));
+        assert!(
+            err.to_string().contains("flow.call"),
+            "original message kept: {err}"
+        );
+        assert!(is_terminal_flow_error(&err), "must not be re-run: {err:#}");
+    }
+
+    #[test]
+    fn a_failure_after_a_pure_node_stays_retryable() {
+        let err = drive_chain_failure("emit.log", json!({ "message": "hi" }));
+        assert!(
+            !is_terminal_flow_error(&err),
+            "no effect happened, the turn may be re-run: {err:#}"
+        );
+    }
+
+    #[test]
+    fn invalid_greentic_control_is_terminal() {
+        for payload in [
+            json!({ "greentic_control": "bad-shape" }),
+            json!({ "greentic_control": { "v": 1 } }),
+            json!({ "greentic_control": { "action": "jump", "v": 2 } }),
+            json!({ "greentic_control": { "action": "jump", "v": 1 } }),
+        ] {
+            let err = parse_component_control(&payload).expect_err("invalid control");
+            assert!(err.to_string().contains("jump_failed") || err.to_string().contains("greentic_control"));
+            assert!(is_terminal_flow_error(&err), "{payload}");
+            assert!(!should_retry(&err));
+        }
     }
 
     #[test]
