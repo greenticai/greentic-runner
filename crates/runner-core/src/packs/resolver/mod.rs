@@ -50,6 +50,46 @@ enum FetchLocation {
     Temporary(TempPath),
 }
 
+/// Largest pack download accepted, in MiB. Override with
+/// `GREENTIC_PACK_MAX_DOWNLOAD_MB`; `0` disables the cap.
+pub(crate) const DEFAULT_MAX_PACK_DOWNLOAD_MB: u64 = 1024;
+/// Largest pack index document accepted, in MiB. Override with
+/// `GREENTIC_PACK_INDEX_MAX_MB`; `0` disables the cap.
+pub(crate) const DEFAULT_MAX_INDEX_DOWNLOAD_MB: u64 = 32;
+/// Whole-request deadline for a download when none is configured, in seconds.
+/// Override with `GREENTIC_PACK_DOWNLOAD_TIMEOUT_SECS`; `0` disables it.
+pub(crate) const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 900;
+
+/// A byte cap read from `var` (MiB), or `default_mb` when unset or not a
+/// number. `None` means uncapped (`0`).
+pub(crate) fn env_cap_bytes(var: &str, default_mb: u64) -> Option<u64> {
+    let mb = std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default_mb);
+    (mb != 0).then(|| mb.saturating_mul(1024 * 1024))
+}
+
+/// Copy `reader` into `writer`, failing as soon as more than `cap` bytes
+/// arrive. Returns the number of bytes copied.
+pub(crate) fn copy_capped<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cap: Option<u64>,
+    what: &str,
+) -> Result<u64> {
+    use std::io::Read as _;
+    let Some(cap) = cap else {
+        return Ok(std::io::copy(reader, writer)?);
+    };
+    // Read one byte past the cap so "exactly cap" passes and "cap + 1" fails.
+    let copied = std::io::copy(&mut reader.by_ref().take(cap.saturating_add(1)), writer)?;
+    if copied > cap {
+        bail!("{what} exceeds the {cap} byte download limit");
+    }
+    Ok(copied)
+}
+
 pub trait PackResolver: Send + Sync {
     fn scheme(&self) -> &'static str;
     fn fetch(&self, locator: &str) -> Result<FetchResponse>;
@@ -131,5 +171,40 @@ impl ParsedReference {
             scheme: scheme_part.to_ascii_lowercase(),
             locator: input.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod download_cap_tests {
+    use super::{copy_capped, env_cap_bytes};
+
+    #[test]
+    fn copy_stops_past_the_cap_and_allows_exactly_the_cap() {
+        let data = vec![7u8; 10];
+        let mut out = Vec::new();
+        let copied = copy_capped(&mut data.as_slice(), &mut out, Some(10), "x").expect("fits");
+        assert_eq!(copied, 10);
+
+        let mut out = Vec::new();
+        let err = copy_capped(&mut data.as_slice(), &mut out, Some(9), "x").expect_err("over");
+        assert!(err.to_string().contains("download limit"));
+        assert!(out.len() <= 10, "must not keep reading past cap + 1");
+    }
+
+    #[test]
+    fn no_cap_copies_everything() {
+        let data = vec![1u8; 100];
+        let mut out = Vec::new();
+        copy_capped(&mut data.as_slice(), &mut out, None, "x").expect("uncapped");
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn unset_variable_uses_the_default() {
+        assert_eq!(
+            env_cap_bytes("GREENTIC_TEST_UNSET_CAP_VAR", 2),
+            Some(2 * 1024 * 1024)
+        );
+        assert_eq!(env_cap_bytes("GREENTIC_TEST_UNSET_CAP_VAR", 0), None);
     }
 }
