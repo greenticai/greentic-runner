@@ -434,6 +434,29 @@ Things most likely to break a running deployment, in the order to check them:
 - No disk quota for the guest `/state`, `/cache`, `/logs` mounts.
 - The extension runtime (`greentic-ext-runtime`) wasmtime engine configuration has not been audited.
 
+## Lifecycle, secrets and auth (round 11)
+
+- **Graceful shutdown:** on SIGTERM/ctrl-c the HTTP server stops accepting connections and drains in-flight requests
+  for `GREENTIC_SHUTDOWN_GRACE_SECS` (default `30`; `0` aborts immediately) before they are cancelled. `host.stop()`
+  (timers, listeners, watcher) now runs on every exit path, including a failed `serve`. **Affected:** supervisors whose
+  kill timeout is shorter than the grace period (raise `terminationGracePeriodSeconds` or lower the variable).
+- **`/agent/chat` and `/operator/op/invoke`** run the turn on a detached task: a client disconnect no longer cancels
+  it half-way (state save and lock release now always happen). A panic becomes a 500 / SSE `error` frame.
+- **Per-unit pack secret address (BREAKING for some pack ids):** `unit_pack_segment` appends a 12-hex `sha256` of the
+  raw pack id whenever the pack slug is lossy (upper case, any non `[a-z0-9_]` character such as `-` or `.`, collapsed
+  `_`, or longer than 40 bytes). Pack ids that are already their own slug keep their address. **Affected:** unit-scoped
+  secrets of packs such as `supplier-sor-0.1.0` or `pack.dw.support` must be re-staged under the new segment (designer /
+  greentic-setup call the same function). There is deliberately NO read fallback to the old address: it is exactly the
+  address colliding pack ids (`my.pack` / `my_pack`) shared. The env-wide (non-unit) address is unchanged.
+- **Hot reload:** a rebuilt tenant's cron timers now start after the runtime swap, and the superseded runtime's timers
+  are stopped first, so a tick no longer fires on both. An invalid cron still rejects the reload before the swap.
+- **Session store:** `put`/`update_cas`/`delete`/`touch` run as one non-cancellable unit, so a timed-out caller can no
+  longer release the session lock while its write is still in flight.
+- **Trace file:** a node that fails and then succeeds on retry now ends with the successful attempt in `trace.json`
+  (the error-time flush no longer freezes it).
+- **Tokens:** `ADMIN_TOKEN`, `OPERATOR_TOKEN` and the config admin token are trimmed and blank ones count as unset
+  (the presented bearer was already trimmed). The secrets broker sends no `Authorization` header for an empty token.
+
 ## Tests and CI
 
 - Tests that used to print "skipping" and pass (offline wasm fixture build, missing `WEATHER_PACK_PATH`, fixture
