@@ -325,6 +325,19 @@ fn maybe_write_gtbind_index(
         return Ok(());
     }
 
+    // Known limitation: a gtbind pack binding carries no signature (and no
+    // digest for a semver `pack_ref`), so the generated index entries cannot
+    // either. With a trust key configured the loader requires a signature per
+    // entry, and strict mode a pinned digest for remote packs, so these packs
+    // are refused. Verification is deliberately not relaxed; say why up front.
+    if pack.public_key.is_some() {
+        tracing::warn!(
+            "gtbind pack_locator packs carry no signature; with a pack trust key configured \
+             the loader will refuse them. Use a signed pack index instead of pack_locator, \
+             or leave the trust key unset for development"
+        );
+    }
+
     let mut entries = serde_json::Map::new();
     for binding in tenant_bindings.values() {
         let mut packs = Vec::new();

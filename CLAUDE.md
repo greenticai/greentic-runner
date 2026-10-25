@@ -30,16 +30,18 @@ RUN_HOST=always ci/local_check.sh
 # Conformance suite
 RUN_CONFORMANCE=1 ci/local_check.sh
 
-# Heavy WASM fixture tests
-GREENTIC_HEAVY_WASM=1 cargo test --workspace
+# Heavy WASM fixture tests (the #[ignore]d test must be asked for explicitly)
+cargo test -p greentic-runner --test contract_cli contract_pack_rejects_mismatched_artifact -- --ignored
+# ...or, as part of the local CI mirror:
+GREENTIC_HEAVY_WASM=1 ci/local_check.sh
 
 # Select specific CI steps
 LOCAL_CHECK_STEPS=fmt,clippy ci/local_check.sh
 ```
 
-The `workspace_tests` step (and `host_wasi_p2_roundtrip`) needs `wasm-tools` on PATH (`cargo install wasm-tools --locked`); `ci/local_check.sh` fails early without it. With `GREENTIC_HEAVY_WASM=1` it also runs the `#[ignore]`d `contract_pack_rejects_mismatched_artifact`.
+The `workspace_tests` step (and `host_wasi_p2_roundtrip`) needs `wasm-tools` on PATH (`cargo install wasm-tools --locked`); `ci/local_check.sh` fails early without it. `GREENTIC_HEAVY_WASM=1` has no effect on a bare `cargo test --workspace`: the heavy test is `#[ignore]`d, so it runs only when named with `-- --ignored` (as above), from the `crate_tests` step of `ci/local_check.sh` when that variable is set, or in the nightly `heavy_wasm` CI job.
 
-`ci/local_check.sh` steps: `fmt`, `dependency_sanity`, `clippy`, `host_smoke`, `crate_tests`, `workspace_tests`, `conformance`, `package`.
+`ci/local_check.sh` steps: `fmt`, `dependency_sanity`, `wit_sync` (vendored extension-provider WIT vs pinned upstream; soft-skips offline outside CI), `clippy`, `host_smoke`, `crate_tests`, `workspace_tests`, `conformance`, `package`.
 
 The `dependency_sanity` step detects multiple wasmtime versions in the dependency tree (local workspace crates vs published greentic-* version skew) and fails early before clippy/tests hit confusing trait-mismatch errors.
 
@@ -807,7 +809,11 @@ files any more.
 
 ### Pack Hot-Reload
 
+Full list of user-visible and breaking changes from the audit branch: `docs/audit-breaking-changes.md`.
+
 Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 30s). On change: resolve locators → verify digest/signature → cache artifacts → atomically swap `TenantRuntime` via `ArcSwap`. Overlays independently deployable per tenant.
+
+**Known limitation: gtbind `pack_locator` packs cannot be verified.** `maybe_write_gtbind_index` generates the index from `*.gtbind` bindings, and a pack binding carries no signature (nor a digest for a semver `pack_ref`). With a trust key configured the loader requires a signature for every entry, and strict mode a pinned digest for remote packs, so such packs are refused; startup logs a warning when it generates an index with a key set. Verification is deliberately not relaxed. Use a signed pack index for verified deployments, or leave the trust key unset in development.
 
 ### Key Modules in `greentic-runner-host`
 
@@ -929,9 +935,11 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | Variable | Purpose |
 |----------|---------|
 | `PACK_REFRESH_INTERVAL` | Watcher cadence (e.g. `30s`, `5m`) |
-| `PACK_CACHE_DIR` | Artifact cache directory (default `.packs`) |
-| `PACK_PUBLIC_KEY` | Ed25519 public key for signature verification |
-| `PACK_VERIFY_STRICT` | Fail on missing/invalid signatures |
+| `PACK_CACHE_DIR` | **Not read by the runner.** The pack cache is `packs.cache_dir` in greentic-config (default `<cache_dir>/packs`); only a test sets this variable. Same for `PACK_SOURCE` / `PACK_INDEX_URL`: the index comes from `packs.source` or the generated gtbind index. |
+| `PACK_PUBLIC_KEY` | **Not read as an env var.** Trust keys come from `packs.trust.public_keys` in greentic-config (several are joined for rotation); the name only appears in error messages. A configured key makes every pack entry need a valid signature, regardless of `PACK_VERIFY_STRICT`. |
+| `PACK_VERIFY_STRICT` | Truthy (`1`/`true`/`yes`/`on`) turns strict verification on (also on via `packs.trust.require_signatures`): a key is required at startup, signatures must be canonical (see `PACK_ALLOW_LEGACY_SIGNATURES`), remote packs need a pinned digest, and `fs://` locators are confined (`PACK_FS_ALLOWED_ROOTS`). It can only add checks; `0`/`false` does NOT disable verification when a trust key is configured. |
+| `GREENTIC_TRACE_OUT` | Path of the trace file. Setting it to any value turns trace capture ON; unset means `Off` (default) and nothing is written. `--trace` / `--trace-out` override it (`--trace-out` alone also turns it on). |
+| `GREENTIC_TRACE_CAPTURE_INPUTS` | Exactly `1` records each node's full invocation input (`invocation_json`) in the trace, which may contain user data; any other value, or unset, leaves inputs out. `--trace-capture-inputs on|off` overrides it. |
 | `PORT` | HTTP server port (also `--port` CLI flag) |
 | `DEFAULT_TENANT` | Fallback tenant for routing |
 | `TENANT_RESOLVER` | Routing mode: host/header/jwt/env. An unsupported value (typo) fails startup via `RoutingConfig::startup_check` |
