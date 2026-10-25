@@ -2040,14 +2040,23 @@ mod aw {
     /// `greentic_llm::LlmProvider` key for the in-process `operala.call`
     /// (`DeepWorkerInvoker`) wiring, so the two in-process LLM paths (dw.agent,
     /// operala.call) share one key-resolution policy instead of drifting.
+    /// The credential reference of the lexicographically first agent that names
+    /// one. `HashMap` order is arbitrary and differs run to run, so picking
+    /// "whichever came first" made the in-process key (and so the billed
+    /// account) change between restarts whenever agents disagree.
+    fn first_credential_ref(merged_agents: &HashMap<String, AgentConfig>) -> Option<String> {
+        let mut ids: Vec<&String> = merged_agents.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .find_map(|id| merged_agents.get(id)?.llm.credential_ref.clone())
+    }
+
     pub(crate) async fn resolve_in_process_llm_key(
         secrets: &crate::secrets::DynSecretsManager,
         tenant: &str,
         merged_agents: &HashMap<String, AgentConfig>,
     ) -> Option<String> {
-        let credential_ref = merged_agents
-            .values()
-            .find_map(|agent| agent.llm.credential_ref.clone())?;
+        let credential_ref = first_credential_ref(merged_agents)?;
         let uri = match greentic_aw_runtime::scoped_secrets::secret_uri(
             "llm",
             tenant,
@@ -3616,6 +3625,20 @@ mod aw {
                 conversational: false,
                 opening_message: None,
                 on_text_while_parked: Default::default(),
+            }
+        }
+
+        #[test]
+        fn the_in_process_llm_credential_ref_choice_is_deterministic() {
+            let mut agents = HashMap::new();
+            for (id, cred) in [("zeta", "cred-z"), ("alpha", "cred-a"), ("mid", "cred-m")] {
+                let mut cfg = sample_agent_config(id);
+                cfg.llm.credential_ref = Some(cred.into());
+                agents.insert(id.to_string(), cfg);
+            }
+            agents.insert("none".to_string(), sample_agent_config("none"));
+            for _ in 0..20 {
+                assert_eq!(first_credential_ref(&agents).as_deref(), Some("cred-a"));
             }
         }
 
