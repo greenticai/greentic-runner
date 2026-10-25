@@ -41,20 +41,30 @@ impl RoutingConfig {
 
     pub fn from_env_with_default(default_tenant: String) -> Self {
         let default_tenant = std::env::var("DEFAULT_TENANT").unwrap_or(default_tenant);
-        let resolver = match std::env::var("TENANT_RESOLVER") {
-            Err(_) => TenantResolver::Env,
-            Ok(value) => TenantResolver::from_str(&value, &default_tenant).unwrap_or_else(|err| {
-                // Fail closed: an unknown mode must not silently degrade to
-                // the single-tenant `env` mode. Every request is rejected
-                // until the configuration is fixed.
-                tracing::error!(error = %err, "invalid TENANT_RESOLVER, rejecting all tenant-routed requests");
-                TenantResolver::Invalid(err.to_string())
-            }),
-        };
+        let resolver = Self::resolver_from_value(
+            std::env::var("TENANT_RESOLVER").ok().as_deref(),
+            &default_tenant,
+        );
         Self {
             resolver,
             default_tenant,
         }
+    }
+
+    /// Resolve the `TENANT_RESOLVER` value. Unset, empty and whitespace-only
+    /// all mean "not configured" (single-tenant `env` mode), the same as
+    /// `SECRETS_BACKEND`; an unknown non-empty mode fails closed.
+    fn resolver_from_value(value: Option<&str>, default_tenant: &str) -> TenantResolver {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return TenantResolver::Env;
+        };
+        TenantResolver::from_str(value, default_tenant).unwrap_or_else(|err| {
+            // Fail closed: an unknown mode must not silently degrade to
+            // the single-tenant `env` mode. Every request is rejected
+            // until the configuration is fixed.
+            tracing::error!(error = %err, "invalid TENANT_RESOLVER, rejecting all tenant-routed requests");
+            TenantResolver::Invalid(err.to_string())
+        })
     }
 
     /// Fail startup on a configuration that must not run: `jwt` mode with no
@@ -776,6 +786,19 @@ mod tests {
         assert_eq!(tenant_from_host("[::1]:8080").as_deref(), Some("::1"));
         assert_eq!(tenant_from_host(":8080"), None);
         assert_eq!(tenant_from_host(""), None);
+    }
+
+    #[test]
+    fn blank_tenant_resolver_is_treated_as_unset() {
+        for blank in [None, Some(""), Some("   ")] {
+            let resolver = RoutingConfig::resolver_from_value(blank, "demo");
+            assert!(
+                matches!(resolver, TenantResolver::Env),
+                "{blank:?} must mean env mode"
+            );
+        }
+        let invalid = RoutingConfig::resolver_from_value(Some("hsot"), "demo");
+        assert!(matches!(invalid, TenantResolver::Invalid(_)));
     }
 
     #[test]
