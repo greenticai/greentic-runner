@@ -23,6 +23,50 @@ use crate::runner::i18n::{I18nText, resolve_text, select_locale};
 use crate::runner::schema_validator::validate_json_instance;
 use crate::runtime::TenantRuntime;
 
+/// Introspected contracts, keyed by `digest::component::operation`.
+///
+/// `describe()` instantiates the component, and it used to run on EVERY
+/// operator invoke before the (hash-only) contract cache was consulted. The
+/// digest in the key pins the exact component bytes, so a hot-reloaded
+/// component with different code misses, and the same bytes always describe
+/// the same contract. Bounded: cleared wholesale at the cap rather than
+/// tracking recency, since the working set is tiny.
+static INTROSPECTION_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<
+        std::collections::HashMap<
+            String,
+            Option<crate::runner::contract_introspection::IntrospectedContract>,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+const INTROSPECTION_CACHE_MAX_ENTRIES: usize = 1024;
+
+fn cached_introspection(
+    digest: &str,
+    component_ref: &str,
+    op_id: &str,
+    compute: impl FnOnce() -> anyhow::Result<
+        Option<crate::runner::contract_introspection::IntrospectedContract>,
+    >,
+) -> anyhow::Result<Option<crate::runner::contract_introspection::IntrospectedContract>> {
+    // Without a real digest nothing pins the bytes: always re-describe.
+    if digest == "unknown" || digest.is_empty() {
+        return compute();
+    }
+    let key = format!("{digest}::{component_ref}::{op_id}");
+    if let Some(hit) = INTROSPECTION_CACHE.lock().get(&key) {
+        return Ok(hit.clone());
+    }
+    let computed = compute()?;
+    let mut cache = INTROSPECTION_CACHE.lock();
+    if cache.len() >= INTROSPECTION_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, computed.clone());
+    Ok(computed)
+}
+
 const CONTENT_TYPE_CBOR: &str = "application/cbor";
 const FLAG_SKIP_OUTPUT_VALIDATE: &str = "skip-output-validate";
 const FLAG_PERMISSIVE_SCHEMA: &str = "permissive-schema";
@@ -691,7 +735,9 @@ pub async fn invoke_operator(
             resolved.digest.clone()
         };
         let introspected_contract =
-            match introspect_component_contract(pack.as_ref(), component_ref.as_str(), &op_id) {
+            match cached_introspection(&resolved_digest, component_ref.as_str(), &op_id, || {
+                introspect_component_contract(pack.as_ref(), component_ref.as_str(), &op_id)
+            }) {
                 Ok(value) => value,
                 Err(err) => {
                     let message = format!("failed to introspect component contract: {err}");
@@ -1435,5 +1481,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(one, two);
+    }
+}
+
+#[cfg(test)]
+mod introspection_cache_tests {
+    use super::cached_introspection;
+    use std::cell::Cell;
+
+    #[test]
+    fn describe_runs_once_per_digest_component_operation() {
+        let calls = Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        };
+        assert!(cached_introspection("sha256:abc-test", "comp", "op", compute).is_ok());
+        assert!(cached_introspection("sha256:abc-test", "comp", "op", compute).is_ok());
+        assert_eq!(calls.get(), 1, "second lookup must be served from cache");
+        assert!(cached_introspection("sha256:other-test", "comp", "op", compute).is_ok());
+        assert_eq!(
+            calls.get(),
+            2,
+            "a different digest is a different component"
+        );
+        assert!(cached_introspection("unknown", "comp", "op", compute).is_ok());
+        assert!(cached_introspection("unknown", "comp", "op", compute).is_ok());
+        assert_eq!(calls.get(), 4, "an unknown digest is never cached");
     }
 }
