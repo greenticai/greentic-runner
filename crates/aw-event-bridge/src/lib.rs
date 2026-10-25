@@ -498,6 +498,20 @@ pub const QUEUE_GROUP: &str = "agentic-workers";
 /// Most core-NATS requests handled at once. Past this the bridge answers
 /// `overloaded` instead of spawning another task: with no cap a burst (or a
 /// slow downstream) grew tasks, and the sessions they hold, without bound.
+///
+/// Why this refuses instead of waiting for a slot before reading the next
+/// message: a core-NATS queue-group subscription has no server-side
+/// backpressure. The server picks the receiving replica at publish time
+/// without asking whether it has capacity, so a message the client has not yet
+/// read is already committed to THIS replica and sits in the client's
+/// subscription buffer; another replica cannot pick it up. Holding off
+/// `next()` would therefore only queue requests behind a full replica (until
+/// the buffer overflows and the client drops them as a slow consumer, with the
+/// caller waiting out its whole deadline), whereas `overloaded` tells the
+/// caller at once to retry, which lands on a random replica again. Real
+/// backpressure is a pull consumer (the durable JetStream path), where a
+/// replica asks for work itself and unread work stays in the stream for the
+/// other replicas.
 pub const MAX_INFLIGHT: usize = 256;
 
 /// Error code published when the in-flight cap refused a request.

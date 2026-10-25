@@ -8,6 +8,7 @@ use cron::Schedule;
 use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::engine::runtime::IngressEnvelope;
 use crate::runtime::TenantRuntime;
@@ -38,6 +39,7 @@ pub fn spawn_timers(runtime: Arc<TenantRuntime>) -> Result<Vec<JoinHandle<()>>> 
         // keep it alive forever, so `TenantRuntime::drop` (which aborts the
         // timers) could never run and every reload would duplicate cron firing.
         let runtime_weak: Weak<TenantRuntime> = Arc::downgrade(&runtime);
+        let cancel = runtime.timer_cancel_token();
 
         let handle = tokio::spawn(async move {
             tracing::info!(
@@ -47,104 +49,144 @@ pub fn spawn_timers(runtime: Arc<TenantRuntime>) -> Result<Vec<JoinHandle<()>>> 
                 normalized_cron = %normalized,
                 "registered timer schedule"
             );
-            // Re-derive the next tick from "now" each round (rather than walking
-            // one `upcoming` iterator) so ticks that elapsed while a slow flow
-            // ran are skipped instead of fired back-to-back.
-            let mut last_fired: Option<DateTime<Utc>> = None;
-            while let Some(next) = schedule
-                .after(&search_origin(Utc::now(), last_fired))
-                .next()
-            {
-                last_fired = Some(next);
-                if let Some(wait) = duration_until(next) {
-                    sleep(wait).await;
-                } else {
-                    continue;
-                }
-                let Some(runtime_clone) = runtime_weak.upgrade() else {
-                    tracing::info!(
-                        flow_id = %flow_id,
-                        schedule_id = %schedule_id,
-                        "tenant runtime dropped; stopping timer schedule"
-                    );
-                    return;
-                };
-                let pack_id = match runtime_clone.engine().flow_by_id(&flow_id) {
-                    Some(flow) => flow.pack_id.clone(),
-                    None => {
-                        tracing::error!(
-                            flow_id = %flow_id,
-                            schedule_id = %schedule_id,
-                            "timer flow is ambiguous; pack_id is required"
-                        );
-                        continue;
-                    }
-                };
-                let payload = json!({
-                    "now": next.to_rfc3339(),
-                    "schedule_id": schedule_id.clone(),
-                });
-                tracing::info!(
-                    flow_id = %flow_id,
-                    schedule_id = %schedule_id,
-                    scheduled_for = %next,
-                    "triggering timer flow"
-                );
-                let envelope = IngressEnvelope {
-                    tenant: tenant.clone(),
-                    env: None,
-                    pack_id: Some(pack_id),
-                    flow_id: flow_id.clone(),
-                    flow_type: Some("timer".into()),
-                    action: Some("timer".into()),
-                    session_hint: Some(schedule_id.clone()),
-                    provider: Some("timer".into()),
-                    // Timers fire without a messaging endpoint by definition.
-                    messaging_endpoint_id: None,
-                    channel: Some(schedule_id.clone()),
-                    conversation: Some(schedule_id.clone()),
-                    user: None,
-                    // A timer fires the flow from its entrypoint; it carries no card nav.
-                    entry_node: None,
-                    activity_id: Some(format!("{}@{}", schedule_id, next)),
-                    timestamp: Some(next.to_rfc3339()),
-                    payload,
-                    metadata: None,
-                    reply_scope: None,
-                }
-                .canonicalize();
-                match runtime_clone.state_machine().handle(envelope).await {
-                    Ok(output) => {
+            drive_schedule(&schedule, &cancel, |next| {
+                let runtime_weak = runtime_weak.clone();
+                let tenant = tenant.clone();
+                let flow_id = flow_id.clone();
+                let schedule_id = schedule_id.clone();
+                async move {
+                    let Some(runtime_clone) = runtime_weak.upgrade() else {
                         tracing::info!(
                             flow_id = %flow_id,
                             schedule_id = %schedule_id,
-                            now = %next,
-                            response = %output,
-                            "timer flow completed"
+                            "tenant runtime dropped; stopping timer schedule"
                         );
-                    }
-                    Err(err) => {
-                        let chain = err.chain().map(|e| e.to_string()).collect::<Vec<_>>();
-                        tracing::error!(
-                            flow_id = %flow_id,
-                            schedule_id = %schedule_id,
-                            error.cause_chain = ?chain,
-                            "timer flow execution failed"
-                        );
-                    }
+                        return false;
+                    };
+                    fire_tick(&runtime_clone, tenant, flow_id, schedule_id, next).await;
+                    true
                 }
-            }
-            tracing::info!(
-                flow_id = %flow_id,
-                schedule_id = %schedule_id,
-                "timer schedule completed"
-            );
+            })
+            .await;
         });
 
         handles.push(handle);
     }
 
     Ok(handles)
+}
+
+/// Sleep-then-fire loop for one schedule. `cancel` is observed ONLY while
+/// sleeping: stop before the next tick, never in the middle of one. `fire`
+/// returns `false` to end the schedule.
+async fn drive_schedule<F, Fut>(schedule: &Schedule, cancel: &CancellationToken, mut fire: F)
+where
+    F: FnMut(DateTime<Utc>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    // Re-derive the next tick from "now" each round (rather than walking
+    // one `upcoming` iterator) so ticks that elapsed while a slow flow
+    // ran are skipped instead of fired back-to-back.
+    let mut last_fired: Option<DateTime<Utc>> = None;
+    while let Some(next) = schedule
+        .after(&search_origin(Utc::now(), last_fired))
+        .next()
+    {
+        last_fired = Some(next);
+        if let Some(wait) = duration_until(next) {
+            tokio::select! {
+                _ = sleep(wait) => {}
+                _ = cancel.cancelled() => {
+                    tracing::info!("timer schedule superseded; stopping before next tick");
+                    return;
+                }
+            }
+        } else {
+            continue;
+        }
+        // A cancel that raced the sleep finishing must not fire the tick too:
+        // the replacement runtime owns it.
+        if cancel.is_cancelled() {
+            return;
+        }
+        if !fire(next).await {
+            return;
+        }
+    }
+    tracing::info!("timer schedule completed");
+}
+
+async fn fire_tick(
+    runtime_clone: &Arc<TenantRuntime>,
+    tenant: String,
+    flow_id: String,
+    schedule_id: String,
+    next: DateTime<Utc>,
+) {
+    let pack_id = match runtime_clone.engine().flow_by_id(&flow_id) {
+        Some(flow) => flow.pack_id.clone(),
+        None => {
+            tracing::error!(
+                flow_id = %flow_id,
+                schedule_id = %schedule_id,
+                "timer flow is ambiguous; pack_id is required"
+            );
+            return;
+        }
+    };
+    let payload = json!({
+        "now": next.to_rfc3339(),
+        "schedule_id": schedule_id.clone(),
+    });
+    tracing::info!(
+        flow_id = %flow_id,
+        schedule_id = %schedule_id,
+        scheduled_for = %next,
+        "triggering timer flow"
+    );
+    let envelope = IngressEnvelope {
+        tenant,
+        env: None,
+        pack_id: Some(pack_id),
+        flow_id: flow_id.clone(),
+        flow_type: Some("timer".into()),
+        action: Some("timer".into()),
+        session_hint: Some(schedule_id.clone()),
+        provider: Some("timer".into()),
+        // Timers fire without a messaging endpoint by definition.
+        messaging_endpoint_id: None,
+        channel: Some(schedule_id.clone()),
+        conversation: Some(schedule_id.clone()),
+        user: None,
+        // A timer fires the flow from its entrypoint; it carries no card nav.
+        entry_node: None,
+        activity_id: Some(format!("{}@{}", schedule_id, next)),
+        timestamp: Some(next.to_rfc3339()),
+        payload,
+        metadata: None,
+        reply_scope: None,
+    }
+    .canonicalize();
+    match runtime_clone.state_machine().handle(envelope).await {
+        Ok(output) => {
+            tracing::info!(
+                flow_id = %flow_id,
+                schedule_id = %schedule_id,
+                now = %next,
+                response = %output,
+                "timer flow completed"
+            );
+        }
+        Err(err) => {
+            let chain = err.chain().map(|e| e.to_string()).collect::<Vec<_>>();
+            tracing::error!(
+                flow_id = %flow_id,
+                schedule_id = %schedule_id,
+                error.cause_chain = ?chain,
+                "timer flow execution failed"
+            );
+        }
+    }
 }
 
 /// Where to search for the next tick: never earlier than the last tick fired,
@@ -315,5 +357,71 @@ mod tests {
             handle.abort();
         }
         drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_a_tick_runs_lets_that_tick_finish_and_stops_before_the_next() {
+        let schedule = Schedule::from_str("* * * * * *").expect("schedule");
+        let cancel = CancellationToken::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = {
+            let (cancel, started, finished, fires) = (
+                cancel.clone(),
+                Arc::clone(&started),
+                Arc::clone(&finished),
+                Arc::clone(&fires),
+            );
+            tokio::spawn(async move {
+                drive_schedule(&schedule, &cancel, |_| {
+                    let (started, finished, fires) = (
+                        Arc::clone(&started),
+                        Arc::clone(&finished),
+                        Arc::clone(&fires),
+                    );
+                    async move {
+                        fires.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        started.notify_one();
+                        // Longer than two schedule periods.
+                        sleep(Duration::from_millis(2300)).await;
+                        finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        true
+                    }
+                })
+                .await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("first tick must start");
+        // What `TenantRuntime::abort_timers` does.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("schedule must stop after the running tick")
+            .expect("no panic");
+        assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            fires.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no further tick may start after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_timers_cancels_the_token_the_timer_tasks_watch() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime_with_timers(
+            r#"[{ flow_id: "flow.main", cron: "0 0 1 1 *" }]"#,
+        )
+        .await
+        .expect("runtime");
+        let token = runtime.timer_cancel_token();
+        let handles = spawn_timers(Arc::clone(&runtime)).expect("spawn");
+        runtime.register_timers(handles);
+        assert!(!token.is_cancelled());
+        runtime.abort_timers();
+        assert!(token.is_cancelled());
+        assert_eq!(runtime.timer_count(), 0);
     }
 }

@@ -771,7 +771,7 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
     let serve_result = drive_until_shutdown(
         serve_task,
         stop_tx,
-        shutdown_signal(),
+        shutdown_signal,
         shutdown_grace_from_raw(std::env::var(SHUTDOWN_GRACE_ENV).ok().as_deref()),
     )
     .await;
@@ -797,27 +797,38 @@ fn shutdown_grace_from_raw(raw: Option<&str>) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Wait for the serve task to end on its own or for `signal`. On a signal,
-/// trigger graceful shutdown and give the task `grace` to drain before it is
-/// aborted. Returns the serve outcome (a panic becomes an error).
-async fn drive_until_shutdown<S>(
+/// Wait for the serve task to end on its own or for a shutdown signal. On the
+/// first signal, trigger graceful shutdown and give the task `grace` to drain
+/// before it is aborted; a SECOND signal during the drain aborts at once (the
+/// usual "press ctrl-c again to force"). `signals` is called once per wait, so
+/// each call must yield a fresh future. Returns the serve outcome (a panic
+/// becomes an error). The caller still runs `host.stop()` after an abort.
+async fn drive_until_shutdown<F, S>(
     mut serve_task: tokio::task::JoinHandle<Result<()>>,
     stop_tx: tokio::sync::oneshot::Sender<()>,
-    signal: S,
+    mut signals: F,
     grace: Duration,
 ) -> Result<()>
 where
+    F: FnMut() -> S,
     S: std::future::Future<Output = ()>,
 {
     let joined = tokio::select! {
         joined = &mut serve_task => joined,
-        _ = signal => {
+        _ = signals() => {
             tracing::info!(grace_secs = grace.as_secs(), "received shutdown signal; draining");
             let _ = stop_tx.send(());
-            match tokio::time::timeout(grace, &mut serve_task).await {
-                Ok(joined) => joined,
-                Err(_) => {
-                    tracing::warn!("drain deadline exceeded; aborting in-flight requests");
+            tokio::select! {
+                drained = tokio::time::timeout(grace, &mut serve_task) => match drained {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        tracing::warn!("drain deadline exceeded; aborting in-flight requests");
+                        serve_task.abort();
+                        return Ok(());
+                    }
+                },
+                _ = signals() => {
+                    tracing::warn!("second shutdown signal; aborting in-flight requests");
                     serve_task.abort();
                     return Ok(());
                 }
@@ -1067,7 +1078,7 @@ mod shutdown_tests {
         let out = drive_until_shutdown(
             task,
             stop_tx,
-            std::future::ready(()),
+            || std::future::ready(()),
             Duration::from_secs(5),
         )
         .await;
@@ -1084,7 +1095,7 @@ mod shutdown_tests {
         let out = drive_until_shutdown(
             task,
             stop_tx,
-            std::future::ready(()),
+            || std::future::ready(()),
             Duration::from_millis(50),
         )
         .await;
@@ -1098,10 +1109,41 @@ mod shutdown_tests {
         let out = drive_until_shutdown(
             task,
             stop_tx,
-            std::future::pending(),
+            std::future::pending::<()>,
             Duration::from_secs(1),
         )
         .await;
         assert!(out.is_err_and(|e| e.to_string().contains("bind failed")));
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_during_the_drain_aborts_without_waiting_for_grace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async {
+            // Never drains.
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        // First wait resolves at once; the second resolves shortly after,
+        // while the drain is still pending.
+        let signals = move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        let started = std::time::Instant::now();
+        let out = drive_until_shutdown(task, stop_tx, signals, Duration::from_secs(30)).await;
+        assert!(out.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not wait out the 30s grace"
+        );
     }
 }

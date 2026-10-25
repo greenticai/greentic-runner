@@ -16,9 +16,9 @@ use crate::mcp_scope::McpCallScope;
 use crate::tenant::TenantContext;
 
 use super::types::{
-    CATALOG_TTL, MCP_ROLE_AGENTIC_WORKER, McpCallerIdentity, McpPackRoute, McpRoute,
-    McpToolCatalog, McpToolEntry, PROBE_TIMEOUT, PULL_TIMEOUT, ParsedServer, Transport, WireBody,
-    call_timeout,
+    CATALOG_TTL, MAX_CONCURRENT_PROBES, MCP_ROLE_AGENTIC_WORKER, McpCallerIdentity, McpPackRoute,
+    McpRoute, McpToolCatalog, McpToolEntry, PROBE_TIMEOUT, PULL_TIMEOUT, ParsedServer, Transport,
+    WireBody, call_timeout,
 };
 
 /// Per-tenant, TTL-gated source of agentic-worker MCP tool catalogs.
@@ -350,11 +350,31 @@ impl McpToolSource {
 
         let mut catalog = McpToolCatalog::empty();
         catalog.secrets = self.secrets();
-        for server in &servers {
-            if !server.roles.iter().any(|r| r == role) {
-                continue;
+        // Probe the role's servers CONCURRENTLY (bounded by a semaphore):
+        // sequentially a cold build cost the sum of every server's budget
+        // (N x 5 s, or 300 s for each local-wasm pull), and it runs under the
+        // agent's session lock. `join_all` yields results in server order, so
+        // the catalog is ingested exactly as the sequential loop built it.
+        // (A `buffered` stream over borrowed servers defeats `Send` inference
+        // for the callers that spawn this future, hence join_all + semaphore.)
+        let permits = tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES);
+        let permits = &permits;
+        let probed: Vec<(&ParsedServer, Option<Vec<McpToolDef>>)> = futures::future::join_all(
+            servers
+                .iter()
+                .filter(|server| server.roles.iter().any(|r| r == role))
+                .map(|server| async move {
+                    // The semaphore is never closed, so acquire cannot fail;
+                    // if it somehow did, probe unbounded rather than skip.
+                    let _permit = permits.acquire().await.ok();
+                    (server, Self::probe_server(server, tenant_key).await)
+                }),
+        )
+        .await;
+        for (server, defs) in probed {
+            if let Some(defs) = defs {
+                ingest_server_tools(&mut catalog, server, &defs);
             }
-            self.probe_server(&mut catalog, server, tenant_key).await;
         }
         catalog
     }
@@ -389,15 +409,11 @@ impl McpToolSource {
         parse_rows_with(body, tenant_key, &self.token_provider)
     }
 
-    /// Probe one server and ingest its (filtered) tools into `catalog`. A
-    /// timeout, connection error, or bad transport URL is skipped with a
-    /// `warn` — the catalog keeps the servers that worked.
-    async fn probe_server(
-        &self,
-        catalog: &mut McpToolCatalog,
-        server: &ParsedServer,
-        tenant_key: &str,
-    ) {
+    /// Probe one server for its tools. A timeout, connection error, or bad
+    /// transport URL yields `None` with a `warn` — the catalog keeps the
+    /// servers that worked. Independent of the catalog so probes can run
+    /// concurrently; the caller ingests the result.
+    async fn probe_server(server: &ParsedServer, tenant_key: &str) -> Option<Vec<McpToolDef>> {
         // The first pull of a local-wasm component downloads and verifies an
         // artifact, which the probe's 5 s "is it reachable" budget cannot
         // cover: it would be cancelled mid-download and retried (and cancelled)
@@ -413,7 +429,7 @@ impl McpToolSource {
                         error = %e,
                         "mcp server probe failed; skipping its tools"
                     );
-                    return;
+                    return None;
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -422,24 +438,30 @@ impl McpToolSource {
                         "mcp local-wasm pull timed out after {}s; skipping its tools",
                         PULL_TIMEOUT.as_secs()
                     );
-                    return;
+                    return None;
                 }
             }
         }
         match tokio::time::timeout(PROBE_TIMEOUT, list_server_tools(server)).await {
-            Ok(Ok(defs)) => ingest_server_tools(catalog, server, &defs),
-            Ok(Err(e)) => tracing::warn!(
-                tenant = %tenant_key,
-                server = %server.id,
-                error = %e,
-                "mcp server probe failed; skipping its tools"
-            ),
-            Err(_) => tracing::warn!(
-                tenant = %tenant_key,
-                server = %server.id,
-                "mcp server probe timed out after {}s; skipping its tools",
-                PROBE_TIMEOUT.as_secs()
-            ),
+            Ok(Ok(defs)) => Some(defs),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    tenant = %tenant_key,
+                    server = %server.id,
+                    error = %e,
+                    "mcp server probe failed; skipping its tools"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    tenant = %tenant_key,
+                    server = %server.id,
+                    "mcp server probe timed out after {}s; skipping its tools",
+                    PROBE_TIMEOUT.as_secs()
+                );
+                None
+            }
         }
     }
 }

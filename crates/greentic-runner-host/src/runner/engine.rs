@@ -1083,7 +1083,10 @@ impl FlowEngine {
             let node_id = NodeId::from_str(node)
                 .with_context(|| format!("invalid entry node id `{node}`"))?;
             if !flow_ir.nodes.contains_key(&node_id) {
-                bail!("flow {} has no node `{}`", ctx.flow_id, node);
+                return Err(terminal_flow_error(format!(
+                    "flow {} has no node `{}`",
+                    ctx.flow_id, node
+                )));
             }
         }
         let span = self.flow_execute_span(&ctx);
@@ -1186,11 +1189,10 @@ impl FlowEngine {
         input: Value,
     ) -> Result<FlowExecution> {
         if snapshot.pack_id != ctx.pack_id {
-            bail!(
+            return Err(terminal_flow_error(format!(
                 "snapshot pack {} does not match requested {}",
-                snapshot.pack_id,
-                ctx.pack_id
-            );
+                snapshot.pack_id, ctx.pack_id
+            )));
         }
         let resume_flow = snapshot
             .next_flow
@@ -1250,7 +1252,7 @@ impl FlowEngine {
                 "required flow variable not provided",
                 "en",
             );
-            return Err(anyhow!("{label}: {}", missing.join(", ")).into());
+            return Err(terminal_flow_error(format!("{label}: {}", missing.join(", "))).into());
         }
         self.drive_flow(ctx, flow_ir, state, entry_node, ctx.flow_id.to_string())
             .await
@@ -2905,7 +2907,7 @@ impl FlowEngine {
     ) -> Result<JumpTarget> {
         let target_flow = jump.flow.trim();
         if target_flow.is_empty() {
-            bail!("missing_flow");
+            return Err(terminal_flow_error("missing_flow"));
         }
 
         let flow = self
@@ -2916,7 +2918,7 @@ impl FlowEngine {
         let target_node = if let Some(node) = jump.node.as_deref() {
             let parsed = NodeId::from_str(node).with_context(|| format!("unknown_node:{node}"))?;
             if !flow.nodes.contains_key(&parsed) {
-                bail!("unknown_node:{node}");
+                return Err(terminal_flow_error(format!("unknown_node:{node}")));
             }
             parsed
         } else {
@@ -2928,7 +2930,7 @@ impl FlowEngine {
 
         let max_redirects = jump.max_redirects.unwrap_or(3);
         if state.redirect_count() >= max_redirects {
-            bail!("redirect_limit");
+            return Err(terminal_flow_error("redirect_limit"));
         }
         state.increment_redirect_count();
         state.replace_input(jump.payload.clone());
@@ -2961,7 +2963,9 @@ impl FlowEngine {
         let call: FlowCallPayload =
             serde_json::from_value(payload).context("invalid payload for flow.call node")?;
         if call.flow_id.trim().is_empty() {
-            bail!("flow.call requires a non-empty flow_id");
+            return Err(terminal_flow_error(
+                "flow.call requires a non-empty flow_id",
+            ));
         }
 
         let sub_input = if call.input.is_null() {
@@ -2993,10 +2997,10 @@ impl FlowEngine {
 
         let depth = FLOW_CALL_DEPTH.try_with(|depth| *depth).unwrap_or(0);
         if depth >= MAX_FLOW_CALL_DEPTH {
-            bail!(
+            return Err(terminal_flow_error(format!(
                 "flow.call nesting exceeds {MAX_FLOW_CALL_DEPTH} levels (calling {})",
                 flow_id_owned
-            );
+            )));
         }
         // The caller's own retry loop owns retries; a nested loop would multiply
         // attempts. The failure is propagated, never rendered as an envelope.
@@ -3016,11 +3020,11 @@ impl FlowEngine {
             .with_context(|| format!("flow.call failed for {}", flow_id_owned))?;
         match execution.status {
             FlowStatus::Completed => Ok(NodeOutput::new(execution.output)),
-            FlowStatus::Waiting(wait) => bail!(
+            // The nested flow's effects already ran: never re-run the turn.
+            FlowStatus::Waiting(wait) => Err(terminal_flow_error(format!(
                 "flow.call cannot pause (flow {} waiting {:?})",
-                flow_id_owned,
-                wait.reason
-            ),
+                flow_id_owned, wait.reason
+            ))),
         }
     }
 }
@@ -3115,7 +3119,9 @@ fn execute_flow_goto(payload: Value) -> Result<DispatchOutcome> {
         serde_json::from_value(payload).context("invalid payload for flow.goto node")?;
     let flow = goto.flow_id.trim().to_string();
     if flow.is_empty() {
-        bail!("flow.goto requires a non-empty flow_id");
+        return Err(terminal_flow_error(
+            "flow.goto requires a non-empty flow_id",
+        ));
     }
     let node = goto
         .node
@@ -6497,9 +6503,12 @@ const MAX_STEPS_PER_TURN: usize = 10_000;
 /// cycle just burns another full budget.
 fn check_step_budget(steps_run: usize, flow_id: &str) -> Result<()> {
     if steps_run > MAX_STEPS_PER_TURN {
-        bail!(
+        // Terminal: the first 10 000 nodes already ran their effects, and a
+        // routing cycle is deterministic, so re-running the turn only repeats
+        // both (see `TerminalFlowError`).
+        return Err(terminal_flow_error(format!(
             "flow_step_limit_exceeded: flow `{flow_id}` ran more than {MAX_STEPS_PER_TURN} nodes in one turn (routing cycle?)"
-        );
+        )));
     }
     Ok(())
 }
@@ -9978,6 +9987,15 @@ mod tests {
         let err = check_step_budget(MAX_STEPS_PER_TURN + 1, "f").unwrap_err();
         assert!(err.to_string().contains("flow_step_limit_exceeded"));
         assert!(!should_retry(&err));
+        assert!(is_terminal_flow_error(&err));
+    }
+
+    #[test]
+    fn terminal_marker_overrides_transient_sounding_text() {
+        let err = terminal_flow_error("internal timeout: unavailable");
+        assert!(!should_retry(&err));
+        assert!(!should_retry(&err.context("node failed")));
+        assert!(should_retry(&anyhow!("internal server error")));
     }
 
     #[test]
@@ -15850,12 +15868,37 @@ fn lift_node_error(output: Value, failure: Option<&(String, NodeOutput)>) -> Val
 #[error("{0}")]
 pub struct TransientFlowError(pub String);
 
+/// Marks a failure as terminal: deterministic (a routing cycle, an unknown
+/// node, a missing required variable) or raised after side effects already ran
+/// (a step budget spent). Re-running the turn cannot help and would repeat the
+/// effects, so neither the engine's own retry loop nor the state machine's
+/// whole-turn `retry_with_jitter` re-runs it; the state machine sees it as
+/// [`RunnerError::FlowTerminal`](crate::engine::error::RunnerError::FlowTerminal).
+/// The `Display` text is the bare message, so existing message assertions hold.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct TerminalFlowError(pub String);
+
+/// Build an `anyhow::Error` carrying a [`TerminalFlowError`].
+pub(crate) fn terminal_flow_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TerminalFlowError(message.into()))
+}
+
+/// Whether any cause in the chain is a [`TerminalFlowError`].
+pub fn is_terminal_flow_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<TerminalFlowError>())
+}
+
 /// Retry transient failures: anything typed as transient (an explicit
 /// [`TransientFlowError`], a timeout, a transient I/O kind) or whose message
 /// names a transient condition ("transient", "unavailable", "internal",
 /// "timeout"). The message check is the long-standing behaviour that
 /// `FlowRetryConfig` callers (fault injection, state-store flakiness) rely on.
 fn should_retry(err: &anyhow::Error) -> bool {
+    // A terminal marker wins over any transient-sounding message text.
+    if is_terminal_flow_error(err) {
+        return false;
+    }
     let typed = err.chain().any(|cause| {
         if cause.is::<TransientFlowError>() || cause.is::<tokio::time::error::Elapsed>() {
             return true;

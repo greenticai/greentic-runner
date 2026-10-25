@@ -613,6 +613,50 @@ turns on one session queue rather than interleave. Not fixed: the lock is
 in-process only; multi-replica deployments on a shared Redis session store still
 need a store-level compare-and-set/lease.
 
+## Round 12
+
+- **Hot reload / cron timers:** the superseded runtime's timers are now stopped cooperatively (a per-runtime
+  `CancellationToken` observed only while a timer is sleeping) instead of `JoinHandle::abort`. A tick already inside
+  its flow now runs to completion and saves its snapshot/state; only the NEXT tick is suppressed. A reload can
+  therefore briefly overlap the old runtime's in-flight cron flow with the new runtime's (never a doubled tick).
+- **Whole-turn retry:** deterministic or post-effect flow failures (`flow_step_limit_exceeded`, `redirect_limit`,
+  unknown node/flow, missing required variable, `flow.call` nesting/pause, snapshot/pack mismatch) are tagged
+  `TerminalFlowError`, reach the state machine as the new `RunnerError::FlowTerminal` and are no longer re-run by
+  `retry_with_jitter` (a step-limit runaway used to execute up to 5 x 10 000 nodes with effects). Transient
+  infrastructure errors are still retried. **Affected:** embedders matching `RunnerError` exhaustively (new variant).
+- **Tool secrets from env:** the `secret://a/b` -> `A_B` env fallback now also refuses `SECRETS_*` (so
+  `secret://secrets/broker/token` can no longer read `SECRETS_BROKER_TOKEN`), `PACK_*`, `REDIS_URL`,
+  `OTLP_ENDPOINT` and `OTLP_HEADERS`. It stays a deny-list on purpose: an allow-list would break the documented
+  fallback for ordinary tool keys (`secret://openai/api_key` -> `OPENAI_API_KEY` still resolves, even though the
+  runner reads that variable itself). **Affected:** a tool that read one of those names from the env must be given
+  the value through the secrets store instead.
+- **Tool extension HTTP client:** requests to a forbidden IP literal (`http://169.254.169.254/`,
+  `http://[::ffff:a9fe:a9fe]/`, any spelling the URL parser normalises to one) are refused; before, only names that
+  RESOLVED to such an address were. `greentic_ext_runtime` offers no pre-request hook, so the client routes a
+  forbidden literal to a local connection-dropping listener (via its proxy selector) and the request fails with a
+  connection error. Same policy as the rest of the host (`GREENTIC_HTTP_ALLOW_METADATA`, `GREENTIC_HTTP_DENY_PRIVATE`).
+- **Pack cache:** a pinned digest written `SHA256:<UPPER>` no longer breaks signature verification on a warm cache,
+  and `ResolvedPack.digest` / the watcher's applied digest are always the canonical lowercase `sha256:<hex>`
+  computed from the file (`PackCache::lookup` now returns `CachedPack { path, digest }`). A watcher that had stored
+  the raw uppercase spelling does one extra rebuild after upgrading.
+- **Pack cache pruning:** after storing a new archive, sibling `sha256_*` directories beyond the newest 2 that have
+  been unused for over an hour, the legacy flat `<name>/<version>/pack.gtpack` and `pack.tmp-*` leftovers older
+  than an hour are deleted. Cache hits refresh the archive's mtime, so a pack a tenant still resolves is never
+  pruned (a loaded runtime keeps its archive PATH and re-opens it lazily, so deleting an in-use one would break it).
+  Disk use per name/version is now bounded instead of growing by up to 1 GiB per republish.
+- **Shutdown:** a second SIGINT/SIGTERM during the drain aborts the in-flight requests immediately instead of waiting
+  out `GREENTIC_SHUTDOWN_GRACE_SECS`; `host.stop()` still runs.
+- **Agentic worker:** the per-step tool-catalog resolve (and user-ledger read) now refreshes the session lock while it
+  runs, so a cold MCP probe/pull can no longer outlast the 90 s lock TTL and kill the turn as `LockLost`
+  (acked as `invoke_failed`). MCP servers are probed concurrently (at most 8 at once, results ingested in server
+  order) instead of one after another.
+- **Event bridges:** the core-NATS `overloaded` reply at the in-flight cap is kept and documented: core-NATS gives
+  no server-side backpressure, so not reading the next message would only queue requests on a full replica.
+- **Pack loading:** a pack whose `components/*.wasm` entries are symlinks pointing outside the pack root now fails
+  to load (confined like every other pack path), and a `pack.lock` in a parent or grandparent directory of the
+  archive is no longer found (only the archive's own directory is searched). Ship component bytes inside the pack
+  and keep `pack.lock` next to the archive.
+
 ## Tests and CI
 
 - Tests that used to print "skipping" and pass (offline wasm fixture build, fixture build failure) now fail. Set
