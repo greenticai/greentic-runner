@@ -684,6 +684,9 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         trace,
         validation,
     } = cfg;
+    // `from_config` already ran this, but an embedder may have hand-built the
+    // `RunnerConfig`; a routing config that must not run fails here as well.
+    routing.startup_check()?;
     let pack_policy = pack_policy_from(&resolved_config);
 
     let mut builder = HostBuilder::new();
