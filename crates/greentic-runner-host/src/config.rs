@@ -410,6 +410,8 @@ fn tenant_ctx_for(tenant: &str, env: Option<&str>) -> Result<greentic_types::Ten
         .map_err(|err| anyhow::anyhow!("invalid GREENTIC_ENV `{env}`: {err}"))?;
     let tenant_id = greentic_types::TenantId::from_str(tenant)
         .map_err(|err| anyhow::anyhow!("invalid tenant id `{tenant}`: {err}"))?;
+    // The strictest downstream rule (secrets path), enforced once here.
+    crate::secrets_broker::validate_tenant_segment(tenant)?;
     Ok(greentic_types::TenantCtx::new(env_id, tenant_id))
 }
 
@@ -929,6 +931,20 @@ fast2flow:
         let policy = webhook_policy_from_bindings(&bindings).expect("policy");
         assert!(!policy.is_allowed("/admin/x"));
         assert!(policy.is_allowed("/hook"));
+    }
+
+    #[test]
+    fn tenant_ids_a_secret_read_would_refuse_are_rejected_at_load() {
+        for bad in [".hidden", "a..b", "..", ".", &"a".repeat(129)] {
+            let err = tenant_ctx_for(bad, None).expect_err(bad);
+            assert!(
+                err.to_string().contains("invalid tenant id"),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in ["demo", "acme-1.eu", "T_1", "a.b"] {
+            assert!(tenant_ctx_for(good, None).is_ok(), "{good:?}");
+        }
     }
 
     #[test]
