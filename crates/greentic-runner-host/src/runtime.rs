@@ -2208,7 +2208,7 @@ mod timer_retirement_tests {
         // rollout identity matches is covered by `insert_revision`'s own tests.
         let mut map = HashMap::new();
         map.insert(
-            RuntimeKey::revision("demo", deployment.clone(), bundle.clone(), revision.clone()),
+            RuntimeKey::revision("demo", deployment, bundle.clone(), revision),
             Arc::clone(&runtime),
         );
         active.replace(map);
