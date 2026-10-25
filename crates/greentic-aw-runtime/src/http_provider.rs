@@ -45,7 +45,15 @@ impl ConfigProvider for HttpConfigProvider {
         agent_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<AgentConfig, ConfigError>> + Send + 'a>> {
         Box::pin(async move {
-            let url = format!("{}/api/v1/designer/agents/{agent_id}", self.base_url);
+            // `..` stays a traversal step even percent-encoded: never send it.
+            if crate::tenant::is_dot_segment(agent_id) {
+                return Err(ConfigError::AgentNotFound(agent_id.to_string()));
+            }
+            let url = format!(
+                "{}/api/v1/designer/agents/{}",
+                self.base_url,
+                crate::tenant::percent_encode_segment(agent_id)
+            );
             let resp = self
                 .client
                 .get(&url)
@@ -163,5 +171,31 @@ mod tests {
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Misconfigured(_))));
+    }
+
+    #[tokio::test]
+    async fn an_agent_id_cannot_steer_the_request_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let provider = HttpConfigProvider::new(server.uri(), "tok");
+        let tenant = TenantContext::new("t", "e");
+        let err = provider
+            .agent_config(&tenant, "../tenant/me/mcp-servers")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::AgentNotFound(_)));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url.path(),
+            "/api/v1/designer/agents/..%2Ftenant%2Fme%2Fmcp-servers"
+        );
+        // A bare `..` is refused without any request being made.
+        let err = provider.agent_config(&tenant, "..").await.unwrap_err();
+        assert!(matches!(err, ConfigError::AgentNotFound(_)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
