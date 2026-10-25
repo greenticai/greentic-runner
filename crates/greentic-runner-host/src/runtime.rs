@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde_json::Value;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
@@ -301,6 +302,10 @@ pub struct TenantRuntime {
     http_client: Client,
     mocks: Option<Arc<MockLayer>>,
     timer_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Cancelled when this runtime's cron timers must stop. The timer tasks
+    /// only observe it while SLEEPING, so a tick that is already running its
+    /// flow finishes (and saves its snapshot) instead of being torn down.
+    timer_cancel: CancellationToken,
     /// NATS response listeners and the MCP warm listener this runtime spawned.
     /// Aborted on drop so a reload (which swaps in a fresh `TenantRuntime`)
     /// does not leave the old listeners running beside the new ones.
@@ -1856,6 +1861,7 @@ impl TenantRuntime {
             http_client,
             mocks,
             timer_handles: Mutex::new(Vec::new()),
+            timer_cancel: CancellationToken::new(),
             background_handles: Mutex::new(background_handles),
             secrets: secrets_manager,
             operator_registry,
@@ -1975,13 +1981,23 @@ impl TenantRuntime {
         self.timer_handles.lock().extend(handles);
     }
 
+    /// Token the cron timer tasks select on while sleeping.
+    pub(crate) fn timer_cancel_token(&self) -> CancellationToken {
+        self.timer_cancel.clone()
+    }
+
     /// Stop this runtime's cron timers now. Used when a reload supersedes the
     /// runtime: it may stay referenced by in-flight work for a while, and its
     /// timers must not fire alongside the replacement's.
+    ///
+    /// Cooperative, not `JoinHandle::abort`: a timer sleeping stops before its
+    /// NEXT tick, but a tick already inside `state_machine().handle(..)` runs
+    /// to completion, so its effects are never left without the snapshot/state
+    /// save that follows them. The handles are detached; each task exits on
+    /// its own.
     pub fn abort_timers(&self) {
-        for handle in self.timer_handles.lock().drain(..) {
-            handle.abort();
-        }
+        self.timer_cancel.cancel();
+        self.timer_handles.lock().clear();
     }
 
     #[cfg(test)]
@@ -2100,9 +2116,10 @@ where
 
 impl Drop for TenantRuntime {
     fn drop(&mut self) {
-        for handle in self.timer_handles.lock().drain(..) {
-            handle.abort();
-        }
+        // Cooperative (see `abort_timers`): a task mid-tick holds a strong
+        // `Arc` to this runtime, so Drop can only race a sleeping timer.
+        self.timer_cancel.cancel();
+        self.timer_handles.lock().clear();
         for handle in self.background_handles.lock().drain(..) {
             handle.abort();
         }
