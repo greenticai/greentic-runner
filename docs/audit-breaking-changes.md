@@ -360,8 +360,9 @@ Things most likely to break a running deployment, in the order to check them:
 - **What:** snapshots are stored as `<escaped id>.snapshot.json`, where unsafe bytes are `%xx`-escaped (the old name
   mapped every unsafe byte to `_`, so `a/b` and `a_b` collided), and the file wraps the snapshot with the owning
   `session_id`. A snapshot recording another session id is refused. A corrupt snapshot is now an error that names
-  the file and says to delete it (it used to silently restart at the flow entry). Writes are atomic (temp file +
-  rename).
+  the file and says to delete it (it used to silently restart at the flow entry). Writes are atomic (a unique `<name>.tmp-<pid>-<n>`
+  temp file, best-effort fsync, then rename; concurrent saves of one session no longer share a temp name, and temp
+  leftovers older than an hour are removed on save/load).
 - **Backward compatibility:** bare legacy snapshots are still read for ids with unsafe characters, with a
   documented residual risk (a bare legacy file is adopted by whichever session maps to its name). A legacy file a
   session adopted is deleted once its park is re-saved under the current name, so it cannot be resurrected by a
