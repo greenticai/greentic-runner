@@ -332,10 +332,15 @@ impl HostConfig {
         {
             cfg.team = Some(team.clone());
         }
-        // Prefer env var; fall back to yaml field. Never log the value.
+        // Prefer env var; fall back to yaml field. Never log the value. A
+        // blank env value is "not set" (like every other blank env knob), so an
+        // empty `GREENTIC_OAUTH_BROKER_SHARED_SECRET=` cannot override a
+        // configured secret with nothing. The value itself is kept verbatim.
+        let usable = |raw: &str| !raw.trim().is_empty();
         cfg.shared_secret = env_secret
+            .filter(|raw| usable(raw))
             .map(str::to_owned)
-            .or_else(|| oauth.shared_secret.clone());
+            .or_else(|| oauth.shared_secret.clone().filter(|raw| usable(raw)));
         Some(cfg)
     }
 
@@ -910,6 +915,41 @@ fast2flow:
             .oauth_broker_config_with_env(Some("env-only-secret"))
             .expect("missing broker config");
         assert_eq!(broker.shared_secret.as_deref(), Some("env-only-secret"));
+    }
+
+    #[test]
+    fn a_blank_env_shared_secret_does_not_override_the_yaml_one() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some("yaml-secret".into()),
+        }));
+        for blank in ["", "   "] {
+            let broker = cfg
+                .oauth_broker_config_with_env(Some(blank))
+                .expect("missing broker config");
+            assert_eq!(
+                broker.shared_secret.as_deref(),
+                Some("yaml-secret"),
+                "{blank:?}"
+            );
+        }
+        // Blank everywhere means no secret, not an empty one.
+        let none = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some(String::new()),
+        }));
+        let broker = none
+            .oauth_broker_config_with_env(Some(""))
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret, None);
     }
 
     #[test]
