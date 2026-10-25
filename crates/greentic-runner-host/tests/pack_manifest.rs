@@ -1133,3 +1133,65 @@ fn nested_flow_load_resolves_same_state_dir_as_parent() -> Result<()> {
     assert_eq!(nested, parent);
     Ok(())
 }
+
+/// The nested pack a direct flow run loads must keep the parent's unit scope
+/// and non-secret runtime config (it used to come back with both empty).
+#[test]
+fn nested_flow_load_keeps_unit_and_runtime_config() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let gtpack = temp.path().join("runner-components.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_pack(&gtpack)?;
+    let mut pack = rt.block_on(PackRuntime::load(
+        &gtpack,
+        Arc::new(host_config(&bindings_path)),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?;
+    let mut cfg = std::collections::BTreeMap::new();
+    cfg.insert("k".to_string(), serde_json::json!("v"));
+    let cfg = Arc::new(cfg);
+    pack.set_unit_id(Some("unit-1".to_string()));
+    pack.set_runtime_config_non_secret(Some(Arc::clone(&cfg)));
+    let (unit, config) = rt.block_on(pack.nested_load_scope())?;
+    assert_eq!(unit.as_deref(), Some("unit-1"));
+    assert_eq!(config, Some(cfg));
+    Ok(())
+}
+
+/// A materialized pack directory whose manifest is corrupt, with no archive to
+/// fall back to, must fail to load rather than come back as an empty pack.
+#[test]
+fn corrupt_materialized_manifest_without_archive_fails_to_load() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_dir = temp.path().join("pack");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(pack_dir.join("manifest.cbor"), b"\xff\xff not cbor")?;
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    let result = rt.block_on(PackRuntime::load(
+        &pack_dir,
+        Arc::new(host_config(&bindings_path)),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ));
+    assert!(result.is_err(), "corrupt manifest must not load as empty");
+    Ok(())
+}
