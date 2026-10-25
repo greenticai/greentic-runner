@@ -160,7 +160,7 @@ cargo run -p greentic-runner -- \
 To run a pack directly with the local runner harness:
 
 ```bash
-cargo run -p greentic-runner --bin greentic-runner-cli -- \
+cargo run -p greentic-runner --features legacy-gen-bindings --bin greentic-runner-cli -- \
   --pack ./path/to/pack.gtpack \
   --input '{}'
 ```
