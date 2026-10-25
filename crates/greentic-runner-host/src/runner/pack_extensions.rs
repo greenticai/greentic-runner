@@ -331,6 +331,15 @@ fn stage_one(entry_name: &str, bytes: &[u8]) -> Result<StagedExtension> {
 /// [`stage_one`] against an explicit root, so tests can inspect the layout
 /// without sharing the process-wide staging root.
 fn stage_one_in(root: &Path, entry_name: &str, bytes: &[u8]) -> Result<StagedExtension> {
+    // Serialise staging process-wide. Two callers staging the same bytes share
+    // one slot; without this, the second sees no marker mid-unpack and clears
+    // the slot under the first (`Directory not empty`), or the sweep races an
+    // unpack. Staging is rare and short, so one lock costs nothing.
+    static STAGING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = STAGING_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let digest = hex::encode(Sha256::digest(bytes));
     let slot = root.join(&digest[..32]);
     let dir = slot.join(EXTENSION_SUBDIR);
