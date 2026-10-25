@@ -3976,6 +3976,12 @@ impl PackRuntime {
             .filter(|name| !name.is_empty())
     }
 
+    /// Archive this runtime was loaded from, when it came from one. The pack
+    /// watcher uses it to keep the cached copy of a runtime it retains alive.
+    pub fn archive_path(&self) -> Option<&Path> {
+        self.archive_path.as_deref()
+    }
+
     /// Read an asset file from the pack's assets directory.
     ///
     /// Accepts paths like `assets/cards/card-a.json` or `cards/card-a.json`
