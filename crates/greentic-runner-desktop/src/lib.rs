@@ -663,6 +663,15 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                         // Successfully paused. Surface the run as Ok so
                         // greentic-start can emit the rendered card and
                         // wait for the user's next submission.
+                        //
+                        // The park now lives under the current-scheme name, so
+                        // the legacy bare file we resumed from is stale: drop
+                        // it, or a later NEW conversation with the same
+                        // session id would resurrect it.
+                        remove_migrated_legacy_snapshot(
+                            legacy_snapshot_path.as_deref(),
+                            loaded_from_legacy,
+                        );
                         RunCompletion::Ok
                     }
                 } else {
@@ -787,18 +796,21 @@ fn parse_snapshot_bytes(
     greentic_runner_host::runner::engine::FlowSnapshot,
     Option<String>,
 )> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)
-        .with_context(|| format!("corrupt session snapshot {}", path.display()))?;
+    let corrupt = || {
+        format!(
+            "corrupt session snapshot {}; delete this file to discard the parked run and start the session fresh",
+            path.display()
+        )
+    };
+    let value: serde_json::Value = serde_json::from_slice(bytes).with_context(corrupt)?;
     let wrapped = value
         .as_object()
         .is_some_and(|o| o.contains_key("session_id") && o.contains_key("snapshot"));
     if wrapped {
-        let file: SnapshotFile = serde_json::from_value(value)
-            .with_context(|| format!("corrupt session snapshot {}", path.display()))?;
+        let file: SnapshotFile = serde_json::from_value(value).with_context(corrupt)?;
         Ok((file.snapshot, Some(file.session_id)))
     } else {
-        let snapshot = serde_json::from_value(value)
-            .with_context(|| format!("corrupt session snapshot {}", path.display()))?;
+        let snapshot = serde_json::from_value(value).with_context(corrupt)?;
         Ok((snapshot, None))
     }
 }
@@ -847,6 +859,8 @@ fn load_session_snapshot(
 /// files, which no current build writes and which disappear as those parks
 /// resume or expire. Anyone sharing a session state dir between untrusted
 /// session ids on such an upgrade should clear the bare `*.snapshot.json` files.
+/// (A bare file this session DID adopt is deleted once its park is re-saved
+/// under the current name, so it cannot be resurrected later.)
 fn load_legacy_session_snapshot(
     path: &Path,
     session_id: &str,
@@ -864,6 +878,26 @@ fn load_legacy_session_snapshot(
             );
             None
         }
+    }
+}
+
+/// Delete the legacy-named snapshot once its contents have been re-saved under
+/// the current name. Only acts when this session actually resumed from that
+/// file (`loaded_from_legacy`); otherwise the legacy path may be another
+/// session's live snapshot (`a/b` legacy-maps onto `a_b`), so it is left alone.
+fn remove_migrated_legacy_snapshot(legacy: Option<&Path>, loaded_from_legacy: bool) {
+    if !loaded_from_legacy {
+        return;
+    }
+    if let Some(path) = legacy
+        && let Err(err) = fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to remove migrated legacy session snapshot"
+        );
     }
 }
 
@@ -885,7 +919,22 @@ fn save_session_snapshot(
         snapshot,
     })
     .with_context(|| "serialize session snapshot for persistence")?;
-    fs::write(path, bytes).with_context(|| format!("write session snapshot {}", path.display()))?;
+    // Write-then-rename: a crash mid-write must not leave a truncated file at
+    // `path`, because a corrupt snapshot is a hard error on the next load and
+    // would wedge the session. The temp file sits beside the target so the
+    // rename stays on one filesystem.
+    let mut tmp_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(format!(".tmp-{}", std::process::id()));
+    let tmp_path = path.with_file_name(tmp_name);
+    fs::write(&tmp_path, bytes)
+        .with_context(|| format!("write session snapshot {}", tmp_path.display()))?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("write session snapshot {}", path.display()));
+    }
     Ok(())
 }
 
@@ -2246,6 +2295,49 @@ mod tests {
         // The file was never touched (no cross-delete: removal is gated on
         // having actually loaded from the legacy path, which returned None).
         assert!(safe.exists());
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("s1.snapshot.json");
+        // Overwrite an existing (even garbage) file in place via rename.
+        std::fs::write(&path, b"old").expect("seed");
+        save_session_snapshot(&path, "s1", &seed_snapshot()).expect("save");
+        assert!(load_session_snapshot(&path, "s1").expect("load").is_some());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn corrupt_snapshot_error_names_the_file_and_says_to_delete_it() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("s2.snapshot.json");
+        std::fs::write(&path, b"{\"truncated").expect("write");
+        let err = load_session_snapshot(&path, "s2").expect_err("corrupt");
+        let text = format!("{err:#}");
+        assert!(text.contains("s2.snapshot.json"), "{text}");
+        assert!(text.contains("delete this file"), "{text}");
+    }
+
+    #[test]
+    fn migrated_legacy_snapshot_is_removed_only_when_ours() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let legacy = tmp.path().join("a_b.snapshot.json");
+        std::fs::write(&legacy, b"{}").expect("write");
+        // Not loaded from legacy: may be another session's park, keep it.
+        remove_migrated_legacy_snapshot(Some(&legacy), false);
+        assert!(legacy.exists());
+        remove_migrated_legacy_snapshot(Some(&legacy), true);
+        assert!(!legacy.exists());
+        // Idempotent / absent path is fine.
+        remove_migrated_legacy_snapshot(Some(&legacy), true);
+        remove_migrated_legacy_snapshot(None, true);
     }
 
     #[test]

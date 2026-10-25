@@ -19,6 +19,7 @@ use aw_event_bridge::{
     valid_dispatch_id,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::dispatch_ledger::{DispatchLedger, NoopDispatchLedger};
 use crate::error::TerminationReason;
@@ -140,13 +141,35 @@ fn step_failure(ok: bool, output: &Value) -> Option<aw_event_bridge::DispatchErr
 /// the dispatch correlation/idempotency hint (which the runner derives from the
 /// flow session). A final synthetic default keeps the function total.
 fn resolve_session_id(input: &Value, idempotency_key: Option<&str>) -> String {
-    input
+    let raw = input
         .get("session_id")
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| idempotency_key.map(str::to_string))
         .filter(|hint| !hint.is_empty())
-        .unwrap_or_else(|| "agentic-dispatch".to_string())
+        .unwrap_or_else(|| "agentic-dispatch".to_string());
+    shorten_session_id(raw)
+}
+
+/// Replace an over-long session id with a stable digest (`h:` + sha256 hex).
+///
+/// The runner's resume markers (`::cnv64=`, `::thr64=`, `::rpl64=`) base64 the
+/// provider conversation / thread / reply ids onto the correlation id, so a
+/// long Teams or email conversation exceeds `MAX_SESSION_ID_LEN` and used to be
+/// rejected on every turn. The digest is deterministic, so one conversation
+/// still maps to one agent memory. An id with a forbidden character is passed
+/// through unchanged so `validate_session_id` still rejects it.
+fn shorten_session_id(id: String) -> String {
+    if id.len() <= crate::tenant::MAX_SESSION_ID_LEN || id.chars().any(char::is_control) {
+        return id;
+    }
+    let digest = Sha256::digest(id.as_bytes());
+    let mut out = String::with_capacity(2 + digest.len() * 2);
+    out.push_str("h:");
+    for byte in digest.iter() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// The ledger key for one dispatch: tenant + env + the publisher's per-dispatch
@@ -562,6 +585,25 @@ mod tests {
         assert_eq!(extract_user_text(&json!({"text": "yo"})), "yo");
         assert_eq!(extract_user_text(&json!("bare")), "bare");
         assert_eq!(extract_user_text(&json!({"other": 1})), "");
+    }
+
+    #[test]
+    fn long_session_id_becomes_stable_valid_digest() {
+        let long_a = format!("conv::cnv64={}", "A".repeat(600));
+        let long_b = format!("conv::cnv64={}", "B".repeat(600));
+        let a1 = resolve_session_id(&json!({}), Some(&long_a));
+        let a2 = resolve_session_id(&json!({}), Some(&long_a));
+        let b = resolve_session_id(&json!({}), Some(&long_b));
+        assert_eq!(a1, a2, "digest must be deterministic");
+        assert_ne!(a1, b, "distinct inputs must stay distinct");
+        assert!(a1.starts_with("h:"));
+        assert_eq!(a1.len(), 66);
+        assert!(crate::tenant::validate_session_id(&a1).is_ok());
+        // Short ids are untouched; control characters are still rejected.
+        assert_eq!(resolve_session_id(&json!({}), Some("short")), "short");
+        let bad = format!("{}\n", "x".repeat(600));
+        let kept = resolve_session_id(&json!({}), Some(&bad));
+        assert!(crate::tenant::validate_session_id(&kept).is_err());
     }
 
     #[test]

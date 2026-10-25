@@ -218,6 +218,17 @@ pub struct RunnerConfig {
 impl RunnerConfig {
     /// Build a [`RunnerConfig`] from a resolved greentic-config and the provided binding files.
     pub fn from_config(resolved_config: ResolvedConfig, bindings: Vec<PathBuf>) -> Result<Self> {
+        Self::from_config_with_port(resolved_config, bindings, None)
+    }
+
+    /// Like [`RunnerConfig::from_config`], with an explicit port (the `--port`
+    /// flag). When `port` is `Some`, the `PORT` environment variable is not
+    /// read at all, so a malformed `PORT` cannot fail a run that overrides it.
+    pub fn from_config_with_port(
+        resolved_config: ResolvedConfig,
+        bindings: Vec<PathBuf>,
+        port: Option<u16>,
+    ) -> Result<Self> {
         if bindings.is_empty() {
             anyhow::bail!("at least one gtbind file is required");
         }
@@ -232,7 +243,7 @@ impl RunnerConfig {
         )?;
         maybe_write_gtbind_index(&tenant_bindings, &resolved_config.config.paths, &mut pack)?;
         let refresh = parse_refresh_interval(std::env::var("PACK_REFRESH_INTERVAL").ok())?;
-        let port = parse_port(std::env::var("PORT").ok())?;
+        let port = resolve_port(port, || std::env::var("PORT").ok())?;
         let default_tenant = resolved_config
             .config
             .dev
@@ -314,6 +325,19 @@ fn maybe_write_gtbind_index(
         return Ok(());
     }
 
+    // Known limitation: a gtbind pack binding carries no signature (and no
+    // digest for a semver `pack_ref`), so the generated index entries cannot
+    // either. With a trust key configured the loader requires a signature per
+    // entry, and strict mode a pinned digest for remote packs, so these packs
+    // are refused. Verification is deliberately not relaxed; say why up front.
+    if pack.public_key.is_some() {
+        tracing::warn!(
+            "gtbind pack_locator packs carry no signature; with a pack trust key configured \
+             the loader will refuse them. Use a signed pack index instead of pack_locator, \
+             or leave the trust key unset for development"
+        );
+    }
+
     let mut entries = serde_json::Map::new();
     for binding in tenant_bindings.values() {
         let mut packs = Vec::new();
@@ -379,11 +403,19 @@ fn maybe_write_gtbind_index(
 
 /// Parse the `PORT` value; an unset variable yields the default, an invalid
 /// one is an error instead of a silent fallback.
+/// An explicit port wins and the environment is never consulted.
+fn resolve_port(explicit: Option<u16>, env: impl FnOnce() -> Option<String>) -> Result<u16> {
+    match explicit {
+        Some(port) => Ok(port),
+        None => parse_port(env()),
+    }
+}
+
+/// Unset, empty and whitespace-only `PORT` all mean the default (8080).
 fn parse_port(value: Option<String>) -> Result<u16> {
-    match value {
+    match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
         None => Ok(8080),
         Some(raw) => raw
-            .trim()
             .parse::<u16>()
             .map_err(|err| anyhow!("invalid PORT `{raw}`: {err}")),
     }
@@ -665,6 +697,9 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         trace,
         validation,
     } = cfg;
+    // `from_config` already ran this, but an embedder may have hand-built the
+    // `RunnerConfig`; a routing config that must not run fails here as well.
+    routing.startup_check()?;
     let pack_policy = pack_policy_from(&resolved_config);
 
     let mut builder = HostBuilder::new();
@@ -762,8 +797,18 @@ mod tests {
     fn parse_port_defaults_and_rejects_invalid_values() {
         assert_eq!(parse_port(None).expect("default"), 8080);
         assert_eq!(parse_port(Some("9090".into())).expect("valid"), 9090);
+        assert_eq!(parse_port(Some(String::new())).expect("empty"), 8080);
+        assert_eq!(parse_port(Some("  ".into())).expect("blank"), 8080);
         assert!(parse_port(Some("not-a-port".into())).is_err());
         assert!(parse_port(Some("70000".into())).is_err());
+    }
+
+    #[test]
+    fn explicit_port_skips_the_port_env_entirely() {
+        let port = resolve_port(Some(9000), || Some("garbage".into())).expect("explicit wins");
+        assert_eq!(port, 9000);
+        assert!(resolve_port(None, || Some("garbage".into())).is_err());
+        assert_eq!(resolve_port(None, || None).expect("default"), 8080);
     }
 
     #[test]

@@ -111,6 +111,39 @@ mod tests {
         }
     }
 
+    fn ref_named(name: &str) -> PackRef {
+        PackRef {
+            name: name.into(),
+            version: PackVersion::Semver(semver::Version::new(1, 0, 0)),
+        }
+    }
+
+    #[test]
+    fn namespaced_and_hostile_names_stay_inside_the_cache_root() {
+        let temp = tempfile::tempdir().expect("tmp");
+        let cache = PackCache::new(temp.path().join("cache"));
+        for name in ["a/b", "..", "a/../b", "../x", "a\\b", "/etc/x"] {
+            let dir = cache.dir_for(&ref_named(name));
+            assert!(dir.starts_with(cache.root()), "{name:?} escaped: {dir:?}");
+            let rel = dir.strip_prefix(cache.root()).expect("under root");
+            assert!(
+                rel.components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "{name:?} has non-normal components: {rel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_and_underscore_names_do_not_share_a_cache_dir() {
+        let temp = tempfile::tempdir().expect("tmp");
+        let cache = PackCache::new(temp.path().join("cache"));
+        assert_ne!(
+            cache.dir_for(&ref_named("a/b")),
+            cache.dir_for(&ref_named("a_b"))
+        );
+    }
+
     #[test]
     fn store_replaces_stale_cache_atomically() {
         let temp = tempfile::tempdir().expect("tmp");

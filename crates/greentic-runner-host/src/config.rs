@@ -384,7 +384,11 @@ fn local_fallback_ctx() -> greentic_types::TenantCtx {
 }
 
 fn tenant_ctx_for(tenant: &str, env: Option<&str>) -> Result<greentic_types::TenantCtx> {
-    let env = env.unwrap_or("local");
+    // An empty `GREENTIC_ENV` is "not configured", like an unset one.
+    let env = env
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("local");
     let env_id = greentic_types::EnvId::from_str(env)
         .map_err(|err| anyhow::anyhow!("invalid GREENTIC_ENV `{env}`: {err}"))?;
     let tenant_id = greentic_types::TenantId::from_str(tenant)
@@ -632,6 +636,16 @@ fn default_retry_base_delay_ms() -> u64 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_greentic_env_is_treated_as_unset() {
+        for blank in [None, Some(""), Some("  ")] {
+            let ctx = tenant_ctx_for("tenant-a", blank).expect("blank env means local");
+            assert_eq!(ctx.env.as_str(), "local");
+        }
+        assert!(tenant_ctx_for("tenant-a", Some("bad env!")).is_err());
+    }
+
     use crate::gtbind::{PackBinding, TenantBindings};
     use std::collections::HashMap;
     use std::path::PathBuf;

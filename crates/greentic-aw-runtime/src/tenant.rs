@@ -170,7 +170,7 @@ pub fn validate_scope_id(kind: &str, id: &str) -> Result<(), String> {
 }
 
 /// Longest session id accepted from an untrusted source.
-const MAX_SESSION_ID_LEN: usize = 512;
+pub(crate) const MAX_SESSION_ID_LEN: usize = 512;
 
 /// Reject a session id that is empty, over-long, or carries a control
 /// character. Unlike tenant/env ids a session id MAY contain `:`, `/` and `..`:

@@ -180,4 +180,36 @@ mod tests {
 
         assert!(run_http_host(cfg).await.is_err());
     }
+
+    #[tokio::test]
+    async fn run_http_host_fails_startup_on_invalid_routing_config() {
+        let cfg = RunnerConfig {
+            tenant_bindings: HashMap::new(),
+            pack: runner_core::env::PackConfig {
+                source: runner_core::env::PackSource::Fs,
+                index_location: runner_core::env::IndexLocation::File(PathBuf::from("index.json")),
+                cache_dir: PathBuf::from("cache"),
+                public_key: None,
+                network: None,
+            },
+            port: 0,
+            refresh_interval: std::time::Duration::from_secs(1),
+            routing: greentic_runner_host::RoutingConfig {
+                resolver: greentic_runner_host::routing::TenantResolver::Invalid(
+                    "unsupported TENANT_RESOLVER `hsot`".into(),
+                ),
+                default_tenant: "demo".into(),
+            },
+            admin: greentic_runner_host::AdminAuth::default(),
+            telemetry: None,
+            secrets_backend: greentic_runner_host::secrets::SecretsBackend::Env,
+            wasi_policy: greentic_runner_host::RunnerWasiPolicy::default(),
+            resolved_config: resolved_config(),
+            trace: greentic_runner_host::trace::TraceConfig::from_env(),
+            validation: greentic_runner_host::validate::ValidationConfig::from_env(),
+        };
+
+        let err = run_http_host(cfg).await.expect_err("must fail at startup");
+        assert!(err.to_string().contains("hsot"), "got: {err}");
+    }
 }

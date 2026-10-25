@@ -326,10 +326,8 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
     let validation_config = validation_mode
         .map(|mode| ValidationConfig::from_env().with_mode(mode))
         .unwrap_or_else(ValidationConfig::from_env);
-    let mut cfg = RunnerConfig::from_config(resolved, bindings)?;
-    if let Some(port) = run.port {
-        cfg = cfg.with_port(port);
-    }
+    // `--port` wins and skips `PORT` entirely, so a bad `PORT` cannot fail it.
+    let mut cfg = RunnerConfig::from_config_with_port(resolved, bindings, run.port)?;
     cfg.trace = trace_config;
     cfg.validation = validation_config;
     run_host(cfg).await

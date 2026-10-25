@@ -153,7 +153,7 @@ To run the HTTP runtime directly:
 
 ```bash
 cargo run -p greentic-runner -- \
-  --bindings examples/bindings/demo.yaml \
+  --bindings ./bindings/acme.gtbind \
   --port 8080
 ```
 
