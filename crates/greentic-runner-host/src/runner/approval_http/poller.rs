@@ -32,7 +32,19 @@ enum PollOutcome {
     Gone(reqwest::StatusCode),
 }
 
+/// Clears `poller_started` however the loop ends (cancel, or a panic that
+/// unwinds out of it), so the next registration can start a replacement
+/// instead of finding a dead poller still marked as running.
+struct PollerGuard(Arc<Inner>);
+
+impl Drop for PollerGuard {
+    fn drop(&mut self) {
+        *self.0.poller_started.lock() = false;
+    }
+}
+
 pub(super) async fn run(inner: Arc<Inner>) {
+    let _guard = PollerGuard(Arc::clone(&inner));
     loop {
         if inner.cancel.is_cancelled() {
             break;
@@ -43,7 +55,7 @@ pub(super) async fn run(inner: Arc<Inner>) {
             if inner.cancel.is_cancelled() {
                 break;
             }
-            expire(&inner, &correlation_id, pending).await;
+            expire(&inner, correlation_id, pending).await;
         }
         for correlation_id in due {
             if inner.cancel.is_cancelled() {
@@ -95,7 +107,7 @@ fn next_wake(inner: &Inner, now: Instant) -> Duration {
         .min(MAX_IDLE)
 }
 
-async fn poll_one(inner: &Inner, correlation_id: &str) {
+async fn poll_one(inner: &Arc<Inner>, correlation_id: &str) {
     let outcome = fetch_decision(inner, correlation_id).await;
     let now = Instant::now();
     match outcome {
@@ -149,7 +161,7 @@ async fn poll_one(inner: &Inner, correlation_id: &str) {
                 error: None::<DispatchError>,
             };
             let body = serde_json::to_vec(&response).unwrap_or_default();
-            resume(inner, correlation_id, &pending, &body).await;
+            spawn_resume(inner, correlation_id, pending, body);
         }
     }
 }
@@ -201,17 +213,17 @@ async fn fetch_decision(inner: &Inner, correlation_id: &str) -> PollOutcome {
 
 /// Deadline reached: withdraw at the admin, then resume locally with the same
 /// `timeout` body the NATS watchdog publishes, token included.
-async fn expire(inner: &Inner, correlation_id: &str, pending: Pending) {
-    withdraw(inner, correlation_id, pending.deadline_reason).await;
+async fn expire(inner: &Arc<Inner>, correlation_id: String, pending: Pending) {
+    withdraw(inner, &correlation_id, pending.deadline_reason).await;
     let (_subject, _headers, body) = build_timeout_response_message_with_token(
         crate::runner::engine::APPROVAL_RUNTIME,
-        correlation_id,
+        &correlation_id,
         pending.tenant.tenant_id.as_str(),
         &pending.env,
         pending.deadline_ms,
         pending.decision_token.as_ref().map(|t| t.expose_secret()),
     );
-    resume(inner, correlation_id, &pending, &body).await;
+    spawn_resume(inner, &correlation_id, pending, body);
 }
 
 async fn withdraw(inner: &Inner, correlation_id: &str, reason: WithdrawReason) {
@@ -241,6 +253,30 @@ async fn withdraw(inner: &Inner, correlation_id: &str, reason: WithdrawReason) {
             "could not withdraw the approval; the timeout is applied locally anyway"
         ),
     }
+}
+
+/// Run the ONE resume attempt for `correlation_id` on its own task.
+///
+/// Resuming drives the whole flow turn that follows the decision, so inline in
+/// the single poller task a slow turn would stall every other approval's polls
+/// and deadlines, and a panic would kill the poller for good. On its own task
+/// neither can: a panic or cancellation is logged from the `JoinError`.
+fn spawn_resume(inner: &Arc<Inner>, correlation_id: &str, pending: Pending, body: Vec<u8>) {
+    let task_inner = Arc::clone(inner);
+    let id = correlation_id.to_string();
+    let handle = tokio::spawn(async move {
+        resume(&task_inner, &id, &pending, &body).await;
+    });
+    let id = correlation_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = handle.await {
+            tracing::error!(
+                correlation_id = %crate::log_safe::log_safe(&id),
+                %error,
+                "approval resume task did not complete (panicked or was cancelled)"
+            );
+        }
+    });
 }
 
 /// The ONE resume attempt for this id. Never retried. The resumer is strict,

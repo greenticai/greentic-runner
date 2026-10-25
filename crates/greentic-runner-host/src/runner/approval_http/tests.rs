@@ -512,3 +512,71 @@ fn the_decision_body_decodes_and_ignores_unknown_fields() {
     assert_eq!(body.decision, ApprovalDecisionKind::Approved);
     assert!(serde_json::from_value::<ApprovalDecisionBody>(json!({"decision": "maybe"})).is_err());
 }
+
+/// Fails (by stalling or panicking) the first resume, records the rest.
+struct MisbehavingFirstResumer {
+    panic_instead_of_stall: bool,
+    seen: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl SessionResumer for MisbehavingFirstResumer {
+    async fn resume(
+        &self,
+        _tenant: TenantCtx,
+        correlation_id: &str,
+        _output: Value,
+    ) -> anyhow::Result<()> {
+        let first = {
+            let mut seen = self.seen.lock();
+            seen.push(correlation_id.to_string());
+            seen.len() == 1
+        };
+        if first {
+            if self.panic_instead_of_stall {
+                panic!("resume blew up");
+            }
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+}
+
+async fn decide_everything(server: &MockServer) {
+    accept_requests(server).await;
+    Mock::given(method("GET"))
+        .and(path(DECISION_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"decision": "approved"})))
+        .mount(server)
+        .await;
+}
+
+async fn second_approval_is_still_resumed(panic_instead_of_stall: bool) {
+    let server = MockServer::start().await;
+    decide_everything(&server).await;
+    let dispatcher = HttpApprovalDispatcher::with_timing(target(&server), fast()).unwrap();
+    let resumer = Arc::new(MisbehavingFirstResumer {
+        panic_instead_of_stall,
+        seen: Mutex::new(Vec::new()),
+    });
+    dispatcher.attach_resumer(resumer.clone());
+
+    dispatcher.dispatch(approval(None)).await.unwrap();
+    eventually(|| resumer.seen.lock().len() == 1).await;
+
+    let mut second = approval(None);
+    second.correlation_id = ID.replace("0123", "4567");
+    dispatcher.dispatch(second).await.unwrap();
+    eventually(|| resumer.seen.lock().len() == 2).await;
+    dispatcher.shutdown();
+}
+
+#[tokio::test]
+async fn a_stalled_resume_does_not_block_other_approvals() {
+    second_approval_is_still_resumed(false).await;
+}
+
+#[tokio::test]
+async fn a_panicking_resume_does_not_kill_the_poller() {
+    second_approval_is_still_resumed(true).await;
+}
