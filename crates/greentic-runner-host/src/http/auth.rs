@@ -78,6 +78,35 @@ impl AdminAuth {
         }
     }
 
+    /// Like [`Self::authorize_operator`], but the operator token may arrive in
+    /// EITHER `Authorization: Bearer` or the dedicated `X-Operator-Token`
+    /// header. The second exists because `Authorization` is also what
+    /// `TENANT_RESOLVER=jwt` reads, so a caller needing both a tenant JWT and
+    /// the operator token could not send them together. Both candidates are
+    /// compared in constant time; either matching is enough.
+    fn authorize_operator_headers(
+        &self,
+        bearer: Option<&str>,
+        header_token: Option<&str>,
+    ) -> Result<(), StatusCode> {
+        match self.effective_operator_token() {
+            None => Ok(()),
+            Some(expected) => {
+                let bearer_ok = bearer
+                    .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
+                    .unwrap_or(false);
+                let header_ok = header_token
+                    .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
+                    .unwrap_or(false);
+                if bearer_ok || header_ok {
+                    Ok(())
+                } else {
+                    Err(StatusCode::UNAUTHORIZED)
+                }
+            }
+        }
+    }
+
     fn authorize(&self, addr: SocketAddr, bearer: Option<&str>) -> Result<(), StatusCode> {
         if let Some(expected) = &self.token {
             let token = bearer.ok_or(StatusCode::UNAUTHORIZED)?;
@@ -103,13 +132,26 @@ pub(crate) async fn require_operator(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let bearer = bearer_from_headers(request.headers(), &AUTHORIZATION);
-    match state.admin.authorize_operator(bearer.as_deref()) {
+    let header_token = request
+        .headers()
+        .get(OPERATOR_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match state
+        .admin
+        .authorize_operator_headers(bearer.as_deref(), header_token)
+    {
         Ok(()) => next.run(request).await,
         Err(status) => {
             (status, Json(json!({ "error": "operator token required" }))).into_response()
         }
     }
 }
+
+/// Dedicated header carrying the operator token, for callers whose
+/// `Authorization` header is already taken by a tenant JWT.
+pub(crate) const OPERATOR_TOKEN_HEADER: &str = "x-operator-token";
 
 pub struct AdminGuard;
 
@@ -243,6 +285,33 @@ mod tests {
             Err(StatusCode::UNAUTHORIZED)
         );
         assert!(auth.authorize_operator(Some("admin")).is_ok());
+    }
+
+    #[test]
+    fn operator_token_accepted_from_x_operator_token_or_bearer() {
+        let auth = AdminAuth::new(Some("admin".into())).with_operator_token(Some("op".into()));
+        // JWT in Authorization, operator token in the dedicated header.
+        assert!(
+            auth.authorize_operator_headers(Some("some.jwt.value"), Some("op"))
+                .is_ok()
+        );
+        assert!(auth.authorize_operator_headers(Some("op"), None).is_ok());
+        assert!(auth.authorize_operator_headers(None, Some("op")).is_ok());
+        assert_eq!(
+            auth.authorize_operator_headers(Some("jwt"), Some("wrong")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            auth.authorize_operator_headers(None, None),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        // The admin token is not accepted when a dedicated operator token is set.
+        assert_eq!(
+            auth.authorize_operator_headers(None, Some("admin")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        let open = AdminAuth::new(None).with_operator_token(None);
+        assert!(open.authorize_operator_headers(None, None).is_ok());
     }
 
     #[test]

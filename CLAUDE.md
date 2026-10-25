@@ -909,7 +909,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `DEFAULT_TENANT` | Fallback tenant for routing |
 | `TENANT_RESOLVER` | Routing mode: host/header/jwt/env |
 | `ADMIN_TOKEN` | Bearer token for `/admin` endpoints (loopback-only when unset) |
-| `OPERATOR_TOKEN` | Bearer token for `POST /operator/op/invoke`; takes precedence over `ADMIN_TOKEN` for that route. With neither set the route stays open and startup logs a warning |
+| `OPERATOR_TOKEN` | Bearer token for `POST /operator/op/invoke`; takes precedence over `ADMIN_TOKEN` for that route. With neither set the route stays open and startup logs a warning. The token is accepted from EITHER `Authorization: Bearer <token>` OR the dedicated `X-Operator-Token: <token>` header (needed when `Authorization` already carries a tenant JWT under `TENANT_RESOLVER=jwt`); both are compared in constant time |
 | `TENANT_JWT_SECRET` | HS256 shared secret for `TENANT_RESOLVER=jwt`: verifies signature, `exp`/`nbf` (60s leeway) and optional `iss`; failures are 401-class rejections. Only `alg: HS256` is accepted (`none`/RS256 rejected). RS256/ES256 (PEM) is not implemented |
 | `TENANT_JWT_ISSUER` | If set, the token `iss` must equal it (jwt mode with `TENANT_JWT_SECRET`) |
 | `TENANT_JWT_TRUST_GATEWAY` | Truthy (`1`/`true`/`yes`/`on`): explicit opt-in for `TENANT_RESOLVER=jwt` without a key, i.e. decode-only because an upstream gateway already verified the token (startup warning). Without a key and without this, startup fails |
@@ -931,7 +931,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_HTTP_MAX_RESPONSE_MB` | Cap on an outbound response body (host `http-client` and `wasi:http`). Default `64`; `0` disables. |
 | `GREENTIC_WASI_HTTP_ENFORCE_POLICY` | Opt-in (default OFF): make `wasi:http` honour a tenant's `http_enabled = false` (that flag is true only when the tenant has a `messaging` binding, so default enforcement would break other tenants' wasi-http components). |
 
-**Auth hardening.** `POST /operator/op/invoke` is guarded by a route layer (`http/auth.rs::require_operator`) that demands `Authorization: Bearer` equal to `OPERATOR_TOKEN`, else the admin token (constant-time compare, 401 otherwise); with no token it stays open for backward compatibility and `HostServer::serve` logs a warning. `TENANT_RESOLVER=jwt` now verifies HS256 tokens when `TENANT_JWT_SECRET` is set (`TenantResolver::JwtVerified`); with no key it fails startup (`RoutingConfig::startup_check`) unless `TENANT_JWT_TRUST_GATEWAY=1` keeps the legacy decode-only `TenantResolver::Jwt`.
+**Auth hardening.** `POST /operator/op/invoke` is guarded by a route layer (`http/auth.rs::require_operator`) that demands `Authorization: Bearer` (or `X-Operator-Token`) equal to `OPERATOR_TOKEN`, else the admin token (constant-time compare, 401 otherwise); with no token it stays open for backward compatibility and `HostServer::serve` logs a warning. `TENANT_RESOLVER=jwt` now verifies HS256 tokens when `TENANT_JWT_SECRET` is set (`TenantResolver::JwtVerified`); with no key it fails startup (`RoutingConfig::startup_check`) unless `TENANT_JWT_TRUST_GATEWAY=1` keeps the legacy decode-only `TenantResolver::Jwt`.
 
 Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
 
