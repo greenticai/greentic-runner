@@ -517,7 +517,6 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("pack.lock component {} missing digest", entry.name))?;
         let wasm_digest = normalize_digest(&wasm_digest)
             .with_context(|| format!("pack.lock component {}", entry.name))?;
-        let key = ArtifactKey::new(cache.engine_profile_id().to_string(), wasm_digest.clone());
         let (bytes, from_local) =
             resolve_component_bytes(&root, &entry, source_ref, &dist_client).await?;
         // A bytes-hash is authoritative when it is declared as such, or when
@@ -526,12 +525,24 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
         let authoritative =
             declared_wasm_digest.is_some() || (from_local && wasm_digest.starts_with("sha256:"));
         check_lock_digest(&entry.name, &wasm_digest, &bytes, authoritative)?;
+        // Key by the digest of the bytes actually in hand, never the lock's
+        // claim: a non-authoritative lock digest is only warned about above,
+        // and keying by it would let a tampered lock store these bytes under a
+        // legitimate component's digest, which the runtime (keyed by the true
+        // sha256) would then hit.
+        let key = warmup_artifact_key(cache.engine_profile_id(), &bytes);
         let _ = cache
             .get_component(&engine, &key, || Ok(bytes))
             .await
             .with_context(|| format!("failed to warm component {}", entry.name))?;
     }
     Ok(())
+}
+
+/// The compiled-artifact cache key for `bytes`: always their own sha256, the
+/// same key the runtime derives when it loads the component.
+fn warmup_artifact_key(engine_profile_id: &str, bytes: &[u8]) -> ArtifactKey {
+    ArtifactKey::new(engine_profile_id.to_string(), sha256_prefixed(bytes))
 }
 
 async fn doctor_cache() -> Result<()> {
