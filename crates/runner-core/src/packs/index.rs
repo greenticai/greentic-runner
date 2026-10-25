@@ -171,6 +171,7 @@ struct RawPackEntry {
 
 impl RawPackEntry {
     fn into_entry(self, base_dir: Option<&Path>) -> Result<PackEntry> {
+        validate_pack_name(&self.name)?;
         let (version, digest) = parse_version_and_digest(self.version, self.digest)?;
         let locator = resolve_locator(&self.locator, base_dir);
         Ok(PackEntry {
@@ -191,6 +192,17 @@ impl TryFrom<RawPackEntry> for PackEntry {
     fn try_from(value: RawPackEntry) -> Result<Self> {
         value.into_entry(None)
     }
+}
+
+/// A pack name becomes a cache directory segment, so it must be a plain,
+/// single path component.
+fn validate_pack_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        bail!(
+            "invalid pack name `{name}`: must be non-empty, not `.`/`..`, and contain no path separators"
+        );
+    }
+    Ok(())
 }
 
 fn parse_version_and_digest(
@@ -223,4 +235,39 @@ fn resolve_locator(locator: &str, base_dir: Option<&Path>) -> String {
         }
     }
     locator.to_string()
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    fn raw(name: &str) -> RawPackEntry {
+        RawPackEntry {
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            digest: None,
+            locator: "file:///tmp/x.gtpack".to_string(),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn rejects_names_that_escape_the_cache() {
+        for bad in ["", ".", "..", "a/b", "a\\b", "../x", "a\0b"] {
+            assert!(
+                raw(bad).into_entry(None).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ordinary_names() {
+        for good in ["demo", "acme.pack-v2", "a_b"] {
+            assert!(
+                raw(good).into_entry(None).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
 }

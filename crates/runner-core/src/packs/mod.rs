@@ -437,6 +437,11 @@ fn compute_digest(path: &Path) -> Result<PackDigest> {
 }
 
 fn sanitize_segment(value: &str) -> String {
+    // `.` and `..` survive the character map but would resolve to the cache
+    // root / its parent when joined as a path segment.
+    if value == "." || value == ".." {
+        return "_".to_string();
+    }
     value
         .chars()
         .map(|ch| match ch {
@@ -448,4 +453,17 @@ fn sanitize_segment(value: &str) -> String {
 
 fn to_hex(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_segment;
+
+    #[test]
+    fn dot_segments_cannot_escape_the_cache_root() {
+        assert_eq!(sanitize_segment("."), "_");
+        assert_eq!(sanitize_segment(".."), "_");
+        assert_eq!(sanitize_segment("a/../b"), "a_.._b");
+        assert_eq!(sanitize_segment("pack.v2"), "pack.v2");
+    }
 }
