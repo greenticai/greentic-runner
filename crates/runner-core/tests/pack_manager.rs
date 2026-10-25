@@ -356,3 +356,47 @@ fn strict_rejects_legacy_digest_only_signature_unless_allowed() -> Result<()> {
     PackManager::with_policy(config, lax)?.resolve_all_for_index(&index)?;
     Ok(())
 }
+
+/// An index may spell the pinned digest `SHA256:<UPPER HEX>`. The cache-hit
+/// path used to verify the signature against (and report) that raw spelling,
+/// while the miss path used the computed lowercase one, so a signature-required
+/// tenant failed after a restart with a warm cache.
+#[test]
+fn uppercase_pinned_digest_verifies_and_reports_canonically_on_a_warm_cache() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pack_path = build_test_pack(temp.path())?;
+    let digest = compute_digest(&pack_path)?;
+    let upper = PackDigest::parse(format!("SHA256:{}", digest.value().to_ascii_uppercase()))?;
+    assert_ne!(upper.as_str(), digest.as_str());
+    let index_path = temp.path().join("index.json");
+    let locator = pack_path.to_str().unwrap();
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    // Signed over the canonical (computed, lowercase) digest.
+    let message = format!(
+        "greentic-pack-sig-v1\nname=runner.demo\nversion=0.1.0\ndigest={}",
+        digest.as_str()
+    );
+    let sig = STANDARD.encode(key.sign(message.as_bytes()).to_bytes());
+    write_signed_index(&index_path, locator, &upper, Some(&sig));
+
+    let mut config = build_config(&index_path, &temp.path().join("cache"), PackSource::Fs);
+    config.public_key = Some(pub_value(&key));
+    let policy = PackPolicy {
+        verify_strict: true,
+        fs_allowed_roots: Some(vec![temp.path().to_path_buf()]),
+        allow_legacy_signatures: false,
+    };
+    let index = Index::load(&config.index_location)?;
+    let manager = PackManager::with_policy(config, policy)?;
+
+    // Cold cache: the miss path.
+    let cold = manager.resolve_all_for_index(&index)?;
+    // Warm cache: the pinned-digest hit path.
+    let warm = manager.resolve_all_for_index(&index)?;
+    let cold_main = &cold.tenants().get("demo").expect("tenant").main;
+    let warm_main = &warm.tenants().get("demo").expect("tenant").main;
+    assert_eq!(cold_main.digest.as_str(), digest.as_str());
+    assert_eq!(warm_main.digest.as_str(), digest.as_str());
+    assert_eq!(warm_main.path, cold_main.path);
+    Ok(())
+}

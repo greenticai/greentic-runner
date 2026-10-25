@@ -5,6 +5,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 use super::{PackDigest, PackEntry, PackRef, PackVersion};
+
+/// A cache hit: the archive plus the digest computed from its bytes.
+#[derive(Debug, Clone)]
+pub struct CachedPack {
+    pub path: PathBuf,
+    /// Canonical lowercase digest of the file, not the caller's spelling.
+    pub digest: PackDigest,
+}
+
 pub struct PackCache {
     root: PathBuf,
 }
@@ -41,14 +50,17 @@ impl PackCache {
     /// The cached `pack.gtpack` for `reference` whose bytes hash to `digest`,
     /// if one exists. A file that no longer matches (truncated, edited) is
     /// treated as a miss so the caller re-fetches.
-    pub fn lookup(&self, reference: &PackRef, digest: &PackDigest) -> Result<Option<PathBuf>> {
+    pub fn lookup(&self, reference: &PackRef, digest: &PackDigest) -> Result<Option<CachedPack>> {
         let path = self.dir_for(reference, digest).join("pack.gtpack");
         if !path.is_file() {
             return Ok(None);
         }
-        match digest.matches_file(&path) {
-            Ok(true) => Ok(Some(path)),
-            Ok(false) => Ok(None),
+        match digest.verified_file_digest(&path) {
+            Ok(Some(computed)) => Ok(Some(CachedPack {
+                path,
+                digest: computed,
+            })),
+            Ok(None) => Ok(None),
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "cached pack unreadable; re-fetching");
                 Ok(None)
@@ -197,6 +209,23 @@ mod tests {
             cache.dir_for(&ref_named("a/b"), &test_digest()),
             cache.dir_for(&ref_named("a_b"), &test_digest())
         );
+    }
+
+    #[test]
+    fn lookup_returns_the_canonical_lowercase_digest_for_an_uppercase_pin() {
+        let temp = tempfile::tempdir().expect("tmp");
+        let cache = PackCache::new(temp.path().join("cache"));
+        let source = temp.path().join("src.gtpack");
+        fs::write(&source, b"bytes").expect("write");
+        let canonical = PackDigest::sha256_from_bytes(b"bytes");
+        cache.store(&entry(), &source, &canonical).expect("store");
+        let upper = PackDigest::parse(format!("SHA256:{}", canonical.value().to_ascii_uppercase()))
+            .expect("parse");
+        let hit = cache
+            .lookup(&entry().reference, &upper)
+            .expect("lookup")
+            .expect("hit");
+        assert_eq!(hit.digest.as_str(), canonical.as_str());
     }
 
     #[test]

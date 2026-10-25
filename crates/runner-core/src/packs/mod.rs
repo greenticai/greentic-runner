@@ -11,7 +11,7 @@ use semver::Version;
 
 use crate::env::PackConfig;
 
-pub use cache::PackCache;
+pub use cache::{CachedPack, PackCache};
 pub use index::{Index, PackEntry, TenantRecord};
 pub use resolver::{FetchResponse, FsResolver, ResolverRegistry};
 pub use verify::PackVerifier;
@@ -124,8 +124,20 @@ impl PackDigest {
     }
 
     pub fn matches_file(&self, path: &Path) -> Result<bool> {
+        Ok(self.verified_file_digest(path)?.is_some())
+    }
+
+    /// Hash `path`; when it matches `self` (case-insensitively), return the
+    /// digest COMPUTED from the file, in its canonical lowercase
+    /// `sha256:<hex>` form. The pinned digest's own spelling (an index may
+    /// write `SHA256:ABC...`) must never reach a signature check, because the
+    /// canonical signing message embeds the digest string verbatim.
+    pub fn verified_file_digest(&self, path: &Path) -> Result<Option<PackDigest>> {
         let computed = compute_digest(path)?;
-        Ok(computed.raw.eq_ignore_ascii_case(&self.raw))
+        Ok(computed
+            .raw
+            .eq_ignore_ascii_case(&self.raw)
+            .then_some(computed))
     }
 }
 
@@ -355,8 +367,12 @@ impl PackManager {
         if let Some(pinned) = pinned
             && let Some(cached) = self.cache.lookup(&entry.reference, pinned)?
         {
-            self.verify_signature(entry, pinned)?;
-            return self.open_resolved(entry, locator, cached, pinned.clone());
+            // The digest computed from the cached file (canonical lowercase),
+            // exactly what the miss path below uses: signatures and the
+            // watcher's `applied` digest string must not depend on how the
+            // index happened to spell the pin.
+            self.verify_signature(entry, &cached.digest)?;
+            return self.open_resolved(entry, locator, cached.path, cached.digest);
         }
 
         let response = self
