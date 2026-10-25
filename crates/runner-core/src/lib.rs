@@ -7,6 +7,7 @@
 //! wrap these helpers with the canonical runtime.
 
 pub mod env;
+pub mod net_guard;
 pub mod packs;
 pub mod path_safety;
 

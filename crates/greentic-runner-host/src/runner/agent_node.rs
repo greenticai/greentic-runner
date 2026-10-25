@@ -1042,10 +1042,7 @@ mod aw {
             tenant: String,
             unit: Option<String>,
         ) -> Self {
-            let env = std::env::var("GREENTIC_ENV")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "dev".to_string());
+            let env = crate::config::greentic_env().unwrap_or_else(|| "dev".to_string());
             Self {
                 secrets,
                 tenant,

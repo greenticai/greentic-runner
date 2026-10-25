@@ -152,7 +152,11 @@ impl A2aToolSource {
     }
 
     fn build(routes: Vec<A2aRoute>, credentials: CredentialScope) -> Result<Self, reqwest::Error> {
+        // A route's URL comes from the pack: refuse link-local / metadata
+        // destinations (see `outbound_guard`). Redirects stay off outright.
+        let guard = crate::outbound_guard::HttpGuard::from_env();
         let client = reqwest::Client::builder()
+            .dns_resolver(Arc::new(crate::outbound_guard::GuardedResolver { guard }))
             .redirect(reqwest::redirect::Policy::none())
             .timeout(CALL_TIMEOUT)
             .build()?;

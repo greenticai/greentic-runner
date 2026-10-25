@@ -240,11 +240,8 @@ impl HostConfig {
 
         // Reject unusable tenant ids up front instead of silently running as
         // the `local` tenant later.
-        tenant_ctx_for(
-            &bindings.tenant,
-            std::env::var("GREENTIC_ENV").ok().as_deref(),
-        )
-        .with_context(|| format!("invalid tenant in bindings file {path:?}"))?;
+        tenant_ctx_for(&bindings.tenant, greentic_env().as_deref())
+            .with_context(|| format!("invalid tenant in bindings file {path:?}"))?;
 
         Ok(Self {
             tenant: bindings.tenant.clone(),
@@ -348,7 +345,7 @@ impl HostConfig {
     /// Fails when the tenant id or `GREENTIC_ENV` is not a valid identifier;
     /// it never substitutes the `local` tenant/env.
     pub fn try_tenant_ctx(&self) -> Result<greentic_types::TenantCtx> {
-        tenant_ctx_for(&self.tenant, std::env::var("GREENTIC_ENV").ok().as_deref())
+        tenant_ctx_for(&self.tenant, greentic_env().as_deref())
     }
 
     /// Infallible variant kept for callers that cannot propagate errors.
@@ -381,6 +378,26 @@ fn local_fallback_ctx() -> greentic_types::TenantCtx {
         greentic_types::EnvId::new("local").expect("`local` is a valid env id"),
         greentic_types::TenantId::new("local").expect("`local` is a valid tenant id"),
     )
+}
+
+/// A raw `GREENTIC_ENV` / `DEFAULT_TENANT` style value: trimmed, and `None` when
+/// absent OR blank. A blank value is "not configured", exactly like an unset one.
+pub(crate) fn non_blank(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// The deployment env from `GREENTIC_ENV`, `None` when unset or blank. Every
+/// reader goes through this so an empty value cannot behave differently per
+/// call site (previously: `""` in one place, an error in another).
+pub(crate) fn greentic_env() -> Option<String> {
+    non_blank(std::env::var("GREENTIC_ENV").ok().as_deref())
+}
+
+/// [`greentic_env`] with the documented `local` default.
+pub(crate) fn greentic_env_or_local() -> String {
+    greentic_env().unwrap_or_else(|| "local".to_string())
 }
 
 fn tenant_ctx_for(tenant: &str, env: Option<&str>) -> Result<greentic_types::TenantCtx> {
@@ -940,5 +957,18 @@ fast2flow:
             cfg.http_enabled,
             "gtbind-backed tenants should allow outbound component HTTP"
         );
+    }
+}
+
+#[cfg(test)]
+mod non_blank_tests {
+    use super::*;
+
+    #[test]
+    fn blank_and_whitespace_are_unset() {
+        assert_eq!(non_blank(None), None);
+        assert_eq!(non_blank(Some("")), None);
+        assert_eq!(non_blank(Some("  \t")), None);
+        assert_eq!(non_blank(Some(" prod ")), Some("prod".to_string()));
     }
 }

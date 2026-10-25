@@ -824,6 +824,7 @@ fn load_session_snapshot(
     path: &Path,
     session_id: &str,
 ) -> Result<Option<greentic_runner_host::runner::engine::FlowSnapshot>> {
+    remove_stale_snapshot_temps(path, STALE_TEMP_AGE);
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -901,6 +902,51 @@ fn remove_migrated_legacy_snapshot(legacy: Option<&Path>, loaded_from_legacy: bo
     }
 }
 
+/// A leftover `<name>.tmp-*` older than this belongs to a writer that died
+/// before its rename; younger ones may be a live concurrent save.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Unique per save: pid separates processes, the counter separates concurrent
+/// saves of the same session inside one process.
+fn snapshot_temp_path(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(format!(".tmp-{}-{seq}", std::process::id()));
+    path.with_file_name(tmp_name)
+}
+
+/// Best-effort removal of `<name>.tmp-*` siblings of `path` older than `age`.
+fn remove_stale_snapshot_temps(path: &Path, age: std::time::Duration) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let mut prefix = name.to_os_string();
+    prefix.push(".tmp-");
+    let prefix = prefix.to_string_lossy().into_owned();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|elapsed| elapsed >= age);
+        if old_enough && let Err(err) = fs::remove_file(entry.path()) {
+            tracing::debug!(path = %entry.path().display(), error = %err, "cannot remove stale snapshot temp");
+        }
+    }
+}
+
 /// Persist a `FlowSnapshot` to disk for later resume, recording the owning
 /// session id. Errors propagate to the caller so the run can surface "we
 /// paused but lost the snapshot" as a hard error rather than silently
@@ -923,14 +969,26 @@ fn save_session_snapshot(
     // `path`, because a corrupt snapshot is a hard error on the next load and
     // would wedge the session. The temp file sits beside the target so the
     // rename stays on one filesystem.
-    let mut tmp_name = path
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_default();
-    tmp_name.push(format!(".tmp-{}", std::process::id()));
-    let tmp_path = path.with_file_name(tmp_name);
-    fs::write(&tmp_path, bytes)
-        .with_context(|| format!("write session snapshot {}", tmp_path.display()))?;
+    remove_stale_snapshot_temps(path, STALE_TEMP_AGE);
+    let tmp_path = snapshot_temp_path(path);
+    let write_result = (|| -> std::io::Result<()> {
+        // `create_new`: a temp name is never shared with another writer.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(&bytes)?;
+        // Best effort: make the bytes durable before the rename publishes them.
+        // A failure here (some filesystems) must not fail the save.
+        if let Err(err) = file.sync_all() {
+            tracing::debug!(path = %tmp_path.display(), error = %err, "snapshot fsync failed");
+        }
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("write session snapshot {}", tmp_path.display()));
+    }
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(err).with_context(|| format!("write session snapshot {}", path.display()));
@@ -2312,6 +2370,54 @@ mod tests {
             .filter(|n| n.contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_saves_of_one_session_do_not_collide() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("s1.snapshot.json");
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || save_session_snapshot(&path, "s1", &seed_snapshot()))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread").expect("save must succeed");
+        }
+        assert!(load_session_snapshot(&path, "s1").expect("load").is_some());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn temp_names_are_unique_per_call() {
+        let path = Path::new("/x/s1.snapshot.json");
+        assert_ne!(snapshot_temp_path(path), snapshot_temp_path(path));
+    }
+
+    #[test]
+    fn stale_temps_are_removed_but_fresh_ones_and_other_sessions_are_kept() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("s1.snapshot.json");
+        let stale = tmp.path().join("s1.snapshot.json.tmp-999-0");
+        let other = tmp.path().join("s2.snapshot.json.tmp-999-0");
+        std::fs::write(&stale, b"x").expect("stale");
+        std::fs::write(&other, b"x").expect("other");
+        // Zero age: everything matching this session's prefix is "old enough".
+        remove_stale_snapshot_temps(&path, std::time::Duration::ZERO);
+        assert!(!stale.exists());
+        assert!(other.exists(), "another session's temp is never touched");
+
+        let fresh = tmp.path().join("s1.snapshot.json.tmp-999-1");
+        std::fs::write(&fresh, b"x").expect("fresh");
+        remove_stale_snapshot_temps(&path, STALE_TEMP_AGE);
+        assert!(fresh.exists(), "a possibly-live temp is kept");
     }
 
     #[test]

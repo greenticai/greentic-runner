@@ -117,6 +117,10 @@ The pack source exists because nothing writes `GREENTIC_EXTENSIONS_DIR` inside a
 k8s or Cloud Run container: the directory scanned there is empty, so every
 extension tool an operator bound used to be dropped with a `warn` after the
 deploy reported success and after they had already supplied its credential.
+Unpacking happens BEFORE that gate, so `unpack_archive` is bounded (64 MiB/entry, 256 MiB total, 4096
+entries; real bytes streamed through a `take`, not just the declared size), and the process-wide staging root
+reclaims superseded digests of the same extension id and crashed partial unpacks after a 1h grace
+(`sweep_stale_slots`; every stage re-touches its slot).
 Pack-carried archives go through the SAME `register_loaded_from_dir` gate
 (signature + `manifest.json` ledger) — the pack is a delivery route, not a
 verification bypass. The in-pack layout is a cross-repo contract with
@@ -807,6 +811,18 @@ park saved for `a_b`. Accepted residual risk, behaviour intentionally unchanged 
 `load_legacy_session_snapshot`); it drains as old parks resume or expire, and nothing writes bare
 files any more.
 
+**Pack/config-controlled URLs in the agentic lane use the same policy.** The pure IP classification and
+env policy (`HttpGuard`: link-local/metadata refused, loopback/private allowed by default,
+`GREENTIC_HTTP_ALLOW_METADATA` / `GREENTIC_HTTP_DENY_PRIVATE`) live in `runner_core::net_guard`, shared by
+`http_guard.rs` and `greentic-aw-runtime::outbound_guard`. Applied to: MCP `transport_url` (pack
+`mcp-routes.json` or admin row) via `check_endpoint` right before `McpHttpClient::new`; the A2A client
+(guarded resolver, redirects off); and the `knowledge_index` client (guarded resolver + redirect policy).
+`McpHttpClient` builds its own `reqwest` client with no hook, so for MCP the check is a resolve-then-validate
+pre-flight: a DNS-rebinding answer that differs on connect, and redirects, are NOT covered until
+`greentic-mcp-client` exposes a resolver/redirect seam (egress-filter at the network layer if that matters).
+The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtime 0.12. Other clients
+(admin/billing/OAuth/sorx route docs/approval inbox) target operator-set URLs and are not guarded.
+
 ### Pack Hot-Reload
 
 Full list of user-visible and breaking changes from the audit branch: `docs/audit-breaking-changes.md`.
@@ -941,7 +957,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_TRACE_OUT` | Path of the trace file. Setting it to any value turns trace capture ON; unset means `Off` (default) and nothing is written. `--trace` / `--trace-out` override it (`--trace-out` alone also turns it on). |
 | `GREENTIC_TRACE_CAPTURE_INPUTS` | Exactly `1` records each node's full invocation input (`invocation_json`) in the trace, which may contain user data; any other value, or unset, leaves inputs out. `--trace-capture-inputs on|off` overrides it. |
 | `PORT` | HTTP server port (also `--port` CLI flag) |
-| `DEFAULT_TENANT` | Fallback tenant for routing |
+| `DEFAULT_TENANT` | Fallback tenant for routing (blank = unset) |
 | `TENANT_RESOLVER` | Routing mode: host/header/jwt/env. An unsupported value (typo) fails startup via `RoutingConfig::startup_check` |
 | `ADMIN_TOKEN` | Bearer token for `/admin` endpoints (loopback-only when unset) |
 | `OPERATOR_TOKEN` | Bearer token for `POST /operator/op/invoke`; takes precedence over `ADMIN_TOKEN` for that route. With neither set the route stays open and startup logs a warning. The token is accepted from EITHER `Authorization: Bearer <token>` OR the dedicated `X-Operator-Token: <token>` header (needed when `Authorization` already carries a tenant JWT under `TENANT_RESOLVER=jwt`); both are compared in constant time |
@@ -979,6 +995,8 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_CACHE_DIR` | Root of the compiled-component cache (default `.greentic/cache/components`, relative to the working directory); entries live under `v1/<engine profile id>`. |
 | `GREENTIC_NO_CACHE` | Truthy (`1`/`true`/`TRUE`/`yes`/`YES`, exact match) disables both the memory and disk component caches. The CLI `--no-cache` flag sets it. |
 | `GREENTIC_DISABLE_CACHE` | Alias of `GREENTIC_NO_CACHE` with identical semantics; either one disables the caches. |
+
+**Blank env vars.** `GREENTIC_ENV` and `DEFAULT_TENANT` are read through `config::greentic_env()` / `config::non_blank` (trim, blank = unset) at every site; never add a raw `std::env::var("GREENTIC_ENV")`. The env-secrets gate treats blank like unset (`local` + warning).
 
 **Auth hardening.** `POST /operator/op/invoke` is guarded by a route layer (`http/auth.rs::require_operator`) that demands `Authorization: Bearer` (or `X-Operator-Token`) equal to `OPERATOR_TOKEN`, else the admin token (constant-time compare, 401 otherwise); with no token it stays open for backward compatibility and `HostServer::serve` logs a warning. `TENANT_RESOLVER=jwt` now verifies HS256 tokens when `TENANT_JWT_SECRET` is set (`TenantResolver::JwtVerified`); with no key it fails startup (`RoutingConfig::startup_check`) unless `TENANT_JWT_TRUST_GATEWAY=1` keeps the legacy decode-only `TenantResolver::Jwt`.
 

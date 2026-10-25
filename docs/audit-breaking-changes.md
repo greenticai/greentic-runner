@@ -27,7 +27,8 @@ Things most likely to break a running deployment, in the order to check them:
 7. `credential_ref` and secret segments that are not `[A-Za-z0-9._-]`.
 8. Wasm component cache (cold start after upgrade).
 9. Operators that call `POST /operator/op/invoke` without a token while `ADMIN_TOKEN` is set.
-10. `PORT=""`, `TENANT_RESOLVER=""`, `GREENTIC_ENV=""` now mean "unset" (this one is a relaxation).
+10. `PORT=""`, `TENANT_RESOLVER=""`, `GREENTIC_ENV=""`, `DEFAULT_TENANT=""` now mean "unset" (a relaxation; for
+    `SECRETS_BACKEND=env` a blank `GREENTIC_ENV` is therefore allowed like an unset one).
 
 ## Pack loading and signing
 
@@ -98,6 +99,14 @@ Things most likely to break a running deployment, in the order to check them:
 - **Affected:** unusually large pack assets.
 - **Restore:** none (limits are constants in `pack.rs`).
 
+### Pack-carried extension archives have size caps and stale staging is swept
+- **What:** an inner `extensions/*.gtxpack` is unpacked BEFORE signature verification, so it is now bounded:
+  64 MiB per entry (declared size checked, real bytes streamed through a cap), 256 MiB total, 4096 entries
+  (`pack_extensions.rs`). An archive over a cap is reported as a staging failure, not truncated. Staging slots of a
+  superseded digest of the same extension, and abandoned partial unpacks, are removed once unused for an hour.
+- **Affected:** extension archives larger than the caps (none known).
+- **Restore:** none (constants).
+
 ## Auth and routing
 
 ### Verified JWT mode, `exp` required, startup failure
@@ -129,8 +138,14 @@ Things most likely to break a running deployment, in the order to check them:
   `RunnerConfig` are covered.
 - **Restore:** fix the value.
 
-### Empty `PORT`, `TENANT_RESOLVER`, `GREENTIC_ENV` are treated as unset
+### Empty `PORT`, `TENANT_RESOLVER`, `GREENTIC_ENV`, `DEFAULT_TENANT` are treated as unset
 - **What:** a relaxation. `PORT=""` used to be a fatal parse error; `--port` now skips reading `PORT` entirely.
+  `GREENTIC_ENV` and `DEFAULT_TENANT` are read through one helper (`config::greentic_env` / `non_blank`: trimmed,
+  blank = unset) at every site; before, only tenant-context building did so, while other readers used `""`
+  (ingress envelope, component ctx, default env) or failed with ``invalid env id ``` (state nodes), and the env
+  secrets gate refused `""`. The gate now treats blank exactly like unset (`local`, with the existing warning):
+  no more permissive than unset, but a deployment that set `GREENTIC_ENV=""` and relied on the refusal must set
+  a real env.
 - **Affected:** containers that template empty env vars. An invalid non-empty `PORT` is still an error.
 
 ### Invalid tenant or env identifiers fail the build
@@ -155,7 +170,7 @@ Things most likely to break a running deployment, in the order to check them:
 
 ### Secrets backend selection
 - **What:** `SECRETS_BACKEND` is `env` (default; allowed only when `GREENTIC_ENV` is `local`/`dev`/`test`
-  or unset) or `broker`; anything else errors. Pack secret lookups return `NotFound` only if every scope
+  or unset/blank) or `broker`; anything else errors. Pack secret lookups return `NotFound` only if every scope
   missed (other failures are typed errors).
 - **Restore:** n/a.
 
@@ -194,6 +209,14 @@ Things most likely to break a running deployment, in the order to check them:
   - `GREENTIC_HTTP_OUTBOUND_TIMEOUT_SECS=<n>`.
   - New opt-ins: `GREENTIC_HTTP_DENY_PRIVATE=1` (also block loopback/RFC1918/CGNAT/ULA) and
     `GREENTIC_WASI_HTTP_ENFORCE_POLICY=1` (make `wasi:http` honour `http_enabled = false`).
+
+### Outbound guard on MCP, A2A and knowledge-index URLs
+- **What:** the host `http-client` policy now also applies to URLs a pack or tenant config names for the
+  agentic lane: MCP `transport_url` (resolved and checked before connecting), A2A routes, and the
+  chronicle-index knowledge endpoint. Link-local and cloud-metadata destinations are refused with
+  "blocked by outbound http policy"; loopback and private ranges stay allowed. MCP redirects and a DNS
+  answer that changes between the pre-flight and the connect are not covered (no hook in `greentic-mcp-client`).
+- **Restore:** `GREENTIC_HTTP_ALLOW_METADATA=1`; `GREENTIC_HTTP_DENY_PRIVATE=1` is the stricter opt-in.
 
 ### Fault injection needs the feature
 - **What:** the `GREENTIC_FAIL_*` variables only take effect in builds with the `fault-injection` feature.
@@ -337,8 +360,9 @@ Things most likely to break a running deployment, in the order to check them:
 - **What:** snapshots are stored as `<escaped id>.snapshot.json`, where unsafe bytes are `%xx`-escaped (the old name
   mapped every unsafe byte to `_`, so `a/b` and `a_b` collided), and the file wraps the snapshot with the owning
   `session_id`. A snapshot recording another session id is refused. A corrupt snapshot is now an error that names
-  the file and says to delete it (it used to silently restart at the flow entry). Writes are atomic (temp file +
-  rename).
+  the file and says to delete it (it used to silently restart at the flow entry). Writes are atomic (a unique `<name>.tmp-<pid>-<n>`
+  temp file, best-effort fsync, then rename; concurrent saves of one session no longer share a temp name, and temp
+  leftovers older than an hour are removed on save/load).
 - **Backward compatibility:** bare legacy snapshots are still read for ids with unsafe characters, with a
   documented residual risk (a bare legacy file is adopted by whichever session maps to its name). A legacy file a
   session adopted is deleted once its park is re-saved under the current name, so it cannot be resurrected by a

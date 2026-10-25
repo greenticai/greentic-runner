@@ -566,6 +566,7 @@ async fn connect(server: &ParsedServer) -> Result<McpHttpClient, String> {
         server.oauth.as_ref(),
     )
     .await?;
+    crate::outbound_guard::check_endpoint(&endpoint).await?;
     McpHttpClient::new(endpoint, auth, client_opts(PROBE_TIMEOUT)).map_err(|e| e.to_string())
 }
 
@@ -579,6 +580,7 @@ async fn connect_route(route: &McpRoute) -> Result<McpHttpClient, String> {
         route.oauth.as_ref(),
     )
     .await?;
+    crate::outbound_guard::check_endpoint(&endpoint).await?;
     // The CALL budget, not the probe budget: this client carries the tool's own
     // work, and reqwest would otherwise cut it off at the probe's 5s regardless
     // of the outer timeout.

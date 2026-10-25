@@ -1014,7 +1014,7 @@ impl RunnerHost {
         let mut envelope = IngressEnvelope {
             entry_node,
             tenant: tenant.to_string(),
-            env: std::env::var("GREENTIC_ENV").ok(),
+            env: crate::config::greentic_env(),
             pack_id: Some(pack_id.clone()),
             flow_id: flow_id.clone(),
             flow_type: resolved_flow_type,

@@ -665,9 +665,17 @@ pub fn write_secret_blocking(
 }
 
 fn ensure_env_secrets_allowed() -> Result<()> {
-    let env = match std::env::var("GREENTIC_ENV") {
-        Ok(value) => value,
-        Err(_) => {
+    check_env_secrets_allowed(crate::config::greentic_env().as_deref())
+}
+
+/// `env` is the already-normalised `GREENTIC_ENV` (`None` = unset OR blank).
+fn check_env_secrets_allowed(env: Option<&str>) -> Result<()> {
+    // A blank value is "not configured", the same branch as unset: it keeps the
+    // documented `local` default (and the warning) rather than being refused as
+    // an env named "". This is exactly as permissive as unset, no more.
+    let env = match env {
+        Some(value) => value.to_string(),
+        None => {
             // Documented default, kept for local dev flows. Failing closed is
             // safer for production but changes behaviour (deferred).
             tracing::warn!(
@@ -684,6 +692,33 @@ fn ensure_env_secrets_allowed() -> Result<()> {
         Err(anyhow!(
             "env secrets backend is disabled for env '{env}' (dev/test only)"
         ))
+    }
+}
+
+#[cfg(test)]
+mod env_secrets_gate_tests {
+    use super::*;
+    use crate::config::non_blank;
+
+    #[test]
+    fn blank_takes_the_same_branch_as_unset() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert!(
+                check_env_secrets_allowed(non_blank(raw).as_deref()).is_ok(),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployed_envs_are_still_refused() {
+        for raw in ["prod", "staging", " Prod "] {
+            assert!(
+                check_env_secrets_allowed(non_blank(Some(raw)).as_deref()).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(check_env_secrets_allowed(Some("dev")).is_ok());
     }
 }
 
