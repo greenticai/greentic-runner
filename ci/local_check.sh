@@ -99,11 +99,20 @@ run_clippy() {
 # Start the real host against the example bindings, wait for /healthz to answer,
 # then stop it. The runner has no "run once" mode, so liveness is the signal.
 host_smoke_probe() {
+  local bindings_dir greentic_root log rc=0
+  bindings_dir="$(mktemp -d)"
+  greentic_root="$(mktemp -d)"
+  log="$(mktemp)"
+  host_smoke_probe_inner "$bindings_dir" "$greentic_root" "$log" || rc=$?
+  rm -rf "$bindings_dir" "$greentic_root" "$log"
+  return "$rc"
+}
+
+host_smoke_probe_inner() {
+  local bindings_dir="$1" greentic_root="$2" log="$3"
   # `examples/bindings/default.bindings.yaml` is the legacy HostConfig format
   # and is not loadable by `--bindings` (which takes *.gtbind), so describe the
   # bundled demo pack with a generated gtbind instead.
-  local bindings_dir
-  bindings_dir="$(mktemp -d)"
   cat >"${bindings_dir}/smoke.gtbind" <<GTBIND
 tenant: acme
 pack_id: runner.components
@@ -118,11 +127,7 @@ GTBIND
   fi
   # Throwaway greentic root: the host writes packs/gtbind.index.json under it,
   # which must never rewrite tracked files in the repo.
-  local greentic_root
-  greentic_root="$(mktemp -d)"
   local timeout_secs="${HOST_SMOKE_TIMEOUT_SECS:-300}"
-  local log
-  log="$(mktemp)"
 
   if ! command -v curl >/dev/null 2>&1; then
     echo "curl not found; cannot probe host health" >&2
@@ -164,10 +169,8 @@ GTBIND
 
 run_host_smoke() {
   RUN_HOST="${RUN_HOST:-never}"
-  if [[ "${RUN_HOST}" == "always" ]] || { [[ "${RUN_HOST}" == "auto" ]] && [[ -f "./examples/index.json" ]]; }; then
+  if [[ "${RUN_HOST}" == "always" ]] || { [[ "${RUN_HOST}" == "auto" ]] && [[ -f "${REPO_ROOT}/examples/packs/demo.gtpack" ]]; }; then
     echo "==> Running host smoke (with safe defaults)"
-    export PACK_INDEX_URL="${PACK_INDEX_URL:-./examples/index.json}"
-    export PACK_CACHE_DIR="${PACK_CACHE_DIR:-.packs}"
     export DEFAULT_TENANT="${DEFAULT_TENANT:-demo}"
 
     if ! host_smoke_probe; then
@@ -175,7 +178,7 @@ run_host_smoke() {
       HOST_SMOKE_FAILED=1
     fi
   else
-    echo "==> Skipping host smoke (no examples/index.json and RUN_HOST != always)"
+    echo "==> Skipping host smoke (no examples/packs/demo.gtpack and RUN_HOST != always)"
   fi
 }
 
