@@ -837,6 +837,8 @@ Full list of user-visible and breaking changes from the audit branch: `docs/audi
 
 Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 30s). On change: resolve locators → verify digest/signature → cache artifacts → atomically swap `TenantRuntime` via `ArcSwap`. Overlays independently deployable per tenant.
 
+The pack cache path is `<name>/<version>/<sha256>/pack.gtpack` (the content digest is always in the key, so equal `name@semver` with different bytes coexist). A pinned-digest pack whose cached file still hashes to it is not re-downloaded on refresh. HTTP pack/index downloads are capped (`GREENTIC_PACK_MAX_DOWNLOAD_MB` 1024, `GREENTIC_PACK_INDEX_MAX_MB` 32, `0` disables) and the total deadline is `GREENTIC_PACK_DOWNLOAD_TIMEOUT_SECS` (900), not `read_timeout_ms`. `pack.lock` is looked up only beside the archive, and pack-authored asset/component paths are confined to the pack root.
+
 **Known limitation: gtbind `pack_locator` packs cannot be verified.** `maybe_write_gtbind_index` generates the index from `*.gtbind` bindings, and a pack binding carries no signature (nor a digest for a semver `pack_ref`). With a trust key configured the loader requires a signature for every entry, and strict mode a pinned digest for remote packs, so such packs are refused; startup logs a warning when it generates an index with a key set. Verification is deliberately not relaxed. Use a signed pack index for verified deployments, or leave the trust key unset in development.
 
 ### Key Modules in `greentic-runner-host`

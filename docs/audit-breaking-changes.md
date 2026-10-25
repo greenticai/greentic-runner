@@ -434,6 +434,31 @@ Things most likely to break a running deployment, in the order to check them:
 - No disk quota for the guest `/state`, `/cache`, `/logs` mounts.
 - The extension runtime (`greentic-ext-runtime`) wasmtime engine configuration has not been audited.
 
+## Pack loading, caches and downloads (round 11)
+
+- **Pack cache layout:** `runner-core` now stores `<cache>/<name>/<version>/<sha256_hex>/pack.gtpack`; the content
+  digest is always part of the key, so two tenants with the same `name@semver` but different bytes no longer
+  overwrite each other. Entries under the old `<name>/<version>/pack.gtpack` layout are ignored and re-fetched (and
+  can be deleted by hand).
+- **No refetch of cached pinned packs:** a pack with a pinned digest whose cached file still hashes to it is not
+  downloaded again on every index refresh. The signature is still verified.
+- **Download limits:** `GREENTIC_PACK_MAX_DOWNLOAD_MB` (1024) and `GREENTIC_PACK_INDEX_MAX_MB` (32) cap pack and
+  remote index downloads; `0` disables. `network.read_timeout_ms` no longer acts as the whole-request deadline
+  (`reqwest::blocking` has no per-read timeout); the total deadline is `GREENTIC_PACK_DOWNLOAD_TIMEOUT_SECS` (900,
+  `0` disables), and `connect_timeout_ms` still applies.
+- **`pack.lock` discovery:** only the archive's own directory is searched (no grandparent), and an unparsable lock
+  is skipped with a warning.
+- **Materialized pack dirs:** a corrupt `manifest.cbor` with no archive to fall back to now fails the load instead
+  of yielding an empty pack. `read_pack_file`, inline component paths and `legacy_path` are confined to the pack
+  root (absolute paths, `..` and escaping symlinks are refused).
+- **Nested flow loads** (`dw.agent` `flow:` tools) keep the parent pack's unit id, non-secret runtime config and
+  runtime refs.
+- **`cache warmup`** keys compiled artifacts by the sha256 of the component bytes, not the digest in `pack.lock`.
+- **Disk compile cache:** readers no longer delete a half-written entry (60s grace); `prune` also sweeps orphan
+  `.cwasm`/`.json` files and stale `tmp/` files, even without a disk limit.
+- **Guest stdio:** guest lines that are not telemetry are control-character sanitised, capped at 8192 chars, and
+  written with their newline in a single call.
+
 ## Tests and CI
 
 - Tests that used to print "skipping" and pass (offline wasm fixture build, missing `WEATHER_PACK_PATH`, fixture
