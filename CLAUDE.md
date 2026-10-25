@@ -229,6 +229,11 @@ downstream SESSION id when the input names none, so a nonce on `agentic.call` wo
 every turn a fresh agent memory. The watchdog is still never cancelled; the nonce makes
 its late `timeout` harmless for approvals, not for the other runtimes.
 
+**The `approval.call` autonomy gate fails closed** (`approval_requires_human`). `above_risk` /
+`above_confidence` auto-approve ONLY when both the value and its threshold are finite JSON numbers; a missing,
+`null`, string or non-finite value or threshold goes to a human (it used to read as `0.0` / `1.0` and
+auto-approve). `always` and unknown modes already required a human.
+
 **`approval.call` is issued a single-use `decision_token`** (greentic-runner#794; approval
 rail contract v2 §4, `docs/approval-rail-contract-v2.md` in greentic-designer). Each
 dispatch mints 32 random bytes, base64url without padding (`runner/approval_token.rs`),
@@ -263,6 +268,10 @@ in ONE place, `approval_http/wire.rs`. Four things fail silently if changed:
   resume; the resume goes through `RuntimeSessionResumer::strict`, where a NONCED id with no
   park recorded under exactly that id is `WrongGate` (the lenient NATS resumer would start a
   fresh run from the entrypoint).
+- **Resume runs on its own task.** The single poller task only fetches decisions and enforces deadlines;
+  `poller::spawn_resume` runs each resume (the whole flow turn after the decision) on a separate task and logs a
+  `JoinError`, so a slow or panicking resume cannot stall or kill the poller. The poller also clears
+  `poller_started` when its loop exits, so the next registration can start a replacement.
 - **Owned by the `TenantRuntime`.** Its `Drop` calls `HttpApprovalDispatcher::shutdown`, which
   cancels the poller, forgets held tokens and drops the resumer (breaking the
   resumer → runtime → engine → dispatcher cycle). A restart loses pending polls even when the
@@ -830,6 +839,26 @@ pre-flight: a DNS-rebinding answer that differs on connect, and redirects, are N
 `greentic-mcp-client` exposes a resolver/redirect seam (egress-filter at the network layer if that matters).
 The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtime 0.12. Other clients
 (admin/billing/OAuth/sorx route docs/approval inbox) target operator-set URLs and are not guarded.
+
+### Engine and tool-secret rules (round 11)
+
+- **Tool-secret env fallback has a deny-list.** `secret://a/b` maps to env var `A_B` for local runs
+  (`agent_node::env_secret_lookup`), but `GREENTIC_*`, `TENANT_JWT_*`, `ADMIN_TOKEN`, `OPERATOR_TOKEN`,
+  `PACK_PUBLIC_KEY` and the provider webhook secrets are host configuration and resolve as not found
+  (`env_secret_name_is_denied`). Extend that list when a new host-level env secret is introduced.
+- **Tool-extension HTTP client** (`build_tool_http_client`): `redirect::Policy::none()` plus the `http_guard`
+  address policy on DNS (a reqwest-0.12 resolver, since the ext-runtime pins 0.12 and `GuardedResolver` targets 0.13).
+- **Pack JSON Schemas never fetch**: `schema_validator::compile_validator` installs a retriever that refuses every
+  external `$ref`.
+- **Playbook turns** (`playbook_turn::build_turn`) get the calling worker's guardrail policy, billing meter
+  (`PlaybookTurnHost.billing_meter`) and MCP source.
+- **Persistence after side effects is never a reason to re-run them.** `resume.clear` / `save_with_run` after a
+  flow ran go through `persist_after_effects` (retries the write only) and fail as
+  `RunnerError::PostEffectPersistence`, which `retry_with_jitter` does not retry.
+- **`redirect_count` (`flow.goto`) is per turn**, reset on resume. `drive_flow` also caps one turn at
+  `MAX_STEPS_PER_TURN` (10,000) nodes.
+- **`RunnerHost` installs `DiscardSessionHost`** as the engine-level `SessionHost`; the store-backed host was
+  write-only and leaked a row per turn. Parked snapshots live in `FlowResumeStore`, not there.
 
 ### Pack Hot-Reload
 

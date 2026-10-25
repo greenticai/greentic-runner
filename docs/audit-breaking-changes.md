@@ -434,6 +434,69 @@ Things most likely to break a running deployment, in the order to check them:
 - No disk quota for the guest `/state`, `/cache`, `/logs` mounts.
 - The extension runtime (`greentic-ext-runtime`) wasmtime engine configuration has not been audited.
 
+## Engine and agent hardening (round 11)
+
+- **`approval.call` gate fails closed:** `mode: above_risk` / `above_confidence` now require a human unless BOTH
+  the value (`risk` / `confidence`) and its threshold are finite JSON numbers. A missing, `null`, string or
+  non-finite value, or a missing threshold, used to read as `0.0` / `1.0` and auto-approve. **Affected:** flows
+  whose templates render `risk` / `confidence` as a numeric STRING (`"0.4"`): they now always go to a human.
+  **Restore:** render the value as a number.
+- **Tool-extension HTTP client:** no longer follows redirects (the ext-runtime contract), and its DNS answers go
+  through the outbound address guard (`GREENTIC_HTTP_ALLOW_METADATA` / `GREENTIC_HTTP_DENY_PRIVATE`).
+- **Pack JSON Schemas cannot fetch:** operator input validation compiles a pack's schema with a retriever that
+  refuses every external `$ref` (`http(s)://`, `file://`). In-document `#/...` refs are unaffected. **Affected:**
+  packs whose schemas `$ref` a remote URL: the schema fails to compile and the input is reported invalid.
+- **Playbook (skill) turns:** the nested runtime now has the same mandatory guardrail policy, billing meter and
+  MCP tool source as the calling worker. **API:** `PlaybookTurnHost` gained a public `billing_meter` field
+  (`Option<Arc<dyn BillingMeter>>`); struct-literal constructors must add it (`None` keeps the old no-op meter).
+- **`flow.goto` redirect budget is per turn:** `redirect_count` resets when a parked run resumes, so the 4th goto
+  across several parked turns no longer fails `redirect_limit`. The limit still trips inside one turn.
+- **Engine-level session host stores nothing:** `RunnerHost` installs a discard `SessionHost` (`get` is `None`,
+  writes are dropped). The store-backed one never read back what it wrote and, with no TTL, leaked one row per
+  turn. Parked-flow snapshots (`FlowResumeStore`) are unaffected.
+- **No re-run after a persistence failure:** `resume.clear` / `resume.save_with_run` after a flow ran are retried
+  in place (the write only) and then fail with the new `RunnerError::PostEffectPersistence`, which
+  `retry_with_jitter` never retries. Previously the whole adapter call (approval dispatch, SoR writes, artifact
+  uploads, emits) was re-run up to 5 times. **API:** `RunnerError` gained that variant.
+- **Approval HTTP poller:** each resume runs on its own task. A panicking or slow resume no longer kills or
+  stalls the poller (and every other approval's polls and deadlines); `poller_started` is cleared when the loop
+  exits.
+- **Side-turn card re-offered after a guardrail denial:** with `on_text_while_parked: side_turn`, a guardrail
+  denial while a `flow:` tool is parked re-offers the card (`awaiting_tool_input`) like any other failed turn.
+- **Card navigation:** a blank `routeToCardId` no longer hides a valid `toCardId` / `nextCardId` after it.
+- **Condition operators:** `evaluate_simple_condition` splits at the FIRST operator outside double quotes, so a
+  value containing another operator (`x > "a==b"`) no longer mis-splits.
+- **Step cap:** one turn may execute at most 10,000 nodes (`flow_step_limit_exceeded`), so a routing cycle that
+  never waits fails instead of spinning.
+- **MS Graph send:** the sender must be a single clean path segment (`\`, `%`, whitespace, control characters,
+  `.` and `..` are refused) and is percent-encoded into the URL.
+- **Knowledge index:** embedding and search responses are capped at 16 MiB.
+- **Welcome marker TTL:** the welcome-seen marker is written with an explicit 365-day TTL, so the Redis wait TTL
+  (24h default) no longer re-fires the welcome flow after a day.
+- **SoR discovery errors:** `sorla.call` over HTTP reports `sorla_unauthorized` / `sorla_unreachable` /
+  `sorla_discovery_failed` instead of "no capability for sorla action ..." when discovery itself failed.
+- **Operator introspection cache:** `describe()` results are cached per `(digest, component, operation)`; an
+  `unknown` digest is never cached.
+- **Tool-secret env fallback deny-list:** `secret://a/b` -> `A_B` no longer resolves host configuration:
+  `GREENTIC_*`, `TENANT_JWT_*`, `ADMIN_TOKEN`, `OPERATOR_TOKEN`, `PACK_PUBLIC_KEY` and the provider webhook
+  secrets are reported as not found.
+- **Discovery dirs:** with no `HOME`, extensions / agent manifests are read from `/var/lib/greentic/...`, not a
+  predictable path under the temp dir.
+- **Deterministic in-process LLM key:** with several agents naming a `credential_ref`, the lexicographically first
+  agent id wins (was `HashMap` order).
+- **Graph agent guardrails run once:** the graph turn no longer also installs the agent's own guardrails as the
+  mandatory fallback policy (they ran twice per turn).
+- **MCP sidecar duplicates:** a duplicate `server_id` in `assets/mcp-routes.json` keeps the FIRST record, like the
+  a2a and sorla sidecars (was last).
+
+### Known, not changed (round 11)
+- Inbound `metadata.nextCardId` / `routeToCardId` / `toCardId` still select the entry node when nothing is parked,
+  whether or not the provider stamped `greentic_submit`. The target must be a node of the routed flow, and
+  non-webchat providers stamp neither marker; requiring the marker is a cross-repo decision.
+- The welcome marker is written before the welcome turn succeeds (a failed welcome is not retried).
+- Graph runs: terminal run-id slots (`__2..__100`) are never reclaimed and a resumed run drops the new user message;
+  both need `greentic-aw-runtime` graph-executor / checkpoint-store API changes.
+
 ## Tests and CI
 
 - Tests that used to print "skipping" and pass (offline wasm fixture build, missing `WEATHER_PACK_PATH`, fixture
