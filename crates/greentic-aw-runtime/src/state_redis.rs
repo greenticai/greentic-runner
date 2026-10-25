@@ -23,16 +23,14 @@ const STATE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 const LOCK_TTL_SECS: i64 = 90;
 const LOCK_POLL_MS: u64 = 50;
 
-/// Lua: refresh the lock TTL if we still own it (value matches). If the key
-/// has lapsed and nobody took it, re-acquire it; if another owner holds it,
-/// return 0 (lock lost).
+/// Lua: refresh the lock TTL only if we still own it (value matches). A
+/// missing key or a different owner both return 0 (lock lost): the script must
+/// never create the key, or a lock that lapsed and was taken by another turn
+/// could be silently stolen back. Re-acquiring a lapsed-but-unclaimed lock is
+/// the caller's explicit `SET NX` (see `RedisSessionLock::refresh`).
 const REFRESH_LUA: &str = r#"
-local cur = redis.call('GET', KEYS[1])
-if cur == ARGV[1] then
+if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('EXPIRE', KEYS[1], ARGV[2])
-elseif not cur then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-  return 1
 else
   return 0
 end
@@ -190,6 +188,22 @@ impl SessionLockInner for RedisSessionLock {
                 .await
                 .map_err(|e| StateError::Redis(format!("refresh eval: {e}")))?;
             if refreshed == 1 {
+                return Ok(());
+            }
+            // The key is absent (TTL lapsed during a long LLM call) or held
+            // by another owner. `SET NX` takes it back only when nobody else
+            // has; failing means another owner holds it, i.e. the lock is lost.
+            let taken: Option<String> = redis::cmd("SET")
+                .arg(&self.key)
+                .arg(&self.value)
+                .arg("NX")
+                .arg("EX")
+                .arg(LOCK_TTL_SECS)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| StateError::Redis(format!("refresh set nx: {e}")))?;
+            if taken.is_some() {
+                tracing::warn!("session lock had lapsed unclaimed; re-acquired");
                 Ok(())
             } else {
                 Err(StateError::LockLost)
