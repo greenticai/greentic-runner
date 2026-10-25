@@ -1326,7 +1326,9 @@ async fn run_step_scoped(
                         source_description: Some("agentic-worker turn".into()),
                         reference_time: chrono::Utc::now(),
                     };
-                    tokio::spawn(async move {
+                    // Bounded: a slow memory backend must not pile up one task
+                    // (holding the whole episode) per turn.
+                    crate::background::long_term_gate().try_spawn("long-term ingest", async move {
                         if let Err(e) = memory.ingest_episode(&ctx, episode).await {
                             warn!(error = %e, "background long-term ingest failed");
                         }

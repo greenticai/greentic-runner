@@ -19,6 +19,7 @@ pub mod artifact_reader;
 pub mod attachment_guard;
 pub mod attachments;
 pub mod attachments_materialize;
+mod background;
 pub mod billing;
 pub mod component_source;
 pub mod config;

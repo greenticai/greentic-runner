@@ -232,6 +232,8 @@ pub struct HttpBillingMeter {
     http: reqwest::Client,
     /// Per-tenant TTL cache: tenant_id → (checked_at, is_over_budget).
     over_budget_cache: Mutex<HashMap<String, (Instant, bool)>>,
+    /// Caps the detached metering POSTs in flight (and bounds each in time).
+    background: crate::background::BackgroundGate,
 }
 
 impl HttpBillingMeter {
@@ -255,6 +257,10 @@ impl HttpBillingMeter {
             bearer,
             http,
             over_budget_cache: Mutex::new(HashMap::new()),
+            background: crate::background::BackgroundGate::new(
+                crate::background::MAX_BACKGROUND,
+                crate::background::BACKGROUND_TIMEOUT,
+            ),
         })
     }
 
@@ -299,7 +305,9 @@ impl BillingMeter for HttpBillingMeter {
         let bearer = self.bearer.clone();
 
         // Detach: spawn independently; never block the agent step on billing.
-        tokio::spawn(async move {
+        // Bounded: with the sink down, unbounded spawns piled up one task per
+        // turn; past the cap a metering event is dropped (and logged).
+        self.background.try_spawn("worker metering", async move {
             let res = http
                 .post(&url)
                 .header("x-greentic-service-auth", format!("Bearer {bearer}"))

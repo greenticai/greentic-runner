@@ -859,7 +859,7 @@ mod tests {
     async fn a_path_steering_target_is_refused_before_any_config_lookup() {
         let runtime = build_test_mock_runtime("greeter", "pong");
         let invoker = RuntimeAgentDispatchInvoker::new(runtime);
-        let Err(err) = invoker
+        let refused = invoker
             .invoke(
                 "acme",
                 "prod",
@@ -869,12 +869,12 @@ mod tests {
                 Some("sess-1"),
             )
             .await
-        else {
-            panic!("a path-steering target must be refused");
-        };
-        assert!(err.to_string().contains("target"), "{err}");
+            .err();
+        assert!(refused.is_some(), "a path-steering target must be refused");
+        let message = refused.map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("target"), "{message}");
         // Non-retryable: not classified as a busy / unavailable session.
-        assert!(!err.to_string().contains("temporarily unavailable"));
+        assert!(!message.contains("temporarily unavailable"));
         assert!(
             invoker
                 .step_timeout("acme", "prod", "../tenant/me/mcp-servers")
