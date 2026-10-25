@@ -930,6 +930,12 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_HTTP_DENY_PRIVATE` | Opt-in (default OFF): also block loopback, `0.0.0.0/8`, RFC1918, CGNAT and ULA destinations. |
 | `GREENTIC_HTTP_MAX_RESPONSE_MB` | Cap on an outbound response body (host `http-client` and `wasi:http`). Default `64`; `0` disables. |
 | `GREENTIC_WASI_HTTP_ENFORCE_POLICY` | Opt-in (default OFF): make `wasi:http` honour a tenant's `http_enabled = false` (that flag is true only when the tenant has a `messaging` binding, so default enforcement would break other tenants' wasi-http components). |
+| `GREENTIC_HTTP_OUTBOUND_TIMEOUT_SECS` | Ceiling, in whole seconds, on every phase timeout (connect / first-byte / between-bytes) of an outbound `wasi:http` request (`http_timeout_hooks.rs`). Default `30`; `0`, empty or unparseable values fall back to `30` rather than failing. |
+| `PACK_FS_ALLOWED_ROOTS` | Platform path list (`:` on Unix) of extra roots, besides the working directory, that absolute `fs://` pack locators may point into. Setting it turns confinement on; confinement is also on whenever `PACK_VERIFY_STRICT` is set. When unset and not strict, absolute paths are unrestricted (dev behaviour). |
+| `PACK_ALLOW_LEGACY_SIGNATURES` | Opt-in (default OFF; truthy = `1`/`true`/`yes`/`on`, case-insensitive): accept legacy digest-only signatures while `PACK_VERIFY_STRICT` is set. They do not bind the pack name/version, so strict mode rejects them otherwise. |
+| `GREENTIC_CACHE_DIR` | Root of the compiled-component cache (default `.greentic/cache/components`, relative to the working directory); entries live under `v1/<engine profile id>`. |
+| `GREENTIC_NO_CACHE` | Truthy (`1`/`true`/`TRUE`/`yes`/`YES`, exact match) disables both the memory and disk component caches. The CLI `--no-cache` flag sets it. |
+| `GREENTIC_DISABLE_CACHE` | Alias of `GREENTIC_NO_CACHE` with identical semantics; either one disables the caches. |
 
 **Auth hardening.** `POST /operator/op/invoke` is guarded by a route layer (`http/auth.rs::require_operator`) that demands `Authorization: Bearer` equal to `OPERATOR_TOKEN`, else the admin token (constant-time compare, 401 otherwise); with no token it stays open for backward compatibility and `HostServer::serve` logs a warning. `TENANT_RESOLVER=jwt` now verifies HS256 tokens when `TENANT_JWT_SECRET` is set (`TenantResolver::JwtVerified`); with no key it fails startup (`RoutingConfig::startup_check`) unless `TENANT_JWT_TRUST_GATEWAY=1` keeps the legacy decode-only `TenantResolver::Jwt`.
 
