@@ -1145,6 +1145,46 @@ mod aw {
     /// process (built off the async runtime) and hand out cheap clones — a
     /// clone dropped in async context never drops the underlying runtime, which
     /// is released only at process exit (outside any runtime).
+    /// DNS resolver for the extension runtime's (reqwest 0.12) client: applies
+    /// the same address policy as the host `http-client`
+    /// ([`crate::http_guard::GuardedResolver`] targets reqwest 0.13's trait, so
+    /// it cannot be reused directly).
+    struct ToolGuardedResolver {
+        guard: crate::http_guard::HttpGuard,
+    }
+
+    impl greentic_ext_runtime::reqwest::dns::Resolve for ToolGuardedResolver {
+        fn resolve(
+            &self,
+            name: greentic_ext_runtime::reqwest::dns::Name,
+        ) -> greentic_ext_runtime::reqwest::dns::Resolving {
+            let guard = self.guard;
+            Box::pin(async move {
+                let addrs: Vec<std::net::SocketAddr> =
+                    tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+                guard.check_addrs(&addrs).map_err(
+                    |reason| -> Box<dyn std::error::Error + Send + Sync> { reason.into() },
+                )?;
+                let iter: greentic_ext_runtime::reqwest::dns::Addrs = Box::new(addrs.into_iter());
+                Ok(iter)
+            })
+        }
+    }
+
+    /// Build the tool-extension HTTP client: no redirect following (an
+    /// extension's request is not allowed to be bounced to another host, per
+    /// the ext-runtime contract) and the outbound address guard on DNS.
+    fn build_tool_http_client() -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
+        greentic_ext_runtime::reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(greentic_ext_runtime::reqwest::redirect::Policy::none())
+            .dns_resolver(std::sync::Arc::new(ToolGuardedResolver {
+                guard: crate::http_guard::HttpGuard::from_env(),
+            }))
+            .build()
+            .ok()
+    }
+
     fn shared_blocking_http_client() -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
         use std::sync::OnceLock;
         static CLIENT: OnceLock<Option<greentic_ext_runtime::reqwest::blocking::Client>> =
@@ -1153,15 +1193,10 @@ mod aw {
             .get_or_init(|| {
                 // Build on a plain OS thread so reqwest's internal runtime is
                 // not constructed inside a tokio context.
-                std::thread::spawn(|| {
-                    greentic_ext_runtime::reqwest::blocking::Client::builder()
-                        .timeout(std::time::Duration::from_secs(30))
-                        .build()
-                        .ok()
-                })
-                .join()
-                .ok()
-                .flatten()
+                std::thread::spawn(build_tool_http_client)
+                    .join()
+                    .ok()
+                    .flatten()
             })
             .clone()
     }
@@ -3120,6 +3155,38 @@ mod aw {
 
         fn aid(c: char) -> String {
             format!("artifact://{}", c.to_string().repeat(64))
+        }
+
+        #[test]
+        fn tool_http_client_does_not_follow_redirects() {
+            use std::io::{Read, Write};
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            let addr = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let server = std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf);
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            });
+            let url = format!("http://{addr}/");
+            let status = std::thread::spawn(move || {
+                let client = build_tool_http_client()?;
+                client.get(url).send().ok().map(|r| r.status().as_u16())
+            })
+            .join()
+            .ok()
+            .flatten();
+            let _ = server.join();
+            assert_eq!(status, Some(302), "the 302 must be returned, not followed");
         }
 
         #[test]
