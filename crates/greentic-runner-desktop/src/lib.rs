@@ -16,7 +16,6 @@ use greentic_runner_host::storage::{new_session_store, new_state_store};
 use greentic_runner_host::trace::TraceConfig;
 use greentic_runner_host::validate::ValidationConfig;
 use parking_lot::Mutex;
-use runner_core::normalize_under_root;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
 use sha2::{Digest, Sha256};
@@ -67,7 +66,11 @@ pub struct DevProfile {
     pub tenant_id: String,
     pub team_id: String,
     pub user_id: String,
+    /// NOT enforced yet: there is no per-node timeout seam in the engine. Kept
+    /// for API compatibility.
     pub max_node_wall_time_ms: u64,
+    /// Wall-clock limit for one `run_pack` call in milliseconds; `0` disables.
+    /// Exceeding it aborts the run with an error.
     pub max_run_wall_time_ms: u64,
 }
 
@@ -603,23 +606,27 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         None => None,
     };
 
-    let execution = if let Some(snapshot) = resume_snapshot {
-        // A parked snapshot OUTRANKS `entry_node`. A card parks awaiting the
-        // user's submit, and only re-dispatching THAT node on resume attaches
-        // the submitted `answers` to its output — which is what the nodes
-        // downstream read (`{{node.<card>.answers.<field>}}`). Jumping to an
-        // entry node instead skips the card, so the answers never exist and
-        // every downstream binding resolves empty.
-        engine.resume(ctx, snapshot, opts.input.clone()).await
-    } else if let Some(entry_node) = opts.entry_node.as_deref() {
-        // No parked run to continue, so this is the caller's first hop into
-        // the flow: start at the node it named.
-        engine
-            .execute_from(ctx, opts.input.clone(), entry_node)
-            .await
-    } else {
-        engine.execute(ctx, opts.input.clone()).await
+    let run_limit_ms = resolved_profile.max_run_wall_time_ms;
+    let run_future = async {
+        if let Some(snapshot) = resume_snapshot {
+            // A parked snapshot OUTRANKS `entry_node`. A card parks awaiting the
+            // user's submit, and only re-dispatching THAT node on resume attaches
+            // the submitted `answers` to its output — which is what the nodes
+            // downstream read (`{{node.<card>.answers.<field>}}`). Jumping to an
+            // entry node instead skips the card, so the answers never exist and
+            // every downstream binding resolves empty.
+            engine.resume(ctx, snapshot, opts.input.clone()).await
+        } else if let Some(entry_node) = opts.entry_node.as_deref() {
+            // No parked run to continue, so this is the caller's first hop into
+            // the flow: start at the node it named.
+            engine
+                .execute_from(ctx, opts.input.clone(), entry_node)
+                .await
+        } else {
+            engine.execute(ctx, opts.input.clone()).await
+        }
     };
+    let execution = run_with_wall_limit(run_limit_ms, run_future).await;
     let finished_at = OffsetDateTime::now_utc();
 
     let status = match execution {
@@ -692,6 +699,24 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         .with_context(|| format!("failed to write run summary {}", run_json_path.display()))?;
 
     Ok(result)
+}
+
+/// Run `future` under the profile's `max_run_wall_time_ms` (`0` disables the
+/// limit). Hitting the limit drops the run and returns a clear error; the
+/// per-node limit (`max_node_wall_time_ms`) has no enforcement seam yet.
+async fn run_with_wall_limit<T>(
+    limit_ms: u64,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if limit_ms == 0 {
+        return future.await;
+    }
+    match tokio::time::timeout(std::time::Duration::from_millis(limit_ms), future).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "run exceeded max_run_wall_time_ms ({limit_ms} ms) and was aborted"
+        )),
+    }
 }
 
 /// Resolve the snapshot file path for a given session id.
@@ -1006,32 +1031,12 @@ fn apply_otlp_hook(hook: &OtlpHook) {
 }
 
 fn normalize_pack_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("pack path {} has no parent", path.display()))?;
-        let root = parent
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", parent.display()))?;
-        let file = path
-            .file_name()
-            .ok_or_else(|| anyhow!("pack path {} has no file name", path.display()))?;
-        return normalize_under_root(&root, Path::new(file));
-    }
-
-    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    let base = if let Some(parent) = path.parent() {
-        cwd.join(parent)
-    } else {
-        cwd
-    };
-    let root = base
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", base.display()))?;
-    let file = path
-        .file_name()
-        .ok_or_else(|| anyhow!("pack path {} has no file name", path.display()))?;
-    normalize_under_root(&root, Path::new(file))
+    // The path comes straight from the user (CLI argument), so there is no trust
+    // boundary to enforce: canonicalize it directly. That accepts `.`/`..`
+    // (a pack directory given as `--pack .`) and symlinked packs, which a
+    // root-confined check on the parent directory rejected.
+    path.canonicalize()
+        .with_context(|| format!("failed to resolve pack path {}", path.display()))
 }
 
 fn prepare_run_dirs(root_override: Option<PathBuf>) -> Result<RunDirectories> {
@@ -1239,7 +1244,7 @@ fn build_host_config(
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // `max_node_wall_time_ms` is carried but not enforced yet.
 #[derive(Clone, Debug)]
 struct ResolvedProfile {
     tenant_id: String,
@@ -1893,7 +1898,7 @@ mod tests {
             resolve_entry_flow(None, &metadata, &flows).unwrap(),
             "entry.flow"
         );
-        assert!(
+        assert_eq!(
             resolve_entry_flow(
                 None,
                 &PackMetadata {
@@ -1902,7 +1907,8 @@ mod tests {
                 },
                 &flows
             )
-            .is_ok()
+            .unwrap(),
+            "fallback.flow"
         );
     }
 
@@ -1919,6 +1925,53 @@ mod tests {
         let normalized = normalize_pack_path(&relative).expect("normalized path");
 
         assert_eq!(normalized, pack.canonicalize().expect("canonical"));
+    }
+
+    #[test]
+    fn normalize_pack_path_accepts_dot_dotdot_and_symlinks() {
+        let temp = TempDir::new().expect("tempdir");
+        let pack_dir = temp.path().join("pack");
+        fs::create_dir_all(&pack_dir).expect("pack dir");
+        let canonical = pack_dir.canonicalize().expect("canonical");
+
+        // `..` segments inside an absolute path.
+        let dotdot = pack_dir.join("..").join("pack");
+        assert_eq!(normalize_pack_path(&dotdot).expect("dotdot"), canonical);
+
+        // A bare `.` resolves to the current directory.
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(
+            normalize_pack_path(Path::new(".")).expect("dot"),
+            cwd.canonicalize().expect("canonical cwd")
+        );
+        assert!(normalize_pack_path(Path::new("..")).is_ok());
+
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("link");
+            std::os::unix::fs::symlink(&pack_dir, &link).expect("symlink");
+            assert_eq!(normalize_pack_path(&link).expect("symlink"), canonical);
+        }
+
+        assert!(normalize_pack_path(&temp.path().join("missing")).is_err());
+    }
+
+    #[tokio::test]
+    async fn run_wall_limit_aborts_slow_runs_and_zero_disables() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            Ok::<_, anyhow::Error>(1)
+        };
+        let err = run_with_wall_limit(20, slow).await.expect_err("timeout");
+        assert!(err.to_string().contains("max_run_wall_time_ms"), "{err}");
+
+        let quick = async { Ok::<_, anyhow::Error>(7) };
+        assert_eq!(run_with_wall_limit(5_000, quick).await.expect("ok"), 7);
+        let unlimited = async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            Ok::<_, anyhow::Error>(9)
+        };
+        assert_eq!(run_with_wall_limit(0, unlimited).await.expect("ok"), 9);
     }
 
     #[test]
