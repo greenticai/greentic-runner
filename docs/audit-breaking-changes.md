@@ -10,7 +10,9 @@ Sections: [Upgrade checklist](#upgrade-checklist) | [Pack loading and signing](#
 [Auth and routing](#auth-and-routing) | [Sandbox and outbound](#sandbox-and-outbound) |
 [Storage](#storage) | [Agentic workers and dispatch](#agentic-workers-and-dispatch) |
 [CLI](#cli) | [Desktop harness](#desktop-harness) | [HTTP surface and telemetry](#http-surface-and-telemetry) |
-[Providers and SQL](#providers-and-sql) | [Tests and CI](#tests-and-ci)
+[Providers and SQL](#providers-and-sql) | [Round 13](#round-13) |
+[Changes missing from earlier rounds](#changes-missing-from-earlier-rounds) | [Rust API changes](#rust-api-changes) |
+[Tests and CI](#tests-and-ci)
 
 ## Upgrade checklist
 
@@ -29,6 +31,13 @@ Things most likely to break a running deployment, in the order to check them:
 9. Operators that call `POST /operator/op/invoke` without a token while `ADMIN_TOKEN` is set.
 10. `PORT=""`, `TENANT_RESOLVER=""`, `GREENTIC_ENV=""`, `DEFAULT_TENANT=""` now mean "unset" (a relaxation; for
     `SECRETS_BACKEND=env` a blank `GREENTIC_ENV` is therefore allowed like an unset one).
+11. Pointer-mode templates (`vars_out`, provider `in_map`/`out_map`) that name a MISSING path under a context root
+    now fail the node instead of passing the literal text on
+    ([details](#changes-missing-from-earlier-rounds)).
+12. Rolling upgrade of the agentic worker on Redis: the tool-call ledger key format changed, so a message redelivered
+    across the upgrade can re-run a side-effecting tool ([details](#changes-missing-from-earlier-rounds)).
+13. Tenant ids with a leading `.` or a `..` (valid `TenantId`s) now fail at config load ([Round 13](#round-13)).
+14. Embedders: new/changed public Rust API, see [Rust API changes](#rust-api-changes) and its semver recommendation.
 
 ## Pack loading and signing
 
@@ -197,7 +206,8 @@ Things most likely to break a running deployment, in the order to check them:
 ### Wasm execution and memory limits
 - **What:** `GREENTIC_WASM_MAX_EXEC_SECS` (default `300`, `0` disables, clamped to avoid epoch overflow; 1 s
   granularity) and `GREENTIC_WASM_MAX_MEMORY_MB` (default `1024`, `0` disables). Tables and instance counts
-  have fixed caps. A trap surfaces as an ordinary invocation error.
+  have fixed caps. A deadline trap surfaces as an ordinary invocation error. A grow past a memory or table cap is
+  denied, not trapped: the guest sees `-1` (round 13 logs it).
 - **Restore:** raise the value or set `0`.
 
 ### Outbound HTTP guard
@@ -288,9 +298,11 @@ Things most likely to break a running deployment, in the order to check them:
   another turn re-armed a watchdog on the receiving replica still retires it (documented residual window).
 
 ### JetStream consumer
-- **What:** `MAX_DELIVER` is now 6 (was 5), with scaled busy-redelivery (5 s growing to 60 s), 2 s error-nak
-  delay, handler timeout derived from the agent timeout (240 s default, 30 min ceiling) and an `ack_wait` of
-  300 s. A stale consumer config is updated on start. Handler errors are nak'd; rejection responses are scoped.
+- **What:** `MAX_DELIVER` is now 6 (was 5) for handler ERRORS, with scaled busy-redelivery (5 s growing to 60 s),
+  2 s error-nak delay, handler timeout derived from the agent timeout (240 s default, 30 min ceiling) and an
+  `ack_wait` of 300 s. A stale consumer config is updated on start. Handler errors are nak'd; rejection responses
+  are scoped. (Round 13 changed how a BUSY session is bounded and what the consumer's own `max_deliver` is, see
+  [Round 13](#round-13).)
 - **Affected:** poison messages are retried once more before being dropped.
 
 ### Redaction (NATS URLs, audit events, secrets in logs)
@@ -503,11 +515,13 @@ Things most likely to break a running deployment, in the order to check them:
   remote index downloads; `0` disables. `network.read_timeout_ms` no longer acts as the whole-request deadline
   (`reqwest::blocking` has no per-read timeout); the total deadline is `GREENTIC_PACK_DOWNLOAD_TIMEOUT_SECS` (900,
   `0` disables), and `connect_timeout_ms` still applies.
-- **`pack.lock` discovery:** only the archive's own directory is searched (no grandparent), and an unparsable lock
-  is skipped with a warning.
+- **`pack.lock` discovery:** only the archive's own directory is searched (a lock in a parent or grandparent
+  directory is no longer found; keep `pack.lock` next to the archive), and an unparsable lock is skipped with a
+  warning. (Commit `c48cc590`; this entry used to be repeated, without a matching commit, under Round 12.)
 - **Materialized pack dirs:** a corrupt `manifest.cbor` with no archive to fall back to now fails the load instead
   of yielding an empty pack. `read_pack_file`, inline component paths and `legacy_path` are confined to the pack
-  root (absolute paths, `..` and escaping symlinks are refused).
+  root (absolute paths, `..` and escaping symlinks are refused: a pack whose `components/*.wasm` entries are symlinks
+  pointing outside the pack root fails to load, so ship component bytes inside the pack).
 - **Nested flow loads** (`dw.agent` `flow:` tools) keep the parent pack's unit id, non-secret runtime config and
   runtime refs.
 - **`cache warmup`** keys compiled artifacts by the sha256 of the component bytes, not the digest in `pack.lock`.
@@ -643,7 +657,8 @@ need a store-level compare-and-set/lease.
   been unused for over an hour, the legacy flat `<name>/<version>/pack.gtpack` and `pack.tmp-*` leftovers older
   than an hour are deleted. Cache hits refresh the archive's mtime, so a pack a tenant still resolves is never
   pruned (a loaded runtime keeps its archive PATH and re-opens it lazily, so deleting an in-use one would break it).
-  Disk use per name/version is now bounded instead of growing by up to 1 GiB per republish.
+  Disk use per name/version is now bounded instead of growing by up to 1 GiB per republish. (Round 13: the one-hour
+  gate became `max(1h, 2 x PACK_REFRESH_INTERVAL)`, see [Round 13](#round-13).)
 - **Shutdown:** a second SIGINT/SIGTERM during the drain aborts the in-flight requests immediately instead of waiting
   out `GREENTIC_SHUTDOWN_GRACE_SECS`; `host.stop()` still runs.
 - **Agentic worker:** the per-step tool-catalog resolve (and user-ledger read) now refreshes the session lock while it
@@ -652,10 +667,159 @@ need a store-level compare-and-set/lease.
   order) instead of one after another.
 - **Event bridges:** the core-NATS `overloaded` reply at the in-flight cap is kept and documented: core-NATS gives
   no server-side backpressure, so not reading the next message would only queue requests on a full replica.
-- **Pack loading:** a pack whose `components/*.wasm` entries are symlinks pointing outside the pack root now fails
-  to load (confined like every other pack path), and a `pack.lock` in a parent or grandparent directory of the
-  archive is no longer found (only the archive's own directory is searched). Ship component bytes inside the pack
-  and keep `pack.lock` next to the archive.
+
+## Round 13
+
+Follow-ups to the round-12 audit. Each entry is a behaviour change; none bumps a version.
+
+- **Whole-turn retry holds the session turn lock (`engine/state_machine.rs`).** The per-session lock used to be
+  taken per attempt inside `call_traced`, so it was released between retry attempts: another message could consume the
+  parked snapshot in the gap and the retry then ran out of order. The state machine now takes the same lock around the
+  whole retry loop. Observable: a second message for a session whose first turn is backing off waits for the
+  first to finish (or fail for good) instead of overtaking it.
+- **No whole-turn retry after an effect (`runner/engine.rs`).** If a node that performs an external effect
+  (`provider.invoke`, `flow.call`, `dw.agent`, `dw.agent_graph`, `sorla.call`, `operala.call`, `agentic.call`,
+  `telco-x.call`, `approval.call`, `mcp`, `a2a`, `media.create`) has succeeded in a run, any LATER failure of that run
+  is terminal (`RunnerError::FlowTerminal`): neither the engine retry loop nor the state machine re-runs the turn, so a
+  second SoR write / approval request / upload no longer follows a transient failure at a later node. A failure before
+  any such node still retries. **Affected:** flows that relied on a retry re-running an already-succeeded effectful
+  node. **Known limitations (documented, not fixed):** generic component nodes are opaque and not counted; a
+  `state.set` read-modify-write re-applies; the failing node's own partial effects are not tracked.
+- **Deterministic jump failures are terminal.** `unknown_flow` (flow not registered), `unknown_node`, "no start
+  node" and a malformed `greentic_control` block used to be plain errors and retried up to 5 times; they now fail
+  at once. A `load_flow` I/O failure stays retryable.
+- **Event bridges: blank `Greentic-Env` and `..` ids.** A blank `Greentic-Env` is treated as absent (defaults to
+  `default`) in `aw-event-bridge` and `telco-x-event-bridge`, and rejection replies echo `Greentic-Tenant` /
+  `Greentic-Env` whenever the ids fit the runner's `[A-Za-z0-9._-]` charset (including `..` inside a name such as
+  `a..b`). Before, such a request was rejected with a reply that carried no tenant/env headers, the runner's
+  tenant-scoped response listener dropped it, and the caller waited out its watchdog (forever with no
+  `deadline_ms`). Key-building validation (`validate_scope_id`) still rejects `..` on purpose.
+- **JetStream busy budget.** A busy session (lock contention or `StateUnavailable`) is redelivered while the message
+  is younger than `busy_budget(step_timeout)` = the handler time bound + 60 s (about 5 minutes by default, at most 31),
+  measured from the publish time; then it is answered `session_busy`. Before, 6 deliveries (about 160 s) was the whole
+  budget, so a second message to a session whose healthy turn ran for minutes got `session_busy`. Every Nak counts
+  against the server's `max_deliver`, so the consumer's `max_deliver` is now `CONSUMER_MAX_DELIVER` = 100 (a finite
+  backstop; `update_consumer` converges an existing consumer on start) and `MAX_DELIVER` = 6 remains the
+  application-level cap for handler errors. **Affected:** monitoring that alerts on `max_deliver`; the
+  poison-message bound is unchanged for errors.
+- **Cron timers of replaced runtimes.** `ActivePacks::insert_pack` (and so `RunnerHost::load_pack`),
+  `insert_revision` and `remove_revision` now cancel the timers of the runtime they replace or remove. Only the
+  watcher did before, so a runtime an embedder still referenced kept firing next to its replacement. Re-inserting
+  the same `Arc` cancels nothing.
+- **Tenant ids are checked against the secrets rule at load.** A tenant such as `.hidden` or `a..b` passed
+  `TenantId` and the WASI directory check but every secret read failed (`is_safe_secret_segment`). It now fails
+  `HostConfig::try_tenant_ctx` (bindings load, host registration) with a message naming the tenant. Tenant ids are
+  now `[A-Za-z0-9._-]{1,128}` with no leading `.` and no `..`. **Restore:** rename the tenant.
+- **Pack cache: read-only archives and the prune gate.** The mtime refresh opens the archive read-only (it failed with
+  `EACCES` on 0444 archives, so the pack looked idle and could be pruned while in use) and warns once if it cannot
+  refresh; the idle gate is `max(1h, 2 x PACK_REFRESH_INTERVAL)`; the watcher touches the archives of a runtime it
+  keeps because a republish failed to build.
+- **Routing truthy env vars are case-insensitive.** `TENANT_JWT_TRUST_GATEWAY=TRUE` / `On` (and
+  `TENANT_JWT_ALLOW_NO_EXP`) were rejected although the docs said `1/true/yes/on` and every other parser
+  lowercases. **Affected:** a deployment that set `TRUE` and relied on it NOT enabling gateway trust now has it enabled;
+  grep your manifests.
+- **`GREENTIC_OAUTH_BROKER_SHARED_SECRET=` (blank) no longer overrides the YAML `shared_secret`.** A blank env value is
+  unset; a blank YAML value is unset too (the broker gets no secret rather than an empty one).
+- **Logging added where data was dropped silently:**
+  - tool results over 32 KiB are cut to a preview for the history (`warn!` with tool name and size; the cap itself is
+    unchanged);
+  - a dispatch response with no `Greentic-Tenant` header on a tenant-scoped listener is dropped as before, now with a
+    `warn!` naming the (log-safe) correlation id. The awaiting flow stays parked until its watchdog fires, indefinitely
+    when the dispatch carried no deadline;
+  - a denied `memory.grow` / `table.grow` (past `GREENTIC_WASM_MAX_MEMORY_MB` or the fixed table caps) is NOT a trap:
+    the guest sees `-1`, and a Rust guest usually aborts on the failed allocation, which does surface as an
+    invocation error. The host now logs one `warn!` per store (the earlier wording above said "trap");
+  - if the tool-extension HTTP client cannot be built (the loopback blackhole listener cannot bind, builder failure)
+    it is cached as unavailable for the life of the process, so every tool HTTP call fails; each site now logs an
+    `error!` with the reason;
+  - files created beyond `MAX_CREATED_PER_TURN` (20) in one turn are stored but not listed in the reply, so not
+    delivered; now a `warn!` with the dropped count, and the cap is documented in `CLAUDE.md`;
+  - an unsafe or unbuildable unit secret scope falls back to the team/tenant scope, which can serve a broader
+    credential; the first skip per process logs a `warn!`.
+
+## Changes missing from earlier rounds
+
+Found by review; each was already in the tree and absent from this document.
+
+- **Template pointer mode errors on a missing path under a context root (`runner/templating.rs`).** With
+  `allow_pointer` (`vars_out` bindings, provider `in_map` / `out_map`), a string such as `/node/x/output/typo` used to
+  fall back to the literal text whenever no such pointer existed. It still does when the FIRST segment is not a context
+  root (a URL path like `/health`), but a missing path under a root (`entry`, `in`, `prev`, `node`, `state`, `vars`,
+  `now`, `input`, `result`, `response`, or a top-level key of the context) now fails with "template pointer ... not
+  found in the render context", so the typo is not sent to a provider as text. **Affected:** flows whose pointer
+  bindings named a path that is sometimes absent and relied on the literal fallback. **Restore:** write the binding as
+  `{{ ... }}` (an exact-path expression resolves to an empty string when absent).
+- **Redis tool-call ledger key format (`greentic-aw-runtime/src/tools.rs`).** The key is now
+  `aw:{tenant}:{env}:{session_len}.{session}:tool_calls:{call_len}.{call_id}` (length-prefixed, since either id may
+  contain `:`), and the ledger call id also carries a digest of the call's extension, tool and arguments. **Affected:**
+  a rolling upgrade: a message redelivered across the upgrade misses the old entry and can re-run a side-effecting tool
+  once (entries live 7 days). Drain in-flight turns before upgrading when tools write.
+- **Per-agent `limits.llm_retry_attempts` / `llm_retry_backoff` are ignored behind a host-wrapped backend
+  (`greentic-aw-runtime/src/llm.rs`).** When the shared backend already retries (`LlmBackend::is_retrying()`, true for
+  every backend the host wraps), only that backend's policy applies, so attempts are never multiplied N x N. The agent
+  limits apply only to a bare backend (tests, unwrapped embedders). **Affected:** anyone tuning those two limits on a
+  deployed worker; they no longer have an effect there.
+- **Desktop harness:** `max_run_wall_time_ms` (default `600000`, `0` disables) is now enforced: hitting it drops the
+  run with "run exceeded max_run_wall_time_ms (N ms) and was aborted". `max_node_wall_time_ms` is still not enforced.
+  The user's `--pack` path is canonicalised (so `.`, `..` and symlinked packs now work; the old parent-root check
+  rejected them).
+- **`conformance`:** an L1/L2 case whose flow returns the session-flow failure envelope (`metadata.error_kind` /
+  `error_message` in an `Ok` reply) now FAILS with code `flow_error_envelope` instead of passing.
+- **`replay`:** `--step` is validated (1-based; `0` and values past the trace length are errors; it used to
+  saturate). Host-managed steps (no component to re-run) are skipped for the output-hash comparison with a note
+  instead of being compared against an empty output.
+- **`flow.call` nesting is capped at 16 levels** (`MAX_FLOW_CALL_DEPTH`); deeper calls fail terminally ("flow.call
+  nesting exceeds 16 levels"), and a nested flow that pauses is an error.
+- **v0.6 components receive non-JSON input as a JSON string** (`parse_v06_input`) instead of failing or being nulled.
+- **`gen-bindings`:** `--component` can now be combined with a pack or `--pack-dir` (before they conflicted); alone it
+  only prints detected capabilities, with a pack it enables the `--strict` HTTP/secrets capability checks. `--pretty`
+  is accepted but a no-op (the YAML is always block-style) and `--complete` now only ensures the base env passthrough.
+- **`greentic-runner --config-explain`** needs no `--bindings`; it prints the resolved configuration and exits before
+  the bindings requirement is checked.
+- **`RunnerConfig::from_config` errors on a malformed non-empty `PORT`** (it used to ignore it and use 8080). The new
+  additive `RunnerConfig::from_config_with_port(.., Some(port))` skips `PORT` entirely, which is what `--port` uses.
+
+## Rust API changes
+
+Public-API changes an embedder (greentic-start, greentic-designer, desktop shims) can hit at compile time. Each item
+was checked against the tree (`git diff 16b0cbfd HEAD`).
+
+| Item | Change | Break |
+|---|---|---|
+| `aw_event_bridge::InvokeOutcome` | gains the required field `error: Option<DispatchError>` | struct literals and exhaustive destructuring |
+| `greentic_runner_host::runtime::block_on` | now `F: Future<Output = R> + Send, R: Send` (it degrades to a runtime-less executor instead of panicking) | callers passing non-`Send` futures |
+| `engine::runtime::IngressEnvelope::tenant_ctx()` | returns `GResult<TenantCtx>` (was `TenantCtx`) | every caller |
+| `cache::ArtifactMetadata` | gains the public field `artifact_sha256: Option<String>` (+ `with_artifact_sha256`) | struct literals |
+| `fault::FaultConfig`, `fault::FaultRate` | exist only with the `fault-injection` feature (`fault` exposes inert entry points otherwise) | code that named them without the feature |
+| `routing::TenantResolver` | new variants `JwtVerified { .. }`, `JwtUnconfigured(String)`, `Invalid(String)` | exhaustive `match` |
+| `greentic_aw_runtime::LlmError` | new variant `RateLimited(String)` (+ `is_retryable()`) | exhaustive `match` |
+| `greentic_aw_runtime::StateError` | new variant `LockLost` | exhaustive `match` |
+| `greentic_aw_runtime::AgentError` | new variants `StateUnavailable(StateError)`, `LockLost` | exhaustive `match` |
+| `greentic_aw_runtime::MemoryError` | new variant `LimitExceeded(String)` | exhaustive `match` |
+| `engine::error::RunnerError` | new variants `PostEffectPersistence { reason }`, `FlowTerminal { reason }` (+ `is_terminal()`) | exhaustive `match` |
+| `runner::playbook_turn::PlaybookTurnHost` | gains the field `billing_meter: Option<Arc<dyn BillingMeter>>` | struct literals |
+| `runner_core::PackCache::lookup` | new since the baseline; returns `Result<Option<CachedPack { path, digest }>>` (`CachedPack` is re-exported), and `ResolvedPack.digest` is always the canonical lowercase digest | callers of `lookup`, code comparing the raw pinned spelling |
+| `RunnerConfig` | additive `from_config_with_port`; `from_config` now errors on a malformed `PORT` | behaviour only | behaviour only |
+| Round 13 additions | `PackManager::with_refresh_interval`, `PackManager::touch_cached_archive`, `PackRuntime::archive_path`, `aw_event_bridge::{is_echoable_scope_id, jetstream::{busy_budget, CONSUMER_MAX_DELIVER, BUSY_BUDGET_MARGIN}}`, `state::cap_tool_result_for` | additive, except `jetstream::busy_policy` which now takes `(delivered, age, budget)` |
+
+No new `#[non_exhaustive]` was added: marking the enums above `#[non_exhaustive]` would stop the NEXT variant from being
+a break, but it is itself a break for exhaustive matchers, so it is a release decision left to the maintainer.
+
+### Semver recommendation
+
+The workspace is `1.2.1` at the baseline. Several of the changes above are breaking for downstream Rust code (new
+variants on public enums, a required struct field, a changed return type and a tightened bound), which is
+semver-major in the strict reading. Recommendation: release as **at least `1.3.0`** if the ecosystem treats these
+crates as application-internal (all known consumers are in-tree siblings pinned together), or **`2.0.0`** if strict
+semver is wanted for third-party embedders. Before bumping, check the sibling constraints in the root `Cargo.toml`
+(about lines 128-186: the `[workspace.dependencies.*]` entries for `greentic-runner-host`, `greentic-runner-desktop`
+and `runner-core`, plus the greentic-* lane ranges) and the per-crate path dependencies
+(`crates/greentic-runner/Cargo.toml`, `crates/greentic-runner-desktop/Cargo.toml`, `crates/tests/Cargo.toml`,
+`crates/greentic-runner-host/Cargo.toml`, `crates/greentic-aw-runtime/Cargo.toml`): every one currently says
+`>=1.2.0-0, <1.3.0-0`, so a `1.3.0` workspace version would not satisfy its own siblings until they are widened, and
+`2.0.0` needs the same. The external `greentic-*` lane ranges are a separate, cross-repo decision. **Whether and when
+to release is the maintainer's decision; no version was bumped, no release workflow was touched, and nothing was
+marked `#[non_exhaustive]`.**
 
 ## Tests and CI
 

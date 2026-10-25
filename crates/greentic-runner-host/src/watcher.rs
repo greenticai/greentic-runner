@@ -146,9 +146,12 @@ pub async fn start_pack_watcher_with_policy(
     refresh: Duration,
 ) -> Result<(PackWatcher, PackReloadHandle)> {
     let cfg_clone = cfg.clone();
-    let manager = task::spawn_blocking(move || PackManager::with_policy(cfg_clone, policy))
-        .await
-        .context("pack manager init task failed")??;
+    let manager = task::spawn_blocking(move || {
+        PackManager::with_policy(cfg_clone, policy)
+            .map(|manager| manager.with_refresh_interval(refresh))
+    })
+    .await
+    .context("pack manager init task failed")??;
     let manager = Arc::new(manager);
     let configs = Arc::new(host.tenant_configs());
     let active = host.active_packs();
@@ -277,6 +280,18 @@ pub async fn start_pack_watcher_with_policy(
     Ok((watcher, handle))
 }
 
+/// Refresh the cached archives of a runtime kept although its republish failed
+/// to build. Its old digest is no longer resolved, so nothing else would bump
+/// the archive mtime and the next successful store could prune it from under
+/// the live runtime.
+fn keep_archives_alive(manager: &PackManager, runtime: &TenantRuntime) {
+    for pack in runtime.all_packs() {
+        if let Some(path) = pack.archive_path() {
+            manager.touch_cached_archive(path);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reload_once(
     configs: &HashMap<String, Arc<HostConfig>>,
@@ -362,6 +377,7 @@ async fn reload_once(
                 "{tenant}: rebuild previously failed for these pack digests"
             ));
             if let Some(prev) = previous {
+                keep_archives_alive(manager, &prev);
                 next.insert(RuntimeKey::legacy(tenant.clone()), prev);
                 if let Some(old) = applied.lock().get(&tenant).cloned() {
                     new_applied.insert(tenant.clone(), old);
@@ -462,6 +478,7 @@ async fn reload_once(
                     .lock()
                     .record_failure(&tenant, &digests, Instant::now());
                 if let Some(prev) = previous {
+                    keep_archives_alive(manager, &prev);
                     next.insert(RuntimeKey::legacy(tenant.clone()), prev);
                     if let Some(old) = applied.lock().get(&tenant).cloned() {
                         new_applied.insert(tenant.clone(), old);

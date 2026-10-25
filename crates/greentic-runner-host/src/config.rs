@@ -332,10 +332,15 @@ impl HostConfig {
         {
             cfg.team = Some(team.clone());
         }
-        // Prefer env var; fall back to yaml field. Never log the value.
+        // Prefer env var; fall back to yaml field. Never log the value. A
+        // blank env value is "not set" (like every other blank env knob), so an
+        // empty `GREENTIC_OAUTH_BROKER_SHARED_SECRET=` cannot override a
+        // configured secret with nothing. The value itself is kept verbatim.
+        let usable = |raw: &str| !raw.trim().is_empty();
         cfg.shared_secret = env_secret
+            .filter(|raw| usable(raw))
             .map(str::to_owned)
-            .or_else(|| oauth.shared_secret.clone());
+            .or_else(|| oauth.shared_secret.clone().filter(|raw| usable(raw)));
         Some(cfg)
     }
 
@@ -410,6 +415,8 @@ fn tenant_ctx_for(tenant: &str, env: Option<&str>) -> Result<greentic_types::Ten
         .map_err(|err| anyhow::anyhow!("invalid GREENTIC_ENV `{env}`: {err}"))?;
     let tenant_id = greentic_types::TenantId::from_str(tenant)
         .map_err(|err| anyhow::anyhow!("invalid tenant id `{tenant}`: {err}"))?;
+    // The strictest downstream rule (secrets path), enforced once here.
+    crate::secrets_broker::validate_tenant_segment(tenant)?;
     Ok(greentic_types::TenantCtx::new(env_id, tenant_id))
 }
 
@@ -911,6 +918,41 @@ fast2flow:
     }
 
     #[test]
+    fn a_blank_env_shared_secret_does_not_override_the_yaml_one() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some("yaml-secret".into()),
+        }));
+        for blank in ["", "   "] {
+            let broker = cfg
+                .oauth_broker_config_with_env(Some(blank))
+                .expect("missing broker config");
+            assert_eq!(
+                broker.shared_secret.as_deref(),
+                Some("yaml-secret"),
+                "{blank:?}"
+            );
+        }
+        // Blank everywhere means no secret, not an empty one.
+        let none = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some(String::new()),
+        }));
+        let broker = none
+            .oauth_broker_config_with_env(Some(""))
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret, None);
+    }
+
+    #[test]
     fn invalid_webhook_binding_config_is_an_error_not_allow_all() {
         let bindings: BindingsFile = serde_yaml::from_str(
             "tenant: demo\nflow_type_bindings:\n  webhook:\n    adapter: webhook\n    config:\n      deny_paths: not-a-list\n",
@@ -929,6 +971,20 @@ fast2flow:
         let policy = webhook_policy_from_bindings(&bindings).expect("policy");
         assert!(!policy.is_allowed("/admin/x"));
         assert!(policy.is_allowed("/hook"));
+    }
+
+    #[test]
+    fn tenant_ids_a_secret_read_would_refuse_are_rejected_at_load() {
+        for bad in [".hidden", "a..b", "..", ".", &"a".repeat(129)] {
+            let err = tenant_ctx_for(bad, None).expect_err(bad);
+            assert!(
+                err.to_string().contains("invalid tenant id"),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in ["demo", "acme-1.eu", "T_1", "a.b"] {
+            assert!(tenant_ctx_for(good, None).is_ok(), "{good:?}");
+        }
     }
 
     #[test]

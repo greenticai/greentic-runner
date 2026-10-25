@@ -28,14 +28,15 @@ pub fn agentic_stream_config() -> stream::Config {
 }
 
 /// Returns the durable pull consumer config (`agentic-workers`) with explicit
-/// ack and a max-deliver cap ([`MAX_DELIVER`]) to prevent poison-pill messages from looping
-/// indefinitely.
+/// ack and a hard max-deliver backstop ([`CONSUMER_MAX_DELIVER`]). The tight
+/// poison-pill bound for handler errors is application-level ([`MAX_DELIVER`]);
+/// a busy session is bounded by message AGE instead (see [`busy_budget`]).
 #[must_use]
 pub fn agentic_consumer_config() -> consumer::pull::Config {
     consumer::pull::Config {
         durable_name: Some(DURABLE_CONSUMER.to_string()),
         ack_policy: consumer::AckPolicy::Explicit,
-        max_deliver: MAX_DELIVER,
+        max_deliver: CONSUMER_MAX_DELIVER,
         ack_wait: ACK_WAIT,
         ..Default::default()
     }
@@ -72,7 +73,7 @@ pub async fn ensure_consumer(
     // created by an older build keeps its 30s `ack_wait`, which is shorter than
     // a turn and would redeliver (and double-run) it. Converge it in place.
     if ack_wait_is_stale(consumer.cached_info().config.ack_wait)
-        || consumer.cached_info().config.max_deliver != MAX_DELIVER
+        || consumer.cached_info().config.max_deliver != CONSUMER_MAX_DELIVER
     {
         tracing::warn!(
             existing = ?consumer.cached_info().config.ack_wait,
@@ -93,8 +94,25 @@ pub fn ack_wait_is_stale(existing: Duration) -> bool {
     existing != ACK_WAIT
 }
 
-/// Redelivery cap of the durable consumer (poison-pill guard).
+/// Application-level redelivery cap for HANDLER ERRORS (poison-pill guard): on
+/// this delivery an erroring request is answered and terminated.
+///
+/// This is no longer the consumer's `max_deliver` ([`CONSUMER_MAX_DELIVER`]).
+/// Every Nak counts against the server-enforced limit, so a busy session (the
+/// user's next message arriving while a long turn still runs) used up the
+/// 6 deliveries in ~160s and got `session_busy` while the first turn was
+/// healthy. Busy redelivery is now bounded by message age ([`busy_budget`]).
 pub const MAX_DELIVER: i64 = 6;
+
+/// Server-side `max_deliver` of the durable consumer: an absolute backstop
+/// above anything the age-based busy budget can reach (the longest budget,
+/// ~32 min at the 60s delay cap, is ~40 deliveries).
+pub const CONSUMER_MAX_DELIVER: i64 = 100;
+
+/// Extra time on top of the handle timeout before a busy request is answered
+/// `session_busy`: covers the holder finishing right at its bound plus the
+/// redelivery delay and the lock wait.
+pub const BUSY_BUDGET_MARGIN: Duration = Duration::from_secs(60);
 
 /// Delay before the first redelivery of a request whose session was busy;
 /// doubles on each further delivery up to [`BUSY_REDELIVER_MAX_DELAY`].
@@ -127,6 +145,19 @@ pub fn busy_redeliver_delay(delivered: i64) -> Duration {
     BUSY_REDELIVER_DELAY
         .saturating_mul(1u32.checked_shl(exp).unwrap_or(u32::MAX))
         .min(BUSY_REDELIVER_MAX_DELAY)
+}
+
+/// How long (from the message's publish time) a request may keep being
+/// redelivered because its session is busy before it is answered `session_busy`.
+///
+/// The session holder is a turn of the same agent, which may run for up to
+/// [`handle_timeout_for`] the agent's step timeout (default 4 minutes, at most
+/// 30), so the budget is that bound plus [`BUSY_BUDGET_MARGIN`]. It is finite by
+/// construction (`HANDLE_TIMEOUT_CEILING` + margin), so a stuck lock cannot make
+/// a poison loop.
+#[must_use]
+pub fn busy_budget(step_timeout: Option<Duration>) -> Duration {
+    handle_timeout_for(step_timeout).saturating_add(BUSY_BUDGET_MARGIN)
 }
 
 /// Per-message handler bound: [`HANDLE_TIMEOUT`], raised when the agent's own
@@ -172,15 +203,34 @@ pub fn backoff_delay(attempt: u32) -> Duration {
         .min(BACKOFF_MAX)
 }
 
-/// Busy policy for a delivery: redeliver while attempts remain, answer on the
-/// last one.
+/// Busy policy for a delivery: redeliver while the request is younger than its
+/// [`busy_budget`] (and the consumer backstop has deliveries left), answer
+/// `session_busy` once either is exhausted.
+///
+/// `age` is the time since the message was published; the next redelivery is
+/// only worth scheduling when it can still land inside the budget.
 #[must_use]
-pub fn busy_policy(delivered: i64) -> BusyPolicy {
-    if delivered >= MAX_DELIVER {
+pub fn busy_policy(delivered: i64, age: Duration, budget: Duration) -> BusyPolicy {
+    let next_delay = busy_redeliver_delay(delivered);
+    if delivered >= CONSUMER_MAX_DELIVER - 1 || age.saturating_add(next_delay) > budget {
         BusyPolicy::Respond
     } else {
         BusyPolicy::Redeliver
     }
+}
+
+/// Time since the message was published, from its JetStream info (zero when the
+/// clocks disagree or the info is unavailable).
+fn message_age(js_msg: &jetstream::Message) -> Duration {
+    let Ok(info) = js_msg.info() else {
+        return Duration::ZERO;
+    };
+    let published_secs = u64::try_from(info.published.unix_timestamp()).unwrap_or(0);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    Duration::from_secs(now_secs.saturating_sub(published_secs))
 }
 
 /// Whether a handled message should be acked.  Errors are left un-acked so
@@ -209,8 +259,10 @@ pub fn settlement(result: &Result<Disposition>, delivered: i64) -> AckKind {
 /// Pull messages from the `agentic-workers` durable consumer, dispatch each
 /// via [`crate::handle_message_outcome`], and settle it (ack / term).
 ///
-/// Un-acked messages are redelivered up to `max_deliver` times (6) before
-/// JetStream marks them as dead-lettered.  Each message is processed in its
+/// Un-acked messages are redelivered up to `max_deliver` times
+/// ([`CONSUMER_MAX_DELIVER`]) before JetStream gives up on them; handler errors
+/// are terminated after [`MAX_DELIVER`] deliveries, a busy session after its
+/// age budget.  Each message is processed in its
 /// own `tokio::spawn` so one slow agent does not stall the pull loop, with
 /// `in_progress` acks sent while it runs. A stream error is logged and the
 /// message stream re-opened with backoff rather than ending the consumer.
@@ -260,8 +312,9 @@ async fn handle_one(
     // On the last allowed delivery there is no redelivery left to lean on, so a
     // busy session must be answered instead of Nak'd into the void.
     let delivered = js_msg.info().map(|info| info.delivered).unwrap_or(1);
-    let busy = busy_policy(delivered);
-    let handle_timeout = handle_timeout_for(step_timeout_of(&invoker, &core).await);
+    let step_timeout = step_timeout_of(&invoker, &core).await;
+    let busy = busy_policy(delivered, message_age(&js_msg), busy_budget(step_timeout));
+    let handle_timeout = handle_timeout_for(step_timeout);
     let handling = tokio::time::timeout(
         handle_timeout,
         crate::handle_message_outcome(&client, invoker, core.clone(), busy),
@@ -408,12 +461,11 @@ mod tests {
     }
 
     #[test]
-    fn consumer_config_caps_max_deliver() {
+    fn consumer_config_keeps_a_finite_max_deliver_backstop() {
         let cfg = agentic_consumer_config();
-        assert_eq!(
-            cfg.max_deliver, MAX_DELIVER,
-            "max_deliver must stay bounded to prevent poison-pill loops"
-        );
+        assert_eq!(cfg.max_deliver, CONSUMER_MAX_DELIVER);
+        assert!(cfg.max_deliver > 0, "never unlimited: poison-pill backstop");
+        assert!(cfg.max_deliver > MAX_DELIVER);
     }
 
     #[test]
@@ -463,11 +515,36 @@ mod tests {
     }
 
     #[test]
-    fn busy_budget_outlasts_the_default_step_timeout() {
-        // Delays between deliveries 1..MAX_DELIVER, plus a lock wait per attempt.
-        let delays: Duration = (1..MAX_DELIVER).map(busy_redeliver_delay).sum();
-        let total = delays + LOCK_WAIT * u32::try_from(MAX_DELIVER).unwrap_or(1);
-        assert!(total > Duration::from_secs(60 + 30), "got {total:?}");
+    fn busy_budget_tracks_the_handle_timeout_and_is_finite() {
+        assert_eq!(busy_budget(None), HANDLE_TIMEOUT + BUSY_BUDGET_MARGIN);
+        // A 20 minute step: the budget must outlast it, not stop at ~160s.
+        let long = busy_budget(Some(Duration::from_secs(20 * 60)));
+        assert!(long > Duration::from_secs(20 * 60), "got {long:?}");
+        // Absolute max age: ceiling + margin, however large the step timeout.
+        assert_eq!(
+            busy_budget(Some(Duration::from_secs(u64::MAX / 4))),
+            HANDLE_TIMEOUT_CEILING + BUSY_BUDGET_MARGIN
+        );
+    }
+
+    #[test]
+    fn busy_redelivery_outlasts_a_healthy_long_turn_without_a_poison_loop() {
+        let budget = busy_budget(Some(Duration::from_secs(20 * 60)));
+        // Walk the redelivery schedule: deliveries stop (answered) at the
+        // budget, well before the consumer backstop, and well after the old
+        // ~160s that 6 deliveries bought.
+        let mut age = Duration::ZERO;
+        let mut delivered = 1;
+        while busy_policy(delivered, age, budget) == BusyPolicy::Redeliver {
+            age += busy_redeliver_delay(delivered);
+            delivered += 1;
+        }
+        assert!(age > Duration::from_secs(20 * 60), "stopped at {age:?}");
+        assert!(age <= budget, "never waits past the budget: {age:?}");
+        assert!(
+            delivered < CONSUMER_MAX_DELIVER - 1,
+            "delivered {delivered}"
+        );
     }
 
     #[test]
@@ -488,11 +565,24 @@ mod tests {
     }
 
     #[test]
-    fn busy_is_redelivered_until_the_last_delivery_then_answered() {
-        assert_eq!(busy_policy(1), BusyPolicy::Redeliver);
-        assert_eq!(busy_policy(MAX_DELIVER - 1), BusyPolicy::Redeliver);
-        assert_eq!(busy_policy(MAX_DELIVER), BusyPolicy::Respond);
-        assert_eq!(busy_policy(MAX_DELIVER + 1), BusyPolicy::Respond);
+    fn busy_is_redelivered_inside_the_budget_then_answered() {
+        let budget = busy_budget(None);
+        assert_eq!(
+            busy_policy(1, Duration::ZERO, budget),
+            BusyPolicy::Redeliver
+        );
+        // Past the old 6th delivery, still young: keep redelivering.
+        assert_eq!(
+            busy_policy(MAX_DELIVER + 1, Duration::from_secs(170), budget),
+            BusyPolicy::Redeliver
+        );
+        // Out of budget: answer session_busy.
+        assert_eq!(busy_policy(3, budget, budget), BusyPolicy::Respond);
+        // Consumer backstop reached: answer regardless of age.
+        assert_eq!(
+            busy_policy(CONSUMER_MAX_DELIVER - 1, Duration::ZERO, budget),
+            BusyPolicy::Respond
+        );
     }
 
     #[test]

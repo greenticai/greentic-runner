@@ -95,19 +95,45 @@ pub fn secret_uri_candidates(
 ) -> Result<Vec<String>, String> {
     let team = team.filter(|t| !t.is_empty() && *t != TENANT_DEFAULT_TEAM);
     let mut uris = Vec::with_capacity(3);
-    if let Some(unit_key) = unit.and_then(|unit| crate::mcp_secrets::mcp_unit_secret_key(key, unit))
-    {
-        // A key that cannot form a safe unit name (e.g. one ending in `.`)
-        // only loses the unit scope; team / tenant candidates still apply.
-        if let Ok(uri) = secret_uri(category, tenant, team, &unit_key) {
-            uris.push(uri);
+    let unit_key = unit.and_then(|unit| crate::mcp_secrets::mcp_unit_secret_key(key, unit));
+    match unit_key {
+        Some(unit_key) => {
+            // A key that cannot form a safe unit name (e.g. one ending in `.`)
+            // only loses the unit scope; team / tenant candidates still apply.
+            match secret_uri(category, tenant, team, &unit_key) {
+                Ok(uri) => uris.push(uri),
+                Err(reason) => note_unit_scope_skipped(category, unit, &reason),
+            }
         }
+        None if unit.is_some() => {
+            note_unit_scope_skipped(category, unit, "no safe unit-scoped secret name");
+        }
+        None => {}
     }
     if let Some(team) = team {
         uris.push(secret_uri(category, tenant, Some(team), key)?);
     }
     uris.push(secret_uri(category, tenant, None, key)?);
     Ok(uris)
+}
+
+/// A known unit's own secret scope was skipped, so the lookup silently falls
+/// back to the broader team / tenant scope. That can serve another unit's
+/// credential, which an operator must be able to see. Warns once per process
+/// (the lookup runs per call), then stays at debug.
+fn note_unit_scope_skipped(category: &str, unit: Option<&str>, reason: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(category, unit = ?unit, reason, "unit-scoped secret candidate skipped; using the team / tenant scope");
+    } else {
+        tracing::warn!(
+            category,
+            unit = ?unit,
+            reason,
+            "unit-scoped secret candidate skipped; falling back to the team / tenant scope (logged once; later skips at debug)"
+        );
+    }
 }
 
 /// No credential was readable at any scope [`read_secret_for_unit`] tried.

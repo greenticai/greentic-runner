@@ -261,6 +261,21 @@ impl PackManager {
         })
     }
 
+    /// Size the cache prune idle gate from the watcher refresh interval
+    /// (`max(1h, 2 x interval)`, see [`cache::prune_min_idle`]).
+    pub fn with_refresh_interval(mut self, refresh_interval: std::time::Duration) -> Self {
+        self.cache
+            .set_min_idle(cache::prune_min_idle(Some(refresh_interval)));
+        self
+    }
+
+    /// Mark a cached archive as used just now (no-op for paths outside the
+    /// cache). The watcher calls this for runtimes it keeps after a failed
+    /// republish so their archive is not pruned.
+    pub fn touch_cached_archive(&self, path: &Path) {
+        self.cache.touch_archive(path);
+    }
+
     /// Verify the entry signature against any configured key. The canonical
     /// identity message `{name, version, digest}` is tried first; the legacy
     /// digest-only message is still accepted for existing signatures.

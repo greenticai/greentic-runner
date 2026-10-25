@@ -15,6 +15,17 @@ const KEEP_RECENT_SIBLINGS: usize = 2;
 /// watcher re-resolves each refresh interval) is never old enough to qualify.
 const PRUNE_MIN_IDLE: Duration = Duration::from_secs(60 * 60);
 
+/// The idle threshold to prune with, given the pack refresh interval when it is
+/// known: at least [`PRUNE_MIN_IDLE`], and never less than two refresh periods,
+/// so a slow watcher cadence cannot make an in-use pack look abandoned between
+/// two of its own re-resolutions.
+pub fn prune_min_idle(refresh_interval: Option<Duration>) -> Duration {
+    match refresh_interval {
+        Some(interval) => PRUNE_MIN_IDLE.max(interval.saturating_mul(2)),
+        None => PRUNE_MIN_IDLE,
+    }
+}
+
 /// A cache hit: the archive plus the digest computed from its bytes.
 #[derive(Debug, Clone)]
 pub struct CachedPack {
@@ -25,12 +36,40 @@ pub struct CachedPack {
 
 pub struct PackCache {
     root: PathBuf,
+    min_idle: Duration,
 }
 
 impl PackCache {
     pub fn new(root: PathBuf) -> Self {
         let root = root.canonicalize().unwrap_or(root);
-        Self { root }
+        Self {
+            root,
+            min_idle: PRUNE_MIN_IDLE,
+        }
+    }
+
+    /// Use `min_idle` as the idle threshold for pruning (see [`prune_min_idle`]).
+    pub fn set_min_idle(&mut self, min_idle: Duration) {
+        self.min_idle = min_idle;
+    }
+
+    /// Idle threshold currently used for pruning.
+    pub fn min_idle(&self) -> Duration {
+        self.min_idle
+    }
+
+    /// Mark an archive inside this cache as used just now. Used by the watcher
+    /// for runtimes it keeps although their republish failed to build, so the
+    /// archive they lazily re-open is not pruned while still in use. Paths
+    /// outside the cache root are ignored.
+    pub fn touch_archive(&self, path: &Path) {
+        let inside = path
+            .canonicalize()
+            .map(|canonical| canonical.starts_with(&self.root))
+            .unwrap_or(false);
+        if inside {
+            touch(path);
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -75,7 +114,7 @@ impl PackCache {
         let Some(parent) = current.parent() else {
             return;
         };
-        remove_stale_files(parent, now);
+        remove_stale_files(parent, now, self.min_idle);
         let Ok(entries) = fs::read_dir(parent) else {
             return;
         };
@@ -95,17 +134,17 @@ impl PackCache {
         // Newest first; keep the first N.
         siblings.sort_by_key(|sibling| std::cmp::Reverse(sibling.0));
         for (index, (used, dir)) in siblings.into_iter().enumerate() {
-            if index >= KEEP_RECENT_SIBLINGS && is_idle(used, now) {
+            if index >= KEEP_RECENT_SIBLINGS && is_idle(used, now, self.min_idle) {
                 if let Err(err) = fs::remove_dir_all(&dir) {
                     tracing::warn!(dir = %dir.display(), error = %err, "failed to prune stale pack cache dir");
                 }
             } else {
                 // Kept: still drop its interrupted-copy leftovers.
-                remove_stale_files(&dir, now);
+                remove_stale_files(&dir, now, self.min_idle);
             }
         }
         // Leftover temp copies inside the current directory.
-        remove_stale_files(current, now);
+        remove_stale_files(current, now, self.min_idle);
     }
 
     /// The cached `pack.gtpack` for `reference` whose bytes hash to `digest`,
@@ -153,13 +192,29 @@ impl PackCache {
 
 /// Record "used just now" on an archive (best effort) so pruning never
 /// mistakes a pack a tenant still resolves for an abandoned one.
+///
+/// Opened READ-ONLY first: cached archives may be mode 0444 (copied from a
+/// read-only source), and a write open fails with EACCES there, which used to
+/// leave the mtime stale. `File::set_modified` does not need write access on
+/// unix. Falls back to a write open (needed on Windows) and warns once if both
+/// fail.
 fn touch(path: &Path) {
-    let result = fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .and_then(|file| file.set_modified(SystemTime::now()));
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let now = SystemTime::now();
+    let read_only = fs::File::open(path).and_then(|file| file.set_modified(now));
+    let result = match read_only {
+        Ok(()) => return,
+        Err(_) => fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(now)),
+    };
     if let Err(err) = result {
-        tracing::debug!(path = %path.display(), error = %err, "could not refresh cached pack mtime");
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(path = %path.display(), error = %err, "could not refresh cached pack mtime; an in-use pack may be pruned (logged once)");
+        } else {
+            tracing::debug!(path = %path.display(), error = %err, "could not refresh cached pack mtime");
+        }
     }
 }
 
@@ -180,16 +235,16 @@ fn last_used(dir: &Path) -> SystemTime {
     }
 }
 
-fn is_idle(used: SystemTime, now: SystemTime) -> bool {
+fn is_idle(used: SystemTime, now: SystemTime, min_idle: Duration) -> bool {
     now.duration_since(used)
-        .map(|age| age > PRUNE_MIN_IDLE)
+        .map(|age| age > min_idle)
         .unwrap_or(false)
 }
 
 /// Remove a legacy `pack.gtpack` file and `pack.tmp-*` leftovers directly
 /// inside `dir` once they are idle. (In a digest directory `pack.gtpack` is the
 /// live archive and is never touched here.)
-fn remove_stale_files(dir: &Path, now: SystemTime) {
+fn remove_stale_files(dir: &Path, now: SystemTime, min_idle: Duration) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -203,7 +258,7 @@ fn remove_stale_files(dir: &Path, now: SystemTime) {
             continue;
         };
         let stale_name = name.starts_with("pack.tmp-") || (!in_digest_dir && name == "pack.gtpack");
-        if !stale_name || !path.is_file() || !is_idle(mtime(&path), now) {
+        if !stale_name || !path.is_file() || !is_idle(mtime(&path), now, min_idle) {
             continue;
         }
         if let Err(err) = fs::remove_file(&path) {
@@ -476,5 +531,67 @@ mod tests {
         // A kept sibling digest dir loses its stale interrupted-copy file too.
         assert!(second.is_file());
         assert!(!stale_tmp.exists(), "stale tmp in a kept sibling swept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn touch_refreshes_mtime_of_a_read_only_archive() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tmp");
+        let path = temp.path().join("pack.gtpack");
+        fs::write(&path, b"x").expect("write");
+        age(&path, 5 * 3600);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("chmod");
+        let before = mtime(&path);
+        touch(&path);
+        assert!(mtime(&path) > before, "0444 archive mtime must refresh");
+    }
+
+    #[test]
+    fn prune_min_idle_scales_with_the_refresh_interval() {
+        let hour = Duration::from_secs(3600);
+        assert_eq!(prune_min_idle(None), hour);
+        assert_eq!(prune_min_idle(Some(Duration::from_secs(30))), hour);
+        assert_eq!(prune_min_idle(Some(Duration::from_secs(1800))), hour);
+        assert_eq!(
+            prune_min_idle(Some(Duration::from_secs(4 * 3600))),
+            Duration::from_secs(8 * 3600)
+        );
+    }
+
+    #[test]
+    fn a_longer_min_idle_keeps_siblings_a_one_hour_gate_would_prune() {
+        let temp = tempfile::tempdir().expect("tmp");
+        let mut cache = PackCache::new(temp.path().join("cache"));
+        cache.set_min_idle(Duration::from_secs(10 * 3600));
+        let old: Vec<PathBuf> = (0..4u8)
+            .map(|i| store_bytes(&cache, temp.path(), &[i; 8]))
+            .collect();
+        for (i, path) in old.iter().enumerate() {
+            age(path, 3 * 3600 - (i as u64) * 60);
+        }
+        let _ = store_bytes(&cache, temp.path(), b"current");
+        assert!(old.iter().all(|path| path.exists()), "3h idle < 10h gate");
+    }
+
+    #[test]
+    fn touch_archive_protects_a_kept_runtimes_archive_and_ignores_outside_paths() {
+        let temp = tempfile::tempdir().expect("tmp");
+        let cache = PackCache::new(temp.path().join("cache"));
+        let kept = store_bytes(&cache, temp.path(), b"kept-runtime");
+        for i in 0..3u8 {
+            let p = store_bytes(&cache, temp.path(), &[i; 8]);
+            age(&p, 5 * 3600);
+        }
+        age(&kept, 6 * 3600);
+        cache.touch_archive(&kept);
+        let outside = temp.path().join("outside.gtpack");
+        fs::write(&outside, b"o").expect("write");
+        age(&outside, 6 * 3600);
+        let before = mtime(&outside);
+        cache.touch_archive(&outside);
+        assert_eq!(mtime(&outside), before, "outside the cache: untouched");
+        let _ = store_bytes(&cache, temp.path(), b"newest");
+        assert!(kept.exists(), "touched archive survives pruning");
     }
 }

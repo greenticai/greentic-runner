@@ -13,6 +13,12 @@
 //!   default 1024, `0` disables both. Table-element, instance, memory and table counts are
 //!   always capped at generous fixed values.
 //!
+//! A grow past a cap is DENIED, not trapped: `memory.grow` / `table.grow`
+//! return `-1` to the guest, which decides what to do (a Rust guest typically
+//! aborts on the failed allocation, and THAT surfaces as an ordinary invocation
+//! error). Wasmtime logs nothing for a denied grow, so the host warns once per
+//! store ([`GuestLimiter`]).
+//!
 //! An unparseable value falls back to the default (a malformed knob must not
 //! silently remove a safety limit, nor break every invocation).
 
@@ -98,6 +104,7 @@ impl WasmLimits {
             inner: builder.build(),
             total_cap,
             total: 0,
+            warned: false,
         }
     }
 }
@@ -109,6 +116,26 @@ pub(crate) struct GuestLimiter {
     total_cap: Option<usize>,
     /// Bytes granted so far across all memories (initial allocation counts).
     total: usize,
+    /// Whether a denied grow was already logged for this store.
+    warned: bool,
+}
+
+impl GuestLimiter {
+    /// Log the first denied grow of this store (once, so a guest retrying a
+    /// failing allocation cannot flood the log).
+    fn note_denied(&mut self, what: &str, current: usize, desired: usize) {
+        if !self.warned {
+            self.warned = true;
+            tracing::warn!(
+                resource = what,
+                current,
+                desired,
+                memory_cap_bytes = ?self.total_cap,
+                "guest {what} grow denied by the wasm resource limits; the guest sees a failed grow (-1). \
+                 Raise GREENTIC_WASM_MAX_MEMORY_MB if this is a legitimate workload (logged once per store)"
+            );
+        }
+    }
 }
 
 impl ResourceLimiter for GuestLimiter {
@@ -119,6 +146,7 @@ impl ResourceLimiter for GuestLimiter {
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         if !self.inner.memory_growing(current, desired, maximum)? {
+            self.note_denied("memory", current, desired);
             return Ok(false);
         }
         let delta = desired.saturating_sub(current);
@@ -126,6 +154,7 @@ impl ResourceLimiter for GuestLimiter {
         if let Some(cap) = self.total_cap
             && new_total > cap
         {
+            self.note_denied("memory", current, desired);
             return Ok(false);
         }
         self.total = new_total;
@@ -142,7 +171,11 @@ impl ResourceLimiter for GuestLimiter {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        self.inner.table_growing(current, desired, maximum)
+        let allowed = self.inner.table_growing(current, desired, maximum)?;
+        if !allowed {
+            self.note_denied("table", current, desired);
+        }
+        Ok(allowed)
     }
 
     fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
@@ -331,6 +364,29 @@ mod tests {
         let mut store = Store::new(&engine, off.store_limits());
         store.limiter(|l| l);
         assert!(wasmtime::Instance::new(&mut store, &module, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_denied_grow_returns_minus_one_to_the_guest_and_is_flagged_once() {
+        let engine = Engine::default();
+        // 1 page now; the guest asks to grow by 32 pages (2 MiB) past a 1 MiB cap.
+        let module = wasmtime::Module::new(
+            &engine,
+            "(module (memory 1) (func (export \"grow\") (result i32) (memory.grow (i32.const 32))))",
+        )
+        .expect("module");
+        let limits = WasmLimits::from_raw(None, Some("1"));
+        let mut store = Store::new(&engine, limits.store_limits());
+        store.limiter(|l| l);
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instance");
+        let grow = instance
+            .get_typed_func::<(), i32>(&mut store, "grow")
+            .expect("grow");
+        assert!(!store.data().warned);
+        // Denied, not trapped: the guest sees -1.
+        assert_eq!(grow.call(&mut store, ()).expect("no trap"), -1);
+        assert!(store.data().warned, "the first denial is recorded");
+        assert_eq!(grow.call(&mut store, ()).expect("no trap"), -1);
     }
 
     #[test]

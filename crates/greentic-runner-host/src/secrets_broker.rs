@@ -23,6 +23,22 @@ pub(crate) fn is_safe_secret_segment(value: &str) -> bool {
         && !value.contains("..")
 }
 
+/// Check a tenant id ONCE, at config load, against every rule a later use of it
+/// imposes: it is a `TenantId` (`[A-Za-z0-9._-]`), a host directory name
+/// (`wasi::tenant_dir_segment`, at most 128 bytes) and a secrets-path segment
+/// ([`is_safe_secret_segment`]: no leading `.`, no `..`). The secrets rule is the
+/// strictest, so a `.hidden` or `a..b` tenant used to load and run, then fail
+/// every secret read; it now fails here with a message naming the tenant.
+pub(crate) fn validate_tenant_segment(tenant: &str) -> anyhow::Result<()> {
+    if tenant.len() <= 128 && is_safe_secret_segment(tenant) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "invalid tenant id {tenant:?}: use 1-128 characters from [A-Za-z0-9._-], not starting with '.' \
+         and without '..' (the id is also a secrets-path segment and a directory name)"
+    )
+}
+
 fn is_plain_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment != "."
