@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-greentic-runner is the production runtime for the Greentic platform. It loads `.gtpack` archives containing WebAssembly components and flow definitions, normalizes inbound messaging-provider events (Telegram, Teams, Slack, WebChat, Webex, WhatsApp, generic webhook, timer/cron) into flow runs, and executes flows with pause/resume session semantics. The workspace produces three binaries (`greentic-runner`, `greentic-runner-cli`, `greentic-gen-bindings`) and a library crate (`greentic_runner`). Workspace version 1.2.0-dev.0.
+greentic-runner is the production runtime for the Greentic platform. It loads `.gtpack` archives containing WebAssembly components and flow definitions, normalizes inbound messaging-provider events (Telegram, Teams, Slack, WebChat, Webex, WhatsApp, generic webhook, timer/cron) into flow runs, and executes flows with pause/resume session semantics. The workspace produces three binaries (`greentic-runner`, `greentic-runner-cli`, `greentic-gen-bindings`) and a library crate (`greentic_runner`). Workspace version: see `[workspace.package]` in `Cargo.toml`.
 
 ## Build & Test
 
@@ -68,7 +68,7 @@ crates/
                              #   dispatches to TelcoXDispatchInvoker (telco-x.call side).
                              #   Phase 2 transport scaffold + EchoInvoker placeholder +
                              #   telco-x-serve bin (real ops = a TelcoXDispatchInvoker impl)
-  greentic-i18n/             # Compile-time i18n (embedded locale bundles)
+  greentic-a2a/              # A2A protocol client/types (agent-card cache, SendMessage)
   tests/                     # Integration test harness
 ```
 
