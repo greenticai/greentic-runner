@@ -1758,11 +1758,17 @@ impl FlowEngine {
                                     // fresh-dispatch branch below), but this also
                                     // handles a `{ok:false}` envelope from any other
                                     // source (e.g. a flow-authored deadline) the same way.
-                                    let (message, payload) =
+                                    let (_reply, payload) =
                                         agent_error_envelope_reply(&state.entry);
+                                    // Log the MACHINE error (code + message), not the
+                                    // localized user-safe reply, so operators keep
+                                    // their diagnostics.
+                                    let (error_code, error_message) =
+                                        agent_error_log_fields(&state.entry);
                                     tracing::warn!(
                                         agent_id = %agent_id,
-                                        error = %message,
+                                        error_code = %error_code,
+                                        error = %error_message,
                                         "conversational dw.agent (nats) response was an error/timeout envelope; surfacing and re-parking without bumping the park-loop cap"
                                     );
                                     let output = NodeOutput::new(payload);
@@ -4836,6 +4842,26 @@ fn component_error(value: &Value) -> Option<(String, String)> {
 /// ([`user_facing_flow_failure_text`]), never the machine string; the error
 /// (code and message) stays on the payload for operators either way.
 #[cfg(feature = "agentic-worker")]
+/// `(code, message)` of an `{ok:false, error}` envelope for operator logs.
+/// The error may be an object `{code, message}` or a bare string; anything
+/// missing degrades to `unknown` / the empty string rather than failing.
+fn agent_error_log_fields(entry: &Value) -> (String, String) {
+    match entry.get("error") {
+        Some(Value::Object(obj)) => (
+            obj.get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            obj.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        Some(Value::String(message)) => ("unknown".to_string(), message.clone()),
+        _ => ("unknown".to_string(), String::new()),
+    }
+}
+
 fn agent_error_envelope_reply(entry: &Value) -> (String, Value) {
     let error = entry.get("error").filter(|e| !e.is_null());
     let output = entry.get("output");
@@ -14409,6 +14435,25 @@ mod tests {
         let (message, payload) = agent_error_envelope_reply(&json!({ "ok": false }));
         assert!(!message.trim().is_empty());
         assert_eq!(payload["reply"], message.as_str());
+    }
+
+    /// The operator log carries the machine error, never the localized reply.
+    #[test]
+    fn agent_error_log_fields_are_the_machine_error() {
+        let entry =
+            json!({"ok": false, "error": {"code": "timeout", "message": "no reply in 30s"}});
+        assert_eq!(
+            agent_error_log_fields(&entry),
+            ("timeout".to_string(), "no reply in 30s".to_string())
+        );
+        assert_eq!(
+            agent_error_log_fields(&json!({"ok": false, "error": "boom"})),
+            ("unknown".to_string(), "boom".to_string())
+        );
+        assert_eq!(
+            agent_error_log_fields(&json!({"ok": false})),
+            ("unknown".to_string(), String::new())
+        );
     }
 
     /// Fix A (interleave guard): a user message arriving before the agent's
