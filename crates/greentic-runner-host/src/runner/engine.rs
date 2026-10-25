@@ -5279,8 +5279,7 @@ fn component_dispatch_outcome(output: NodeOutput) -> Result<DispatchOutcome> {
 /// deterministic output of the component, so the failure is terminal: re-running
 /// the turn would produce the same block.
 fn parse_component_control(payload: &Value) -> Result<Option<NodeControl>> {
-    parse_component_control_inner(payload)
-        .map_err(|err| terminal_flow_error(format!("{err:#}")))
+    parse_component_control_inner(payload).map_err(|err| terminal_flow_error(format!("{err:#}")))
 }
 
 fn parse_component_control_inner(payload: &Value) -> Result<Option<NodeControl>> {
@@ -10059,7 +10058,10 @@ mod tests {
             ))
             .unwrap_err();
         assert!(err.to_string().contains("unknown_flow"), "{err}");
-        assert!(is_terminal_flow_error(&err), "unknown_flow must be terminal");
+        assert!(
+            is_terminal_flow_error(&err),
+            "unknown_flow must be terminal"
+        );
         assert!(!should_retry(&err));
 
         // unknown_node: a node that does not exist, and one that is not even a
@@ -10089,7 +10091,11 @@ mod tests {
         );
         let mut state = ExecutionState::new(Value::Null);
         let err = rt
-            .block_on(engine.apply_jump(&jump_ctx("flow.source"), &mut state, jump("flow.empty", None)))
+            .block_on(engine.apply_jump(
+                &jump_ctx("flow.source"),
+                &mut state,
+                jump("flow.empty", None),
+            ))
             .unwrap_err();
         assert!(err.to_string().contains("no start node"), "{err}");
         assert!(is_terminal_flow_error(&err));
@@ -10226,7 +10232,10 @@ mod tests {
             json!({ "greentic_control": { "action": "jump", "v": 1 } }),
         ] {
             let err = parse_component_control(&payload).expect_err("invalid control");
-            assert!(err.to_string().contains("jump_failed") || err.to_string().contains("greentic_control"));
+            assert!(
+                err.to_string().contains("jump_failed")
+                    || err.to_string().contains("greentic_control")
+            );
             assert!(is_terminal_flow_error(&err), "{payload}");
             assert!(!should_retry(&err));
         }

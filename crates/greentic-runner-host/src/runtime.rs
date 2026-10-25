@@ -2198,8 +2198,11 @@ mod timer_retirement_tests {
     #[tokio::test]
     async fn remove_revision_stops_the_timers_of_the_removed_runtime() {
         let (_w, runtime) = runtime_with_timers().await;
-        let (deployment, bundle, revision) =
-            (DeploymentId::new(), BundleId::from("bundle-a"), RevisionId::new());
+        let (deployment, bundle, revision) = (
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
         let active = ActivePacks::new();
         // Install under a revision key directly: building a runtime whose
         // rollout identity matches is covered by `insert_revision`'s own tests.

@@ -563,7 +563,11 @@ mod tests {
                 .to_string();
             self.events.lock().push(format!("start {msg}"));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            if msg == "m1" && !self.failed_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if msg == "m1"
+                && !self
+                    .failed_once
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
                 self.events.lock().push(format!("fail {msg}"));
                 return Err(RunnerError::AdapterCall {
                     reason: "transient".into(),

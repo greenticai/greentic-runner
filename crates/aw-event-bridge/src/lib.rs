@@ -254,7 +254,9 @@ pub fn validate_scope_id(kind: &str, value: &str) -> Result<(), Rejection> {
 pub fn response_scope(tenant: Option<&str>, env: Option<&str>) -> Option<(String, String)> {
     let tenant = tenant?;
     // A blank env header is "absent", exactly as in `parse_request`.
-    let env = env.filter(|value| !value.trim().is_empty()).unwrap_or("default");
+    let env = env
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("default");
     if is_echoable_scope_id(tenant) && is_echoable_scope_id(env) {
         Some((tenant.to_string(), env.to_string()))
     } else {

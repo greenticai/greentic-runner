@@ -542,7 +542,9 @@ mod tests {
 
     #[test]
     fn truthy_values_are_case_insensitive() {
-        for yes in ["1", "true", "TRUE", "True", "yes", "YES", "on", "On", " on "] {
+        for yes in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "On", " on ",
+        ] {
             assert!(is_truthy_value(Some(yes)), "{yes:?}");
         }
         for no in ["", "0", "false", "off", "no", "2", "truee", "enable"] {

@@ -541,7 +541,10 @@ mod tests {
         }
         assert!(age > Duration::from_secs(20 * 60), "stopped at {age:?}");
         assert!(age <= budget, "never waits past the budget: {age:?}");
-        assert!(delivered < CONSUMER_MAX_DELIVER - 1, "delivered {delivered}");
+        assert!(
+            delivered < CONSUMER_MAX_DELIVER - 1,
+            "delivered {delivered}"
+        );
     }
 
     #[test]
