@@ -18,6 +18,40 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Server-side cap on one statement's runtime (Postgres/MySQL).
 const STATEMENT_TIMEOUT_MS: u64 = 30_000;
 
+/// Session statements that cap one statement's runtime, in preference order.
+///
+/// MySQL 5.7.8+ names it `max_execution_time` (milliseconds). MariaDB does not
+/// have that variable (`SET` fails with "Unknown system variable") and calls
+/// it `max_statement_time` (seconds). The `mysql` engine speaks to both, so
+/// each is tried in turn.
+fn mysql_timeout_statements() -> [String; 2] {
+    [
+        format!("SET SESSION max_execution_time = {STATEMENT_TIMEOUT_MS}"),
+        format!(
+            "SET SESSION max_statement_time = {}",
+            STATEMENT_TIMEOUT_MS / 1000
+        ),
+    ]
+}
+
+/// Best-effort server-side timeout. The cap is defence in depth (the gateway
+/// also bounds the call client-side), so a server that supports neither
+/// variable must still connect rather than make the whole pool unusable.
+async fn apply_mysql_statement_timeout(conn: &mut sqlx::MySqlConnection) {
+    for statement in mysql_timeout_statements() {
+        match sqlx::query(&statement).execute(&mut *conn).await {
+            Ok(_) => return,
+            Err(err) => {
+                tracing::debug!(%statement, error = %err, "mysql statement timeout variable not accepted");
+            }
+        }
+    }
+    tracing::warn!(
+        "mysql server accepts neither max_execution_time nor max_statement_time; \
+         no server-side statement timeout is in effect"
+    );
+}
+
 pub async fn build(engine: Engine, dsn: &str, read_only: bool) -> Result<ConnectionPool, String> {
     match engine {
         Engine::Postgres => sqlx::postgres::PgPoolOptions::new()
@@ -40,11 +74,7 @@ pub async fn build(engine: Engine, dsn: &str, read_only: bool) -> Result<Connect
             .acquire_timeout(ACQUIRE_TIMEOUT)
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
-                    sqlx::query(&format!(
-                        "SET SESSION max_execution_time = {STATEMENT_TIMEOUT_MS}"
-                    ))
-                    .execute(conn)
-                    .await?;
+                    apply_mysql_statement_timeout(conn).await;
                     Ok(())
                 })
             })
@@ -71,6 +101,14 @@ pub async fn build(engine: Engine, dsn: &str, read_only: bool) -> Result<Connect
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_timeout_covers_mysql_then_mariadb_variables() {
+        let [mysql, mariadb] = mysql_timeout_statements();
+        assert_eq!(mysql, "SET SESSION max_execution_time = 30000");
+        // MariaDB's variable is in seconds, not milliseconds.
+        assert_eq!(mariadb, "SET SESSION max_statement_time = 30");
+    }
 
     #[tokio::test]
     async fn builds_sqlite_pool_readonly() {
