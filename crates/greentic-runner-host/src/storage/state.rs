@@ -53,10 +53,35 @@ impl StateStoreHost {
 }
 
 fn ttl_from_env() -> Option<u32> {
-    std::env::var(STATE_TTL_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|secs| *secs > 0)
+    parse_ttl(std::env::var(STATE_TTL_ENV).ok().as_deref())
+}
+
+/// Parse the TTL setting. `0`/unset means "never expire"; a value above
+/// `u32::MAX` is clamped (and warned about) rather than silently disabling the
+/// TTL; an unparsable value is warned about and ignored.
+fn parse_ttl(raw: Option<&str>) -> Option<u32> {
+    let raw = raw?.trim();
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => match u32::try_from(secs) {
+            Ok(secs) => Some(secs),
+            Err(_) => {
+                tracing::warn!(
+                    value = secs,
+                    max = u32::MAX,
+                    "{STATE_TTL_ENV} exceeds the maximum; clamping"
+                );
+                Some(u32::MAX)
+            }
+        },
+        Err(_) => {
+            tracing::warn!(
+                value = raw,
+                "{STATE_TTL_ENV} is not a valid number of seconds; flow state will not expire"
+            );
+            None
+        }
+    }
 }
 
 pub fn new_state_store() -> DynStateStore {
@@ -261,6 +286,19 @@ fn map_state_error(err: greentic_types::GreenticError) -> RunnerError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ttl_parsing_clamps_instead_of_disabling() {
+        use super::parse_ttl;
+        assert_eq!(parse_ttl(None), None);
+        assert_eq!(parse_ttl(Some("0")), None);
+        assert_eq!(parse_ttl(Some(" 3600 ")), Some(3600));
+        assert_eq!(parse_ttl(Some("4294967295")), Some(u32::MAX));
+        assert_eq!(parse_ttl(Some("4294967296")), Some(u32::MAX));
+        assert_eq!(parse_ttl(Some("99999999999999")), Some(u32::MAX));
+        assert_eq!(parse_ttl(Some("abc")), None);
+        assert_eq!(parse_ttl(Some("-5")), None);
+    }
+
     use super::*;
     use greentic_state::StatePath;
     use greentic_types::GResult as TypesResult;
