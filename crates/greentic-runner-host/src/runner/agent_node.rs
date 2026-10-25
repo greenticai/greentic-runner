@@ -682,8 +682,8 @@ mod aw {
     /// Resolve the extension discovery directory for tool dispatch.
     ///
     /// Honours `GREENTIC_EXTENSIONS_DIR`; otherwise falls back to
-    /// `~/.greentic/extensions` (the platform convention), and finally to a
-    /// temp-dir path when no home directory can be resolved. A missing or
+    /// `~/.greentic/extensions` (the platform convention), and finally to
+    /// `/var/lib/greentic/extensions` when no home directory can be resolved. A missing or
     /// empty directory is harmless — `list_tools`/`invoke_tool` simply return
     /// empty/NotFound, which is correct for tool-less agents.
     fn extension_discovery_dir() -> PathBuf {
@@ -695,13 +695,15 @@ mod aw {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(".greentic").join("extensions");
         }
-        std::env::temp_dir().join("greentic").join("extensions")
+        // Not the temp dir: a predictable path under a world-writable
+        // directory is one another local user can pre-create.
+        PathBuf::from("/var/lib/greentic/extensions")
     }
 
     /// Resolve the directory scanned for `<agent_id>.json` Digital Worker manifests.
     ///
     /// Honours `GREENTIC_AGENT_MANIFESTS_DIR`; otherwise `~/.greentic/agents`, and
-    /// finally a temp-dir path when no home is resolvable (keeps the fn total). A
+    /// finally `/var/lib/greentic/agents` when no home is resolvable (keeps the fn total). A
     /// missing dir is harmless — the overlay provider simply finds no manifest and
     /// returns the YAML base unchanged.
     fn manifests_discovery_dir() -> PathBuf {
@@ -713,7 +715,7 @@ mod aw {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(".greentic").join("agents");
         }
-        std::env::temp_dir().join("greentic").join("agents")
+        PathBuf::from("/var/lib/greentic/agents")
     }
 
     /// Build an [`HttpConfigProvider`] from `GREENTIC_AW_ADMIN_ENDPOINT` +
