@@ -1011,9 +1011,7 @@ mod aw {
 
     impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
-            let name = env_var_name_for_secret(uri);
-            std::env::var(&name)
-                .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
+            env_secret_lookup(uri)
         }
     }
 
@@ -1134,9 +1132,7 @@ mod aw {
                 }
             }
             // Fallback: env var (preserves pre-store behaviour).
-            let name = env_var_name_for_secret(uri);
-            std::env::var(&name)
-                .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
+            env_secret_lookup(uri)
         }
     }
 
@@ -1203,6 +1199,49 @@ mod aw {
                     .flatten()
             })
             .clone()
+    }
+
+    /// Env vars an extension's `secret://` reference may NEVER resolve to.
+    /// The env fallback maps `secret://a/b` to `A_B` with no allow-list, so
+    /// without this a signed extension asking for `secret://admin/token` read
+    /// the host's own `ADMIN_TOKEN`. Anything the runner itself is configured
+    /// with (`GREENTIC_*`, `TENANT_JWT_*`, the admin/operator bearer tokens and
+    /// the provider webhook secrets) is host configuration, not a tool secret.
+    const ENV_SECRET_DENY_EXACT: &[&str] = &[
+        "ADMIN_TOKEN",
+        "OPERATOR_TOKEN",
+        "PACK_PUBLIC_KEY",
+        "SLACK_SIGNING_SECRET",
+        "WEBEX_WEBHOOK_SECRET",
+        "WHATSAPP_VERIFY_TOKEN",
+        "WHATSAPP_APP_SECRET",
+        "TELEGRAM_BOT_TOKEN",
+    ];
+    const ENV_SECRET_DENY_PREFIXES: &[&str] = &["GREENTIC_", "TENANT_JWT_"];
+
+    pub(crate) fn env_secret_name_is_denied(name: &str) -> bool {
+        ENV_SECRET_DENY_EXACT.contains(&name)
+            || ENV_SECRET_DENY_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    }
+
+    /// Resolve a tool-secret reference from the process env, refusing the
+    /// host-configuration names above (reported as not found, so the refusal is
+    /// indistinguishable from an unset variable).
+    fn env_secret_lookup(uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+        let name = env_var_name_for_secret(uri);
+        if env_secret_name_is_denied(&name) {
+            tracing::warn!(
+                env_var = %name,
+                "tool secret reference maps to a host configuration variable; refused"
+            );
+            return Err(greentic_ext_runtime::SecretsError::NotFound(
+                uri.to_string(),
+            ));
+        }
+        std::env::var(&name)
+            .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
     }
 
     pub(crate) fn env_var_name_for_secret(uri: &str) -> String {
@@ -3182,6 +3221,26 @@ mod aw {
 
         fn aid(c: char) -> String {
             format!("artifact://{}", c.to_string().repeat(64))
+        }
+
+        #[test]
+        fn host_configuration_env_vars_are_not_readable_as_tool_secrets() {
+            for denied in [
+                "secret://admin/token",
+                "secret://operator/token",
+                "secret://tenant/jwt/secret",
+                "secret://greentic/llm/api/key",
+                "secret://telegram/bot/token",
+            ] {
+                let name = env_var_name_for_secret(denied);
+                assert!(
+                    env_secret_name_is_denied(&name),
+                    "{denied} -> {name} must be refused"
+                );
+            }
+            for ok in ["secret://tavily/api_key", "secret://openai/api_key"] {
+                assert!(!env_secret_name_is_denied(&env_var_name_for_secret(ok)));
+            }
         }
 
         #[test]
