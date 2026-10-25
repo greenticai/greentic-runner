@@ -5,8 +5,12 @@
 //! ledger, the LLM step would re-run, causing duplicate replies and wasted
 //! credits.
 //!
-//! The ledger is keyed by the dispatch correlation/idempotency hint (the same
-//! string the runner derives from the flow session). On a cache hit the
+//! The ledger is keyed by `{tenant}:{env}:{dispatch_id}`, where `dispatch_id`
+//! is the random per-publish `Greentic-Dispatch-Id` header (see
+//! `serve::ledger_key`). It is NOT the correlation/idempotency hint: that is the
+//! conversation's session hint and is the same for every turn, so keying on it
+//! replayed turn 1's reply as turn 2's. A dispatch without the header is not
+//! deduplicated. On a cache hit the
 //! invoker short-circuits and returns the cached [`InvokeOutcome`] output
 //! without calling [`AgentRuntime::step`] again.
 //!

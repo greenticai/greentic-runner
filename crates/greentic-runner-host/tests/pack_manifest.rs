@@ -1089,3 +1089,47 @@ fn agentic_worker_component_invoker_lists_and_invokes() -> Result<()> {
     );
     Ok(())
 }
+
+/// A direct flow run / resumed tool flow reloads the pack through
+/// `load_flow_engine`. It must resolve the SAME tenant-scoped `/state` as the
+/// parent (it used to re-scope an already scoped policy, giving
+/// `<host>/tenants/demo/tenants/demo`).
+#[test]
+fn nested_flow_load_resolves_same_state_dir_as_parent() -> Result<()> {
+    use greentic_runner_host::wasi::PreopenSpec;
+
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let gtpack = temp.path().join("runner-components.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_pack(&gtpack)?;
+    let state_root = temp.path().join("host-state");
+    std::fs::create_dir_all(&state_root)?;
+    let policy = RunnerWasiPolicy::new().with_preopen(PreopenSpec::new(&state_root, "/state"));
+
+    let pack = rt.block_on(PackRuntime::load(
+        &gtpack,
+        Arc::new(host_config(&bindings_path)),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(policy),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?;
+    let state_dir = |p: &RunnerWasiPolicy| {
+        p.preopens
+            .iter()
+            .find(|s| s.guest_path == "/state")
+            .map(|s| s.host_path.clone())
+    };
+    let parent = state_dir(&pack.effective_wasi_policy());
+    let nested = state_dir(&*rt.block_on(pack.nested_load_wasi_policy())?);
+    assert_eq!(parent, Some(state_root.join("tenants").join("demo")));
+    assert_eq!(nested, parent);
+    Ok(())
+}

@@ -104,6 +104,14 @@ pub fn decode_response(
 
 /// Forward a decoded input to the resumer, logging failures.
 pub async fn dispatch_to_resumer(resumer: Arc<dyn SessionResumer>, input: ResumeInput) {
+    dispatch_to_resumer_outcome(resumer, input).await;
+}
+
+/// [`dispatch_to_resumer`], reporting what the resumer did (`None` on failure).
+async fn dispatch_to_resumer_outcome(
+    resumer: Arc<dyn SessionResumer>,
+    input: ResumeInput,
+) -> Option<ResumeOutcome> {
     match resumer
         .resume_checked(input.tenant, &input.correlation_id, input.output)
         .await
@@ -111,13 +119,72 @@ pub async fn dispatch_to_resumer(resumer: Arc<dyn SessionResumer>, input: Resume
         // The watchdog was already retired inside `resume_checked`, at
         // admission and before the resumed flow ran; cancelling here would kill
         // a watchdog that flow registered for its next dispatch.
-        Ok(ResumeOutcome::Admitted | ResumeOutcome::Dropped) => {}
-        Err(error) => tracing::error!(
-            %error,
-            correlation_id = %input.correlation_id,
-            "failed to resume session on dispatch response"
-        ),
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                correlation_id = %input.correlation_id,
+                "failed to resume session on dispatch response"
+            );
+            None
+        }
     }
+}
+
+/// Subject on which a replica that ADMITTED a response tells every other
+/// replica to retire the deadline watchdog it may have armed for the same
+/// correlation id.
+///
+/// The watchdog map is process-local, but the response listeners share a queue
+/// group per tenant, so the replica that receives (and admits) a response need
+/// not be the one that armed the watchdog. Without this, the arming replica's
+/// watchdog outlives the call it guarded and later publishes a bogus `timeout`
+/// into whatever wait the conversation is parked on by then (the correlation id
+/// is deterministic per conversation).
+pub const WATCHDOG_CANCEL_SUBJECT: &str = "greentic.dispatch.watchdog-cancel.v1";
+
+/// Wire body of a watchdog-cancel notice.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct WatchdogCancel {
+    pub tenant: String,
+    pub correlation_id: String,
+    /// Random id of the publishing replica; it ignores its own notice, since it
+    /// already retired the watchdog at admission and may by now have armed the
+    /// next one under the same id.
+    pub origin: String,
+}
+
+/// Pure: the correlation id to cancel for `payload`, or `None` when the notice
+/// is malformed, came from `own_origin`, or names another tenant.
+pub fn watchdog_cancel_target(
+    scope_tenant: &str,
+    own_origin: &str,
+    payload: &[u8],
+) -> Option<String> {
+    let notice: WatchdogCancel = serde_json::from_slice(payload).ok()?;
+    if notice.origin == own_origin
+        || notice.tenant != scope_tenant
+        || notice.correlation_id.is_empty()
+    {
+        return None;
+    }
+    Some(notice.correlation_id)
+}
+
+/// Retire watchdogs on behalf of other replicas' admitted responses. Plain
+/// (non-queue) subscription: EVERY replica must see every notice.
+pub async fn run_watchdog_cancel_listener(
+    client: async_nats::Client,
+    tenant: String,
+    origin: String,
+) -> Result<()> {
+    let mut subscription = client.subscribe(WATCHDOG_CANCEL_SUBJECT).await?;
+    while let Some(msg) = subscription.next().await {
+        if let Some(correlation_id) = watchdog_cancel_target(&tenant, &origin, &msg.payload) {
+            crate::runner::remote_dispatch::cancel_watchdog(&correlation_id);
+        }
+    }
+    Ok(())
 }
 
 type Job = futures::future::BoxFuture<'static, ()>;
@@ -188,6 +255,10 @@ pub const MAX_CONCURRENT_RESUMES: usize = 32;
 pub struct ListenerScope {
     pub queue_group: Option<String>,
     pub tenant: Option<String>,
+    /// When set, an ADMITTED response is announced on
+    /// [`WATCHDOG_CANCEL_SUBJECT`] under this replica id so other replicas
+    /// retire their watchdog for it (needed whenever `queue_group` is set).
+    pub cancel_origin: Option<String>,
 }
 
 /// Pure: should a listener scoped to `scope_tenant` handle a message whose
@@ -236,6 +307,11 @@ pub async fn run_response_listener_scoped(
     };
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESUMES));
     let serializer = KeyedSerializer::default();
+    let announce = scope
+        .cancel_origin
+        .clone()
+        .zip(scope.tenant.clone())
+        .map(|(origin, tenant)| (client.clone(), origin, tenant));
     while let Some(msg) = subscription.next().await {
         let headers = msg.headers.as_ref();
         let get_header = |name: &str| headers.and_then(|h| h.get(name)).map(|v| v.as_str());
@@ -263,10 +339,34 @@ pub async fn run_response_listener_scoped(
                 // Per-conversation order: responses sharing a correlation id
                 // are handled one at a time, in arrival order.
                 let key = input.correlation_id.clone();
+                let announce = announce.clone();
                 serializer.submit(
                     key,
                     Box::pin(async move {
-                        dispatch_to_resumer(resumer, input).await;
+                        let correlation_id = input.correlation_id.clone();
+                        let outcome = dispatch_to_resumer_outcome(resumer, input).await;
+                        if let (Some(ResumeOutcome::Admitted), Some((client, origin, tenant))) =
+                            (outcome, announce)
+                        {
+                            let notice = WatchdogCancel {
+                                tenant,
+                                correlation_id,
+                                origin,
+                            };
+                            match serde_json::to_vec(&notice) {
+                                Ok(body) => {
+                                    if let Err(error) = client
+                                        .publish(WATCHDOG_CANCEL_SUBJECT, body.into())
+                                        .await
+                                    {
+                                        tracing::warn!(%error, "could not announce watchdog cancel");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "could not encode watchdog cancel")
+                                }
+                            }
+                        }
                         drop(permit);
                     }),
                 );
@@ -283,6 +383,49 @@ mod tests {
     use greentic_types::{DispatchError, RuntimeDispatchResponse};
     use serde_json::json;
     use std::sync::Mutex;
+
+    #[test]
+    fn watchdog_cancel_targets_only_other_replicas_same_tenant() {
+        let body = |tenant: &str, origin: &str| {
+            serde_json::to_vec(&WatchdogCancel {
+                tenant: tenant.into(),
+                correlation_id: "corr-1".into(),
+                origin: origin.into(),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            watchdog_cancel_target("acme", "me", &body("acme", "other")),
+            Some("corr-1".to_string())
+        );
+        assert_eq!(
+            watchdog_cancel_target("acme", "me", &body("acme", "me")),
+            None
+        );
+        assert_eq!(
+            watchdog_cancel_target("acme", "me", &body("globex", "other")),
+            None
+        );
+        assert_eq!(watchdog_cancel_target("acme", "me", b"not json"), None);
+    }
+
+    #[tokio::test]
+    async fn a_remote_admission_notice_retires_the_local_watchdog() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        crate::runner::remote_dispatch::register_watchdog_for_test("corr-remote", handle);
+        let body = serde_json::to_vec(&WatchdogCancel {
+            tenant: "acme".into(),
+            correlation_id: "corr-remote".into(),
+            origin: "replica-b".into(),
+        })
+        .unwrap();
+        // Replica A (origin "replica-a") armed the watchdog; B admitted.
+        let target = watchdog_cancel_target("acme", "replica-a", &body).unwrap();
+        assert!(crate::runner::remote_dispatch::cancel_watchdog(&target));
+        assert!(!crate::runner::remote_dispatch::watchdog_pending(
+            "corr-remote"
+        ));
+    }
 
     #[test]
     fn tenant_filter_only_rejects_a_different_tenant() {

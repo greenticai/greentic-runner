@@ -680,6 +680,19 @@ empty) and `RuntimeSessionResumer` parses them back into the synthesized `ReplyS
 `FlowResumeStore::fetch` recomputes the same `scope_hash` as `save`. The sorx bridge echoes
 the correlation verbatim, so no sorx change is required.
 
+**Multi-replica response delivery.** Response listeners join a per-tenant queue group
+(`runner-{tenant}-{runtime}`) with a tenant filter, so one replica resumes each response:
+the park read (`FlowResumeStore::fetch`) and clear are NOT one atomic take, so letting every
+replica see every response (no queue group) could resume a wait twice. The deadline watchdog map
+(`remote_dispatch::WATCHDOGS`) is process-local, so the replica that admits a response may not be
+the one that armed the watchdog. The admitting replica therefore announces the correlation id on
+`greentic.dispatch.watchdog-cancel.v1` (`WatchdogCancel`), and every replica's
+`run_watchdog_cancel_listener` (plain subscription, tenant-filtered, ignoring its own `origin`)
+cancels the matching watchdog. Residual window: a notice that arrives after another turn of the
+same conversation armed a new watchdog on the receiving replica would retire it (the call then
+has no timeout fallback, the documented no-deadline limitation). Re-checking the park before
+publishing a `timeout` is not enough: a later wait parks under the same deterministic id.
+
 ### Agentic dispatch serve mode (`agentic.call` runtime side)
 
 The `agentic.call` node uses runtime name `"agentic"` → subjects
@@ -700,6 +713,16 @@ For a credit-free live e2e there is an `aw-serve` bin (features `serve,test-mock
 --features serve,test-mock --bin aw-serve` (env `AW_SERVE_AGENT_ID`,
 `AW_SERVE_REPLY`). `dw.agent` (in-process) stays untouched — `agentic.call` is the
 out-of-process path.
+
+**Dispatch ledger key.** Redelivery dedup (`DispatchLedger`) is keyed
+`{tenant}:{env}:{dispatch_id}`, where `dispatch_id` is the random `Greentic-Dispatch-Id`
+header `remote_dispatch::build_request` mints once per publish (stable when the broker redelivers
+that message, different for the next turn). It is a separate header on purpose: the correlation
+id / `Greentic-Idempotency-Key` is the downstream SESSION id for the agentic/telco bridges, so a
+nonce there would reset agent memory every turn, and keying the ledger on it replayed turn 1's
+reply as turn 2's for up to an hour. A request with no (or a malformed) dispatch id from an older
+runner is not deduplicated at all. The bridge hands it to invokers through
+`AgentDispatchInvoker::invoke_identified` (default delegates to `invoke`).
 
 **Opt-in in-process co-host (`GREENTIC_AGENTIC_SERVE_INPROC`)**: a single-node
 deployment can co-host the agentic-worker service inside the main runner process
@@ -743,6 +766,17 @@ Known gap, not closed here: `tenant_ctx_from_v1` lets a component override `team
 ### Guest sandbox, limits and outbound guard
 
 Each tenant's packs get `/state`, `/cache`, `/logs` backed by `<host dir>/tenants/<tenant>` (`RunnerWasiPolicy::for_tenant`; tenant ids must be `[A-Za-z0-9._-]{1,128}`, not `.`/`..`), and `env_allow` is only that tenant's `env_passthrough`. The pack-artifact cache (`<cache>/packs`) is never visible to guests. Data under the old host-wide dirs is not migrated. Execution limits live in `wasm_limits.rs`; the outbound SSRF/size guard in `http_guard.rs` (host `http-client`: checked in the client's DNS resolver, so it covers the connect address and redirects; `wasi:http`: the name is resolved and validated just before the upstream connector re-resolves it, so a DNS-rebinding race remains — egress-filter at the network layer if that matters).
+
+### Desktop session snapshots (legacy adoption)
+
+`greentic-runner-desktop` persists a parked run as `<escaped id>.snapshot.json`, wrapped with the
+owning `session_id`. Builds before `%xx` escaping used a lossy name (every unsafe byte became `_`)
+and wrote bare snapshots with no owner. For an id with unsafe characters the loader falls back to
+that legacy name when the current file is absent; a wrapped file must record the same id, but a
+BARE legacy file is accepted by whichever session maps to its name, so `a/b` can adopt a pre-upgrade
+park saved for `a_b`. Accepted residual risk, behaviour intentionally unchanged (see
+`load_legacy_session_snapshot`); it drains as old parks resume or expire, and nothing writes bare
+files any more.
 
 ### Pack Hot-Reload
 

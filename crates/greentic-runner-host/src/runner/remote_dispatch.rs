@@ -145,6 +145,14 @@ pub enum RemoteDispatchAction {
     Dispatched,
 }
 
+/// A fresh random per-publish dispatch id (32 lowercase hex characters).
+fn new_dispatch_id() -> String {
+    use rand::RngExt as _;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill(&mut bytes);
+    hex::encode(bytes)
+}
+
 /// A built NATS message (broker-free; unit-testable).
 pub struct BuiltRequest {
     pub subject: String,
@@ -185,6 +193,11 @@ pub fn build_request(req: &RemoteDispatch) -> Result<BuiltRequest> {
     headers.insert("Greentic-Tenant", req.tenant.as_str());
     headers.insert("Greentic-Env", req.env.as_str());
     headers.insert("Greentic-Idempotency-Key", req.correlation_id.as_str());
+    // Unique per publish (stable across broker redelivery of this message), so a
+    // consumer can dedup a redelivery without replaying an earlier turn of the
+    // same conversation. Kept OUT of the correlation id, which bridges reuse as
+    // the downstream session id.
+    headers.insert("Greentic-Dispatch-Id", new_dispatch_id().as_str());
 
     let action = match req.mode {
         DispatchMode::Await => RemoteDispatchAction::AwaitingResponse {
@@ -444,6 +457,28 @@ mod tests {
             !fired.load(std::sync::atomic::Ordering::SeqCst),
             "cancelled watchdog must never fire"
         );
+    }
+
+    #[test]
+    fn each_publish_gets_its_own_dispatch_id_but_the_same_correlation() {
+        let first = build_request(&sample(DispatchMode::Await)).unwrap();
+        let second = build_request(&sample(DispatchMode::Await)).unwrap();
+        let id = |built: &BuiltRequest| {
+            built
+                .headers
+                .get("Greentic-Dispatch-Id")
+                .map(|v| v.as_str().to_string())
+        };
+        let (a, b) = (id(&first), id(&second));
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(a, b, "two turns must not share a dispatch id");
+        let key = |built: &BuiltRequest| {
+            built
+                .headers
+                .get("Greentic-Idempotency-Key")
+                .map(|v| v.as_str().to_string())
+        };
+        assert_eq!(key(&first), key(&second), "the session hint is unchanged");
     }
 
     #[test]

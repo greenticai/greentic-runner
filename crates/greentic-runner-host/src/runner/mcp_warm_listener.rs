@@ -50,6 +50,27 @@ fn release_warm(key: &str) {
     WARMED.lock().remove(key);
 }
 
+/// Run `pull` under the in-flight claim for `key`, then ALWAYS release it.
+///
+/// The claim only dedupes listeners racing on the same event while a pull is
+/// running. It must not outlive the pull: the claim set is process-lifetime, so
+/// a key kept after success would make a repeated warm event (after the cache
+/// entry was evicted) be skipped forever. A repeat for an already cached
+/// component is a cheap no-op in `ensure_cached`. `None` = another listener
+/// holds the claim and the pull was skipped.
+async fn warm_once<F, Fut, T>(key: &str, pull: F) -> Option<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    if !claim_warm(key) {
+        return None;
+    }
+    let result = pull().await;
+    release_warm(key);
+    Some(result)
+}
+
 /// Subscribe to `greentic.mcp.warm.v1` and eagerly pull each pinned component
 /// into the local-wasm cache via
 /// [`greentic_aw_runtime::mcp_store_pull::ensure_cached`].
@@ -80,16 +101,18 @@ pub async fn run_mcp_warm_listener(client: async_nats::Client) -> Result<()> {
         };
 
         let warm_key = warm_key(&event);
-        if !claim_warm(&warm_key) {
-            continue;
-        }
-        match greentic_aw_runtime::mcp_store_pull::ensure_cached(
-            &event.component_ref,
-            &event.version,
-            &event.digest,
-        )
+        let Some(result) = warm_once(&warm_key, || {
+            greentic_aw_runtime::mcp_store_pull::ensure_cached(
+                &event.component_ref,
+                &event.version,
+                &event.digest,
+            )
+        })
         .await
-        {
+        else {
+            continue;
+        };
+        match result {
             Ok(()) => {
                 tracing::info!(
                     tenant = %event.tenant,
@@ -99,8 +122,8 @@ pub async fn run_mcp_warm_listener(client: async_nats::Client) -> Result<()> {
                 );
             }
             Err(pull_error) => {
-                // A failed pull may be retried by a later event.
-                release_warm(&warm_key);
+                // A failed pull may be retried by a later event (the claim was
+                // already released by `warm_once`).
                 tracing::warn!(
                     %pull_error,
                     tenant = %event.tenant,
@@ -117,7 +140,22 @@ pub async fn run_mcp_warm_listener(client: async_nats::Client) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WarmEvent, claim_warm, release_warm};
+    use super::{WarmEvent, claim_warm, release_warm, warm_once};
+
+    #[tokio::test]
+    async fn a_repeated_event_after_success_pulls_again_but_inflight_dedups() {
+        let key = "test-ref\u{1f}1.0.0\u{1f}digest-repeat";
+        // In flight: a second listener on the same event is skipped.
+        let inner = warm_once(key, || async {
+            let skipped = warm_once(key, || async { "second" }).await;
+            assert_eq!(skipped, None, "in-flight pull is deduped");
+            "first"
+        })
+        .await;
+        assert_eq!(inner, Some("first"));
+        // After success the claim is gone: a later event (cache evicted) pulls.
+        assert_eq!(warm_once(key, || async { "again" }).await, Some("again"));
+    }
 
     #[test]
     fn a_component_is_claimed_once_per_process_until_released() {
