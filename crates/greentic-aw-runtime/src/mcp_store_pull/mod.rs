@@ -66,6 +66,13 @@ const WASM_ENTRY: &str = "extension.wasm";
 /// hostile or misconfigured store from OOM-ing the runner before the digest check.
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// TCP connect bound for the artifact download.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest gap between two body reads before the download is abandoned.
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-download ceiling (the artifact cap is 256 MiB).
+const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Maximum DECOMPRESSED size of any single ZIP entry inside a `.gtxpack`. The
 /// `MAX_ARTIFACT_BYTES` cap bounds the compressed archive, but a hostile (or
 /// MITM'd) store could ship a small archive whose entries inflate hugely (a zip
@@ -125,6 +132,21 @@ pub async fn ensure_cached(
     validate_component_ref(component_ref)?;
     validate_component_version(component_version)?;
     let dest = cache_dir().join(format!("{component_ref}.wasm"));
+    if cache_is_current(&dest, component_digest) {
+        return Ok(());
+    }
+
+    // One pull per component at a time, process-wide. The cache is three files
+    // (sidecar, wasm, marker) per ref with no lock: two concurrent pulls (two
+    // tenants pinning different digests of one ref, or a warm event racing a
+    // probe) interleaved their writes, leaving a wasm paired with another
+    // pull's sidecar or marker. Serialised, the install order below holds.
+    let lock = pull_lock(component_ref);
+    let _held = lock.lock().await;
+    // Another task may have finished this exact pull while we waited.
+    if cache_is_current(&dest, component_digest) {
+        return Ok(());
+    }
     // Cache-hit ONLY when the cached wasm, its execution-digest sidecar, AND the
     // pinned-gtxpack marker are all present and the marker matches THIS request's
     // `component_digest`. Keying on file existence alone (the previous behaviour)
@@ -132,13 +154,6 @@ pub async fn ensure_cached(
     // digest — e.g. a security patch) would short-circuit on the stale cached
     // wasm and the runner would keep executing the OLD code indefinitely.
     // Comparing the marker forces a re-pull whenever the pinned digest changes.
-    if dest.exists()
-        && sidecar_path(&dest).exists()
-        && gtxpack_marker_matches(&gtxpack_marker_path(&dest), component_digest)
-    {
-        return Ok(());
-    }
-
     let base = std::env::var(STORE_URL_ENV)
         .map_err(|_| StorePullError::Config(format!("{STORE_URL_ENV} unset")))?;
     let url = format!(
@@ -184,6 +199,27 @@ pub async fn ensure_cached(
         .map_err(|e| StorePullError::Io(format!("write gtxpack marker: {e}")))?;
 
     Ok(())
+}
+
+/// Whether the cached wasm, its sidecar AND a marker equal to `digest` are all
+/// present (the marker is written last, so this means a completed pull).
+fn cache_is_current(dest: &Path, digest: &str) -> bool {
+    dest.exists()
+        && sidecar_path(dest).exists()
+        && gtxpack_marker_matches(&gtxpack_marker_path(dest), digest)
+}
+
+/// The per-`component_ref` pull lock (see [`ensure_cached`]).
+fn pull_lock(component_ref: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = OnceLock::new();
+    let map = LOCKS.get_or_init(Default::default);
+    // A poisoned map still holds valid locks: recover it rather than panic.
+    let mut guard = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.entry(component_ref.to_string()).or_default().clone()
 }
 
 /// Return the sidecar path for a cached wasm file (e.g. `router_echo.wasm.sha256`).
@@ -450,7 +486,15 @@ fn parse_trusted_signer(entry: &str) -> Option<VerifyingKey> {
 /// [`MAX_ARTIFACT_BYTES`], and also after buffering in case the header was absent
 /// or lied. This limits exposure to a hostile/misconfigured store.
 async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
-    let mut request = reqwest::Client::new().get(url);
+    // Bounded: an unbounded client let a stalled store hold a pull (and, now
+    // that pulls are serialised per ref, every waiter behind it) forever.
+    let client = reqwest::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .timeout(DOWNLOAD_TOTAL_TIMEOUT)
+        .build()
+        .map_err(|e| StorePullError::Network(format!("build http client: {e}")))?;
+    let mut request = client.get(url);
     if let Ok(token) = std::env::var(STORE_TOKEN_ENV)
         && !token.is_empty()
     {
