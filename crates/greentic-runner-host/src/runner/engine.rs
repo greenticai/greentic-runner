@@ -6909,7 +6909,8 @@ mod approval_gate_tests {
         ] {
             assert!(approval_requires_human(&input), "{input}");
         }
-        let ok = json!({ "mode": "above_confidence", "confidence": 0.9, "confidence_threshold": 0.5 });
+        let ok =
+            json!({ "mode": "above_confidence", "confidence": 0.9, "confidence_threshold": 0.5 });
         assert!(!approval_requires_human(&ok));
     }
 
