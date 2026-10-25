@@ -875,6 +875,7 @@ impl FlowEngine {
     /// dispatch or fail outright with `sorla_route_missing`.
     ///
     /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    #[cfg(feature = "agentic-worker")]
     fn remote_dispatch_configured(&self) -> bool {
         self.remote_dispatch_handler.is_some()
     }
@@ -4831,16 +4832,6 @@ fn component_error(value: &Value) -> Option<(String, String)> {
     Some((code.to_string(), message.to_string()))
 }
 
-/// Reply and node payload for an `{ok:false}` agent response envelope.
-///
-/// The agentic bridge reports a turn that ended without a final reply
-/// (timeout, max iterations) as `ok:false` with `error.message` set to a
-/// machine string while keeping the partial reply in `output.reply`. A
-/// non-empty `output.reply` is what the user should see; the error (and the
-/// trail, when present) stay on the payload for operators and routing. Without
-/// one, the reply is the localized user-safe failure line
-/// ([`user_facing_flow_failure_text`]), never the machine string; the error
-/// (code and message) stays on the payload for operators either way.
 #[cfg(feature = "agentic-worker")]
 /// `(code, message)` of an `{ok:false, error}` envelope for operator logs.
 /// The error may be an object `{code, message}` or a bare string; anything
@@ -4862,6 +4853,17 @@ fn agent_error_log_fields(entry: &Value) -> (String, String) {
     }
 }
 
+/// Reply and node payload for an `{ok:false}` agent response envelope.
+///
+/// The agentic bridge reports a turn that ended without a final reply
+/// (timeout, max iterations) as `ok:false` with `error.message` set to a
+/// machine string while keeping the partial reply in `output.reply`. A
+/// non-empty `output.reply` is what the user should see; the error (and the
+/// trail, when present) stay on the payload for operators and routing. Without
+/// one, the reply is the localized user-safe failure line
+/// ([`user_facing_flow_failure_text`]), never the machine string; the error
+/// (code and message) stays on the payload for operators either way.
+#[cfg(feature = "agentic-worker")]
 fn agent_error_envelope_reply(entry: &Value) -> (String, Value) {
     let error = entry.get("error").filter(|e| !e.is_null());
     let output = entry.get("output");
@@ -8993,6 +8995,7 @@ mod tests {
         assert_ne!(got["sub"], "forged@evil");
     }
 
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn dw_agent_node_routes_to_handler_and_returns_reply() {
         use crate::runner::agent_node::{AgentNodeHandler, RuntimeAgentNodeHandler};
@@ -10701,6 +10704,7 @@ mod tests {
     /// `bound` here has no `output:` binding key, so it degrades to the bare
     /// tool result (`{"error": "..."}`); `mcp_node_output_preserves_the_output_binding_key`
     /// below covers the wrapped case.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_reports_failure_when_the_node_has_an_error_route() {
         let result = json!({ "error": "MCP is not configured on this runner" });
@@ -10747,6 +10751,7 @@ mod tests {
     /// Compared against calling `mcp_tool_error` directly on the same value —
     /// not a hand-typed string — so this test cannot drift from the detector
     /// it is supposed to match.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_uses_mcp_tool_error_for_the_object_shaped_error() {
         let result = json!({
@@ -10792,6 +10797,7 @@ mod tests {
     /// field survives verbatim alongside the new top-level `ok`/`error`
     /// fields the errors envelope needs. `node.<id>.quote_result_data` and
     /// `node.<id>.errors[0].message` must both resolve from the same output.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_preserves_the_output_binding_key_alongside_the_error_envelope() {
         let result = json!({ "error": "connection refused" });
@@ -10829,6 +10835,7 @@ mod tests {
     /// failure is surfaced only when `has_error_route` is true; a node
     /// without one keeps reporting `ok: true`, byte-for-byte the pre-R3
     /// behaviour.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_ignores_failure_when_the_node_has_no_error_route() {
         let result = json!({ "error": "MCP is not configured on this runner" });
@@ -10850,6 +10857,7 @@ mod tests {
     /// The success path must stay exactly as it was, regardless of
     /// `has_error_route`: a node that opted into error routing but whose
     /// call succeeded must not be affected.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_stays_ok_on_success_regardless_of_error_route() {
         let result = json!({ "annual_premium": 1234 });
@@ -10865,6 +10873,7 @@ mod tests {
 
     /// Case 2 of the third-routing-shape analysis: a node WITH an `on_error`
     /// route takes it — this is the point of R3.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_failure_with_on_error_route_routes_to_the_error_branch() {
         let raw_routing = json!([
@@ -10898,6 +10907,7 @@ mod tests {
     /// `evaluate_custom_routing`: a node whose `Routing::Custom` array has
     /// only success-family routes never flips to `ok: false`, so it stays on
     /// the success path — never `CustomRoutingDecision::Wait` (parked).
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_failure_with_success_only_routing_never_parks() {
         let raw_routing = json!([
@@ -14438,6 +14448,7 @@ mod tests {
     }
 
     /// The operator log carries the machine error, never the localized reply.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn agent_error_log_fields_are_the_machine_error() {
         let entry =

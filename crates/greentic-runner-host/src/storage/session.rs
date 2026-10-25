@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+#[cfg(any(feature = "session-redis", test))]
+use greentic_session::SessionResult;
 use greentic_session::inmemory::InMemorySessionStore;
-use greentic_session::{SessionData, SessionKey as StoreSessionKey, SessionResult, SessionStore};
+use greentic_session::{SessionData, SessionKey as StoreSessionKey, SessionStore};
 use greentic_types::{
     EnvId, FlowId, GreenticError, PackId, SessionCursor as TypesSessionCursor, TenantCtx, TenantId,
     UserId,
@@ -21,6 +23,7 @@ use crate::engine::host::{
 };
 use crate::storage::config::SessionBackend;
 use crate::storage::offload::{Offloaded, StoreKind};
+#[cfg(any(feature = "session-redis", test))]
 use greentic_session::ReplyScope;
 
 pub type DynSessionStore = Arc<dyn SessionStore>;
@@ -464,17 +467,20 @@ fn map_store_error(err: GreenticError) -> RunnerError {
 /// it empties). Completing a flow clears everything via `clear_wait`; the
 /// residue is only for conversations abandoned mid-wait. Expiring that set is an
 /// upstream change in `greentic-session`.
+#[cfg(any(feature = "session-redis", test))]
 struct DefaultWaitTtl {
     inner: DynSessionStore,
     ttl: Duration,
 }
 
+#[cfg(any(feature = "session-redis", test))]
 impl DefaultWaitTtl {
     fn new(inner: DynSessionStore, ttl: Duration) -> Self {
         Self { inner, ttl }
     }
 }
 
+#[cfg(any(feature = "session-redis", test))]
 impl SessionStore for DefaultWaitTtl {
     fn create_session(&self, ctx: &TenantCtx, data: SessionData) -> SessionResult<StoreSessionKey> {
         self.inner.create_session(ctx, data)
