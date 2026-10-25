@@ -6396,40 +6396,54 @@ fn evaluate_custom_routing(
 ///   `f64`, and a non-numeric operand makes the condition false (never a panic).
 /// - `contains` — case-insensitive substring of the resolved string.
 fn evaluate_simple_condition(condition: &str, ctx: &Value) -> bool {
-    if let Some((path, expected)) = split_condition(condition, "==") {
-        return string_eq(ctx, path, expected, false);
+    let Some((op, path, expected)) = split_at_first_operator(condition) else {
+        return false;
+    };
+    match op {
+        "==" => string_eq(ctx, path, expected, false),
+        "!=" => string_eq(ctx, path, expected, true),
+        ">=" => numeric_cmp(ctx, path, expected, |a, b| a >= b),
+        "<=" => numeric_cmp(ctx, path, expected, |a, b| a <= b),
+        ">" => numeric_cmp(ctx, path, expected, |a, b| a > b),
+        "<" => numeric_cmp(ctx, path, expected, |a, b| a < b),
+        " contains " => {
+            let needle = expected.to_lowercase();
+            resolve_dotted_path(ctx, path)
+                .is_some_and(|actual| actual.to_lowercase().contains(&needle))
+        }
+        _ => false,
     }
-    if let Some((path, expected)) = split_condition(condition, "!=") {
-        return string_eq(ctx, path, expected, true);
-    }
-    if let Some((path, expected)) = split_condition(condition, ">=") {
-        return numeric_cmp(ctx, path, expected, |a, b| a >= b);
-    }
-    if let Some((path, expected)) = split_condition(condition, "<=") {
-        return numeric_cmp(ctx, path, expected, |a, b| a <= b);
-    }
-    if let Some((path, expected)) = split_condition(condition, ">") {
-        return numeric_cmp(ctx, path, expected, |a, b| a > b);
-    }
-    if let Some((path, expected)) = split_condition(condition, "<") {
-        return numeric_cmp(ctx, path, expected, |a, b| a < b);
-    }
-    if let Some((path, expected)) = split_condition(condition, " contains ") {
-        let needle = expected.to_lowercase();
-        return resolve_dotted_path(ctx, path)
-            .is_some_and(|actual| actual.to_lowercase().contains(&needle));
-    }
-    false
 }
 
-/// Split a condition on the first occurrence of `op` into a trimmed
-/// `(path, value)`, with surrounding quotes stripped from the value.
-/// `None` when `op` is absent.
-fn split_condition<'a>(condition: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
-    let idx = condition.find(op)?;
-    let path = condition[..idx].trim();
-    let value = condition[idx + op.len()..].trim().trim_matches('"');
-    Some((path, value))
+/// Operators in the order they are tried at one position: longer tokens first
+/// so `>=`/`<=` win over `>`/`<`.
+const CONDITION_OPERATORS: [&str; 7] = ["==", "!=", ">=", "<=", ">", "<", " contains "];
+
+/// Split a condition at its FIRST operator that is not inside double quotes,
+/// into `(operator, trimmed path, trimmed value)` with the value's surrounding
+/// quotes stripped.
+///
+/// "First" is by position, not by operator priority: a value that itself
+/// contains another operator (`x > "a==b"`) must split at the real operator,
+/// not at the one inside the literal. `None` when there is no operator.
+fn split_at_first_operator(condition: &str) -> Option<(&'static str, &str, &str)> {
+    let mut in_quotes = false;
+    for (idx, ch) in condition.char_indices() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if in_quotes {
+            continue;
+        }
+        let rest = &condition[idx..];
+        if let Some(op) = CONDITION_OPERATORS.iter().find(|op| rest.starts_with(**op)) {
+            let path = condition[..idx].trim();
+            let value = condition[idx + op.len()..].trim().trim_matches('"');
+            return Some((op, path, value));
+        }
+    }
+    None
 }
 
 /// Case-insensitive string equality of the resolved path against `expected`,
@@ -9921,6 +9935,19 @@ mod tests {
             .expect("jump target");
         assert_eq!(target.flow_id, "flow.target");
         assert_eq!(target.node_id.as_str(), "node-a");
+    }
+
+    #[test]
+    fn condition_values_containing_another_operator_split_at_the_real_one() {
+        let ctx = json!({ "x": "5", "msg": { "text": "a>=b" }, "n": 7 });
+        assert!(evaluate_simple_condition(r#"msg.text == "a>=b""#, &ctx));
+        assert!(!evaluate_simple_condition(r#"msg.text != "a>=b""#, &ctx));
+        // `>` is the operator; the `==` lives inside the quoted literal.
+        assert!(evaluate_simple_condition(r#"n > "3""#, &ctx));
+        assert!(!evaluate_simple_condition(r#"n > "a==b""#, &ctx));
+        assert!(evaluate_simple_condition(r#"x >= 5"#, &ctx));
+        assert!(evaluate_simple_condition(r#"msg.text contains "=b""#, &ctx));
+        assert!(!evaluate_simple_condition("no operator here", &ctx));
     }
 
     #[test]
