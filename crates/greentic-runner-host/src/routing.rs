@@ -58,12 +58,16 @@ impl RoutingConfig {
     }
 
     /// Fail startup on a configuration that must not run: `jwt` mode with no
-    /// verification key and no explicit gateway opt-in.
+    /// verification key and no explicit gateway opt-in, or an unsupported
+    /// `TENANT_RESOLVER` value.
     pub fn startup_check(&self) -> Result<()> {
-        if let TenantResolver::JwtUnconfigured(reason) = &self.resolver {
-            bail!("{reason}");
+        match &self.resolver {
+            TenantResolver::JwtUnconfigured(reason) => bail!("{reason}"),
+            // A typo in TENANT_RESOLVER must not boot a host that rejects
+            // every tenant-routed request.
+            TenantResolver::Invalid(reason) => bail!("{reason}"),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// Strict variant of [`Self::from_env_with_default`]: an invalid
@@ -665,6 +669,17 @@ mod tests {
         assert_eq!(tenant_from_host("[::1]:8080").as_deref(), Some("::1"));
         assert_eq!(tenant_from_host(":8080"), None);
         assert_eq!(tenant_from_host(""), None);
+    }
+
+    #[test]
+    fn invalid_resolver_fails_startup_check() {
+        let cfg = RoutingConfig {
+            resolver: TenantResolver::Invalid("unsupported TENANT_RESOLVER `hsot`".into()),
+            default_tenant: "demo".into(),
+        };
+        let err = cfg.startup_check().unwrap_err();
+        assert!(err.to_string().contains("hsot"));
+        assert!(RoutingConfig::default().startup_check().is_ok());
     }
 
     #[test]

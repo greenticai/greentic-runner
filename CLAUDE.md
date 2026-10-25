@@ -907,7 +907,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `PACK_VERIFY_STRICT` | Fail on missing/invalid signatures |
 | `PORT` | HTTP server port (also `--port` CLI flag) |
 | `DEFAULT_TENANT` | Fallback tenant for routing |
-| `TENANT_RESOLVER` | Routing mode: host/header/jwt/env |
+| `TENANT_RESOLVER` | Routing mode: host/header/jwt/env. An unsupported value (typo) fails startup via `RoutingConfig::startup_check` |
 | `ADMIN_TOKEN` | Bearer token for `/admin` endpoints (loopback-only when unset) |
 | `OPERATOR_TOKEN` | Bearer token for `POST /operator/op/invoke`; takes precedence over `ADMIN_TOKEN` for that route. With neither set the route stays open and startup logs a warning. The token is accepted from EITHER `Authorization: Bearer <token>` OR the dedicated `X-Operator-Token: <token>` header (needed when `Authorization` already carries a tenant JWT under `TENANT_RESOLVER=jwt`); both are compared in constant time |
 | `TENANT_JWT_SECRET` | HS256 shared secret for `TENANT_RESOLVER=jwt`: verifies signature, `exp`/`nbf` (60s leeway) and optional `iss`; failures are 401-class rejections. Only `alg: HS256` is accepted (`none`/RS256 rejected). RS256/ES256 (PEM) is not implemented |
