@@ -159,6 +159,9 @@ const JWT_LEEWAY_SECS: f64 = 60.0;
 pub struct JwtVerifier {
     secret: Vec<u8>,
     issuer: Option<String>,
+    /// Accept tokens that carry no `exp` claim. Default `false`: a token that
+    /// never expires is rejected. Opt out with `TENANT_JWT_ALLOW_NO_EXP`.
+    allow_no_exp: bool,
 }
 
 impl JwtVerifier {
@@ -166,7 +169,14 @@ impl JwtVerifier {
         Self {
             secret: secret.into(),
             issuer: issuer.filter(|v| !v.is_empty()),
+            allow_no_exp: false,
         }
+    }
+
+    /// Accept tokens without an `exp` claim (`TENANT_JWT_ALLOW_NO_EXP`).
+    pub fn with_allow_no_exp(mut self, allow: bool) -> Self {
+        self.allow_no_exp = allow;
+        self
     }
 
     /// Verify `token` and return its claims. `now` is unix seconds.
@@ -194,13 +204,17 @@ impl JwtVerifier {
             .map_err(|_| anyhow!("jwt signature mismatch"))?;
 
         let claims: Value = serde_json::from_slice(&b64url(payload_b64)?)?;
-        if let Some(exp) = claims.get("exp") {
-            let exp = exp
-                .as_f64()
-                .ok_or_else(|| anyhow!("jwt exp is not a number"))?;
-            if now > exp + JWT_LEEWAY_SECS {
-                bail!("jwt expired");
+        match claims.get("exp") {
+            Some(exp) => {
+                let exp = exp
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("jwt exp is not a number"))?;
+                if now > exp + JWT_LEEWAY_SECS {
+                    bail!("jwt expired");
+                }
             }
+            None if self.allow_no_exp => {}
+            None => bail!("jwt has no exp claim"),
         }
         if let Some(nbf) = claims.get("nbf") {
             let nbf = nbf
@@ -243,14 +257,20 @@ fn env_truthy(name: &str) -> bool {
 
 impl TenantResolver {
     /// Build the `jwt` resolver from explicit settings (testable without env).
-    fn jwt(secret: Option<String>, issuer: Option<String>, trust_gateway: bool) -> Self {
+    fn jwt(
+        secret: Option<String>,
+        issuer: Option<String>,
+        trust_gateway: bool,
+        allow_no_exp: bool,
+    ) -> Self {
         let header = AUTHORIZATION;
         let claim = "tenant".to_string();
         if let Some(secret) = secret.filter(|v| !v.is_empty()) {
             return Self::JwtVerified {
                 header,
                 claim,
-                verifier: JwtVerifier::new(secret.into_bytes(), issuer),
+                verifier: JwtVerifier::new(secret.into_bytes(), issuer)
+                    .with_allow_no_exp(allow_no_exp),
             };
         }
         if trust_gateway {
@@ -275,6 +295,7 @@ impl TenantResolver {
                 env_nonempty("TENANT_JWT_SECRET"),
                 env_nonempty("TENANT_JWT_ISSUER"),
                 env_truthy("TENANT_JWT_TRUST_GATEWAY"),
+                env_truthy("TENANT_JWT_ALLOW_NO_EXP"),
             )),
             "env" => Ok(Self::Env),
             other => bail!("unsupported TENANT_RESOLVER `{other}`"),
@@ -598,18 +619,30 @@ mod tests {
     }
 
     #[test]
+    fn jwt_verified_requires_exp_unless_opted_out() {
+        let token = hs256(r#"{"tenant":"acme"}"#);
+        let err = verifier(None).verify(&token, NOW).unwrap_err();
+        assert!(err.to_string().contains("exp"));
+        let lenient = verifier(None).with_allow_no_exp(true);
+        assert!(lenient.verify(&token, NOW).is_ok());
+        // With a present `exp` the opt-out changes nothing: still enforced.
+        let expired = hs256(r#"{"tenant":"acme","exp":1}"#);
+        assert!(lenient.verify(&expired, NOW).is_err());
+    }
+
+    #[test]
     fn jwt_verified_rejects_not_yet_valid() {
-        let token = hs256(r#"{"tenant":"acme","nbf":1800001000}"#);
+        let token = hs256(r#"{"tenant":"acme","exp":1800009000,"nbf":1800001000}"#);
         assert!(verifier(None).verify(&token, NOW).is_err());
     }
 
     #[test]
     fn jwt_verified_rejects_wrong_issuer() {
-        let token = hs256(r#"{"tenant":"acme","iss":"evil"}"#);
+        let token = hs256(r#"{"tenant":"acme","exp":1800000600,"iss":"evil"}"#);
         assert!(verifier(Some("good")).verify(&token, NOW).is_err());
-        let token = hs256(r#"{"tenant":"acme"}"#);
+        let token = hs256(r#"{"tenant":"acme","exp":1800000600}"#);
         assert!(verifier(Some("good")).verify(&token, NOW).is_err());
-        let token = hs256(r#"{"tenant":"acme","iss":"good"}"#);
+        let token = hs256(r#"{"tenant":"acme","exp":1800000600,"iss":"good"}"#);
         assert!(verifier(Some("good")).verify(&token, NOW).is_ok());
     }
 
@@ -633,7 +666,7 @@ mod tests {
 
     #[test]
     fn jwt_resolver_without_key_fails_startup() {
-        let resolver = TenantResolver::jwt(None, None, false);
+        let resolver = TenantResolver::jwt(None, None, false, false);
         assert!(matches!(resolver, TenantResolver::JwtUnconfigured(_)));
         let cfg = RoutingConfig {
             resolver,
@@ -647,7 +680,7 @@ mod tests {
 
     #[test]
     fn jwt_resolver_trust_gateway_opt_in_decodes_only() {
-        let resolver = TenantResolver::jwt(None, None, true);
+        let resolver = TenantResolver::jwt(None, None, true, false);
         assert!(matches!(resolver, TenantResolver::Jwt { .. }));
         let cfg = RoutingConfig {
             resolver,
@@ -666,12 +699,12 @@ mod tests {
 
     #[test]
     fn jwt_resolver_with_secret_verifies_end_to_end() {
-        let resolver = TenantResolver::jwt(Some(SECRET.into()), None, false);
+        let resolver = TenantResolver::jwt(Some(SECRET.into()), None, false, false);
         let routing = TenantRouting::new(RoutingConfig {
             resolver,
             default_tenant: "demo".into(),
         });
-        let good = hs256(r#"{"tenant":"acme"}"#);
+        let good = hs256(r#"{"tenant":"acme","exp":4102444800}"#);
         let forged = sign(r#"{"alg":"HS256"}"#, r#"{"tenant":"acme"}"#, "bad");
         let req = |t: &str| {
             Request::builder()
@@ -688,7 +721,7 @@ mod tests {
     #[test]
     fn jwt_verification_failures_are_auth_errors_but_missing_claim_is_not() {
         let routing = TenantRouting::new(RoutingConfig {
-            resolver: TenantResolver::jwt(Some(SECRET.into()), None, false),
+            resolver: TenantResolver::jwt(Some(SECRET.into()), None, false, false),
             default_tenant: "demo".into(),
         });
         let req = |auth: Option<String>| {
