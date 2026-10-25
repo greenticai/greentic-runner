@@ -319,6 +319,42 @@ impl Transport {
         want_card: bool,
         answer: Option<&Value>,
     ) -> Result<A2aReply, String> {
+        let first = self
+            .send_once(agent_id, text, prior, want_card, answer)
+            .await;
+        match (first, prior) {
+            // The remote refused a message that named a task: that task is
+            // probably gone (collected, expired, restarted). Keep the context
+            // (the conversation), drop the task id, and ask once more; a task
+            // id the remote has forgotten would otherwise fail every call
+            // until the one-hour idle expiry.
+            (Err(SendError::Rejected(reason)), Some(held)) if held.task_id.is_some() => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %reason,
+                    "a2a agent rejected a message naming a task; retrying once without the task id"
+                );
+                let without_task = A2aContinuation {
+                    task_id: None,
+                    ..held.clone()
+                };
+                self.send_once(agent_id, text, Some(&without_task), want_card, answer)
+                    .await
+                    .map_err(SendError::into_message)
+            }
+            (result, _) => result.map_err(SendError::into_message),
+        }
+    }
+
+    /// One attempt of [`send`](Self::send).
+    async fn send_once(
+        &self,
+        agent_id: &str,
+        text: &str,
+        prior: Option<&A2aContinuation>,
+        want_card: bool,
+        answer: Option<&Value>,
+    ) -> Result<A2aReply, SendError> {
         let route = self
             .agents
             .get(agent_id)
@@ -331,7 +367,7 @@ impl Transport {
             .map_err(|err| format!("fetching card for a2a agent {agent_id} failed: {err}"))?;
 
         if let Some(reason) = unsupported_required_extensions(&card) {
-            return Err(format!("a2a agent {agent_id} {reason}"));
+            return Err(format!("a2a agent {agent_id} {reason}").into());
         }
 
         let interface = card
@@ -351,7 +387,8 @@ impl Transport {
         if !target.username().is_empty() || target.password().is_some() {
             return Err(format!(
                 "a2a agent {agent_id} names an interface URL carrying userinfo; refusing it"
-            ));
+            )
+            .into());
         }
 
         // hyper-util skips the DNS resolver for an IP-literal host, so the
@@ -424,19 +461,29 @@ impl Transport {
         // JSON would otherwise report only "unreadable reply".
         let status = response.status();
         if !status.is_success() {
-            return Err(format!("a2a agent {agent_id} answered HTTP {status}"));
+            let message = format!("a2a agent {agent_id} answered HTTP {status}");
+            // A 4xx other than auth/rate-limit says the REQUEST was refused
+            // (e.g. an unknown task id); 5xx and the rest are not about it.
+            return Err(
+                if status.is_client_error() && !is_auth_or_rate_limit(status) {
+                    SendError::Rejected(message)
+                } else {
+                    SendError::Failed(message)
+                },
+            );
         }
 
-        let body: JsonRpcResponse<SendMessageResult> = response
-            .json()
+        let bytes = read_capped(response, MAX_REPLY_BYTES)
             .await
+            .map_err(|err| format!("a2a agent {agent_id} sent an unreadable reply: {err}"))?;
+        let body: JsonRpcResponse<SendMessageResult> = serde_json::from_slice(&bytes)
             .map_err(|err| format!("a2a agent {agent_id} sent an unreadable reply: {err}"))?;
 
         if let Some(error) = body.error {
-            return Err(format!(
+            return Err(SendError::Rejected(format!(
                 "a2a agent {agent_id} returned an error: {}",
                 error.message
-            ));
+            )));
         }
 
         match body.result {
@@ -453,11 +500,66 @@ impl Transport {
                 task_id: None,
             }),
             Some(SendMessageResult::Task(task)) => Ok(task_reply(agent_id, task)),
-            None => Err(format!(
-                "a2a agent {agent_id} returned neither a result nor an error"
-            )),
+            None => {
+                Err(format!("a2a agent {agent_id} returned neither a result nor an error").into())
+            }
         }
     }
+}
+
+/// Largest `SendMessage` reply body read. A reply is text and a few structured
+/// artifacts; a remote that sends more is broken or hostile, and the body is
+/// otherwise buffered whole.
+const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Why one `SendMessage` attempt failed.
+enum SendError {
+    /// The remote answered and refused THIS request (a JSON-RPC error, or an
+    /// HTTP 4xx other than auth/rate limit): the one failure that a stale
+    /// task id can cause.
+    Rejected(String),
+    /// Anything else: we could not reach it, it errored, or its reply was
+    /// unusable. Retrying without the task id would not help.
+    Failed(String),
+}
+
+impl SendError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Rejected(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
+impl From<String> for SendError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// 401/403 (credential problems) and 429 (rate limit) are about the caller,
+/// not about the task the message named.
+fn is_auth_or_rate_limit(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 429)
+}
+
+/// Read `response`'s body, refusing more than `cap` bytes (declared by
+/// `Content-Length` or actually received).
+async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > cap as u64)
+    {
+        return Err(format!("reply larger than {cap} bytes"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > cap {
+            return Err(format!("reply larger than {cap} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// The parts of the message we send: the text (when there is any) and, when
