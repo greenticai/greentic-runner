@@ -62,23 +62,7 @@ impl AdminAuth {
         self.effective_operator_token().is_some()
     }
 
-    /// Check a bearer against the operator token. `Ok` when no token is
-    /// configured (open route).
-    fn authorize_operator(&self, bearer: Option<&str>) -> Result<(), StatusCode> {
-        match self.effective_operator_token() {
-            None => Ok(()),
-            Some(expected) => {
-                let token = bearer.ok_or(StatusCode::UNAUTHORIZED)?;
-                if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-                    Ok(())
-                } else {
-                    Err(StatusCode::UNAUTHORIZED)
-                }
-            }
-        }
-    }
-
-    /// Like [`Self::authorize_operator`], but the operator token may arrive in
+    /// Check the operator token may arrive in
     /// EITHER `Authorization: Bearer` or the dedicated `X-Operator-Token`
     /// header. The second exists because `Authorization` is also what
     /// `TENANT_RESOLVER=jwt` reads, so a caller needing both a tenant JWT and
@@ -270,7 +254,7 @@ mod tests {
     fn operator_open_without_token() {
         let auth = AdminAuth::default();
         assert!(!auth.operator_protected());
-        assert!(auth.authorize_operator(None).is_ok());
+        assert!(auth.authorize_operator_headers(None, None).is_ok());
     }
 
     #[test]
@@ -279,12 +263,15 @@ mod tests {
             token: Some("admin".into()),
             ..AdminAuth::default()
         };
-        assert_eq!(auth.authorize_operator(None), Err(StatusCode::UNAUTHORIZED));
         assert_eq!(
-            auth.authorize_operator(Some("nope")),
+            auth.authorize_operator_headers(None, None),
             Err(StatusCode::UNAUTHORIZED)
         );
-        assert!(auth.authorize_operator(Some("admin")).is_ok());
+        assert_eq!(
+            auth.authorize_operator_headers(Some("nope"), None),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert!(auth.authorize_operator_headers(Some("admin"), None).is_ok());
     }
 
     #[test]
@@ -321,9 +308,9 @@ mod tests {
             ..AdminAuth::default()
         }
         .with_operator_token(Some("op".into()));
-        assert!(auth.authorize_operator(Some("op")).is_ok());
+        assert!(auth.authorize_operator_headers(Some("op"), None).is_ok());
         assert_eq!(
-            auth.authorize_operator(Some("admin")),
+            auth.authorize_operator_headers(Some("admin"), None),
             Err(StatusCode::UNAUTHORIZED)
         );
     }
