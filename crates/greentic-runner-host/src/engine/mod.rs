@@ -8,6 +8,7 @@ pub mod registry;
 pub mod runtime;
 pub mod shims;
 pub mod state_machine;
+pub(crate) mod turn_lock;
 
 pub use api::{FlowSchema, FlowSummary, RunFlowRequest, RunFlowResult, RunnerApi};
 pub use builder::{Runner, RunnerBuilder};

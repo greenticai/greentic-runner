@@ -602,6 +602,17 @@ Things most likely to break a running deployment, in the order to check them:
 - Graph runs: terminal run-id slots (`__2..__100`) are never reclaimed and a resumed run drops the new user message;
   both need `greentic-aw-runtime` graph-executor / checkpoint-store API changes.
 
+### Per-session turn lock (round 11)
+
+Concurrent turns for one parked session are now serialised in-process
+(`engine/turn_lock.rs`), including a late dispatch response racing a user
+message. The second turn observes the first's cleared/re-saved park instead of
+resuming the same snapshot, so a duplicated message no longer repeats
+`approval.call`, `sorla` writes, artifact uploads or emits. Observable change:
+turns on one session queue rather than interleave. Not fixed: the lock is
+in-process only; multi-replica deployments on a shared Redis session store still
+need a store-level compare-and-set/lease.
+
 ## Tests and CI
 
 - Tests that used to print "skipping" and pass (offline wasm fixture build, fixture build failure) now fail. Set

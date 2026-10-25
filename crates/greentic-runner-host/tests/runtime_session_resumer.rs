@@ -986,3 +986,82 @@ fn non_approval_dispatches_carry_no_nonce() -> Result<()> {
     assert!(split_dispatch_nonce(&correlation).1.is_none());
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Turn lock: `fetch` does not consume a parked snapshot, so two concurrent
+// messages for one parked session used to both resume it and both run its
+// effects. The per-session turn lock makes the second one see the cleared park
+// (the documented lenient-resumer behaviour: no park -> a fresh run).
+// ---------------------------------------------------------------------------
+
+fn completed_count(outputs: &[serde_json::Value]) -> usize {
+    outputs
+        .iter()
+        .filter(|value| value.to_string().contains("resumed and completed"))
+        .count()
+}
+
+#[test]
+fn two_concurrent_turns_on_one_parked_session_resume_it_exactly_once() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("turn-lock.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_wait_pack(&pack_path)?;
+    let config = Arc::new(host_config(&bindings_path));
+    let runtime = build_runtime(&pack_path, config)?;
+
+    rt.block_on(runtime.handle(inbound_envelope()))
+        .context("turn 1 should pause at session.wait")?;
+
+    let mut second = inbound_envelope();
+    second.payload = json!({ "text": "second" });
+    let mut third = inbound_envelope();
+    third.payload = json!({ "text": "third" });
+    let (a, b) = rt.block_on(async { tokio::join!(runtime.handle(second), runtime.handle(third)) });
+    let outputs = vec![a?, b?];
+    assert_eq!(
+        completed_count(&outputs),
+        1,
+        "the parked snapshot must be resumed by exactly one of two concurrent turns: {outputs:?}"
+    );
+    Ok(())
+}
+
+/// The resumer takes the turn lock and then calls `handle`, which takes it
+/// again for the same session on the same task: this must complete (no
+/// deadlock) while a user turn races it for the same park.
+#[test]
+fn a_dispatch_response_racing_a_user_turn_completes_without_deadlock() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("turn-lock-resumer.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_wait_pack(&pack_path)?;
+    let config = Arc::new(host_config(&bindings_path));
+    let runtime = build_runtime(&pack_path, config)?;
+    rt.block_on(runtime.handle(inbound_envelope()))
+        .context("turn 1 should pause at session.wait")?;
+
+    let correlation_id = format!("{BARE_HINT}::pack={PACK_ID}::flow={FLOW_ID}");
+    let tenant = TenantCtx::new(
+        EnvId::from_str("local").unwrap(),
+        TenantId::from_str("demo").unwrap(),
+    );
+    let resumer = RuntimeSessionResumer::new(Arc::clone(&runtime));
+    let raced = rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                runtime.handle(inbound_envelope()),
+                resumer.resume(tenant, &correlation_id, json!({ "ok": true }))
+            )
+        })
+        .await
+    });
+    let (user, response) = raced.context("resumer + user turn deadlocked")?;
+    response?;
+    assert!(completed_count(&[user?]) <= 1);
+    Ok(())
+}

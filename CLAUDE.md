@@ -873,6 +873,23 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
 - **`RunnerHost` installs `DiscardSessionHost`** as the engine-level `SessionHost`; the store-backed host was
   write-only and leaked a row per turn. Parked snapshots live in `FlowResumeStore`, not there.
 
+### Per-session turn lock
+
+`FlowResumeStore::fetch` does not consume a parked snapshot (it is cleared after
+a completed turn or overwritten by a new park), so two concurrent messages for
+one parked session used to both resume it and repeat its effects. Both
+`PackFlowAdapter::call_traced` and `RuntimeSessionResumer::resume_checked`
+(admission check + resume as one unit) now run under `engine::turn_lock`, an
+in-process keyed async mutex (key = `env:tenant:<derived store user id>`, the
+identity the park is stored under). Different sessions run in parallel; the
+guard is released on drop (cancellation/panic); map entries are swept when
+unused. The held keys ride a task-local, so a nested run for the same session on
+the same task (the resumer's inner `handle`) skips the lock; a `tokio::spawn`
+between them would NOT inherit it. Lenient-resumer semantics are unchanged: the
+loser of the race finds no park and starts a fresh run. **Limit: in-process
+only.** Replicas sharing a Redis session store need a store-level
+compare-and-set/lease, which the session store does not expose today.
+
 ### Pack Hot-Reload
 
 Full list of user-visible and breaking changes from the audit branch: `docs/audit-breaking-changes.md`.
