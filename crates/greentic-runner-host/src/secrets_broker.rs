@@ -91,7 +91,17 @@ impl BrokerSecretsManager {
                     Client::new()
                 }),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
-            token: token.into(),
+            token: token.into().trim().to_string(),
+        }
+    }
+
+    /// Attach the bearer credential only when there is one: an empty token
+    /// must not become `Authorization: Bearer ` on the wire.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.token.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.token)
         }
     }
 }
@@ -101,9 +111,7 @@ impl SecretsManager for BrokerSecretsManager {
     async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
         let url = format!("{}{}", self.endpoint, broker_path_from_uri(path)?);
         let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
+            .authorize(self.client.get(&url))
             .send()
             .await
             .map_err(|e| SecretError::Backend(Cow::Owned(e.to_string())))?;
@@ -138,9 +146,7 @@ impl SecretsManager for BrokerSecretsManager {
         let value = String::from_utf8(bytes.to_vec())
             .map_err(|e| SecretError::Backend(Cow::Owned(e.to_string())))?;
         let resp = self
-            .client
-            .put(&url)
-            .bearer_auth(&self.token)
+            .authorize(self.client.put(&url))
             .json(&serde_json::json!({
                 "visibility": "private",
                 "content_type": "text",
@@ -162,9 +168,7 @@ impl SecretsManager for BrokerSecretsManager {
     async fn delete(&self, path: &str) -> greentic_secrets_lib::Result<()> {
         let url = format!("{}{}", self.endpoint, broker_path_from_uri(path)?);
         let resp = self
-            .client
-            .delete(&url)
-            .bearer_auth(&self.token)
+            .authorize(self.client.delete(&url))
             .send()
             .await
             .map_err(|e| SecretError::Backend(Cow::Owned(e.to_string())))?;
@@ -240,6 +244,38 @@ mod tests {
         let mgr = BrokerSecretsManager::new(server.uri(), "tok");
         let bytes = mgr.read("secrets://default/acme/_/llm/abc").await.unwrap();
         assert_eq!(bytes, b"sk-xyz");
+    }
+
+    #[tokio::test]
+    async fn empty_token_sends_no_authorization_header() -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "value": "v", "encoding": "utf8"
+                })),
+            )
+            .mount(&server)
+            .await;
+        for token in ["", "   "] {
+            let mgr = BrokerSecretsManager::new(server.uri(), token);
+            mgr.read("secrets://default/acme/_/llm/abc").await?;
+        }
+        let with_token = BrokerSecretsManager::new(server.uri(), "tok");
+        with_token.read("secrets://default/acme/_/llm/abc").await?;
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].headers.get("authorization").is_none());
+        assert!(requests[1].headers.get("authorization").is_none());
+        assert_eq!(
+            requests[2]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer tok")
+        );
+        Ok(())
     }
 
     #[tokio::test]
