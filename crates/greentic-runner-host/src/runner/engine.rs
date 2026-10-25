@@ -1274,7 +1274,10 @@ impl FlowEngine {
                 .with_context(|| format!("flow {} has no start node", flow_ir.id))?,
         };
 
+        let mut steps_run: usize = 0;
         loop {
+            steps_run += 1;
+            check_step_budget(steps_run, flow_ir.id.as_str())?;
             let step_ctx = FlowContext {
                 tenant: ctx.tenant,
                 pack_id: ctx.pack_id,
@@ -6483,6 +6486,24 @@ fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
     }
 }
 
+/// Upper bound on nodes executed by ONE `drive_flow` call (one inbound turn).
+/// Pausing nodes end the call, so only a flow that loops without ever waiting
+/// (a routing cycle, a self-`flow.goto` chain) can reach it; generous enough
+/// that no legitimate graph does.
+const MAX_STEPS_PER_TURN: usize = 10_000;
+
+/// Fail a runaway turn with a clear error instead of spinning forever. The
+/// message deliberately avoids `should_retry`'s trigger words: re-running a
+/// cycle just burns another full budget.
+fn check_step_budget(steps_run: usize, flow_id: &str) -> Result<()> {
+    if steps_run > MAX_STEPS_PER_TURN {
+        bail!(
+            "flow_step_limit_exceeded: flow `{flow_id}` ran more than {MAX_STEPS_PER_TURN} nodes in one turn (routing cycle?)"
+        );
+    }
+    Ok(())
+}
+
 /// Success-family outcome ports, in the priority order used to pick the default
 /// success `event` for a node that succeeded without emitting an explicit
 /// `outcome`. `on_success` is first so components whose success name is the
@@ -9948,6 +9969,14 @@ mod tests {
         assert!(evaluate_simple_condition(r#"x >= 5"#, &ctx));
         assert!(evaluate_simple_condition(r#"msg.text contains "=b""#, &ctx));
         assert!(!evaluate_simple_condition("no operator here", &ctx));
+    }
+
+    #[test]
+    fn step_budget_trips_only_past_the_cap() {
+        assert!(check_step_budget(MAX_STEPS_PER_TURN, "f").is_ok());
+        let err = check_step_budget(MAX_STEPS_PER_TURN + 1, "f").unwrap_err();
+        assert!(err.to_string().contains("flow_step_limit_exceeded"));
+        assert!(!should_retry(&err));
     }
 
     #[test]
