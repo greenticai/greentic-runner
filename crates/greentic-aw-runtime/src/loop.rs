@@ -648,10 +648,19 @@ async fn run_step_scoped(
     // across turns or conversations (it holds bytes fetched under this turn's
     // authorisation).
     let turn_attachments = crate::attachments_materialize::TurnAttachments::for_turn();
+    // A turn resumed from a park continues the parked turn's budget, but gets
+    // at least one iteration: a flow that parked on the LAST iteration
+    // (`first_iter == max_iter`) would otherwise leave an empty range and the
+    // user's answer would never get a reply.
+    let iter_end = if first_iter > 0 {
+        config.limits.max_iter.max(first_iter.saturating_add(1))
+    } else {
+        config.limits.max_iter
+    };
     let iter_range = if suspension.is_some() {
         0..0
     } else {
-        first_iter..config.limits.max_iter
+        first_iter..iter_end
     };
 
     for iter in iter_range {
