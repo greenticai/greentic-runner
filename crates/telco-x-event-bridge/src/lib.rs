@@ -110,6 +110,10 @@ const MAX_SCOPE_ID_LEN: usize = 128;
 /// be acquired within wait window"); see [`is_lock_contention`].
 const LOCK_CONTENTION_MARKER: &str = "session lock could not be acquired";
 
+/// Substring of `AgentError::StateUnavailable`'s `Display` (state backend did
+/// not answer; nothing ran or was saved). Retryable like a busy session.
+const STATE_UNAVAILABLE_MARKER: &str = "agent state temporarily unavailable";
+
 /// Error an invoker can return when the target session is busy (another turn
 /// holds its lock). A busy session is never dropped silently: the bridge
 /// publishes a `session_busy` error response so the parked caller is not left
@@ -130,9 +134,10 @@ impl std::error::Error for LockContention {}
 #[must_use]
 pub fn is_lock_contention(error: &anyhow::Error) -> bool {
     error.downcast_ref::<LockContention>().is_some()
-        || error
-            .chain()
-            .any(|cause| cause.to_string().contains(LOCK_CONTENTION_MARKER))
+        || error.chain().any(|cause| {
+            let text = cause.to_string();
+            text.contains(LOCK_CONTENTION_MARKER) || text.contains(STATE_UNAVAILABLE_MARKER)
+        })
 }
 
 /// What became of one request message; drives the JetStream ack decision.
@@ -605,6 +610,9 @@ mod tests {
             .context("agent step failed");
         assert!(is_lock_contention(&wrapped));
         assert!(!is_lock_contention(&anyhow::anyhow!("boom")));
+        assert!(is_lock_contention(&anyhow::anyhow!(
+            "agent state temporarily unavailable: redis error: down"
+        )));
     }
 
     #[test]

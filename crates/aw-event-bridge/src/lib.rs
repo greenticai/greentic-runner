@@ -144,6 +144,12 @@ const MAX_SCOPE_ID_LEN: usize = 128;
 /// be acquired within wait window"); see [`is_lock_contention`].
 const LOCK_CONTENTION_MARKER: &str = "session lock could not be acquired";
 
+/// Substring of `AgentError::StateUnavailable`'s `Display` (the state backend
+/// did not answer; nothing ran or was saved). Retryable like a busy session,
+/// so it takes the same redeliver / `session_busy` path instead of
+/// `invoke_failed`.
+const STATE_UNAVAILABLE_MARKER: &str = "agent state temporarily unavailable";
+
 /// Error an invoker can return when the target session is busy (another turn
 /// holds its lock). A busy session is never acked silently: depending on the
 /// [`BusyPolicy`] the message is redelivered later or answered with a
@@ -164,9 +170,10 @@ impl std::error::Error for LockContention {}
 #[must_use]
 pub fn is_lock_contention(error: &anyhow::Error) -> bool {
     error.downcast_ref::<LockContention>().is_some()
-        || error
-            .chain()
-            .any(|cause| cause.to_string().contains(LOCK_CONTENTION_MARKER))
+        || error.chain().any(|cause| {
+            let text = cause.to_string();
+            text.contains(LOCK_CONTENTION_MARKER) || text.contains(STATE_UNAVAILABLE_MARKER)
+        })
 }
 
 /// What to do when the target session stays locked for the whole wait window.
@@ -775,6 +782,15 @@ mod tests {
             .context("agent step failed");
         assert!(is_lock_contention(&wrapped));
         assert!(!is_lock_contention(&anyhow::anyhow!("boom")));
+        let unavailable = anyhow::anyhow!("agent state temporarily unavailable: redis error: down")
+            .context("agentic step failed");
+        assert!(is_lock_contention(&unavailable));
+    }
+
+    #[test]
+    fn state_load_failures_other_than_a_blip_are_not_retryable() {
+        let decode = anyhow::anyhow!("agent state load failed: decode error: bad");
+        assert!(!is_lock_contention(&decode));
     }
 
     #[test]

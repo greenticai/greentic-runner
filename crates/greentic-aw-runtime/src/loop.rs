@@ -204,15 +204,19 @@ async fn run_step_scoped(
         .await
         .map_err(|e| match e {
             crate::error::StateError::LockTimeout(_) => AgentError::LockTimeout,
-            other => AgentError::StateLoad(other),
+            other => AgentError::from_state_error(other),
         })?;
 
-    // --- Load state (best-effort; empty on failure) ---
+    // --- Load state ---
+    // Only a stored state or a genuinely missing key (the store returns an
+    // empty state for that) may start the turn. Any other failure (backend
+    // blip, undecodable or too-new state) aborts WITHOUT saving: starting
+    // empty would let the end-of-turn save overwrite the stored conversation.
     let mut state = match runtime.state_store.load(&tenant, session_id).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, "state load failed; proceeding with empty state");
-            ConversationState::empty(&tenant, session_id)
+            warn!(error = %e, "state load failed; aborting the turn without saving");
+            return Err(AgentError::from_state_error(e));
         }
     };
     // --- Opening-message short-circuit ---
@@ -753,7 +757,12 @@ async fn run_step_scoped(
                 // Persist the (bounded) history so far; a failed save is
                 // logged, not swallowed.
                 state.truncate_history(config.limits.max_history_turns);
-                if let Err(save_err) = runtime.state_store.save(&tenant, session_id, &state).await {
+                // A lapsed lock means a newer turn may own the session: do
+                // not save over it.
+                if ensure_lock_held(&lock).await.is_ok()
+                    && let Err(save_err) =
+                        runtime.state_store.save(&tenant, session_id, &state).await
+                {
                     warn!(error = %save_err, "state save failed after llm error");
                 }
                 record_error_exit(
@@ -1105,13 +1114,19 @@ async fn run_step_scoped(
                     // remote side effect that is NOT recorded in any ledger, so
                     // a retried turn can perform it again. Tools with side
                     // effects must be idempotent.
+                    // `limits.timeout` may exceed the 90 s lock TTL, so the
+                    // lock is kept alive while the call is pending.
                     match tokio::time::timeout(
                         remaining,
-                        catalogs.dispatch(
-                            runtime.ext_runtime.clone(),
-                            call.clone(),
-                            &tenant,
-                            Some(&mut state.a2a),
+                        crate::lock_keepalive::keep_alive(
+                            &lock,
+                            crate::lock_keepalive::LOCK_KEEPALIVE_INTERVAL,
+                            catalogs.dispatch(
+                                runtime.ext_runtime.clone(),
+                                call.clone(),
+                                &tenant,
+                                Some(&mut state.a2a),
+                            ),
                         ),
                     )
                     .await

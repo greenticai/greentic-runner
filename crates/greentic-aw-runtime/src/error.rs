@@ -9,10 +9,35 @@ use thiserror::Error;
 
 use crate::config::AgentConfig;
 
+/// Substring of [`AgentError::StateUnavailable`]'s `Display`; the event
+/// bridges match it to classify the failure as retryable.
+pub const STATE_UNAVAILABLE_MARKER: &str = "agent state temporarily unavailable";
+
+impl AgentError {
+    /// Classify a state-backend failure met before the turn changed anything:
+    /// a backend that did not answer (`Redis`) is transient and retryable;
+    /// undecodable or too-new state is deterministic and must not be retried
+    /// (nor overwritten).
+    #[must_use]
+    pub fn from_state_error(error: StateError) -> Self {
+        match error {
+            StateError::Redis(_) => Self::StateUnavailable(error),
+            other => Self::StateLoad(other),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("agent state load failed: {0}")]
     StateLoad(#[from] StateError),
+
+    /// The state backend could not answer (a Redis blip). Transient: the turn
+    /// ran nothing and saved nothing, so it is safe to retry. The `Display`
+    /// text carries [`STATE_UNAVAILABLE_MARKER`] so the dispatch bridges
+    /// redeliver the request instead of answering with a failure.
+    #[error("agent state temporarily unavailable: {0}")]
+    StateUnavailable(StateError),
 
     #[error("llm provider unavailable")]
     LlmProviderUnavailable,

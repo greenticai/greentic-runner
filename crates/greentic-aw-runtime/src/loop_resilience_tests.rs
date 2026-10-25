@@ -171,6 +171,108 @@ async fn a_lost_session_lock_aborts_the_step_without_saving() {
     assert_eq!(recorded[0].terminated_by, TerminationReason::Error);
 }
 
+/// A store whose `load` always fails with the given error; counts saves.
+struct FailingLoadStore {
+    inner: MockAgentStateStore,
+    make_error: fn() -> StateError,
+    saves: std::sync::atomic::AtomicUsize,
+}
+impl FailingLoadStore {
+    fn new(make_error: fn() -> StateError) -> Self {
+        Self {
+            inner: MockAgentStateStore::new(),
+            make_error,
+            saves: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+impl AgentStateStore for FailingLoadStore {
+    fn load<'a>(
+        &'a self,
+        _tenant: &'a TenantContext,
+        _session_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ConversationState, StateError>> + Send + 'a>> {
+        let err = (self.make_error)();
+        Box::pin(async move { Err(err) })
+    }
+    fn save<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        state: &'a ConversationState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.save(tenant, session_id, state)
+    }
+    fn acquire_lock<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        wait: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionLock, StateError>> + Send + 'a>> {
+        self.inner.acquire_lock(tenant, session_id, wait)
+    }
+}
+
+#[tokio::test]
+async fn a_transient_state_load_failure_aborts_retryably_without_saving() {
+    let store = Arc::new(FailingLoadStore::new(|| StateError::Redis("blip".into())));
+    let llm = Arc::new(MockLlmBackend::new(vec![reply("never reached")]));
+    let (rt, tc, _t) = runtime(llm, store.clone(), AgentLimits::default());
+    let err = rt.step(tc, "s", "a", hi()).await.unwrap_err();
+    assert!(
+        matches!(err, AgentError::StateUnavailable(_)),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains(crate::error::STATE_UNAVAILABLE_MARKER)
+    );
+    assert_eq!(
+        store.saves.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a failed load must never be followed by a save"
+    );
+}
+
+#[tokio::test]
+async fn an_undecodable_or_too_new_state_aborts_without_saving_or_retry() {
+    for make in [
+        (|| StateError::Decode("bad json".into())) as fn() -> StateError,
+        || StateError::SchemaIncompatible {
+            found: 9,
+            supported: 1,
+        },
+    ] {
+        let store = Arc::new(FailingLoadStore::new(make));
+        let llm = Arc::new(MockLlmBackend::new(vec![reply("never reached")]));
+        let (rt, tc, _t) = runtime(llm, store.clone(), AgentLimits::default());
+        let err = rt.step(tc, "s", "a", hi()).await.unwrap_err();
+        assert!(matches!(err, AgentError::StateLoad(_)), "got {err:?}");
+        assert!(
+            !err.to_string()
+                .contains(crate::error::STATE_UNAVAILABLE_MARKER)
+        );
+        assert_eq!(store.saves.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_failed_load_does_not_take_the_opening_message_shortcut() {
+    let store = Arc::new(FailingLoadStore::new(|| StateError::Redis("blip".into())));
+    let llm = Arc::new(MockLlmBackend::new(vec![]));
+    let (rt, tc, _t) = runtime(llm, store.clone(), AgentLimits::default());
+    let err = rt
+        .step(tc, "s", "a", AgentInput::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AgentError::StateUnavailable(_)),
+        "got {err:?}"
+    );
+    assert_eq!(store.saves.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn malformed_tool_arguments_are_returned_to_the_model_not_dispatched() {
     let bad = call(
