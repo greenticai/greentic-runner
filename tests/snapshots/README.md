@@ -5,21 +5,27 @@ Snapshot tests live under `tests/snapshots/`:
 - `inputs/` holds the test inputs used to drive the runner.
 - `expected/` stores the golden snapshots (insta `.snap` files).
 
-## Updating snapshots
+## Running and updating snapshots
 
-To update snapshots locally:
-
-```bash
-INSTA_UPDATE=always cargo test -p greentic-runner snapshots
-```
-
-Alternatively, use the CLI flag to accept updates:
+The harness is the `snapshots` integration test of the `greentic-runner` crate
+(`crates/greentic-runner/tests/snapshots.rs`), driven by [insta](https://insta.rs):
 
 ```bash
-cargo test -p greentic-runner snapshots -- --accept
+cargo test -p greentic-runner --test snapshots
 ```
 
-Snapshots must **not** auto-update in CI.
+To update snapshots locally, set insta's update mode (there is no `--accept`
+test flag; that belongs to `cargo insta`):
+
+```bash
+INSTA_UPDATE=always cargo test -p greentic-runner --test snapshots
+```
+
+Alternatively, review pending `.snap.new` files with `cargo insta review`
+(requires `cargo install cargo-insta`).
+
+Snapshots must **not** auto-update in CI (insta defaults to `INSTA_UPDATE=no`
+when `CI` is set).
 
 ## Debugging failures
 
