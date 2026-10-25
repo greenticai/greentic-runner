@@ -4113,9 +4113,13 @@ impl ExecutionState {
     /// Record files a node created for the user this turn. Deduplicated by id
     /// and bounded, so a looping flow cannot grow the list without limit.
     fn note_created_artifacts(&mut self, created: Vec<Value>) {
+        let mut dropped = 0usize;
         for file in created {
             if self.created_artifacts.len() >= MAX_CREATED_PER_TURN {
-                break;
+                // The file exists in the artifact store but will NOT be listed
+                // in the turn's reply, so the user never receives it.
+                dropped += 1;
+                continue;
             }
             let id = file.get("id").and_then(Value::as_str);
             let known = self
@@ -4125,6 +4129,13 @@ impl ExecutionState {
             if id.is_some() && !known {
                 self.created_artifacts.push(file);
             }
+        }
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                cap = MAX_CREATED_PER_TURN,
+                "a turn created more files than the per-turn delivery cap; the extra files are stored but not listed in the reply"
+            );
         }
     }
 
