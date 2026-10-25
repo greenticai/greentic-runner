@@ -94,7 +94,7 @@ struct Cli {
     #[arg(long)]
     strict_signing: bool,
 
-    /// Signing policy (overrides --strict-signing)
+    /// Signing policy (mutually exclusive with --strict-signing)
     #[arg(long, value_enum)]
     policy: Option<RunPolicyArg>,
 
@@ -385,7 +385,7 @@ fn init_run_logging() -> Result<PathBuf> {
 }
 
 /// Combine `--policy` and `--strict-signing` into the effective policy.
-/// An explicit `--policy` wins; otherwise `--strict-signing` selects `Strict`.
+/// The two flags are rejected together earlier; `--strict-signing` alone selects `Strict`.
 fn resolve_policy(policy: Option<RunPolicyArg>, strict_signing: bool) -> RunPolicyArg {
     match (policy, strict_signing) {
         (Some(policy), _) => policy,
