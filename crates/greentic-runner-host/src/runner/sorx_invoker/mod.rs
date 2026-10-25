@@ -33,7 +33,7 @@ pub(crate) use http::fixtures;
 // not a descendant of it): a single `sorla.call` HTTP dispatch needs the
 // same discover-then-invoke pair `SorxRoutedInvoker` uses, without wanting
 // a whole tool-catalog invoker for one call.
-pub(crate) use http::{discover, invoke_sor};
+pub(crate) use http::{discover_checked, invoke_sor};
 pub(crate) use routed::SorxRoutedInvoker;
 
 /// Caller identity stamped on every capability invocation. SP1 has no

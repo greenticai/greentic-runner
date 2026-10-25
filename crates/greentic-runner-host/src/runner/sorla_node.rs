@@ -13,7 +13,7 @@ use greentic_secrets_lib::SecretsManager;
 use serde_json::Value;
 
 use super::sorla_route::{SorlaRouteError, resolve_route};
-use super::sorx_invoker::{discover, invoke_sor, shared_client};
+use super::sorx_invoker::{discover_checked, invoke_sor, shared_client};
 
 /// Run one `sorla.call` action over HTTP when a route document resolves for
 /// `sor`.
@@ -58,7 +58,10 @@ pub(crate) async fn execute_sorla_http(
     // THIS SoR offers under its own name — an offer for another pack, from a
     // misbehaving or shared-deployment server, simply has no entry under
     // this key and is never reachable through it.
-    let (_ops, cap_by_key) = discover(&client, &route).await;
+    //
+    // An unreachable or unauthorised SoR is reported as THAT, not as "no
+    // capability": the two send an operator to different places.
+    let (_ops, cap_by_key) = discover_checked(&client, &route).await?;
 
     let action = payload
         .get("operation")
@@ -185,5 +188,42 @@ mod tests {
             err.contains("landlord"),
             "error must name the SoR, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unauthorised_sor_is_reported_as_such_not_as_a_missing_capability() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/v1/capabilities"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let secrets = seed_landlord_route(&server).manager();
+
+        let payload = json!({"operation": "record_rent_payment", "input": {}});
+        let err = execute_sorla_http(&*secrets, "acme", None, "landlord", &payload, "flow:f/n")
+            .await
+            .expect_err("a rejected credential must be an error");
+
+        assert!(err.contains("sorla_unauthorized"), "got: {err}");
+        assert!(!err.contains("no capability"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_sor_is_reported_as_such() {
+        // Port 1 on loopback: nothing listens there (and, unlike a dropped
+        // mock server's port, no parallel test can be handed it).
+        let secrets = Handle::with(&[(
+            "secrets://default/acme/_/sorla/landlord",
+            r#"{"url":"http://127.0.0.1:1","tenant":"acme"}"#,
+        )])
+        .manager();
+
+        let payload = json!({"operation": "record_rent_payment", "input": {}});
+        let err = execute_sorla_http(&*secrets, "acme", None, "landlord", &payload, "flow:f/n")
+            .await
+            .expect_err("an unreachable SoR must be an error");
+
+        assert!(err.contains("sorla_unreachable"), "got: {err}");
     }
 }
