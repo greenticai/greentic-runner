@@ -371,8 +371,16 @@ pub async fn run_response_listener_scoped(
             if scope.tenant.is_some()
                 && get_header("Greentic-Tenant").is_none_or(|header| header.is_empty())
             {
+                // The awaiting flow is NOT resumed by a dropped response: it
+                // stays parked until its watchdog fires (indefinitely when the
+                // dispatch carried no deadline). Name the correlation id so an
+                // operator can find the wedged session.
                 tracing::warn!(
-                    "dropping dispatch response without a Greentic-Tenant header on a tenant-scoped listener"
+                    correlation_id = %crate::log_safe::log_safe(
+                        get_header("Greentic-Correlation-Id").unwrap_or("<none>")
+                    ),
+                    "dropping dispatch response without a Greentic-Tenant header on a tenant-scoped listener; \
+                     the awaiting flow stays parked until its watchdog fires"
                 );
             }
             continue;
