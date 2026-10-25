@@ -1330,6 +1330,12 @@ async fn apply_welcome_flow_override(
     Ok(())
 }
 
+/// How long a welcome-seen marker lives. Passed explicitly because `None`
+/// would let the Redis store's default wait TTL (24h) apply, and the marker is
+/// the DURABLE first-contact gate: expiring it would greet a returning user
+/// again the next day.
+const WELCOME_MARKER_TTL: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
 /// Persists a per-`(tenant, env, eid, user)` welcome-seen marker on first
 /// contact and returns `true` only when this turn observed no marker AND
 /// wrote one. Subsequent turns short-circuit to `false`.
@@ -1368,7 +1374,14 @@ async fn try_mark_welcome_first_contact(
         let data = marker_session_data(&ctx, &user);
         let session_key = marker_session_key(&ctx, &user, &scope);
         store
-            .register_wait(&ctx, &user, &scope, &session_key, data, None)
+            .register_wait(
+                &ctx,
+                &user,
+                &scope,
+                &session_key,
+                data,
+                Some(WELCOME_MARKER_TTL),
+            )
             .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
         Ok(true)
     })
