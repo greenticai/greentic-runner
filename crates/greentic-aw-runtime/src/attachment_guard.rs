@@ -98,13 +98,17 @@ impl AttachmentTextGuard for InboundChainGuard {
             inner: self.evaluator.as_ref(),
             errored: &errored,
         };
-        match run_chain(
-            &self.chain,
-            GuardrailDirection::Inbound,
-            text.to_string(),
-            &self.ctx,
-            &tracking,
-        ) {
+        // The evaluator runs WASM synchronously; keep it off the async worker.
+        let outcome = crate::guardrail::in_place_blocking(|| {
+            run_chain(
+                &self.chain,
+                GuardrailDirection::Inbound,
+                text.to_string(),
+                &self.ctx,
+                &tracking,
+            )
+        });
+        match outcome {
             ChainOutcome::Pass {
                 content,
                 observations,

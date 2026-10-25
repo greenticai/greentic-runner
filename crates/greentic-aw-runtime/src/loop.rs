@@ -354,13 +354,15 @@ async fn run_step_scoped(
     let user_message = if resuming.is_some() {
         crate::flow_suspend::last_user_text(&state)
     } else {
-        let user_text = match crate::guardrail::run_chain(
+        let user_text = match crate::guardrail::run_chain_blocking(
             &guardrail_chain,
             crate::guardrail::GuardrailDirection::Inbound,
             message.text,
             &guardrail_ctx,
-            runtime.guardrail_evaluator.as_ref(),
-        ) {
+            runtime.guardrail_evaluator.clone(),
+        )
+        .await
+        {
             crate::guardrail::ChainOutcome::Pass {
                 content,
                 observations,
@@ -1247,13 +1249,15 @@ async fn run_step_scoped(
         terminated_by,
         TerminationReason::FinalReply | TerminationReason::ConversationEnded
     ) {
-        let reply = match crate::guardrail::run_chain(
+        let reply = match crate::guardrail::run_chain_blocking(
             &guardrail_chain,
             crate::guardrail::GuardrailDirection::Outbound,
             reply,
             &guardrail_ctx,
-            runtime.guardrail_evaluator.as_ref(),
-        ) {
+            runtime.guardrail_evaluator.clone(),
+        )
+        .await
+        {
             crate::guardrail::ChainOutcome::Pass {
                 content,
                 observations,
