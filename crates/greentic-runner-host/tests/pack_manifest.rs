@@ -1127,7 +1127,7 @@ fn nested_flow_load_resolves_same_state_dir_as_parent() -> Result<()> {
             .find(|s| s.guest_path == "/state")
             .map(|s| s.host_path.clone())
     };
-    let parent = state_dir(&*pack.effective_wasi_policy());
+    let parent = state_dir(&pack.effective_wasi_policy());
     let nested = state_dir(&*rt.block_on(pack.nested_load_wasi_policy())?);
     assert_eq!(parent, Some(state_root.join("tenants").join("demo")));
     assert_eq!(nested, parent);
