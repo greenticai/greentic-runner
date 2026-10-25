@@ -417,9 +417,10 @@ Things most likely to break a running deployment, in the order to check them:
   `HostState::try_put_secret` for the `Result`. The runner registers `secrets-store` itself instead of the library's
   `add_secrets_store_compat_to_linker`.
 - **Size caps:** `GREENTIC_STATE_MAX_VALUE_MB` (16) and `GREENTIC_HTTP_MAX_REQUEST_MB` (64); `0` disables.
-- **Request timeout:** `GREENTIC_HTTP_REQUEST_TIMEOUT_SECS` (60, `0` disables) -> 408, except `/agent/chat/stream`.
+- **Request timeout:** `GREENTIC_HTTP_REQUEST_TIMEOUT_SECS` (60, `0` disables) -> 408 on `/admin/*`, `/healthz`, `/sql/*`. Exempt (`LONG_RUNNING_PATHS`, own deadlines): `/agent/chat`,
+  `/agent/chat/stream`, `/operator/op/invoke`.
 - **Logs:** guest- or peer-supplied text (secret keys, URLs, telemetry fields, correlation ids) is control-char
-  sanitised and length-capped (`log_safe`); URLs have userinfo/query redacted. Guest telemetry logs carry the
+  sanitised (`is_unsafe_log_char`: also U+2028/2029, bidi controls U+202A-202E / U+2066-2069, zero-width U+200B-200F and U+FEFF) and length-capped (`log_safe`); URLs have userinfo/query redacted. Guest telemetry logs carry the
   host-bound tenant as `host_tenant` and the guest claim as `guest_tenant`.
 - **stdin:** guests no longer inherit the host's stdin when stdio is inherited.
 

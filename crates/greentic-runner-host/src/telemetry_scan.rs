@@ -461,6 +461,10 @@ mod tests {
     fn sanitize_attr_strips_control_chars_and_bounds_length() {
         assert_eq!(sanitize_attr("a\nb\x1b[31mc", 64), "a b [31mc");
         assert_eq!(sanitize_attr(&"x".repeat(100), 10).len(), 10);
+        assert_eq!(
+            sanitize_attr("a\u{2028}b\u{202E}c\u{200B}d\u{FEFF}", 64),
+            "a b c d "
+        );
     }
 
     #[test]

@@ -2,6 +2,11 @@
 //! line: control characters (newlines, ANSI escapes) are replaced so one value
 //! cannot forge extra log records, and the length is bounded so it cannot
 //! flood the log.
+//!
+//! "Unsafe" is [`is_unsafe_log_char`]: C0/C1 controls plus the Unicode
+//! characters that can forge or visually reorder a log line without being
+//! `char::is_control` (line/paragraph separators, bidi controls, zero-width and
+//! format characters, BOM).
 
 use std::borrow::Cow;
 
@@ -9,23 +14,42 @@ use std::borrow::Cow;
 /// tenant name, ...) re-emitted into a log line.
 pub(crate) const DEFAULT_LOG_CHARS: usize = 256;
 
+/// True for a character that must not reach a log line verbatim.
+///
+/// `char::is_control` alone misses U+2028/U+2029 (line/paragraph separators,
+/// which many log viewers render as a line break), the bidi embedding,
+/// override and isolate controls (U+202A-U+202E, U+2066-U+2069) that reorder
+/// displayed text, and the zero-width / directional marks U+200B-U+200F and
+/// U+FEFF that make two different values look identical.
+pub(crate) fn is_unsafe_log_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
 /// [`log_safe_max`] with the default cap.
 pub(crate) fn log_safe(raw: &str) -> Cow<'_, str> {
     log_safe_max(raw, DEFAULT_LOG_CHARS)
 }
 
-/// Replace control characters with a space and keep at most `max_chars`
+/// Replace unsafe characters ([`is_unsafe_log_char`]) with a space and keep at most `max_chars`
 /// characters (never splitting a multibyte character). Borrows when the input
 /// needs no change.
 pub(crate) fn log_safe_max(raw: &str, max_chars: usize) -> Cow<'_, str> {
-    let clean = raw.chars().count() <= max_chars && !raw.chars().any(char::is_control);
+    let clean = raw.chars().count() <= max_chars && !raw.chars().any(is_unsafe_log_char);
     if clean {
         return Cow::Borrowed(raw);
     }
     Cow::Owned(
         raw.chars()
             .take(max_chars)
-            .map(|c| if c.is_control() { ' ' } else { c })
+            .map(|c| if is_unsafe_log_char(c) { ' ' } else { c })
             .collect(),
     )
 }
@@ -71,6 +95,42 @@ mod tests {
     fn multibyte_is_not_split() {
         assert_eq!(log_safe_max("ééééé", 3), "ééé");
         assert_eq!(log_safe_max("日本語日本語", 4), "日本語日");
+    }
+
+    #[test]
+    fn unicode_line_separators_are_neutralised() {
+        assert_eq!(log_safe("a\u{2028}b\u{2029}c"), "a b c");
+    }
+
+    #[test]
+    fn bidi_controls_are_neutralised() {
+        for c in ('\u{202A}'..='\u{202E}').chain('\u{2066}'..='\u{2069}') {
+            let raw = format!("a{c}b");
+            let out = log_safe(&raw);
+            assert_eq!(out, "a b", "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn zero_width_and_format_chars_are_neutralised() {
+        for c in ('\u{200B}'..='\u{200F}').chain(['\u{FEFF}']) {
+            let raw = format!("a{c}b");
+            let out = log_safe(&raw);
+            assert_eq!(out, "a b", "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn ordinary_unicode_is_kept() {
+        assert!(matches!(log_safe("日本語 é"), Cow::Borrowed(_)));
+        assert!(!is_unsafe_log_char('\u{2027}'));
+        assert!(!is_unsafe_log_char('\u{2030}'));
+    }
+
+    #[test]
+    fn truncation_stays_on_char_boundary_with_unsafe_chars() {
+        assert_eq!(log_safe_max("日\u{202E}本語日", 3), "日 本");
+        assert_eq!(log_safe_max("é\u{2028}éé", 2), "é ");
     }
 
     #[test]
