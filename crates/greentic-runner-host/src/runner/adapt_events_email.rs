@@ -69,9 +69,28 @@ pub fn build_email_http_execution(request: &EmailSendRequest) -> Result<EmailHtt
                     sender
                 );
             }
+            // The sender becomes ONE path segment. `\` and `%` are read as
+            // separators or escapes by some URL parsers, `.`/`..` collapse the
+            // segment, and whitespace/control characters have no business in a
+            // mailbox address.
+            let sender = sender.trim();
+            if sender.contains(['\\', '%'])
+                || sender.chars().any(|c| c.is_whitespace() || c.is_control())
+                || sender == "."
+                || sender == ".."
+            {
+                bail!("msgraph sender address is not a valid mailbox path segment");
+            }
+            let mut url = Url::parse("https://graph.microsoft.com/v1.0/users/")
+                .context("msgraph base url")?;
+            url.path_segments_mut()
+                .map_err(|_| anyhow!("msgraph base url cannot carry path segments"))?
+                .pop_if_empty()
+                .push(sender)
+                .push("sendMail");
             Ok(EmailHttpExecution {
                 method: "POST",
-                url: format!("https://graph.microsoft.com/v1.0/users/{sender}/sendMail"),
+                url: url.to_string(),
             })
         }
         EmailProviderKind::Gmail => Ok(EmailHttpExecution {
@@ -544,5 +563,31 @@ mod tests {
         let request = parse_email_send_request(&value).expect("parse request");
         let err = build_email_http_execution(&request).expect_err("invalid sender should fail");
         assert!(err.to_string().contains("must not contain '/', '?' or '#'"));
+    }
+
+    #[test]
+    fn msgraph_rejects_sender_path_tricks() {
+        for bad in [
+            "..",
+            ".",
+            "a\\b@example.com",
+            "a%2fb@example.com",
+            "a b@example.com",
+        ] {
+            let value = json!({
+                "provider": "msgraph",
+                "payload": { "message": { "from": { "emailAddress": { "address": bad } } } },
+                "oauth": {
+                    "provider_id": "msgraph-email",
+                    "flow": "client_credentials",
+                    "scopes": []
+                }
+            });
+            let request = parse_email_send_request(&value).expect("parse request");
+            assert!(
+                build_email_http_execution(&request).is_err(),
+                "sender {bad:?} must be rejected"
+            );
+        }
     }
 }
