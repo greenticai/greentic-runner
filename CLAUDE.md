@@ -286,6 +286,14 @@ team/tenant candidates still apply.
 context goes through `greentic_aw_runtime::url_redact::redact_url` (masks userinfo, handles
 comma-separated lists); see `serve::serve_with_ledger` and `maybe_spawn_inproc_agentic_serve`.
 
+**Outbound literal-IP guard (A2A and knowledge index).** `hyper-util` never consults the
+DNS resolver for an IP-literal host, so `GuardedResolver` alone does not stop
+`http://169.254.169.254/...`. The A2A client (`a2a_source::source::check_target_literal`, before any
+secret read) and the knowledge-index client (`knowledge_index::client::check_literal`, on the
+embeddings URL and each index search URL) therefore also call `HttpGuard::check_url_literal`. Known
+gap: `greentic-a2a`'s `CardCache` agent-card GET uses its own unguarded client. `runtime.rs`'s broker
+client talks to fixed provider endpoints, not pack-supplied URLs.
+
 ### Knowledge retrieval backends
 
 An agent's `Knowledge` implementation is a chain of wrappers around whatever is

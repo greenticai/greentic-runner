@@ -423,7 +423,11 @@ Things most likely to break a running deployment, in the order to check them:
   host-bound tenant as `host_tenant` and the guest claim as `guest_tenant`.
 - **stdin:** guests no longer inherit the host's stdin when stdio is inherited.
 
+- **Literal-IP SSRF:** A2A calls and knowledge-index embedding/search calls now refuse IP-literal link-local /
+  metadata hosts before sending (the resolver guard is skipped for IP literals).
+
 ### Known, not fixed
+- `greentic-a2a`'s `CardCache` agent-card GET uses its own unguarded HTTP client.
 - A guest can override the `Host` header on outbound requests. It does not bypass the SSRF guard (the connect
   address is checked), but the virtual host seen by the upstream is guest-chosen.
 - No disk quota for the guest `/state`, `/cache`, `/logs` mounts.
