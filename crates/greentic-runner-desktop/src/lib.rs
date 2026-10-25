@@ -837,6 +837,16 @@ fn load_session_snapshot(
 /// as "not ours" rather than aborting or resuming it. A bare snapshot with no
 /// recorded id predates id recording and is accepted: the caller only reaches
 /// here for ids containing unsafe characters.
+///
+/// RESIDUAL RISK (accepted, behaviour deliberately unchanged): the legacy name
+/// maps every unsafe byte to `_`, so distinct ids collide (`a/b` and `a_b`
+/// both map to `a_b.snapshot.json`). A bare legacy file carries no owner, so
+/// the session whose lossy name matches ADOPTS it: `a/b` can resume the park a
+/// build predating id recording saved for `a_b` (or the reverse). Wrapped files
+/// are checked against the recorded id, so this affects only pre-recording
+/// files, which no current build writes and which disappear as those parks
+/// resume or expire. Anyone sharing a session state dir between untrusted
+/// session ids on such an upgrade should clear the bare `*.snapshot.json` files.
 fn load_legacy_session_snapshot(
     path: &Path,
     session_id: &str,

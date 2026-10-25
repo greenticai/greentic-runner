@@ -767,6 +767,17 @@ Known gap, not closed here: `tenant_ctx_from_v1` lets a component override `team
 
 Each tenant's packs get `/state`, `/cache`, `/logs` backed by `<host dir>/tenants/<tenant>` (`RunnerWasiPolicy::for_tenant`; tenant ids must be `[A-Za-z0-9._-]{1,128}`, not `.`/`..`), and `env_allow` is only that tenant's `env_passthrough`. The pack-artifact cache (`<cache>/packs`) is never visible to guests. Data under the old host-wide dirs is not migrated. Execution limits live in `wasm_limits.rs`; the outbound SSRF/size guard in `http_guard.rs` (host `http-client`: checked in the client's DNS resolver, so it covers the connect address and redirects; `wasi:http`: the name is resolved and validated just before the upstream connector re-resolves it, so a DNS-rebinding race remains — egress-filter at the network layer if that matters).
 
+### Desktop session snapshots (legacy adoption)
+
+`greentic-runner-desktop` persists a parked run as `<escaped id>.snapshot.json`, wrapped with the
+owning `session_id`. Builds before `%xx` escaping used a lossy name (every unsafe byte became `_`)
+and wrote bare snapshots with no owner. For an id with unsafe characters the loader falls back to
+that legacy name when the current file is absent; a wrapped file must record the same id, but a
+BARE legacy file is accepted by whichever session maps to its name, so `a/b` can adopt a pre-upgrade
+park saved for `a_b`. Accepted residual risk, behaviour intentionally unchanged (see
+`load_legacy_session_snapshot`); it drains as old parks resume or expire, and nothing writes bare
+files any more.
+
 ### Pack Hot-Reload
 
 Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 30s). On change: resolve locators → verify digest/signature → cache artifacts → atomically swap `TenantRuntime` via `ArcSwap`. Overlays independently deployable per tenant.
