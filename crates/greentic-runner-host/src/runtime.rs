@@ -1786,6 +1786,23 @@ impl TenantRuntime {
                     &state_machine,
                 )),
             );
+            // Replica id for the watchdog-cancel broadcast: the queue group
+            // below means the replica that admits a response may not be the
+            // one that armed the (process-local) deadline watchdog.
+            let cancel_origin = {
+                use rand::RngExt as _;
+                let mut bytes = [0u8; 16];
+                rand::rng().fill(&mut bytes);
+                hex::encode(bytes)
+            };
+            background_handles.push(spawn_listener_logged(
+                "watchdog-cancel",
+                crate::runner::dispatch_listener::run_watchdog_cancel_listener(
+                    client.clone(),
+                    config.tenant.clone(),
+                    cancel_origin.clone(),
+                ),
+            ));
             for runtime_name in ["sorla", "operala", "agentic", "telco-x", "approval"] {
                 // Per-tenant queue group + tenant filter: replicas and reloaded
                 // runtimes of one tenant share a delivery, and one tenant's
@@ -1793,6 +1810,7 @@ impl TenantRuntime {
                 let scope = crate::runner::dispatch_listener::ListenerScope {
                     queue_group: Some(format!("runner-{}-{runtime_name}", config.tenant)),
                     tenant: Some(config.tenant.clone()),
+                    cancel_origin: Some(cancel_origin.clone()),
                 };
                 background_handles.push(spawn_listener_logged(
                     runtime_name,

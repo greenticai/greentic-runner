@@ -680,6 +680,19 @@ empty) and `RuntimeSessionResumer` parses them back into the synthesized `ReplyS
 `FlowResumeStore::fetch` recomputes the same `scope_hash` as `save`. The sorx bridge echoes
 the correlation verbatim, so no sorx change is required.
 
+**Multi-replica response delivery.** Response listeners join a per-tenant queue group
+(`runner-{tenant}-{runtime}`) with a tenant filter, so one replica resumes each response:
+the park read (`FlowResumeStore::fetch`) and clear are NOT one atomic take, so letting every
+replica see every response (no queue group) could resume a wait twice. The deadline watchdog map
+(`remote_dispatch::WATCHDOGS`) is process-local, so the replica that admits a response may not be
+the one that armed the watchdog. The admitting replica therefore announces the correlation id on
+`greentic.dispatch.watchdog-cancel.v1` (`WatchdogCancel`), and every replica's
+`run_watchdog_cancel_listener` (plain subscription, tenant-filtered, ignoring its own `origin`)
+cancels the matching watchdog. Residual window: a notice that arrives after another turn of the
+same conversation armed a new watchdog on the receiving replica would retire it (the call then
+has no timeout fallback, the documented no-deadline limitation). Re-checking the park before
+publishing a `timeout` is not enough: a later wait parks under the same deterministic id.
+
 ### Agentic dispatch serve mode (`agentic.call` runtime side)
 
 The `agentic.call` node uses runtime name `"agentic"` → subjects
