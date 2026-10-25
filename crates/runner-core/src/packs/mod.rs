@@ -436,19 +436,32 @@ fn compute_digest(path: &Path) -> Result<PackDigest> {
     PackDigest::parse(format!("sha256:{digest_hex}"))
 }
 
+/// Turn a pack name into one safe path segment.
+///
+/// Characters that could add a path component (`/`, `\`, `:`) map to `_`, and
+/// `.`/`..` (which would resolve to the cache root / its parent) become `_`.
+/// That mapping is lossy (`a/b` and `a_b` agree), so whenever it changed
+/// anything a short digest of the RAW name is appended: `a/b` and `a_b` get
+/// different cache directories instead of sharing, and overwriting, one.
+/// A name the mapping leaves alone (the ordinary case) is unchanged, so
+/// existing cache directories keep their names.
 fn sanitize_segment(value: &str) -> String {
-    // `.` and `..` survive the character map but would resolve to the cache
-    // root / its parent when joined as a path segment.
-    if value == "." || value == ".." {
-        return "_".to_string();
+    let mapped: String = match value {
+        "." | ".." => "_".to_string(),
+        _ => value
+            .chars()
+            .map(|ch| match ch {
+                '/' | '\\' | ':' => '_',
+                other => other,
+            })
+            .collect(),
+    };
+    if mapped == value {
+        return mapped;
     }
-    value
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' => '_',
-            other => other,
-        })
-        .collect()
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{mapped}-{}", to_hex(&digest[..4]))
 }
 
 fn to_hex(digest: &[u8]) -> String {
@@ -461,9 +474,25 @@ mod sanitize_tests {
 
     #[test]
     fn dot_segments_cannot_escape_the_cache_root() {
-        assert_eq!(sanitize_segment("."), "_");
-        assert_eq!(sanitize_segment(".."), "_");
-        assert_eq!(sanitize_segment("a/../b"), "a_.._b");
+        for hostile in [".", "..", "a/../b", "../x", "..\\x", "/abs", "a/b"] {
+            let seg = sanitize_segment(hostile);
+            assert!(
+                !seg.contains(['/', '\\']) && seg != "." && seg != "..",
+                "{hostile:?} -> {seg:?}"
+            );
+        }
         assert_eq!(sanitize_segment("pack.v2"), "pack.v2");
+    }
+
+    #[test]
+    fn names_the_mapping_conflates_get_distinct_segments() {
+        let slash = sanitize_segment("a/b");
+        let underscore = sanitize_segment("a_b");
+        assert_eq!(underscore, "a_b", "ordinary names are unchanged");
+        assert_ne!(slash, underscore);
+        assert!(slash.starts_with("a_b-"));
+        // Deterministic.
+        assert_eq!(slash, sanitize_segment("a/b"));
+        assert_ne!(sanitize_segment("a/b"), sanitize_segment("a:b"));
     }
 }

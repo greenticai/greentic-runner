@@ -194,13 +194,15 @@ impl TryFrom<RawPackEntry> for PackEntry {
     }
 }
 
-/// A pack name becomes a cache directory segment, so it must be a plain,
-/// single path component.
+/// A pack name is an identifier, not a path. Namespaced names (`acme/pack`)
+/// are legitimate; the cache never uses the raw name as a path, it goes through
+/// `sanitize_segment`, which maps separators away and keeps `..` from escaping.
+/// So only names that are meaningless or unsafe to sanitize are rejected:
+/// empty, `.`, `..` and NUL. One bad entry aborts the whole reload for every
+/// tenant, which is why this stays as permissive as the cache allows.
 fn validate_pack_name(name: &str) -> Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
-        bail!(
-            "invalid pack name `{name}`: must be non-empty, not `.`/`..`, and contain no path separators"
-        );
+    if name.is_empty() || name == "." || name == ".." || name.contains('\0') {
+        bail!("invalid pack name `{name}`: must be non-empty, not `.`/`..`, and contain no NUL");
     }
     Ok(())
 }
@@ -252,8 +254,8 @@ mod name_tests {
     }
 
     #[test]
-    fn rejects_names_that_escape_the_cache() {
-        for bad in ["", ".", "..", "a/b", "a\\b", "../x", "a\0b"] {
+    fn rejects_empty_dot_dotdot_and_nul_names() {
+        for bad in ["", ".", "..", "a\0b"] {
             assert!(
                 raw(bad).into_entry(None).is_err(),
                 "{bad:?} must be rejected"
@@ -263,7 +265,15 @@ mod name_tests {
 
     #[test]
     fn accepts_ordinary_names() {
-        for good in ["demo", "acme.pack-v2", "a_b"] {
+        for good in [
+            "demo",
+            "acme.pack-v2",
+            "a_b",
+            "a/b",
+            "a\\b",
+            "a/../b",
+            "../x",
+        ] {
             assert!(
                 raw(good).into_entry(None).is_ok(),
                 "{good:?} must be accepted"
