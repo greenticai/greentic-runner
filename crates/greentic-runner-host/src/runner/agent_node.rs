@@ -606,12 +606,16 @@ mod aw {
                         %code,
                         "DwAgent blocked by guardrail"
                     );
-                    Ok(guardrail_denied_json(
-                        direction,
-                        &code,
-                        &message,
-                        details.as_deref(),
-                    ))
+                    let mut out =
+                        guardrail_denied_json(direction, &code, &message, details.as_deref());
+                    // A denial must not strand a `flow:` tool that is still
+                    // parked on its card: re-offer it like any other failed turn
+                    // so the engine keeps its await armed.
+                    if let Some(card) = self.runtime.parked_card(&tenant_for_card, session_id).await
+                    {
+                        reoffer_parked_card(&mut out, card);
+                    }
+                    Ok(out)
                 }
                 Err(error) => {
                     // Never leak the internal AgentError to the flow output. Log
@@ -3122,6 +3126,25 @@ mod aw {
     #[cfg(test)]
     mod parked_card_tests {
         use serde_json::json;
+
+        #[test]
+        fn a_guardrail_denial_with_a_kept_park_offers_the_denial_then_the_card() {
+            use greentic_aw_runtime::guardrail::GuardrailDirection;
+            let mut out = super::guardrail_denied_json(
+                GuardrailDirection::Inbound,
+                "permission_denied",
+                "not allowed",
+                None,
+            );
+            let card = json!({ "type": "AdaptiveCard", "body": [] });
+            super::reoffer_parked_card(&mut out, card.clone());
+            assert_eq!(out["terminated_by"], "awaiting_tool_input");
+            assert_eq!(out["guardrail"]["blocked"], true);
+            let rendered = crate::runner::engine::rendered_park(&out);
+            let items = rendered.as_array().expect("reply + card");
+            assert_eq!(items[0]["reply"], "not allowed");
+            assert_eq!(items[1], card);
+        }
 
         #[test]
         fn a_failed_turn_with_a_kept_park_offers_its_reply_then_the_card() {
