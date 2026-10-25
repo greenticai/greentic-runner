@@ -29,12 +29,24 @@ fn lock_key(tenant: &TenantContext, session_id: &str) -> String {
 /// `AgentStateStore` backed by an [`AwKv`]. Cheap to clone the `Arc`.
 pub struct KvAgentStateStore {
     kv: Arc<dyn AwKv>,
+    lock_ttl: Duration,
 }
 
 impl KvAgentStateStore {
     /// Wrap a shared key-value backend.
     pub fn new(kv: Arc<dyn AwKv>) -> Self {
-        Self { kv }
+        Self {
+            kv,
+            lock_ttl: LOCK_TTL,
+        }
+    }
+
+    /// Override the session-lock TTL (default 90 s). Lets a test make a lock
+    /// lapse quickly; production keeps the default.
+    #[must_use]
+    pub fn with_lock_ttl(mut self, ttl: Duration) -> Self {
+        self.lock_ttl = ttl;
+        self
     }
 }
 
@@ -88,13 +100,14 @@ impl AgentStateStore for KvAgentStateStore {
             loop {
                 if self
                     .kv
-                    .set_nx(&key, token.clone().into_bytes(), LOCK_TTL)
+                    .set_nx(&key, token.clone().into_bytes(), self.lock_ttl)
                     .await?
                 {
                     let inner = KvSessionLock {
                         kv: self.kv.clone(),
                         key,
                         token,
+                        ttl: self.lock_ttl,
                     };
                     return Ok(SessionLock::new(Box::new(inner)));
                 }
@@ -111,6 +124,7 @@ struct KvSessionLock {
     kv: Arc<dyn AwKv>,
     key: String,
     token: String,
+    ttl: Duration,
 }
 
 impl SessionLockInner for KvSessionLock {
@@ -118,7 +132,7 @@ impl SessionLockInner for KvSessionLock {
         Box::pin(async move {
             let ok = self
                 .kv
-                .compare_refresh(&self.key, self.token.as_bytes(), LOCK_TTL)
+                .compare_refresh(&self.key, self.token.as_bytes(), self.ttl)
                 .await?;
             if ok {
                 return Ok(());

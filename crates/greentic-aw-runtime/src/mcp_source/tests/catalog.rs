@@ -550,3 +550,71 @@ async fn a_team_less_identity_sends_no_team_header() {
          different claim and the admin may reject it"
     );
 }
+
+/// A catalog build probes servers concurrently: N servers each taking 1 s to
+/// list tools cost about 1 s, not N seconds (it runs under the session lock).
+#[tokio::test]
+async fn servers_are_probed_concurrently_and_ingested_in_order() {
+    use wiremock::matchers::body_partial_json;
+
+    const SERVERS: usize = 6;
+    let mut mcps = Vec::new();
+    let mut rows = Vec::new();
+    for i in 0..SERVERS {
+        let mcp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "initialize" })))
+            .respond_with(initialize_ok())
+            .mount(&mcp)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({ "method": "notifications/initialized" }),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mcp)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "tools/list" })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(1))
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0", "id": 2,
+                        "result": { "tools": two_tools() }
+                    })),
+            )
+            .mount(&mcp)
+            .await;
+        rows.push(json!({
+            "id": format!("srv{i}"),
+            "name": "Server",
+            "transport_url": mcp.uri(),
+            "auth_header_name": null,
+            "auth_token": null,
+            "allowed_tools": null,
+            "roles": [MCP_ROLE_AGENTIC_WORKER],
+        }));
+        mcps.push(mcp);
+    }
+    let admin = MockServer::start().await;
+    mount_admin(&admin, json!({ "servers": rows })).await;
+
+    let source = McpToolSource::new(admin.uri(), "gtc_live_x");
+    let started = std::time::Instant::now();
+    let catalog = source.catalog(&tenant()).await;
+    let elapsed = started.elapsed();
+
+    for i in 0..SERVERS {
+        assert!(
+            catalog
+                .tool_entry(&format!("srv{i}"), "get_issue")
+                .is_some(),
+            "srv{i} must be in the catalog"
+        );
+    }
+    assert!(
+        elapsed < std::time::Duration::from_millis(4500),
+        "probes must overlap (sequential would be {SERVERS}s+), took {elapsed:?}"
+    );
+}

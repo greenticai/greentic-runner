@@ -68,6 +68,29 @@ fn preflight_warn_tools(agent_id: &str, missing: &[crate::tools::MissingTool], d
 /// extension is preferable to aborting a partially-complete turn), but a lock
 /// that is genuinely gone means another worker may now own the session:
 /// carrying on would let two turns race and the last save win.
+/// Await the per-step ledger read and tool-catalog resolve together while
+/// keeping the session `lock` alive.
+///
+/// Both run under the lock, and a cold catalog resolve can outlast its TTL (90 s):
+/// a local-wasm MCP pull is allowed `PULL_TIMEOUT` = 300 s and every other
+/// server `PROBE_TIMEOUT` = 5 s. A lapsed lock is `LockLost` at the next
+/// `ensure_lock_held`, which killed the turn (and JetStream acked it as
+/// `invoke_failed`). So refresh every `every`, like every other long await in
+/// this loop.
+async fn resolve_under_lock<L, C>(
+    lock: &crate::state::SessionLock,
+    every: std::time::Duration,
+    ledger_read: L,
+    catalogs: C,
+) -> (L::Output, C::Output)
+where
+    L: std::future::Future,
+    C: std::future::Future,
+{
+    crate::lock_keepalive::keep_alive(lock, every, async { tokio::join!(ledger_read, catalogs) })
+        .await
+}
+
 async fn ensure_lock_held(lock: &crate::state::SessionLock) -> Result<(), AgentError> {
     match lock.refresh().await {
         Ok(()) => Ok(()),
@@ -553,10 +576,13 @@ async fn run_step_scoped(
             None => None,
         }
     };
-    let (ledger_view, catalogs) = tokio::join!(
+    let (ledger_view, catalogs) = resolve_under_lock(
+        &lock,
+        crate::lock_keepalive::LOCK_KEEPALIVE_INTERVAL,
         ledger_read,
         crate::tool_session::ToolCatalogs::resolve(runtime, &tenant, &config.tools, &config.llm),
-    );
+    )
+    .await;
     // Prompt block order: the agent's prompt, long-term facts, knowledge
     // chunks, the conversational note, then `<user_history>` (bounded by
     // `user_ledger::MAX_VIEW_CHARS`), and last, per iteration, the run
@@ -2740,5 +2766,54 @@ mod tests {
         assert!(runtime.share_policy().is_some());
         assert!(runtime.share_modes_for("a").is_some());
         assert!(runtime.share_modes_for("b").is_none());
+    }
+
+    /// A catalog resolve (and ledger read) slower than the lock TTL must not
+    /// lose the lock. Real time, kv backend, 300 ms TTL, 50 ms keep-alive.
+    #[tokio::test]
+    async fn a_slow_catalog_resolve_keeps_the_session_lock_alive() {
+        use crate::state::AgentStateStore;
+        use std::time::Duration;
+        let store = crate::state_kv::KvAgentStateStore::new(Arc::new(crate::kv::MemoryKv::new()))
+            .with_lock_ttl(Duration::from_millis(300));
+        let tc = TenantContext::new("acme", "prod");
+
+        // Control: the same wait WITHOUT a keep-alive lapses the lock, so the
+        // wrapped case below is a real test of the wrapper.
+        let bare = store
+            .acquire_lock(&tc, "bare", Duration::from_millis(50))
+            .await
+            .expect("lock");
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            matches!(
+                bare.refresh().await,
+                Err(crate::error::StateError::LockLost)
+            ),
+            "without keep-alive the 300 ms lock must have lapsed"
+        );
+
+        let lock = store
+            .acquire_lock(&tc, "held", Duration::from_millis(50))
+            .await
+            .expect("lock");
+        let (ledger, catalogs) = super::resolve_under_lock(
+            &lock,
+            Duration::from_millis(50),
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                "ledger"
+            },
+            async {
+                // Slower than the TTL: a sequentially probed catalog.
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                "catalogs"
+            },
+        )
+        .await;
+        assert_eq!((ledger, catalogs), ("ledger", "catalogs"));
+        lock.refresh()
+            .await
+            .expect("the lock must still be ours after the slow resolve");
     }
 }
