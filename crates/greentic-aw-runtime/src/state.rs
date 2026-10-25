@@ -101,7 +101,15 @@ impl ConversationState {
             let Some((start, end)) = self.oldest_removable_turn(pending_id.as_deref()) else {
                 return;
             };
-            self.messages.drain(start..end);
+            // System messages inside the span (a mid-turn note, such as an
+            // attachment notice) outlive the turn they sit in: only the
+            // conversational messages are dropped.
+            let kept: Vec<ChatMessage> = self
+                .messages
+                .drain(start..end)
+                .filter(|m| matches!(m, ChatMessage::System { .. }))
+                .collect();
+            self.messages.splice(start..start, kept);
         }
     }
 
@@ -631,6 +639,29 @@ mod tests {
         assert!(matches!(s.messages.first(), Some(ChatMessage::User { .. })));
         assert_eq!(s.messages.len(), 2, "{:?}", s.messages);
         assert!(pairing_is_valid(&s.messages));
+    }
+
+    #[test]
+    fn truncate_keeps_system_messages_inside_a_removed_turn() {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = vec![
+            user("a"),
+            ChatMessage::System {
+                content: "note".into(),
+            },
+            asst_text("done a"),
+            user("b"),
+            asst_text("r"),
+        ];
+        s.truncate_history(2);
+        let systems = s
+            .messages
+            .iter()
+            .filter(|m| matches!(m, ChatMessage::System { .. }))
+            .count();
+        assert_eq!(systems, 1, "{:?}", s.messages);
+        let non_system = s.messages.len() - systems;
+        assert_eq!(non_system, 2, "{:?}", s.messages);
     }
 
     #[test]
