@@ -346,7 +346,7 @@ impl RemoteDispatchHandler for NatsDispatcher {
                     {
                         tracing::warn!(
                             %publish_error,
-                            %correlation_id,
+                            correlation_id = %crate::log_safe::log_safe(&correlation_id),
                             deadline_ms,
                             "failed to publish timeout response for awaited dispatch"
                         );

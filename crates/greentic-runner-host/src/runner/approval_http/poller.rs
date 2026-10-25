@@ -101,13 +101,13 @@ async fn poll_one(inner: &Inner, correlation_id: &str) {
     match outcome {
         PollOutcome::Pending => reschedule(inner, correlation_id, now, None),
         PollOutcome::Transient(reason) => {
-            tracing::debug!(%correlation_id, %reason, "approval decision poll failed; backing off");
+            tracing::debug!(correlation_id = %crate::log_safe::log_safe(correlation_id), %reason, "approval decision poll failed; backing off");
             reschedule(inner, correlation_id, now, Some(inner.timing.backoff));
         }
         PollOutcome::Gone(status) => {
             if inner.pending.lock().remove(correlation_id).is_some() {
                 tracing::warn!(
-                    %correlation_id,
+                    correlation_id = %crate::log_safe::log_safe(correlation_id),
                     %status,
                     "approval inbox no longer answers for this approval; stopped waiting for it \
                      (the flow stays parked)"
@@ -117,7 +117,7 @@ async fn poll_one(inner: &Inner, correlation_id: &str) {
         PollOutcome::Unreadable => {
             if inner.pending.lock().remove(correlation_id).is_some() {
                 tracing::warn!(
-                    %correlation_id,
+                    correlation_id = %crate::log_safe::log_safe(correlation_id),
                     "approval inbox answered with a decision this runner cannot read; stopped \
                      waiting for it (the flow stays parked)"
                 );
@@ -231,12 +231,12 @@ async fn withdraw(inner: &Inner, correlation_id: &str, reason: WithdrawReason) {
     match sent {
         Ok(response) if response.status().is_success() => {}
         Ok(response) => tracing::warn!(
-            %correlation_id,
+            correlation_id = %crate::log_safe::log_safe(correlation_id),
             status = %response.status(),
             "approval inbox refused the withdrawal; the timeout is applied locally anyway"
         ),
         Err(error) => tracing::warn!(
-            %correlation_id,
+            correlation_id = %crate::log_safe::log_safe(correlation_id),
             error = %error.without_url(),
             "could not withdraw the approval; the timeout is applied locally anyway"
         ),
@@ -252,7 +252,7 @@ async fn resume(inner: &Inner, correlation_id: &str, pending: &Pending, body: &[
     }
     let Some(resumer) = inner.resumer.lock().clone() else {
         tracing::warn!(
-            %correlation_id,
+            correlation_id = %crate::log_safe::log_safe(correlation_id),
             "approval decision arrived but this runtime has no resumer attached; dropped"
         );
         return;
@@ -265,7 +265,7 @@ async fn resume(inner: &Inner, correlation_id: &str, pending: &Pending, body: &[
     ) {
         Ok(input) => input,
         Err(error) => {
-            tracing::error!(%correlation_id, %error, "could not build the approval resume input");
+            tracing::error!(correlation_id = %crate::log_safe::log_safe(correlation_id), %error, "could not build the approval resume input");
             return;
         }
     };
@@ -274,6 +274,6 @@ async fn resume(inner: &Inner, correlation_id: &str, pending: &Pending, body: &[
         .resume(pending.tenant.clone(), &input.correlation_id, input.output)
         .await
     {
-        tracing::error!(%correlation_id, %error, "failed to resume the approval gate");
+        tracing::error!(correlation_id = %crate::log_safe::log_safe(correlation_id), %error, "failed to resume the approval gate");
     }
 }
