@@ -97,7 +97,11 @@ pub fn secret_uri_candidates(
     let mut uris = Vec::with_capacity(3);
     if let Some(unit_key) = unit.and_then(|unit| crate::mcp_secrets::mcp_unit_secret_key(key, unit))
     {
-        uris.push(secret_uri(category, tenant, team, &unit_key)?);
+        // A key that cannot form a safe unit name (e.g. one ending in `.`)
+        // only loses the unit scope; team / tenant candidates still apply.
+        if let Ok(uri) = secret_uri(category, tenant, team, &unit_key) {
+            uris.push(uri);
+        }
     }
     if let Some(team) = team {
         uris.push(secret_uri(category, tenant, Some(team), key)?);
@@ -237,6 +241,36 @@ mod tests {
             assert!(
                 secret_uri_candidates("mcp", "acme", Some(bad), None, "k").is_err(),
                 "candidates team {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_ending_in_a_dot_loses_only_the_unit_candidate() {
+        // `key.` + `.unit-x` contains `..`, so the unit name is unsafe.
+        let uris = secret_uri_candidates("mcp", "acme", Some("sales"), Some("u1"), "key.")
+            .expect("team and tenant candidates survive");
+        assert_eq!(
+            uris,
+            vec![
+                "secrets://default/acme/sales/mcp/key.".to_string(),
+                "secrets://default/acme/_/mcp/key.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn hostile_segments_are_refused() {
+        for bad in ["..", "../x", "a/b", "%2e%2e", "a?b", "a#b", ".x"] {
+            assert!(secret_uri("llm", "acme", None, bad).is_err(), "key {bad}");
+            assert!(secret_uri("llm", bad, None, "k").is_err(), "tenant {bad}");
+            assert!(
+                secret_uri("llm", "acme", Some(bad), "k").is_err(),
+                "team {bad}"
+            );
+            assert!(
+                secret_uri(bad, "acme", None, "k").is_err(),
+                "category {bad}"
             );
         }
     }

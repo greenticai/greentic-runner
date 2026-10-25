@@ -566,6 +566,17 @@ pub fn agent_tool_secret_uri(
         Some(segment) => segment,
         None => provider.to_string(),
     };
+    // Provider and key come from pack / agent config; env and tenant from the
+    // host. The category is either the raw provider or a generated unit
+    // segment; every segment lands verbatim in the URI, so an unsafe value
+    // (`..`, `/`, `%2e%2e`) yields no address rather than one in another
+    // tenant's path.
+    if ![env, tenant, category.as_str(), key]
+        .into_iter()
+        .all(crate::secrets_broker::is_safe_secret_segment)
+    {
+        return None;
+    }
     Some(format!("secrets://{env}/{tenant}/_/{category}/{key}"))
 }
 
@@ -605,6 +616,19 @@ pub fn scoped_secret_path_for_pack(ctx: &TenantCtx, pack_id: &str, key: &str) ->
         team: team.map(|value| value.as_str().to_string()),
     };
     let team_segment = normalize_team_segment(scope.team.as_deref());
+    // `pack_id` and the key are normalised to `[a-z0-9_-]` below, so they cannot
+    // escape; env / tenant / team are written verbatim and must be checked.
+    for (label, value) in [
+        ("env", scope.env.as_str()),
+        ("tenant", scope.tenant.as_str()),
+        ("team", team_segment.as_str()),
+    ] {
+        if !crate::secrets_broker::is_safe_secret_segment(value) {
+            return Err(anyhow!(
+                "secret {label} is not a safe secret-path segment; refusing to build a secrets uri"
+            ));
+        }
+    }
     let pack_segment = pack_id.trim();
     if pack_segment.is_empty() {
         return Err(anyhow!("pack_id must not be empty for scoped secrets"));
@@ -978,6 +1002,29 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, shared);
         assert_ne!(b, shared);
+    }
+
+    #[test]
+    fn unsafe_segments_have_no_agent_tool_address() {
+        for bad in ["..", "a/b", "%2e%2e", "../x", ".h"] {
+            assert!(agent_tool_secret_uri("dev", "acme", bad, "api_key", None).is_none());
+            assert!(agent_tool_secret_uri("dev", "acme", "tavily", bad, None).is_none());
+            assert!(agent_tool_secret_uri(bad, "acme", "tavily", "api_key", None).is_none());
+            assert!(agent_tool_secret_uri("dev", bad, "tavily", "api_key", None).is_none());
+        }
+    }
+
+    #[test]
+    fn scoped_pack_path_normalises_hostile_pack_id() {
+        let ctx = greentic_types::TenantCtx::new(
+            EnvId::new("dev").expect("env"),
+            TenantId::new("acme").expect("tenant"),
+        );
+        let path = scoped_secret_path_for_pack(&ctx, "../../evil/pack%2e", "k")
+            .expect("pack_id is normalised, not rejected");
+        assert!(!path.contains(".."), "{path}");
+        assert!(!path.contains('%'), "{path}");
+        assert_eq!(path.matches('/').count(), 6, "{path}");
     }
 
     #[test]

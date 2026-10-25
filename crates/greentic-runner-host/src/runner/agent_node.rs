@@ -1973,7 +1973,18 @@ mod aw {
         let credential_ref = merged_agents
             .values()
             .find_map(|agent| agent.llm.credential_ref.clone())?;
-        let uri = format!("secrets://default/{tenant}/_/llm/{credential_ref}");
+        let uri = match greentic_aw_runtime::scoped_secrets::secret_uri(
+            "llm",
+            tenant,
+            None,
+            &credential_ref,
+        ) {
+            Ok(uri) => uri,
+            Err(err) => {
+                tracing::warn!(error = %err, "llm credential_ref rejected; no in-process key resolved");
+                return None;
+            }
+        };
         let bytes = secrets.read(&uri).await.ok()?;
         let key = String::from_utf8(bytes).ok()?.trim().to_string();
         if key.is_empty() { None } else { Some(key) }

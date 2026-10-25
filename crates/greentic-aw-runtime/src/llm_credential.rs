@@ -26,7 +26,8 @@ impl SecretsBackedCredentialResolver {
         let cref = pr.credential_ref.as_deref().ok_or_else(|| {
             LlmError::BadRequest(format!("no credential_ref for provider `{}`", pr.provider))
         })?;
-        let uri = format!("secrets://default/{}/_/llm/{}", self.tenant, cref);
+        let uri = crate::scoped_secrets::secret_uri("llm", &self.tenant, None, cref)
+            .map_err(|e| LlmError::BadRequest(format!("credential_ref rejected: {e}")))?;
         let bytes = self
             .secrets
             .read(&uri)
@@ -90,5 +91,40 @@ mod tests {
             credential_ref: None,
         };
         assert!(resolver.resolve(&pr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_unsafe_credential_ref_without_reading() {
+        for bad in [
+            "..",
+            "../other",
+            "a/b",
+            "%2e%2e",
+            "vault://acme/x",
+            ".hidden",
+        ] {
+            let resolver = SecretsBackedCredentialResolver::new(Arc::new(NeverRead), "acme");
+            let pr = LlmProviderRef {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+                credential_ref: Some(bad.into()),
+            };
+            // NeverRead answers Ok if reached, so Err proves rejection before the read.
+            assert!(resolver.resolve(&pr).await.is_err(), "{bad}");
+        }
+    }
+
+    struct NeverRead;
+    #[async_trait]
+    impl greentic_secrets_lib::SecretsManager for NeverRead {
+        async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            Ok(format!("REACHED {path}").into_bytes())
+        }
+        async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
     }
 }
