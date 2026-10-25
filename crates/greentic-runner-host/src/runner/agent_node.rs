@@ -1173,16 +1173,60 @@ mod aw {
         }
     }
 
+    /// Address of a local listener that accepts and immediately drops every
+    /// connection, started once per process. See [`build_tool_http_client_with`].
+    fn blackhole_proxy_url() -> Option<String> {
+        use std::sync::OnceLock;
+        static URL: OnceLock<Option<String>> = OnceLock::new();
+        URL.get_or_init(|| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+            let addr = listener.local_addr().ok()?;
+            std::thread::Builder::new()
+                .name("tool-http-blackhole".into())
+                .spawn(move || {
+                    for stream in listener.incoming() {
+                        drop(stream);
+                    }
+                })
+                .ok()?;
+            Some(format!("http://{addr}"))
+        })
+        .clone()
+    }
+
     /// Build the tool-extension HTTP client: no redirect following (an
     /// extension's request is not allowed to be bounced to another host, per
     /// the ext-runtime contract) and the outbound address guard on DNS.
     fn build_tool_http_client() -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
+        build_tool_http_client_with(crate::http_guard::HttpGuard::from_env())
+    }
+
+    /// The resolver guard never runs for an IP-LITERAL URL (nothing to
+    /// resolve), and `greentic_ext_runtime` hands the extension a finished
+    /// `reqwest::blocking::Client` with no pre-request hook, so a literal
+    /// metadata address (IPv4, or its v4-mapped IPv6 spelling) would otherwise
+    /// connect straight out. The only per-request seam a built client exposes
+    /// is its proxy selector, so a forbidden literal is routed to a local
+    /// listener that drops the connection: the request fails without a byte
+    /// reaching the target. Domain hosts and permitted literals select no
+    /// proxy and go direct, subject to the DNS guard as before.
+    fn build_tool_http_client_with(
+        guard: crate::http_guard::HttpGuard,
+    ) -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
+        let blackhole = blackhole_proxy_url()?;
         greentic_ext_runtime::reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .redirect(greentic_ext_runtime::reqwest::redirect::Policy::none())
-            .dns_resolver(std::sync::Arc::new(ToolGuardedResolver {
-                guard: crate::http_guard::HttpGuard::from_env(),
+            .proxy(greentic_ext_runtime::reqwest::Proxy::custom(move |url| {
+                match guard.check_url_literal(url) {
+                    Ok(()) => None,
+                    Err(reason) => {
+                        tracing::warn!(%reason, "tool http request to a blocked IP literal refused");
+                        Some(blackhole.clone())
+                    }
+                }
             }))
+            .dns_resolver(std::sync::Arc::new(ToolGuardedResolver { guard }))
             .build()
             .ok()
     }
@@ -3304,6 +3348,83 @@ mod aw {
             .flatten();
             let _ = server.join();
             assert_eq!(status, Some(302), "the 302 must be returned, not followed");
+        }
+
+        #[test]
+        fn tool_http_client_refuses_ip_literal_metadata_targets() {
+            // A listener standing in for the "metadata service": it must never
+            // see a connection, whatever the literal spelling.
+            let target = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            let port = target.local_addr().map(|a| a.port()).unwrap_or(0);
+            if target.set_nonblocking(true).is_err() {
+                return;
+            }
+            // deny_private makes the loopback listener a forbidden literal too,
+            // so the test can observe that nothing reached it.
+            let guard = crate::http_guard::HttpGuard::from_raw(None, Some("1"), None);
+            let urls = vec![
+                format!("http://127.0.0.1:{port}/"),
+                "http://169.254.169.254/latest/meta-data/".to_string(),
+                "http://[::ffff:a9fe:a9fe]/".to_string(),
+                "http://0xa9fea9fe/".to_string(),
+            ];
+            let results = std::thread::spawn(move || {
+                let client = build_tool_http_client_with(guard)?;
+                Some(
+                    urls.into_iter()
+                        .map(|url| (url.clone(), client.get(url).send().is_err()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .join()
+            .ok()
+            .flatten();
+            let Some(results) = results else {
+                panic!("tool http client must build");
+            };
+            for (url, refused) in results {
+                assert!(refused, "{url} must be refused");
+            }
+            assert!(
+                target.accept().is_err(),
+                "no connection may reach a forbidden literal"
+            );
+        }
+
+        #[test]
+        fn tool_http_client_lets_permitted_literals_go_direct() {
+            use std::io::{Read, Write};
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            let addr = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let server = std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf);
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            });
+            let url = format!("http://{addr}/");
+            let guard = crate::http_guard::HttpGuard::from_raw(None, None, None);
+            let status = std::thread::spawn(move || {
+                let client = build_tool_http_client_with(guard)?;
+                client.get(url).send().ok().map(|r| r.status().as_u16())
+            })
+            .join()
+            .ok()
+            .flatten();
+            let _ = server.join();
+            assert_eq!(status, Some(200));
         }
 
         #[test]
