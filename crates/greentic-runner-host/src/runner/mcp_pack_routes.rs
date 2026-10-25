@@ -160,7 +160,10 @@ impl PackMcpRoutes {
                     );
                 }
                 Ok(route) => {
-                    by_server.insert(route.server_id.clone(), route);
+                    // First record wins, like the a2a and sorla sidecar
+                    // readers: a later duplicate must not silently replace
+                    // the route an earlier record declared.
+                    by_server.entry(route.server_id.clone()).or_insert(route);
                 }
                 Err(e) => {
                     tracing::warn!(index, error = %e, "mcp-routes: record unreadable; dropped");
@@ -191,6 +194,19 @@ impl PackMcpRoutes {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_duplicate_server_id_keeps_the_first_record() {
+        let routes = PackMcpRoutes::from_sidecar_bytes(
+            br#"[{"server_id":"srv-1","transport_url":"https://first/"},
+                 {"server_id":"srv-1","transport_url":"https://second/"}]"#,
+        )
+        .expect("sidecar parses");
+        assert_eq!(
+            routes.get("srv-1").unwrap().transport_url.as_deref(),
+            Some("https://first/")
+        );
+    }
 
     #[test]
     fn auth_team_round_trips_from_the_sidecar() {
