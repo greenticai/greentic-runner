@@ -70,6 +70,7 @@ pub mod tool_call_frame;
 pub mod tool_session;
 pub mod tool_wire_name;
 pub mod tools;
+pub mod url_redact;
 pub mod user_ledger;
 
 #[cfg(feature = "test-mock")]

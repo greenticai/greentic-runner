@@ -363,20 +363,23 @@ pub async fn serve_with_ledger(
     ledger: Arc<dyn DispatchLedger>,
 ) -> Result<()> {
     warm_on_start(|k| std::env::var(k).ok());
+    // The URL may carry `user:pass@`; only the redacted form is ever logged
+    // or put in an error context.
+    let nats_url_display = crate::url_redact::redact_url(nats_url);
     let client = async_nats::connect(nats_url)
         .await
-        .with_context(|| format!("connecting to NATS at {nats_url}"))?;
+        .with_context(|| format!("connecting to NATS at {nats_url_display}"))?;
     tracing::info!(
-        nats_url,
+        nats_url = %nats_url_display,
         subject = aw_event_bridge::request_topic(aw_event_bridge::RUNTIME_NAME),
         "aw event bridge connected; serving agentic dispatch"
     );
     let invoker = Arc::new(RuntimeAgentDispatchInvoker::with_ledger(runtime, ledger));
     if use_jetstream(|k| std::env::var(k).ok()) {
-        tracing::info!(nats_url, "aw serve: JetStream durable consumer");
+        tracing::info!(nats_url = %nats_url_display, "aw serve: JetStream durable consumer");
         run_bridge_jetstream(client, invoker).await
     } else {
-        tracing::info!(nats_url, "aw serve: core-NATS consumer (legacy)");
+        tracing::info!(nats_url = %nats_url_display, "aw serve: core-NATS consumer (legacy)");
         run_bridge(client, invoker).await
     }
 }

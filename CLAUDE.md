@@ -272,6 +272,12 @@ off, `secrets_broker::is_safe_secret_segment`): only `[A-Za-z0-9._-]`, no leadin
 `secret_uri_candidates` an unsafe unit candidate (e.g. a key ending in `.`) is skipped and the
 team/tenant candidates still apply.
 
+### Broker URLs are logged redacted
+
+`GREENTIC_EVENTS_NATS_URL` may carry `user:pass@`. Anything that logs it or puts it in an error
+context goes through `greentic_aw_runtime::url_redact::redact_url` (masks userinfo, handles
+comma-separated lists); see `serve::serve_with_ledger` and `maybe_spawn_inproc_agentic_serve`.
+
 ### Knowledge retrieval backends
 
 An agent's `Knowledge` implementation is a chain of wrappers around whatever is
