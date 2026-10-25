@@ -40,9 +40,10 @@ async fn main() -> ExitCode {
     let reply =
         std::env::var("AW_SERVE_REPLY").unwrap_or_else(|_| "Hello from aw-serve".to_string());
 
+    let nats_url_display = greentic_aw_runtime::url_redact::redact_url(&nats_url);
     eprintln!(
         "aw-serve: starting test-mock agentic runtime (agent_id='{agent_id}', \
-         reply='{reply}') on {nats_url}"
+         reply='{reply}') on {nats_url_display}"
     );
 
     let runtime = build_test_mock_runtime(&agent_id, &reply);

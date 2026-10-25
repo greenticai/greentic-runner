@@ -3001,7 +3001,7 @@ mod aw {
                 };
 
                 tracing::info!(
-                    nats_url,
+                    nats_url = %greentic_aw_runtime::url_redact::redact_url(nats_url),
                     dispatch_ledger_active = ledger_active,
                     "agentic serve mode starting"
                 );
