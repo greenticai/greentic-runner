@@ -6728,28 +6728,33 @@ fn approval_requires_human(input: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("always");
     match mode {
-        "above_risk" => {
-            let risk = input.get("risk").and_then(Value::as_f64).unwrap_or(0.0);
-            let threshold = input
-                .get("risk_threshold")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            risk >= threshold
-        }
-        "above_confidence" => {
-            let confidence = input
-                .get("confidence")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let threshold = input
-                .get("confidence_threshold")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            confidence < threshold
-        }
+        // Fail closed: a missing, null, string or non-finite value (or
+        // threshold) can never auto-approve; it goes to a human.
+        "above_risk" => match (
+            finite_number(input, "risk"),
+            finite_number(input, "risk_threshold"),
+        ) {
+            (Some(risk), Some(threshold)) => risk >= threshold,
+            _ => true,
+        },
+        "above_confidence" => match (
+            finite_number(input, "confidence"),
+            finite_number(input, "confidence_threshold"),
+        ) {
+            (Some(confidence), Some(threshold)) => confidence < threshold,
+            _ => true,
+        },
         // "always" and any unknown mode fail safe: require a human.
         _ => true,
     }
+}
+
+/// A JSON number under `key`, or `None` when absent, non-numeric or non-finite.
+fn finite_number(input: &Value, key: &str) -> Option<f64> {
+    input
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite())
 }
 
 /// True when `entry` is a runtime-dispatch response envelope rather than a user
@@ -6835,6 +6840,34 @@ mod approval_gate_tests {
         let input =
             json!({ "confidence": 0.4, "mode": "above_confidence", "confidence_threshold": 0.8 });
         assert!(approval_requires_human(&input));
+    }
+
+    #[test]
+    fn above_risk_fails_closed_on_missing_or_non_numeric_values() {
+        for input in [
+            json!({ "mode": "above_risk", "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": null, "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": "0.1", "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": 0.1 }),
+            json!({ "mode": "above_risk", "risk": 0.1, "risk_threshold": "high" }),
+            json!({ "mode": "above_risk" }),
+        ] {
+            assert!(approval_requires_human(&input), "{input}");
+        }
+    }
+
+    #[test]
+    fn above_confidence_fails_closed_on_missing_or_non_numeric_values() {
+        for input in [
+            json!({ "mode": "above_confidence", "confidence_threshold": 0.5 }),
+            json!({ "mode": "above_confidence", "confidence": "0.99", "confidence_threshold": 0.5 }),
+            json!({ "mode": "above_confidence", "confidence": 0.99 }),
+            json!({ "mode": "above_confidence", "confidence": null, "confidence_threshold": null }),
+        ] {
+            assert!(approval_requires_human(&input), "{input}");
+        }
+        let ok = json!({ "mode": "above_confidence", "confidence": 0.9, "confidence_threshold": 0.5 });
+        assert!(!approval_requires_human(&ok));
     }
 
     #[test]
