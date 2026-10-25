@@ -337,12 +337,26 @@ impl StateMachine {
         call_clone.payload = resolved_payload.clone();
         // `call_traced` also yields the flow's per-node output map (keyed by the
         // real node id, e.g. `insights_agent`) when the adapter drives a flow.
-        let (response, flow_nodes) = retry_with_jitter(&self.policy.retry, || {
+        //
+        // The per-session turn lock is held across the WHOLE retry loop, not
+        // just each attempt: otherwise it is released between attempts, another
+        // message for the session can consume the parked snapshot in that gap,
+        // and the retry then runs out of order. The inner `call_traced` lock
+        // sees the key already held by this task and skips.
+        let retry_attempts = retry_with_jitter(&self.policy.retry, || {
             let adapter = adapter_clone.clone();
             let call = call_clone.clone();
             async move { adapter.call_traced(&call).await }
-        })
-        .await?;
+        });
+        let (response, flow_nodes) = match super::runtime::turn_key_for_payload(&call_clone.payload)
+        {
+            Some(turn_key) => {
+                super::turn_lock::global()
+                    .run(turn_key, retry_attempts)
+                    .await?
+            }
+            None => retry_attempts.await?,
+        };
 
         session.cursor.position += 1;
         session.cursor.outbox_seq = session.cursor.outbox_seq.saturating_add(1);
@@ -519,6 +533,126 @@ mod tests {
         let history = adapter.history();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1]["text"], json!("need help"));
+    }
+
+    /// An ingress envelope payload that maps to ONE turn-lock key ("shared")
+    /// whatever `msg` is.
+    fn turn_payload(msg: &str) -> Value {
+        json!({
+            "tenant": "demo",
+            "flow_id": "retry.flow",
+            "session_hint": "shared",
+            "reply_scope": { "conversation": "c" },
+            "payload": { "msg": msg },
+        })
+    }
+
+    /// Fails the first attempt of message `m1` (after a pause), recording
+    /// start/end events so the test can assert ordering across sessions.
+    struct FlakyOrderAdapter {
+        events: Arc<Mutex<Vec<String>>>,
+        failed_once: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Adapter for FlakyOrderAdapter {
+        async fn call(&self, call: &AdapterCall) -> GResult<Value> {
+            let msg = call.payload["payload"]["msg"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string();
+            self.events.lock().push(format!("start {msg}"));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if msg == "m1" && !self.failed_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.events.lock().push(format!("fail {msg}"));
+                return Err(RunnerError::AdapterCall {
+                    reason: "transient".into(),
+                });
+            }
+            self.events.lock().push(format!("end {msg}"));
+            Ok(json!({ "ok": msg }))
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_lock_is_held_across_whole_turn_retries() {
+        let host = Arc::new(HostBundle::new(
+            Arc::new(FnSecretsHost::new(|_| Ok(String::new()))),
+            Arc::new(FnTelemetryHost::new(|_, _| Ok(()))),
+            Arc::new(InMemorySessionHost::new()) as Arc<dyn SessionHost>,
+            Arc::new(InMemoryStateHost::new()) as Arc<dyn StateHost>,
+        ));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut adapters = AdapterRegistry::default();
+        adapters.register(
+            "flaky",
+            Box::new(FlakyOrderAdapter {
+                events: Arc::clone(&events),
+                failed_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+        );
+        let mut policy = Policy::default();
+        // A backoff gap wide enough that, without the fix, m2 starts inside it.
+        policy.retry.initial_backoff = std::time::Duration::from_millis(100);
+        policy.retry.max_backoff = std::time::Duration::from_millis(100);
+        let sm = Arc::new(StateMachine::new(host, adapters, policy));
+        sm.register_flow(FlowDefinition::new(
+            FlowSummary {
+                pack_id: "test-pack".into(),
+                id: "retry.flow".into(),
+                name: "Retry".into(),
+                version: "1.0.0".into(),
+                description: None,
+            },
+            json!({ "type": "object" }),
+            vec![FlowStep::Adapter(AdapterCall {
+                adapter: "flaky".into(),
+                operation: "run".into(),
+                payload: Value::String(PAYLOAD_FROM_LAST_INPUT.into()),
+            })],
+        ));
+        let tenant = TenantCtx::new(
+            EnvId::from_str("local").unwrap(),
+            TenantId::from_str("demo").unwrap(),
+        );
+
+        let first = {
+            let (sm, tenant) = (Arc::clone(&sm), tenant.clone());
+            tokio::spawn(async move {
+                sm.step(
+                    &tenant,
+                    "test-pack",
+                    "retry.flow",
+                    Some("step-1".into()),
+                    turn_payload("m1"),
+                )
+                .await
+            })
+        };
+        // Let m1's first attempt start and fail before m2 arrives.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let second = {
+            let (sm, tenant) = (Arc::clone(&sm), tenant.clone());
+            tokio::spawn(async move {
+                sm.step(
+                    &tenant,
+                    "test-pack",
+                    "retry.flow",
+                    Some("step-2".into()),
+                    turn_payload("m2"),
+                )
+                .await
+            })
+        };
+        assert!(first.await.expect("join m1").is_ok());
+        assert!(second.await.expect("join m2").is_ok());
+        assert_eq!(
+            events.lock().clone(),
+            vec![
+                "start m1", "fail m1", "start m1", "end m1", "start m2", "end m2"
+            ],
+            "m2 must wait for m1's retries to finish"
+        );
     }
 
     fn test_flow() -> FlowDefinition {

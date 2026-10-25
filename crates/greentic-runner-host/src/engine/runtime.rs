@@ -1117,9 +1117,7 @@ impl Adapter for PackFlowAdapter {
         // snapshot, so without this two concurrent messages both resume it.
         // A payload that does not parse (or has no session identity) is left
         // to the body, which reports the same error it always did.
-        let key = serde_json::from_value::<IngressEnvelope>(call.payload.clone())
-            .ok()
-            .and_then(|envelope| FlowResumeStore::turn_key(&envelope.canonicalize()).ok());
+        let key = turn_key_for_payload(&call.payload);
         match key {
             Some(key) => {
                 super::turn_lock::global()
@@ -1129,6 +1127,19 @@ impl Adapter for PackFlowAdapter {
             None => self.call_traced_unlocked(call).await,
         }
     }
+}
+
+/// The per-session turn-lock key for an adapter call payload, or `None` when
+/// the payload is not an ingress envelope with a session identity.
+///
+/// The ONE derivation used both by [`PackFlowAdapter::call_traced`] (the
+/// per-attempt lock) and by the whole-turn retry loop in the state machine
+/// (which holds the same lock across attempts so another message cannot slip in
+/// between a failed attempt and its retry).
+pub(crate) fn turn_key_for_payload(payload: &Value) -> Option<String> {
+    serde_json::from_value::<IngressEnvelope>(payload.clone())
+        .ok()
+        .and_then(|envelope| FlowResumeStore::turn_key(&envelope.canonicalize()).ok())
 }
 
 impl PackFlowAdapter {
