@@ -449,7 +449,7 @@ pub fn generate_bindings(
         }
         if opts.strict {
             bail!(
-                "MCP component '{}' referenced but no server hint; add hints or rerun with --complete",
+                "MCP component '{}' referenced but no server hint; add an `mcp.servers` entry to bindings.hints.yaml or run without --strict to infer a default",
                 component
             );
         }
@@ -464,12 +464,12 @@ pub fn generate_bindings(
     if opts.strict {
         if opts.component.as_ref().map(|c| c.http).unwrap_or(false) && network.is_empty() {
             bail!(
-                "HTTP capability detected but no network allow rules; add hints or use --complete"
+                "HTTP capability detected but no network allow rules; add `network.allow` entries to bindings.hints.yaml or run without --strict"
             );
         }
         if opts.component.as_ref().map(|c| c.secrets).unwrap_or(false) && secrets.is_empty() {
             bail!(
-                "Secrets capability detected but no secrets.required hints; add hints or use --complete"
+                "Secrets capability detected but no secrets.required hints; add `secrets.required` entries to bindings.hints.yaml or run without --strict"
             );
         }
     }

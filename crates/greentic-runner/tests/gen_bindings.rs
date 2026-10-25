@@ -136,3 +136,40 @@ fn generated_bindings_are_gtbind_compatible() {
         "fs:///packs/weather-demo.gtpack"
     );
 }
+
+#[test]
+fn strict_capability_checks_use_component_features() {
+    use greentic_runner::gen_bindings::component::ComponentFeatures;
+
+    let mut metadata = gen_bindings::load_pack(&fixture("weather-demo")).expect("load pack");
+    metadata.flows.clear();
+    metadata.hints.secrets.required.clear();
+    metadata.hints.network.allow.clear();
+    let strict_with = |features: ComponentFeatures| {
+        gen_bindings::generate_bindings(
+            &metadata,
+            GeneratorOptions {
+                strict: true,
+                component: Some(features),
+                ..Default::default()
+            },
+        )
+    };
+    assert!(strict_with(ComponentFeatures::default()).is_ok());
+    for features in [
+        ComponentFeatures {
+            secrets: true,
+            ..Default::default()
+        },
+        ComponentFeatures {
+            http: true,
+            ..Default::default()
+        },
+    ] {
+        let message = strict_with(features)
+            .expect_err("capability without hints must fail strict")
+            .to_string();
+        assert!(message.contains("bindings.hints.yaml"), "{message}");
+        assert!(!message.contains("--complete"), "{message}");
+    }
+}
