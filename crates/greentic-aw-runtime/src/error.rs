@@ -163,6 +163,10 @@ pub enum MemoryError {
     Backend(String),
     #[error("memory provider not configured")]
     NotConfigured,
+    /// A size cap of the in-process provider refused the write. Safe to show
+    /// the model: it names the limit, never any stored content.
+    #[error("memory limit reached: {0}")]
+    LimitExceeded(String),
 }
 
 #[derive(Debug, Error)]
