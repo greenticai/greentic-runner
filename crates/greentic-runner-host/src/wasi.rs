@@ -131,7 +131,9 @@ impl RunnerWasiPolicy {
             // visibility.
             builder.stdout(crate::telemetry_scan::TelemetryStream::stdout());
             builder.stderr(crate::telemetry_scan::TelemetryStream::stderr());
-            builder.inherit_stdin();
+            // stdin is deliberately NOT inherited: a guest has no business
+            // reading the host process's stdin (the builder default is an
+            // empty, closed stream).
         }
         let env_pairs = self.collect_env();
         if !env_pairs.is_empty() {
@@ -229,6 +231,23 @@ impl RunnerWasiPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `WasiCtx` cannot be introspected for its stdin, so pin the source:
+    /// a guest must never be handed the host's stdin.
+    #[test]
+    fn guest_stdin_is_never_inherited() {
+        let src = include_str!("wasi.rs");
+        let needle = ["inherit", "_stdin("].concat();
+        let calls = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && l.contains(&needle))
+            .count();
+        // The only mention left is this test's own `needle` construction.
+        assert_eq!(
+            calls, 0,
+            "wasi.rs must not call the stdin-inheriting builder method"
+        );
+    }
 
     fn base(root: &Path) -> RunnerWasiPolicy {
         let state = root.join("state");

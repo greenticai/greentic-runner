@@ -123,7 +123,7 @@ async fn dispatch_to_resumer_outcome(
         Err(error) => {
             tracing::error!(
                 %error,
-                correlation_id = %input.correlation_id,
+                correlation_id = %crate::log_safe::log_safe(&input.correlation_id),
                 "failed to resume session on dispatch response"
             );
             None

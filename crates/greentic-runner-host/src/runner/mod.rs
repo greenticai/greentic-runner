@@ -87,6 +87,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::response::IntoResponse as _;
 use axum::routing::{get, post};
 use axum::{Router, serve};
 use tokio::net::TcpListener;
@@ -207,6 +208,49 @@ impl HostServer {
 /// router — route registration included — without binding a socket. Mirrors the
 /// `sql::routes::router` precedent.
 pub(crate) fn router(state: ServerState) -> Router {
+    with_request_timeout(
+        base_router(state),
+        request_timeout_from_raw(std::env::var(REQUEST_TIMEOUT_ENV).ok().as_deref()),
+    )
+}
+
+/// Per-request wall-clock limit in seconds for every route except the
+/// streaming `/agent/chat/stream`. `0` disables.
+pub(crate) const REQUEST_TIMEOUT_ENV: &str = "GREENTIC_HTTP_REQUEST_TIMEOUT_SECS";
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+/// Routes that legitimately stay open longer than the request timeout.
+const STREAMING_PATHS: &[&str] = &["/agent/chat/stream"];
+
+/// `None` = disabled. Absent or unparseable falls back to the default: a
+/// malformed knob must not silently remove the limit.
+pub(crate) fn request_timeout_from_raw(raw: Option<&str>) -> Option<std::time::Duration> {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Wrap `router` so a request not answered within `timeout` gets a 408.
+/// (`tower-http` is not a dependency; this is the same behaviour as its
+/// `TimeoutLayer`, with the streaming route exempt.)
+pub(crate) fn with_request_timeout(router: Router, timeout: Option<std::time::Duration>) -> Router {
+    let Some(timeout) = timeout else {
+        return router;
+    };
+    router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            if STREAMING_PATHS.contains(&req.uri().path()) {
+                return next.run(req).await;
+            }
+            match tokio::time::timeout(timeout, next.run(req)).await {
+                Ok(response) => response,
+                Err(_) => axum::http::StatusCode::REQUEST_TIMEOUT.into_response(),
+            }
+        },
+    ))
+}
+
+fn base_router(state: ServerState) -> Router {
     // `/operator/op/invoke` is guarded by the operator/admin bearer token when
     // one is configured; with none it stays open (see `warn_if_operator_open`).
     let operator_routes = Router::new()
@@ -315,6 +359,68 @@ impl ServerState {
 impl axum::extract::FromRef<ServerState> for SqlGateway {
     fn from_ref(state: &ServerState) -> Self {
         state.sql.clone()
+    }
+}
+
+#[cfg(test)]
+mod request_timeout_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::time::Duration;
+    use tower::ServiceExt as _;
+
+    #[test]
+    fn timeout_env_resolution() {
+        assert_eq!(
+            request_timeout_from_raw(None),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            request_timeout_from_raw(Some("5")),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(request_timeout_from_raw(Some("0")), None);
+        assert_eq!(
+            request_timeout_from_raw(Some("junk")),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    fn slow_app(timeout: Option<Duration>) -> Router {
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            "done"
+        };
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .route("/agent/chat/stream", get(slow));
+        with_request_timeout(app, timeout)
+    }
+
+    async fn status(app: Router, path: &str) -> Result<StatusCode> {
+        let req = Request::builder().uri(path).body(Body::empty())?;
+        Ok(app.oneshot(req).await?.status())
+    }
+
+    #[tokio::test]
+    async fn slow_handler_times_out_with_408() -> Result<()> {
+        let app = slow_app(Some(Duration::from_millis(50)));
+        assert_eq!(status(app, "/slow").await?, StatusCode::REQUEST_TIMEOUT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_route_is_exempt() -> Result<()> {
+        let app = slow_app(Some(Duration::from_millis(50)));
+        assert_eq!(status(app, "/agent/chat/stream").await?, StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_timeout_lets_slow_handlers_finish() -> Result<()> {
+        assert_eq!(status(slow_app(None), "/slow").await?, StatusCode::OK);
+        Ok(())
     }
 }
 

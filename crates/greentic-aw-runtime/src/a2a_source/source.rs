@@ -354,6 +354,11 @@ impl Transport {
             ));
         }
 
+        // hyper-util skips the DNS resolver for an IP-literal host, so the
+        // client's `GuardedResolver` never sees `http://169.254.169.254/...`:
+        // check the literal here, before any secret is read or byte is sent.
+        check_target_literal(agent_id, &target)?;
+
         // A credential goes only to the host and port the admin configured.
         // Checked before the secret is read, so a card naming another host
         // never causes a secrets lookup, and nothing is sent: there is no
@@ -602,5 +607,45 @@ fn task_reply(agent_id: &str, task: Task) -> A2aReply {
         outcome,
         context_id: task.context_id,
         task_id: open.then_some(task.id),
+    }
+}
+
+/// Refuse an interface URL whose host is an IP literal in a blocked range
+/// (link-local / cloud metadata). Domains are covered by the resolver.
+fn check_target_literal(agent_id: &str, target: &url::Url) -> Result<(), String> {
+    crate::outbound_guard::HttpGuard::from_env()
+        .check_url_literal(target)
+        .map_err(|reason| format!("a2a agent {agent_id} interface URL refused: {reason}"))
+}
+
+#[cfg(test)]
+mod literal_guard_tests {
+    use super::check_target_literal;
+
+    fn refused(raw: &str) -> bool {
+        match url::Url::parse(raw) {
+            Ok(u) => check_target_literal("a1", &u).is_err(),
+            Err(_) => false,
+        }
+    }
+
+    fn allowed(raw: &str) -> bool {
+        match url::Url::parse(raw) {
+            Ok(u) => check_target_literal("a1", &u).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn metadata_and_link_local_literals_are_refused() {
+        assert!(refused("http://169.254.169.254/latest/meta-data/"));
+        assert!(refused("http://[fd00:ec2::254]/"));
+        assert!(refused("http://169.254.1.1:8080/rpc"));
+    }
+
+    #[test]
+    fn ordinary_hosts_and_loopback_pass() {
+        assert!(allowed("https://agent.example.com/rpc"));
+        assert!(allowed("http://127.0.0.1:9000/rpc"));
     }
 }

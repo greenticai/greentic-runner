@@ -32,13 +32,9 @@ const MAX_COMPONENT_CHARS: usize = 64;
 const MAX_LOCATION_CHARS: usize = 256;
 const MAX_MESSAGE_CHARS: usize = 4096;
 
-/// Make guest-controlled text safe to log: control characters (log injection)
-/// are replaced and the length is bounded.
+/// Make guest-controlled text safe to log: see [`crate::log_safe`].
 fn sanitize_attr(raw: &str, max_chars: usize) -> String {
-    raw.chars()
-        .take(max_chars)
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+    crate::log_safe::log_safe_max(raw, max_chars).into_owned()
 }
 
 /// Severity level parsed from a fallback line.

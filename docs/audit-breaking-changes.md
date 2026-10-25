@@ -404,6 +404,35 @@ Things most likely to break a running deployment, in the order to check them:
   `max_statement_time`.
 - **Affected:** clients that treated `NULL` as "could not decode".
 
+## Guest import hardening (round 9)
+
+- **Outbound `http-client` timeout:** a guest `timeout-ms` is clamped to the host ceiling
+  (`GREENTIC_HTTP_OUTBOUND_TIMEOUT_SECS`, default 30s), as on the `wasi:http` path. Zero/absent keeps the default.
+- **Memory:** `GREENTIC_WASM_MAX_MEMORY_MB` now also bounds the TOTAL linear memory per store, and a store may hold at
+  most 16 memories (was 10000). **Affected:** components declaring more than 16 memories, or whose combined memories
+  exceed the cap.
+- **`secrets-store.put`:** a refused write (empty key, provider-core-only, policy, backend failure) no longer
+  panics the host; the guest traps with the error message (an ordinary invocation error). The WIT `put` has no result
+  type, so a trap is the only way to surface it. Calling the trait method directly logs and drops the write; use
+  `HostState::try_put_secret` for the `Result`. The runner registers `secrets-store` itself instead of the library's
+  `add_secrets_store_compat_to_linker`.
+- **Size caps:** `GREENTIC_STATE_MAX_VALUE_MB` (16) and `GREENTIC_HTTP_MAX_REQUEST_MB` (64); `0` disables.
+- **Request timeout:** `GREENTIC_HTTP_REQUEST_TIMEOUT_SECS` (60, `0` disables) -> 408, except `/agent/chat/stream`.
+- **Logs:** guest- or peer-supplied text (secret keys, URLs, telemetry fields, correlation ids) is control-char
+  sanitised and length-capped (`log_safe`); URLs have userinfo/query redacted. Guest telemetry logs carry the
+  host-bound tenant as `host_tenant` and the guest claim as `guest_tenant`.
+- **stdin:** guests no longer inherit the host's stdin when stdio is inherited.
+
+- **Literal-IP SSRF:** A2A calls and knowledge-index embedding/search calls now refuse IP-literal link-local /
+  metadata hosts before sending (the resolver guard is skipped for IP literals).
+
+### Known, not fixed
+- `greentic-a2a`'s `CardCache` agent-card GET uses its own unguarded HTTP client.
+- A guest can override the `Host` header on outbound requests. It does not bypass the SSRF guard (the connect
+  address is checked), but the virtual host seen by the upstream is guest-chosen.
+- No disk quota for the guest `/state`, `/cache`, `/logs` mounts.
+- The extension runtime (`greentic-ext-runtime`) wasmtime engine configuration has not been audited.
+
 ## Tests and CI
 
 - Tests that used to print "skipping" and pass (offline wasm fixture build, missing `WEATHER_PACK_PATH`, fixture

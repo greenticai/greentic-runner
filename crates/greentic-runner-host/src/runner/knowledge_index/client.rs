@@ -47,6 +47,14 @@ fn embed_error(reason: impl std::fmt::Display) -> KnowledgeError {
     KnowledgeError::Backend(format!("embedding the query failed: {reason}"))
 }
 
+/// `hyper-util` skips the DNS resolver for an IP-literal host, so the guarded
+/// client's `GuardedResolver` never sees `http://169.254.169.254/...`. The
+/// binding's URLs come from the pack, and the bearer key goes to them: check
+/// the literal before sending anything.
+pub(super) fn check_literal(url: &url::Url) -> Result<(), String> {
+    crate::http_guard::HttpGuard::from_env().check_url_literal(url)
+}
+
 /// Embed `text` through the binding's OpenAI-compatible embeddings API.
 pub(super) async fn embed(
     http: &reqwest::Client,
@@ -58,6 +66,9 @@ pub(super) async fn embed(
         "{}/embeddings",
         binding.embedding_base_url.as_str().trim_end_matches('/')
     );
+    if let Ok(parsed) = url::Url::parse(&url) {
+        check_literal(&parsed).map_err(embed_error)?;
+    }
     let response = http
         .post(&url)
         .bearer_auth(key)
@@ -153,6 +164,7 @@ async fn search_one(
         .clear()
         .extend(["v1", "indexes", index_id, "search"]);
 
+    check_literal(&url)?;
     let response = http
         .post(url)
         .bearer_auth(key)
@@ -225,5 +237,20 @@ fn transport_reason(error: &reqwest::Error) -> &'static str {
         "could not connect"
     } else {
         "transport error"
+    }
+}
+
+#[cfg(test)]
+mod literal_guard_tests {
+    use super::check_literal;
+
+    #[test]
+    fn metadata_literal_is_refused_and_ordinary_hosts_pass() {
+        let bad = url::Url::parse("http://169.254.169.254/v1/embeddings").expect("url");
+        assert!(check_literal(&bad).is_err());
+        let ok = url::Url::parse("https://api.openai.com/v1/embeddings").expect("url");
+        assert!(check_literal(&ok).is_ok());
+        let loopback = url::Url::parse("http://127.0.0.1:8080/").expect("url");
+        assert!(check_literal(&loopback).is_ok());
     }
 }

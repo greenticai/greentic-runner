@@ -421,7 +421,7 @@ impl SessionResumer for RuntimeSessionResumer {
         let parked = match self.runtime.parked_approvals(&envelope).await {
             Ok(parked) => parked,
             Err(error) if !nonced => {
-                tracing::warn!(%error, %correlation_id, "could not read the parked flow before resuming; the gate re-checks the response itself");
+                tracing::warn!(%error, correlation_id = %crate::log_safe::log_safe(correlation_id), "could not read the parked flow before resuming; the gate re-checks the response itself");
                 None
             }
             Err(error) => return Err(error),
@@ -443,7 +443,7 @@ impl SessionResumer for RuntimeSessionResumer {
                 // decision (or its watchdog's late `timeout`) to a different
                 // gate — or to whatever the conversation is parked on now.
                 tracing::warn!(
-                    %correlation_id,
+                    correlation_id = %crate::log_safe::log_safe(correlation_id),
                     "dropping approval response: it does not match the approval this conversation is parked on"
                 );
                 return Ok(ResumeOutcome::Dropped);
@@ -453,7 +453,7 @@ impl SessionResumer for RuntimeSessionResumer {
                 // the gate was issued (or is replaying a spent one). The gate
                 // stays parked. The token is never logged.
                 tracing::warn!(
-                    %correlation_id,
+                    correlation_id = %crate::log_safe::log_safe(correlation_id),
                     "dropping approval response: its decision_token is missing or does not match the one the parked approval was issued"
                 );
                 return Ok(ResumeOutcome::Dropped);

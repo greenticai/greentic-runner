@@ -38,6 +38,7 @@ pub mod gtbind;
 pub mod http;
 mod http_guard;
 pub mod identify_hint;
+mod log_safe;
 pub mod metrics;
 pub mod operator_metrics;
 pub mod operator_registry;
