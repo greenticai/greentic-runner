@@ -29,6 +29,14 @@ pub enum RunnerError {
 
     #[error("serialization error: {reason}")]
     Serialization { reason: String },
+
+    /// Persisting the session/resume record failed AFTER the flow's side
+    /// effects had run (approval dispatch, SoR writes, artifact uploads,
+    /// emits). It is never retried by `retry_with_jitter`: re-running the
+    /// adapter call would repeat those effects. The persistence call itself is
+    /// retried in place before this is raised.
+    #[error("persisting flow state after execution failed: {reason}")]
+    PostEffectPersistence { reason: String },
 }
 
 /// Result alias for runner operations.
