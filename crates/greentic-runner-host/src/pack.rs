@@ -129,6 +129,10 @@ pub struct PackRuntime {
     session_store: Option<DynSessionStore>,
     state_store: Option<DynStateStore>,
     wasi_policy: Arc<RunnerWasiPolicy>,
+    /// The policy `load` was HANDED, before `for_tenant` scoped it. A nested
+    /// load (`load_flow_engine`) must start from this: `for_tenant` is not
+    /// idempotent, so re-scoping `wasi_policy` would give `<host>/tenants/<t>/tenants/<t>`.
+    base_wasi_policy: Arc<RunnerWasiPolicy>,
     assets_tempdir: Option<TempDir>,
     provider_registry: RwLock<Option<ProviderRegistry>>,
     /// Per-revision lazy cache of `describe-identify-instance` results,
@@ -2622,6 +2626,7 @@ impl PackRuntime {
                 component_manifests.insert(component.id.as_str().to_string(), component.clone());
             }
         }
+        let base_wasi_policy = Arc::clone(&wasi_policy);
         let mut pack_policy = wasi_policy
             .for_tenant(&config.tenant, &config.env_passthrough)
             .with_context(|| format!("failed to build WASI policy for tenant {}", config.tenant))?;
@@ -2647,6 +2652,7 @@ impl PackRuntime {
             session_store,
             state_store,
             wasi_policy,
+            base_wasi_policy,
             assets_tempdir,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
@@ -2782,6 +2788,20 @@ impl PackRuntime {
         Vec::new()
     }
 
+    /// The tenant-scoped WASI policy this pack's components run under.
+    #[doc(hidden)]
+    pub fn effective_wasi_policy(&self) -> Arc<RunnerWasiPolicy> {
+        Arc::clone(&self.wasi_policy)
+    }
+
+    /// The WASI policy of the pack a direct flow run loads. Must equal
+    /// [`Self::effective_wasi_policy`]; exposed so a test can pin that.
+    #[doc(hidden)]
+    pub async fn nested_load_wasi_policy(&self) -> Result<Arc<RunnerWasiPolicy>> {
+        let (pack, _engine) = self.load_flow_engine().await?;
+        Ok(pack.effective_wasi_policy())
+    }
+
     /// Load a fresh engine over this pack, the way every direct flow run here
     /// does. Shared by [`Self::execute_flow_inner`] and
     /// [`Self::resume_flow_for_tool`], so a resumed tool flow runs on exactly
@@ -2795,7 +2815,7 @@ impl PackRuntime {
                 self.archive_path.as_deref(),
                 self.session_store.clone(),
                 self.state_store.clone(),
-                Arc::clone(&self.wasi_policy),
+                Arc::clone(&self.base_wasi_policy),
                 self.secrets.clone(),
                 self.oauth_config.clone(),
                 false,
@@ -4449,6 +4469,7 @@ impl PackRuntime {
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(RunnerWasiPolicy::new()),
+            base_wasi_policy: Arc::new(RunnerWasiPolicy::new()),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
@@ -6652,6 +6673,7 @@ pub(crate) mod tests {
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
+            base_wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
