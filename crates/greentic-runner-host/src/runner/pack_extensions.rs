@@ -181,9 +181,11 @@ pub(crate) struct PackExtensions {
 /// stages the same archives, so a shared, digest-keyed root turns N tenants
 /// into one unpack rather than N.
 ///
-/// A `TempDir` inside a `static` never runs its `Drop`, so the tree survives
+/// A `TempDir` inside a `static` never runs its `Drop`, so the root survives
 /// until the OS temp reaper takes it. That is the deliberate trade: the
-/// alternative deletes a directory the runtime is still pointing at.
+/// alternative deletes a directory the runtime is still pointing at. Within the
+/// root, superseded digests of an extension and abandoned partial unpacks are
+/// reclaimed by `sweep_stale_slots` after a grace period.
 ///
 /// [`LoadedExtension`]: greentic_ext_runtime::LoadedExtension
 static STAGING_ROOT: OnceLock<Option<tempfile::TempDir>> = OnceLock::new();
@@ -209,14 +211,54 @@ fn staging_root() -> Option<&'static Path> {
         .map(tempfile::TempDir::path)
 }
 
+/// Per-entry cap on the decompressed size of one file in an extension archive.
+const MAX_EXT_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+/// Cap on the total decompressed size of one extension archive.
+const MAX_EXT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+/// Cap on the number of entries (files and directories) in one archive.
+const MAX_EXT_ENTRIES: usize = 4096;
+
 /// Unpack `bytes` into `dest`, refusing any entry that escapes it.
 ///
 /// `enclosed_name` returning `None` is the refusal: an entry naming `..` or an
 /// absolute path is a hostile archive, and sanitising the path would silently
 /// load an extension whose contents are not what it claims.
+///
+/// This runs BEFORE signature / ledger verification (the archive comes from a
+/// tenant pack), so it must be safe against a decompression bomb: the entry
+/// count, each declared size and the running total are capped, and the real
+/// decompressed bytes are streamed to disk through a `take` because a declared
+/// size can lie.
 fn unpack_archive(bytes: &[u8], dest: &Path) -> Result<()> {
+    unpack_archive_with_limits(
+        bytes,
+        dest,
+        ExtractLimits {
+            max_entry_bytes: MAX_EXT_ENTRY_BYTES,
+            max_total_bytes: MAX_EXT_TOTAL_BYTES,
+            max_entries: MAX_EXT_ENTRIES,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExtractLimits {
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+    max_entries: usize,
+}
+
+fn unpack_archive_with_limits(bytes: &[u8], dest: &Path, limits: ExtractLimits) -> Result<()> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes)).context("read the extension archive")?;
+    if archive.len() > limits.max_entries {
+        bail!(
+            "extension archive has too many entries ({}, limit {})",
+            archive.len(),
+            limits.max_entries
+        );
+    }
+    let mut total_bytes = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let raw_name = entry.name().to_string();
@@ -228,13 +270,35 @@ fn unpack_archive(bytes: &[u8], dest: &Path) -> Result<()> {
             std::fs::create_dir_all(&out_path)?;
             continue;
         }
+        if entry.size() > limits.max_entry_bytes {
+            bail!(
+                "extension archive entry `{raw_name}` is too large ({} bytes, limit {})",
+                entry.size(),
+                limits.max_entry_bytes
+            );
+        }
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut contents = Vec::new();
-        entry.read_to_end(&mut contents)?;
-        std::fs::write(&out_path, &contents)
+        let mut outfile = std::fs::File::create(&out_path)
+            .with_context(|| format!("create {}", out_path.display()))?;
+        // Bound the real decompressed size, not just the declared one.
+        let mut limited = (&mut entry).take(limits.max_entry_bytes.saturating_add(1));
+        let copied = std::io::copy(&mut limited, &mut outfile)
             .with_context(|| format!("write {}", out_path.display()))?;
+        if copied > limits.max_entry_bytes {
+            bail!(
+                "extension archive entry `{raw_name}` exceeds the size limit ({})",
+                limits.max_entry_bytes
+            );
+        }
+        total_bytes = total_bytes.saturating_add(copied);
+        if total_bytes > limits.max_total_bytes {
+            bail!(
+                "extension archive exceeds the total size limit ({} bytes)",
+                limits.max_total_bytes
+            );
+        }
     }
     Ok(())
 }
@@ -289,11 +353,83 @@ fn stage_one_in(root: &Path, entry_name: &str, bytes: &[u8]) -> Result<StagedExt
     }
 
     let extension_id = staged_extension_id(&dir);
+    record_slot_use(&slot, extension_id.as_deref());
+    sweep_stale_slots(root, &slot, SUPERSEDED_GRACE);
     Ok(StagedExtension {
         entry_name: entry_name.to_string(),
         dir,
         extension_id,
     })
+}
+
+/// File in a slot naming the extension id staged there, so a later digest of
+/// the same extension can find the slots it supersedes.
+const SLOT_ID_FILE: &str = ".ext-id";
+
+/// How long a superseded or abandoned slot is left alone before the sweep
+/// removes it. A [`LoadedExtension`](greentic_ext_runtime::LoadedExtension)
+/// keeps pointing into its slot, and nothing tells this module when a runtime
+/// drops, so a slot is only reclaimed once nothing has staged it for this
+/// long. Every stage of a digest re-touches its slot (`record_slot_use`), so a
+/// slot some pack still carries never ages out while that pack is rebuilt.
+const SUPERSEDED_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Refresh the slot's last-use time and remember which extension it holds.
+/// Best effort: failing to record only means the slot is swept less precisely.
+fn record_slot_use(slot: &Path, extension_id: Option<&str>) {
+    if let Some(id) = extension_id
+        && let Err(error) = std::fs::write(slot.join(SLOT_ID_FILE), id)
+    {
+        tracing::debug!(error = %error, "cannot record extension id for staging slot");
+    }
+    let touched = std::fs::File::options()
+        .write(true)
+        .open(slot.join(COMPLETE_MARKER))
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+    if let Err(error) = touched {
+        tracing::debug!(error = %error, "cannot refresh staging slot use time");
+    }
+}
+
+/// Remove staging slots nothing has used for `grace`: incomplete slots (a crash
+/// mid-unpack) and slots holding an older digest of the same extension as
+/// `keep`. `keep` itself is never removed. Slots of other extensions are left
+/// alone, so tenants carrying different extensions never evict each other.
+/// Best effort: a failure is logged, never propagated.
+fn sweep_stale_slots(root: &Path, keep: &Path, grace: std::time::Duration) {
+    let keep_id = std::fs::read_to_string(keep.join(SLOT_ID_FILE)).ok();
+    let Ok(read_dir) = std::fs::read_dir(root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for candidate in read_dir.flatten() {
+        let path = candidate.path();
+        if path == keep || !path.is_dir() {
+            continue;
+        }
+        let last_used = match std::fs::metadata(path.join(COMPLETE_MARKER)) {
+            Ok(meta) => {
+                let same_extension = keep_id.is_some()
+                    && std::fs::read_to_string(path.join(SLOT_ID_FILE)).ok() == keep_id;
+                if !same_extension {
+                    continue;
+                }
+                meta.modified().ok()
+            }
+            // No marker: an unpack that died partway.
+            Err(_) => std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+        };
+        let aged = last_used
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= grace);
+        if aged && let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::debug!(
+                error = %error,
+                slot = %path.display(),
+                "cannot remove stale extension staging slot"
+            );
+        }
+    }
 }
 
 /// Stage every `(entry_name, bytes)` pair, recording per-archive failures
@@ -812,6 +948,184 @@ mod tests {
         assert_eq!(second.extension_id.as_deref(), Some("acme.tool"));
     }
 
+    fn small_limits() -> ExtractLimits {
+        ExtractLimits {
+            max_entry_bytes: 1024,
+            max_total_bytes: 3 * 1024,
+            max_entries: 4,
+        }
+    }
+
+    /// Flip the declared uncompressed size in every central-directory header
+    /// (and local header) of a stored zip, producing an archive that lies
+    /// about how big its entries are.
+    fn lie_about_size(mut bytes: Vec<u8>, declared: u32) -> Vec<u8> {
+        let patch = |bytes: &mut Vec<u8>, sig: &[u8; 4], offset: usize| {
+            let mut at = 0;
+            while at + 4 <= bytes.len() {
+                if &bytes[at..at + 4] == sig && at + offset + 4 <= bytes.len() {
+                    bytes[at + offset..at + offset + 4].copy_from_slice(&declared.to_le_bytes());
+                    at += 4;
+                } else {
+                    at += 1;
+                }
+            }
+        };
+        // Central directory header: uncompressed size at +24.
+        patch(&mut bytes, b"PK\x01\x02", 24);
+        bytes
+    }
+
+    #[test]
+    fn a_normal_archive_unpacks_under_the_limits() {
+        let dir = tempfile::tempdir().expect("dest");
+        let archive = extension_archive("acme.tool");
+        unpack_archive_with_limits(&archive, dir.path(), small_limits()).expect("unpack");
+        assert!(dir.path().join("describe.json").is_file());
+        assert!(dir.path().join("extension.wasm").is_file());
+        // And the production limits accept it too.
+        let dir = tempfile::tempdir().expect("dest");
+        unpack_archive(&archive, dir.path()).expect("unpack with default limits");
+    }
+
+    #[test]
+    fn an_entry_declared_over_the_cap_is_refused() {
+        let dir = tempfile::tempdir().expect("dest");
+        let payload = vec![0u8; 2048];
+        let archive = zip_bytes(&[("big.bin", payload.as_slice())]);
+        let err = unpack_archive_with_limits(&archive, dir.path(), small_limits())
+            .expect_err("oversized entry must be refused");
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn an_entry_that_lies_about_its_size_is_stopped_by_the_streaming_cap() {
+        let dir = tempfile::tempdir().expect("dest");
+        let payload = vec![0u8; 4096];
+        let archive = lie_about_size(zip_bytes(&[("big.bin", payload.as_slice())]), 10);
+        let err = unpack_archive_with_limits(&archive, dir.path(), small_limits())
+            .expect_err("a lying declared size must not bypass the cap");
+        // Either the zip reader rejects the inconsistent entry, or our streaming
+        // cap does; in no case may the full payload be written out.
+        let written = std::fs::metadata(dir.path().join("big.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(written <= small_limits().max_entry_bytes + 1, "{err}");
+    }
+
+    #[test]
+    fn the_total_size_cap_is_enforced_across_entries() {
+        let dir = tempfile::tempdir().expect("dest");
+        let chunk = vec![1u8; 1000];
+        let archive = zip_bytes(&[
+            ("a.bin", chunk.as_slice()),
+            ("b.bin", chunk.as_slice()),
+            ("c.bin", chunk.as_slice()),
+            ("d.bin", chunk.as_slice()),
+        ]);
+        let limits = ExtractLimits {
+            max_entry_bytes: 1024,
+            max_total_bytes: 2500,
+            max_entries: 10,
+        };
+        let err = unpack_archive_with_limits(&archive, dir.path(), limits)
+            .expect_err("total cap must trip");
+        assert!(err.to_string().contains("total size"), "{err}");
+    }
+
+    #[test]
+    fn the_entry_count_cap_is_enforced() {
+        let dir = tempfile::tempdir().expect("dest");
+        let names: Vec<String> = (0..5).map(|i| format!("f{i}.txt")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        let archive = zip_bytes(&entries);
+        let err = unpack_archive_with_limits(&archive, dir.path(), small_limits())
+            .expect_err("too many entries must be refused");
+        assert!(err.to_string().contains("too many entries"), "{err}");
+    }
+
+    fn age_slot(slot: &Path, age: std::time::Duration) {
+        let past = std::time::SystemTime::now() - age;
+        let marker = std::fs::File::options()
+            .write(true)
+            .open(slot.join(COMPLETE_MARKER))
+            .expect("open marker");
+        marker.set_modified(past).expect("age marker");
+    }
+
+    #[test]
+    fn a_superseded_digest_is_swept_after_the_grace_but_not_before() {
+        let root = tempfile::tempdir().expect("staging root");
+        let old = stage_one_in(
+            root.path(),
+            "extensions/a.gtxpack",
+            &zip_bytes(&[
+                ("describe.json", describe_bytes("acme.tool").as_slice()),
+                ("v", b"1".as_slice()),
+            ]),
+        )
+        .expect("old");
+        let old_slot = old.dir.parent().expect("slot").to_path_buf();
+        let other = stage_one_in(
+            root.path(),
+            "extensions/b.gtxpack",
+            &extension_archive("other.tool"),
+        )
+        .expect("other");
+        let other_slot = other.dir.parent().expect("slot").to_path_buf();
+
+        // A fresh superseding digest does not remove the old one inside the grace.
+        let new = stage_one_in(
+            root.path(),
+            "extensions/a.gtxpack",
+            &zip_bytes(&[
+                ("describe.json", describe_bytes("acme.tool").as_slice()),
+                ("v", b"2".as_slice()),
+            ]),
+        )
+        .expect("new");
+        let new_slot = new.dir.parent().expect("slot").to_path_buf();
+        assert!(old_slot.exists(), "inside the grace the old slot stays");
+
+        age_slot(
+            &old_slot,
+            SUPERSEDED_GRACE + std::time::Duration::from_secs(60),
+        );
+        age_slot(
+            &other_slot,
+            SUPERSEDED_GRACE + std::time::Duration::from_secs(60),
+        );
+        sweep_stale_slots(root.path(), &new_slot, SUPERSEDED_GRACE);
+
+        assert!(!old_slot.exists(), "an aged superseded slot is removed");
+        assert!(new_slot.exists(), "the current slot is kept");
+        assert!(
+            other_slot.exists(),
+            "another extension's slot is never evicted"
+        );
+    }
+
+    #[test]
+    fn an_aged_incomplete_slot_is_swept() {
+        let root = tempfile::tempdir().expect("staging root");
+        let orphan = root.path().join("deadbeefdeadbeefdeadbeefdeadbeef");
+        std::fs::create_dir_all(orphan.join(EXTENSION_SUBDIR)).expect("orphan");
+        let staged = stage_one_in(
+            root.path(),
+            "extensions/a.gtxpack",
+            &extension_archive("acme.tool"),
+        )
+        .expect("stage");
+        let keep = staged.dir.parent().expect("slot").to_path_buf();
+
+        sweep_stale_slots(root.path(), &keep, SUPERSEDED_GRACE);
+        assert!(orphan.exists(), "a fresh incomplete slot may be mid-unpack");
+
+        sweep_stale_slots(root.path(), &keep, std::time::Duration::ZERO);
+        assert!(!orphan.exists());
+        assert!(keep.exists());
+    }
+
     #[test]
     fn a_partial_unpack_without_the_marker_is_redone() {
         let root = tempfile::tempdir().expect("staging root");
@@ -862,6 +1176,7 @@ mod tests {
         assert_eq!(
             files_under(&slot),
             vec![
+                SLOT_ID_FILE.to_string(),
                 COMPLETE_MARKER.to_string(),
                 format!("{EXTENSION_SUBDIR}/describe.json"),
                 format!("{EXTENSION_SUBDIR}/extension.wasm"),
