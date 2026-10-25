@@ -1975,6 +1975,20 @@ impl TenantRuntime {
         self.timer_handles.lock().extend(handles);
     }
 
+    /// Stop this runtime's cron timers now. Used when a reload supersedes the
+    /// runtime: it may stay referenced by in-flight work for a while, and its
+    /// timers must not fire alongside the replacement's.
+    pub fn abort_timers(&self) {
+        for handle in self.timer_handles.lock().drain(..) {
+            handle.abort();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timer_count(&self) -> usize {
+        self.timer_handles.lock().len()
+    }
+
     /// Read a RUNTIME-level secret, at the `_runner` pseudo-pack segment.
     ///
     /// **Deliberately NOT unit-scoped**, unlike every pack secret a component
