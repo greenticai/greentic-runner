@@ -19,9 +19,10 @@ use crate::runner::adapt_timer;
 use crate::runner::engine::FlowEngine;
 use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::secrets::{DynSecretsManager, default_manager};
+#[cfg(test)]
+use crate::storage::session_host_from;
 use crate::storage::{
-    DynSessionStore, DynStateStore, StorageConfig, session_host_from, state_host_from,
-    stores_from_config,
+    DynSessionStore, DynStateStore, StorageConfig, state_host_from, stores_from_config,
 };
 use crate::wasi::RunnerWasiPolicy;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
@@ -315,32 +316,20 @@ impl HostBuilder {
         })
         .context("invalid session/state Redis environment configuration")?;
         let (session_store, state_store) = stores_from_config(&storage)?;
-        // `SessionStoreHost` is deliberately NOT pointed at a durable store.
-        //
-        // It is write-only by construction: `put` goes through
-        // `SessionStore::create_session`, which does not add the row to the
-        // per-user wait index — and `get` reads exactly that index, via
-        // `find_by_user`. Both backends behave this way, so `get` never returns
-        // what `put` wrote, `state_machine::step`'s `is_new` is always true, and
-        // every turn writes a fresh row under a random UUID.
-        //
-        // In memory that is a bounded-by-process-lifetime map nobody reads. On
-        // Redis it would be one permanent key PER TURN — `create_session` takes
-        // no TTL argument, so there is no expiry to attach and the
-        // `DefaultWaitTtl` decorator cannot reach it — growing without bound
-        // while buying nothing, because nothing can read it back.
+        // The engine-level `SessionHost` is write-only by construction: the
+        // store's `create_session` does not add the row to the per-user wait
+        // index that `get` reads (`find_by_user`), on either backend, so `get`
+        // never returns what `put` wrote, `state_machine::step`'s `is_new` is
+        // always true, and every turn would write a fresh row under a random id
+        // that nothing can read back. `create_session` takes no TTL, so those
+        // rows never expire: unbounded growth in memory, one permanent key per
+        // turn on Redis. So the host is `DiscardSessionHost`, which keeps the
+        // observable behaviour (`get` -> `None`) and stores nothing.
         //
         // The parked-flow snapshot, which is what durability is for, does NOT
         // travel this path: `FlowResumeStore` uses `register_wait` /
-        // `find_wait_by_scope` and gets `session_store` below. Closing the
-        // write-only behaviour itself is an upstream change in greentic-session.
-        let session_host = if storage.session.is_durable() {
-            session_host_from(crate::storage::new_session_store())
-        } else {
-            // Unchanged for every caller that names no storage: one store,
-            // shared, exactly as before.
-            session_host_from(Arc::clone(&session_store))
-        };
+        // `find_wait_by_scope` and gets `session_store` below.
+        let session_host: Arc<dyn SessionHost> = Arc::new(DiscardSessionHost);
         let state_host = state_host_from(Arc::clone(&state_store));
         if storage.is_durable() {
             // Names, never the configured values: a Redis URL may carry
@@ -2298,5 +2287,71 @@ mod storage_resolution_tests {
         )
         .expect("config parses; the URL is only checked on connect");
         assert!(stores_from_config(&config).is_err());
+    }
+}
+
+/// A [`SessionHost`] that retains nothing. See the comment where
+/// [`HostBuilder::build`] installs it for why the store-backed host was a leak.
+struct DiscardSessionHost;
+
+#[async_trait::async_trait]
+impl SessionHost for DiscardSessionHost {
+    async fn get(
+        &self,
+        _key: &crate::engine::host::SessionKey,
+    ) -> crate::engine::error::GResult<Option<crate::engine::host::SessionSnapshot>> {
+        Ok(None)
+    }
+
+    async fn put(
+        &self,
+        _snapshot: crate::engine::host::SessionSnapshot,
+    ) -> crate::engine::error::GResult<()> {
+        Ok(())
+    }
+
+    async fn update_cas(
+        &self,
+        _snapshot: crate::engine::host::SessionSnapshot,
+        _expected_revision: u64,
+    ) -> crate::engine::error::GResult<bool> {
+        // Nothing is ever stored, so there is no revision to match.
+        Ok(false)
+    }
+
+    async fn delete(
+        &self,
+        _key: &crate::engine::host::SessionKey,
+    ) -> crate::engine::error::GResult<()> {
+        Ok(())
+    }
+
+    async fn touch(
+        &self,
+        _key: &crate::engine::host::SessionKey,
+        _ttl: std::time::Duration,
+    ) -> crate::engine::error::GResult<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod discard_session_host_tests {
+    use super::*;
+    use crate::engine::host::{SessionKey, SessionSnapshot};
+
+    #[tokio::test]
+    async fn put_retains_nothing() {
+        let host = DiscardSessionHost;
+        let key = SessionKey {
+            tenant_key: "dev::acme".into(),
+            pack_id: "p".into(),
+            flow_id: "f".into(),
+            session_hint: Some("s".into()),
+        };
+        let snapshot = SessionSnapshot::new(key.clone(), "id".into());
+        assert!(host.put(snapshot.clone()).await.is_ok());
+        assert!(matches!(host.get(&key).await, Ok(None)));
+        assert!(matches!(host.update_cas(snapshot, 0).await, Ok(false)));
     }
 }
