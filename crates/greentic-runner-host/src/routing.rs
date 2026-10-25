@@ -128,6 +128,29 @@ pub enum TenantResolver {
     Invalid(String),
 }
 
+/// The caller failed to authenticate (missing, malformed-as-credential,
+/// unverifiable or expired bearer token). Carried inside the `anyhow::Error`
+/// returned by [`TenantRouting::resolve`] so [`TenantRuntimeHandle`] can answer
+/// 401 instead of 400; every other resolve error is malformed routing input
+/// (400).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct TenantAuthError(pub String);
+
+/// Whether `err` is an authentication failure (401) rather than bad input (400).
+pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TenantAuthError>().is_some()
+}
+
+/// HTTP status for a [`TenantRouting::resolve`] failure.
+pub fn resolve_error_status(err: &anyhow::Error) -> StatusCode {
+    if is_auth_error(err) {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
 /// Clock leeway applied to `exp` / `nbf`.
 const JWT_LEEWAY_SECS: f64 = 60.0;
 
@@ -301,12 +324,15 @@ impl TenantRouting {
                 Ok(tenant)
             }
             TenantResolver::Jwt { header, claim } => {
-                let token = bearer_from_headers(&parts.headers, header)
-                    .ok_or_else(|| anyhow!("authorization header missing or not a bearer token"))?;
+                let token = bearer_from_headers(&parts.headers, header).ok_or_else(|| {
+                    anyhow::Error::new(TenantAuthError(
+                        "authorization header missing or not a bearer token".into(),
+                    ))
+                })?;
                 let tenant = decode_jwt_claim(&token, claim)
                     .map_err(|err| {
                         tracing::warn!(error = %err, "failed to decode jwt claim");
-                        anyhow!("invalid bearer token")
+                        anyhow::Error::new(TenantAuthError("invalid bearer token".into()))
                     })?
                     .ok_or_else(|| anyhow!("bearer token has no `{claim}` claim"))?;
                 Ok(tenant)
@@ -316,11 +342,14 @@ impl TenantRouting {
                 claim,
                 verifier,
             } => {
-                let token = bearer_from_headers(&parts.headers, header)
-                    .ok_or_else(|| anyhow!("authorization header missing or not a bearer token"))?;
+                let token = bearer_from_headers(&parts.headers, header).ok_or_else(|| {
+                    anyhow::Error::new(TenantAuthError(
+                        "authorization header missing or not a bearer token".into(),
+                    ))
+                })?;
                 let claims = verifier.verify(&token, now_unix()).map_err(|err| {
                     tracing::warn!(error = %err, "jwt verification failed");
-                    anyhow!("invalid bearer token")
+                    anyhow::Error::new(TenantAuthError("invalid bearer token".into()))
                 })?;
                 claims
                     .get(claim)
@@ -398,10 +427,10 @@ where
         let server_state = ServerState::from_ref(state);
         async move {
             let tenant = server_state.routing.resolve(parts).map_err(|err| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({ "error": err.to_string() })),
-                )
+                // Authentication failures are 401; everything else here is
+                // malformed routing input.
+                let status = resolve_error_status(&err);
+                (status, axum::Json(json!({ "error": err.to_string() })))
             })?;
             let runtime = server_state.active.load_pack(&tenant).ok_or_else(|| {
                 (
@@ -654,6 +683,51 @@ mod tests {
         };
         assert_eq!(routing.resolve(&req(&good)).unwrap(), "acme");
         assert!(routing.resolve(&req(&forged)).is_err());
+    }
+
+    #[test]
+    fn jwt_verification_failures_are_auth_errors_but_missing_claim_is_not() {
+        let routing = TenantRouting::new(RoutingConfig {
+            resolver: TenantResolver::jwt(Some(SECRET.into()), None, false),
+            default_tenant: "demo".into(),
+        });
+        let req = |auth: Option<String>| {
+            let mut b = Request::builder();
+            if let Some(a) = auth {
+                b = b.header(AUTHORIZATION, a);
+            }
+            b.body(()).unwrap().into_parts().0
+        };
+        let forged = sign(
+            r#"{"alg":"HS256"}"#,
+            r#"{"tenant":"acme","exp":4102444800}"#,
+            "bad",
+        );
+        let err = routing
+            .resolve(&req(Some(format!("Bearer {forged}"))))
+            .unwrap_err();
+        assert!(is_auth_error(&err), "bad signature is a 401");
+        assert_eq!(resolve_error_status(&err), StatusCode::UNAUTHORIZED);
+        let expired = hs256(r#"{"tenant":"acme","exp":1}"#);
+        let err = routing
+            .resolve(&req(Some(format!("Bearer {expired}"))))
+            .unwrap_err();
+        assert!(is_auth_error(&err), "expired is a 401");
+        let err = routing.resolve(&req(None)).unwrap_err();
+        assert!(is_auth_error(&err), "missing bearer is a 401");
+        // A valid token with no tenant claim is a routing problem, not authn.
+        let no_claim = hs256(r#"{"sub":"x","exp":4102444800}"#);
+        let err = routing
+            .resolve(&req(Some(format!("Bearer {no_claim}"))))
+            .unwrap_err();
+        assert!(!is_auth_error(&err));
+        assert_eq!(resolve_error_status(&err), StatusCode::BAD_REQUEST);
+        // Misconfiguration stays a non-auth error.
+        let invalid = TenantRouting::new(RoutingConfig {
+            resolver: TenantResolver::Invalid("x".into()),
+            default_tenant: "demo".into(),
+        });
+        assert!(!is_auth_error(&invalid.resolve(&req(None)).unwrap_err()));
     }
 
     #[test]
