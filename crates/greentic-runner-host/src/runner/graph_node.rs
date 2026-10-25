@@ -1428,11 +1428,14 @@ mod aw {
         // Guardrails for EVERY graph agent turn (inline ones included), through
         // the builder the serve path and in-process `dw.agent` share, so a graph
         // can never run an agent with fewer guardrails than a flow node would.
-        runtime = super::super::agent_node::attach_guardrails(
-            runtime,
-            ext_runtime.clone(),
-            cfg.guardrails.clone(),
-        );
+        //
+        // The fallback policy is EMPTY on purpose: `cfg.guardrails` already
+        // rides in the agent config the loop evaluates as agent-level
+        // guardrails, and naming them here too made them the mandatory
+        // fallback as well, so `assemble_chain` ran every one of them twice
+        // per turn (double cost, double verdicts).
+        runtime =
+            super::super::agent_node::attach_guardrails(runtime, ext_runtime.clone(), Vec::new());
 
         // Full fidelity ONLY for a referenced agent — mirrors
         // `agent_node::build_agent_runtime`'s guardrail/short-term-memory/
