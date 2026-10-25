@@ -28,7 +28,7 @@
 //! that race. IP-literal hosts are exact in both paths. Deployments that need
 //! a hard guarantee should also egress-filter at the network layer.
 
-#[cfg(test)]
+#[allow(unused_imports)] // the test module reaches the address types through `super::*`
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
