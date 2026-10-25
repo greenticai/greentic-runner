@@ -62,12 +62,6 @@ fn preflight_warn_tools(agent_id: &str, missing: &[crate::tools::MissingTool], d
     );
 }
 
-/// Stop the step when its session lock is no longer ours.
-///
-/// A refresh that fails for a transient reason only logs (losing one
-/// extension is preferable to aborting a partially-complete turn), but a lock
-/// that is genuinely gone means another worker may now own the session:
-/// carrying on would let two turns race and the last save win.
 /// Await the per-step ledger read and tool-catalog resolve together while
 /// keeping the session `lock` alive.
 ///
@@ -91,6 +85,12 @@ where
         .await
 }
 
+/// Stop the step when its session lock is no longer ours.
+///
+/// A refresh that fails for a transient reason only logs (losing one
+/// extension is preferable to aborting a partially-complete turn), but a lock
+/// that is genuinely gone means another worker may now own the session:
+/// carrying on would let two turns race and the last save win.
 async fn ensure_lock_held(lock: &crate::state::SessionLock) -> Result<(), AgentError> {
     match lock.refresh().await {
         Ok(()) => Ok(()),
