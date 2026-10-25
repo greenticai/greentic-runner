@@ -287,7 +287,13 @@ off, `secrets_broker::is_safe_secret_segment`): only `[A-Za-z0-9._-]`, no leadin
 (unsafe -> `Err`; the pack id is normalised to `[a-z0-9_-]` there). A `credential_ref` such as
 `vault://acme/x` or `../other` is therefore REJECTED, not looked up. In
 `secret_uri_candidates` an unsafe unit candidate (e.g. a key ending in `.`) is skipped and the
-team/tenant candidates still apply.
+team/tenant candidates still apply (the first skip per process logs a `warn!`, later ones `debug!`: the
+lookup has silently widened to a broader scope).
+
+A tenant id is checked once against the strictest of these rules at config load
+(`config::tenant_ctx_for` -> `secrets_broker::validate_tenant_segment`: `[A-Za-z0-9._-]`, at most 128 bytes, no
+leading `.`, no `..`). A `.hidden` / `a..b` tenant used to load and then fail every secret read; it now fails the
+load with a message naming the tenant.
 
 ### Broker URLs are logged redacted
 
@@ -314,7 +320,10 @@ gap. `ensure_lock_held` runs before every end-of-turn save, and `keep_alive` wra
 tool, generic tool dispatch). (3) Guardrail WASM goes through `guardrail::run_chain_blocking` (blocking pool,
 fail-closed on a task panic); never call `run_chain` directly from async code. (4) Detached side effects go
 through `background::BackgroundGate` (cap + timeout), not a bare `tokio::spawn`. (5) The core-NATS bridges cap
-in-flight requests (`MAX_INFLIGHT`) and bound each handler. See `docs/audit-breaking-changes.md`.
+in-flight requests (`MAX_INFLIGHT`) and bound each handler. (6) A tool result over `MAX_TOOL_RESULT_BYTES`
+(32 KiB serialised) is replaced in the history by `{truncated, original_bytes, preview}`; the model never sees the
+rest, so `state::cap_tool_result_for` logs a `warn!` with the tool name and size. See
+`docs/audit-breaking-changes.md`.
 
 ### Knowledge retrieval backends
 
@@ -610,6 +619,9 @@ Rules, each silent if broken:
   nothing. A failed node elsewhere in the flow makes `lift_first_node_error_from_nodes`
   wrap an ARRAY reply under `payload`, which hides the list from the host: known,
   rare, and the file is not delivered then.
+- **At most 20 files per turn are listed** (`MAX_CREATED_PER_TURN`, mirrored in `runner/engine.rs`). Files beyond
+  the cap are stored but not listed in the reply (so not delivered); `note_created_artifacts` logs a `warn!` with the
+  dropped count.
 - **A failure is a value.** The node is marked failed (errors envelope via
   `normalize_mcp_tool_error`) only when it has an `on_error` edge; otherwise it
   completes with the failure value, exactly like `a2a`.
@@ -806,6 +818,17 @@ cannot be built (no usable state backend — e.g. `GREENTIC_AW_STATE_BACKEND=red
 `GREENTIC_AW_REDIS_URL`, or a Redis connect failure — or no LLM key). With no backend env set
 it defaults to the in-memory backend, so the runtime builds without Redis.
 
+**Event-bridge scope headers and JetStream budgets (round 13).** Both bridges (`aw-event-bridge`,
+`telco-x-event-bridge`) treat a blank `Greentic-Env` as absent (default `default`) and echo `Greentic-Tenant` /
+`Greentic-Env` on every rejection reply whenever the ids fit the runner's charset (`is_echoable_scope_id`:
+`[A-Za-z0-9._-]`, at most 128 bytes, `..` allowed). `validate_scope_id` still rejects `..` because it guards ids used
+to build keys; the two rules differ on purpose. Without the echo the runner's tenant-scoped response listener drops
+the rejection (it also drops, with a `warn!` naming the correlation id, any response with no `Greentic-Tenant`), and
+the awaiting flow stays parked until its watchdog fires (forever with no deadline). On JetStream a busy session is
+redelivered while the message is younger than `busy_budget(step_timeout)` (handle timeout + 60 s, at most 31 min),
+measured from the message's publish time; every Nak counts against the server's `max_deliver`, so the consumer's is
+now the backstop `CONSUMER_MAX_DELIVER` (100) and `MAX_DELIVER` (6) is the application cap for handler ERRORS only.
+
 ### What a component is told about its caller
 
 A `component.exec` node runs under two different identities, and they must not be confused:
@@ -828,7 +851,7 @@ Known gap, not closed here: `tenant_ctx_from_v1` lets a component override `team
 
 ### Guest sandbox, limits and outbound guard
 
-Each tenant's packs get `/state`, `/cache`, `/logs` backed by `<host dir>/tenants/<tenant>` (`RunnerWasiPolicy::for_tenant`; tenant ids must be `[A-Za-z0-9._-]{1,128}`, not `.`/`..`), and `env_allow` is only that tenant's `env_passthrough`. The pack-artifact cache (`<cache>/packs`) is never visible to guests. Data under the old host-wide dirs is not migrated. Execution limits live in `wasm_limits.rs`; the outbound SSRF/size guard in `http_guard.rs` (host `http-client`: checked in the client's DNS resolver, so it covers the connect address and redirects; `wasi:http`: the name is resolved and validated just before the upstream connector re-resolves it, so a DNS-rebinding race remains — egress-filter at the network layer if that matters).
+Each tenant's packs get `/state`, `/cache`, `/logs` backed by `<host dir>/tenants/<tenant>` (`RunnerWasiPolicy::for_tenant`; tenant ids must be `[A-Za-z0-9._-]{1,128}`, not `.`/`..`), and `env_allow` is only that tenant's `env_passthrough`. The pack-artifact cache (`<cache>/packs`) is never visible to guests. Data under the old host-wide dirs is not migrated. Execution limits live in `wasm_limits.rs` (a grow past the memory/table cap is DENIED, not trapped: the guest sees `-1` from `memory.grow`/`table.grow` and a Rust guest usually aborts on the failed allocation; `GuestLimiter` logs one `warn!` per store); the outbound SSRF/size guard in `http_guard.rs` (host `http-client`: checked in the client's DNS resolver, so it covers the connect address and redirects; `wasi:http`: the name is resolved and validated just before the upstream connector re-resolves it, so a DNS-rebinding race remains — egress-filter at the network layer if that matters).
 
 ### Desktop session snapshots (legacy adoption)
 
@@ -856,11 +879,16 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
 ### Engine and tool-secret rules (round 11)
 
 - **Tool-secret env fallback has a deny-list.** `secret://a/b` maps to env var `A_B` for local runs
-  (`agent_node::env_secret_lookup`), but `GREENTIC_*`, `TENANT_JWT_*`, `ADMIN_TOKEN`, `OPERATOR_TOKEN`,
-  `PACK_PUBLIC_KEY` and the provider webhook secrets are host configuration and resolve as not found
-  (`env_secret_name_is_denied`). Extend that list when a new host-level env secret is introduced.
+  (`agent_node::env_secret_lookup`), but host configuration resolves as not found
+  (`env_secret_name_is_denied`): the exact names `ADMIN_TOKEN`, `OPERATOR_TOKEN`, `PACK_PUBLIC_KEY`,
+  `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`,
+  `TELEGRAM_BOT_TOKEN`, `REDIS_URL`, `OTLP_ENDPOINT`, `OTLP_HEADERS`, and any name with the prefix `GREENTIC_`,
+  `TENANT_JWT_`, `SECRETS_` or `PACK_`. Extend `ENV_SECRET_DENY_EXACT` / `ENV_SECRET_DENY_PREFIXES` when a new
+  host-level env secret is introduced. `OPENAI_API_KEY` is deliberately NOT denied.
 - **Tool-extension HTTP client** (`build_tool_http_client`): `redirect::Policy::none()` plus the `http_guard`
   address policy on DNS (a reqwest-0.12 resolver, since the ext-runtime pins 0.12 and `GuardedResolver` targets 0.13).
+  The client is built once per process and cached even when it is `None` (the blackhole listener could not bind, the
+  builder failed): every later tool HTTP call then fails, so each failure site logs an `error!` with the reason.
 - **Pack JSON Schemas never fetch**: `schema_validator::compile_validator` installs a retriever that refuses every
   external `$ref`.
 - **Playbook turns** (`playbook_turn::build_turn`) get the calling worker's guardrail policy, billing meter
@@ -886,9 +914,31 @@ guard is released on drop (cancellation/panic); map entries are swept when
 unused. The held keys ride a task-local, so a nested run for the same session on
 the same task (the resumer's inner `handle`) skips the lock; a `tokio::spawn`
 between them would NOT inherit it. Lenient-resumer semantics are unchanged: the
-loser of the race finds no park and starts a fresh run. **Limit: in-process
+loser of the race finds no park and starts a fresh run. The state machine takes the same lock around the WHOLE
+`retry_with_jitter` loop of `execute_adapter_step` (key from `engine::runtime::turn_key_for_payload`, the one
+derivation shared with `call_traced`), so another message cannot consume the parked snapshot between a failed
+attempt and its retry; the inner per-attempt acquisition skips through the task-local. **Limit: in-process
 only.** Replicas sharing a Redis session store need a store-level
 compare-and-set/lease, which the session store does not expose today.
+
+### Whole-turn retry rules (round 13)
+
+Two retry layers re-run a failed turn from its start: the engine's own loop (`execute_with_options`,
+`FlowRetryConfig`) and the state machine's `retry_with_jitter`. Both stop on a `TerminalFlowError`.
+
+- **After an effect, a failure is terminal.** `drive_flow` tracks whether a node that performs an external effect
+  has succeeded in THIS run (`NodeKind::performs_external_effect`: `provider.invoke`, `flow.call`, `dw.agent`,
+  `dw.agent_graph`, `sorla/operala/agentic/telco-x/approval.call`, `mcp`, `a2a`, `media.create`); any later failure
+  of the run is rewrapped by `terminal_after_effects` (message kept, cause chain logged at `warn`) so neither layer
+  repeats the effect. Failures BEFORE any such node keep their classification, so transient failures still retry.
+  Not counted, on purpose: `emit.*` (only appends to the turn's egress, dropped on failure), `var.set`, `state.get`,
+  `state.set` (an overwrite is idempotent), `session.wait`, `flow.goto`. **Known limitations:** generic component
+  nodes (`Exec` / `PackComponent`) are opaque to the host, so a component that wrote to an external system is NOT
+  counted (counting them would turn the whole-turn retry into a no-op for nearly every flow); a `state.set` that
+  is a read-modify-write (a counter) re-applies on retry; and the node that itself fails may have partly acted.
+  If you add a node kind with an external effect, add it to `performs_external_effect`.
+- **Deterministic jump failures are terminal**: `unknown_flow` (flow not registered), `unknown_node`, "no start node"
+  and a malformed `greentic_control` block (`parse_component_control`). A `load_flow` I/O failure stays retryable.
 
 ### Pack Hot-Reload
 
@@ -896,7 +946,12 @@ Full list of user-visible and breaking changes from the audit branch: `docs/audi
 
 Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 30s). On change: resolve locators → verify digest/signature → cache artifacts → atomically swap `TenantRuntime` via `ArcSwap`. Overlays independently deployable per tenant.
 
-Three things that fail silently if changed: (1) the superseded runtime's cron timers are stopped with a per-runtime `CancellationToken` that `adapt_timer::drive_schedule` observes ONLY while sleeping — never `JoinHandle::abort`, which would cancel a tick mid-`handle()` after its effects but before the snapshot save; (2) the digest used for signatures and the watcher's applied-digest comparison is the one COMPUTED from the cached file (`CachedPack.digest`, canonical lowercase), never the index's spelling of the pin; (3) `PackCache::store` prunes idle sibling digest dirs, but a loaded `PackRuntime` keeps its archive PATH and re-opens it lazily, so pruning is gated on mtime (cache hits refresh it), keeps the newest 2, and must never delete anything recently used.
+Three things that fail silently if changed: (1) the superseded runtime's cron timers are stopped with a per-runtime `CancellationToken` that `adapt_timer::drive_schedule` observes ONLY while sleeping — never `JoinHandle::abort`, which would cancel a tick mid-`handle()` after its effects but before the snapshot save; (2) the digest used for signatures and the watcher's applied-digest comparison is the one COMPUTED from the cached file (`CachedPack.digest`, canonical lowercase), never the index's spelling of the pin; (3) `PackCache::store` prunes idle sibling digest dirs, but a loaded `PackRuntime` keeps its archive PATH and re-opens it lazily, so pruning is gated on mtime (cache hits refresh it), keeps the newest 2, and must never delete anything recently used. The idle gate is `max(1h, 2 x PACK_REFRESH_INTERVAL)`
+(`runner_core::packs::prune_min_idle`, applied through `PackManager::with_refresh_interval` by the watcher); `touch`
+opens the archive READ-ONLY (a 0444 cached archive used to fail the write open, so its mtime never refreshed); and a
+runtime kept because its republish failed to build has its archives touched (`watcher::keep_archives_alive`).
+`ActivePacks::insert_pack` / `insert_revision` / `remove_revision` cancel the cron timers of the runtime they replace or
+remove (not when the same `Arc` is re-inserted), so an embedder still holding it does not double-fire a tick.
 
 Whole-turn retry (`retry_with_jitter`) never re-runs a `RunnerError::FlowTerminal`/`PostEffectPersistence`. Deterministic or post-effect flow failures are raised through `runner::engine::terminal_flow_error` (`TerminalFlowError`: step limit, `redirect_limit`, unknown node/flow, missing required var); `should_retry` also returns false for them.
 
@@ -933,7 +988,9 @@ The pack cache path is `<name>/<version>/<sha256>/pack.gtpack` (the content dige
 | Module | Responsibility |
 |--------|---------------|
 | `engine/mod.rs` | `FlowEngine` entry, DAG walker |
-| `engine/state_machine.rs` | State transitions, pause/resume orchestration |
+| `engine/state_machine.rs` | State transitions, pause/resume orchestration; holds the turn lock across the whole retry loop |
+| `engine/turn_lock.rs` | In-process per-session async mutex (task-local reentrant); see "Per-session turn lock" |
+| `engine/runtime.rs` | `PackFlowAdapter`, `FlowResumeStore`, `IngressEnvelope`, `turn_key_for_payload` |
 | `engine/builder.rs` | Engine builder pattern |
 | `engine/policy.rs` | Execution policy enforcement |
 | `engine/registry.rs` | Node-type registry |
@@ -961,7 +1018,7 @@ The pack cache path is `<name>/<version>/<sha256>/pack.gtpack` (the content dige
 |--------|---------------|
 | `http/mod.rs` | Module declarations only (`admin`, `agent_chat`, `agent_stream`, `auth`, `health`). The Axum router is assembled in `runner/mod.rs::router`: `/healthz`, `/admin/*`, `/agent/chat*`, `/operator/op/invoke`, `/sql/*`. Provider webhook ingress is NOT registered there; the per-provider `Activity` normalization lives in the `runner/adapt_*` modules and `activity.rs`, and the HTTP receivers for provider webhooks are hosted outside this router |
 | `http/admin.rs` | Admin API endpoints |
-| `http/auth.rs` | `AdminAuth` extractor: bearer-token or loopback-only gating for admin routes |
+| `http/auth.rs` | `AdminAuth` holds the configured admin and operator tokens (config, not an extractor); `AdminGuard` is the extractor that gates admin/chat routes (bearer token, else loopback only); `require_operator` is the route layer for `POST /operator/op/invoke` |
 | `http/health.rs` | Health/readiness probes |
 
 **Cross-cutting**
@@ -984,6 +1041,15 @@ The pack cache path is `<name>/<version>/<sha256>/pack.gtpack` (the content dige
 | `telemetry_scan.rs` | Telemetry configuration scanning |
 | `greentic_x_provider.rs` | Greentic-X extension provider (behind `greentic-x-provider` feature) |
 | `gtbind.rs` | Bindings generation helpers |
+| `http_guard.rs` | Outbound SSRF/size guard shared by the host `http-client` and `wasi:http` (`GREENTIC_HTTP_*`) |
+| `http_timeout_hooks.rs` | Ceiling on outbound `wasi:http` request timeouts (`HttpTimeoutHooks`) |
+| `wasm_limits.rs` | Guest execution deadline (epoch interruption) and linear-memory/table caps (`GuestLimiter`) |
+| `log_safe.rs` | `log_safe` / `log_safe_max`: strip control and bidi characters from peer-supplied text before logging |
+| `secrets_broker.rs` | `BrokerSecretsManager` (broker HTTP client) and `is_safe_secret_segment` / `validate_tenant_segment` |
+| `caller_identity.rs` | The one place a provider-verified caller enters the runtime (`FlowContext::caller`) |
+| `extension_provider.rs` | Host adapter for the `greentic:extension-provider` worlds (0.1.0 and 0.2.0) |
+| `sql/` | In-runtime SQL gateway (`/sql/<conn>/schema` and `/query`) over read-only sqlx pools |
+| `run_outcome/` | Deployed run audit: one outcome event per flow turn (`RunOutcomeReporter`) |
 | `fault/` | Fault injection framework (behind `fault-injection` feature) |
 | `testing/` | Test utilities and mock helpers |
 | `trace/` | Distributed tracing helpers |
@@ -1057,7 +1123,8 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_OAUTH_BROKER_SHARED_SECRET` | Shared secret sent as `Authorization: Bearer` on OAuth broker token requests (including the email-send path). Overrides `oauth.shared_secret` from the host config; never logged |
 | `GREENTIC_PRESENT_PROVIDER_AS_USER` | Opt-in (default OFF): restore the legacy presentation in which a component invoked by a flow with no verified caller is told the PROVIDER id as its `user` / `user_id`. See "What a component is told about its caller" above. Truthy = `1`/`true`/`yes`/`on`. |
 | `GREENTIC_WASM_MAX_EXEC_SECS` | Per-invocation wall-clock deadline for a guest component (epoch interruption, 1s granularity). Default `300`; `0` disables. A trap surfaces as an ordinary invocation error. |
-| `GREENTIC_WASM_MAX_MEMORY_MB` | Cap on any one guest linear memory AND on the total linear memory across all memories in one store (`wasm_limits::GuestLimiter`; multi-memory is enabled). Default `1024`; `0` disables both. At most 16 memories per store. Table/instance counts are always capped at generous fixed values. |
+| `GREENTIC_WASM_MAX_MEMORY_MB` | Cap on any one guest linear memory AND on the total linear memory across all memories in one store (`wasm_limits::GuestLimiter`; multi-memory is enabled). Default `1024`; `0` disables both. At most 16 memories per store. Table/instance counts are always capped at generous fixed values. A grow past the cap is denied (`memory.grow` returns `-1`, no trap) with one `warn!` per store. |
+| `GREENTIC_OAUTH_BROKER_SHARED_SECRET` | Shared secret for the OAuth broker; overrides the YAML `oauth.shared_secret`. A blank value is treated as unset. Never logged. |
 | `GREENTIC_SHUTDOWN_GRACE_SECS` | Seconds in-flight HTTP requests get to drain after SIGTERM/ctrl-c before being cancelled (axum graceful shutdown). Default `30`; `0` aborts at once. `host.stop()` runs on every exit path. |
 | `GREENTIC_HTTP_ALLOW_METADATA` | Truthy disables the default outbound block on link-local (`169.254/16`, `fe80::/10`) and cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`). |
 | `GREENTIC_HTTP_DENY_PRIVATE` | Opt-in (default OFF): also block loopback, `0.0.0.0/8`, RFC1918, CGNAT and ULA destinations. |
@@ -1073,7 +1140,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_NO_CACHE` | Truthy (`1`/`true`/`TRUE`/`yes`/`YES`, exact match) disables both the memory and disk component caches. The CLI `--no-cache` flag sets it. |
 | `GREENTIC_DISABLE_CACHE` | Alias of `GREENTIC_NO_CACHE` with identical semantics; either one disables the caches. |
 
-**Blank env vars.** `GREENTIC_ENV` and `DEFAULT_TENANT` are read through `config::greentic_env()` / `config::non_blank` (trim, blank = unset) at every site; never add a raw `std::env::var("GREENTIC_ENV")`. The env-secrets gate treats blank like unset (`local` + warning).
+**Blank env vars.** `GREENTIC_ENV` and `DEFAULT_TENANT` are read through `config::greentic_env()` / `config::non_blank` (trim, blank = unset) at every site; never add a raw `std::env::var("GREENTIC_ENV")`. The env-secrets gate treats blank like unset (`local` + warning). The same rule holds elsewhere with its own helper: `storage/config.rs::named()` (the Redis URL / namespace vars), `routing::env_nonempty` (`TENANT_JWT_*`), and `GREENTIC_OAUTH_BROKER_SHARED_SECRET` (a blank value does not override the YAML `shared_secret`). Boolean knobs parse case-insensitively and trimmed (`1`/`true`/`yes`/`on`; `routing::is_truthy_value` for `TENANT_JWT_TRUST_GATEWAY` / `TENANT_JWT_ALLOW_NO_EXP`).
 
 **Auth hardening.** `POST /operator/op/invoke` is guarded by a route layer (`http/auth.rs::require_operator`) that demands `Authorization: Bearer` (or `X-Operator-Token`) equal to `OPERATOR_TOKEN`, else the admin token (constant-time compare, 401 otherwise); with no token it stays open for backward compatibility and `HostServer::serve` logs a warning. `TENANT_RESOLVER=jwt` now verifies HS256 tokens when `TENANT_JWT_SECRET` is set (`TenantResolver::JwtVerified`); with no key it fails startup (`RoutingConfig::startup_check`) unless `TENANT_JWT_TRUST_GATEWAY=1` keeps the legacy decode-only `TenantResolver::Jwt`.
 
@@ -1083,10 +1150,18 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 
 ## Workspace Features
 
+Default-on features, by crate: `greentic-runner-host` = `verify`, `agentic-worker`, `state-disk`, `session-redis`;
+`greentic-runner` = `verify`, `agentic-worker` (which also turns on the host's `state-disk`);
+`greentic-runner-desktop` = `agentic-worker`; `greentic-aw-runtime` = `state-disk`.
+
 - `verify` (default) — validate pack files before loading
+- `agentic-worker` (default) — `dw.agent` / `agentic.call` support (pulls `greentic-aw-runtime` and `greentic-ext-runtime`); disable for a lean publishable build
+- `state-disk` (default) — on-disk (redb) agent state backend, `GREENTIC_AW_STATE_BACKEND=disk`; without it, `disk` falls back to in-memory with a warning (host feature forwards to `greentic-aw-runtime/state-disk`)
+- `dev-allow-unsigned` — lets `GREENTIC_EXT_ALLOW_UNSIGNED=1` skip extension signature verification. LOCAL DEV ONLY; deliberately not pulled in by `desktop-agent-ephemeral`
+- `greentic-aw-runtime` own features: `serve` (NATS serve mode: pulls `aw-event-bridge` + `async-nats`), `test-mock` (canned-reply runtime types; required with `serve` by the `aw-serve` bin; never in a server build), `state-disk`, `greentic-llm-backend`, `dev-allow-unsigned`
 - `telemetry` — explicit span annotation via `greentic-telemetry` (telemetry crate always linked; feature gates `annotate_span` calls)
 - `fault-injection` — testing fault injection
-- `session-redis` — Redis session storage backend
+- `session-redis` (host default) — Redis session storage backend
 - `component-v0-6-introspection` — v0.6 component inspection
 - `greentic-x-provider` — Greentic-X extension runtime integration (host crate; pulls `greentic-x-runtime` + `greentic-x-types`)
 - `legacy-gen-bindings` — gates the `greentic-gen-bindings` binary (runner crate only)
