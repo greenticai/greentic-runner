@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use aw_event_bridge::{AgentDispatchInvoker, InvokeOutcome, run_bridge, run_bridge_jetstream};
+use aw_event_bridge::{
+    AgentDispatchInvoker, DispatchIdentity, InvokeOutcome, run_bridge, run_bridge_jetstream,
+    valid_dispatch_id,
+};
 use serde_json::{Value, json};
 
 use crate::dispatch_ledger::{DispatchLedger, NoopDispatchLedger};
@@ -146,6 +149,20 @@ fn resolve_session_id(input: &Value, idempotency_key: Option<&str>) -> String {
         .unwrap_or_else(|| "agentic-dispatch".to_string())
 }
 
+/// The ledger key for one dispatch: tenant + env + the publisher's per-dispatch
+/// id. `None` when there is no well-formed dispatch id, in which case the
+/// ledger is not used at all.
+///
+/// The key is NOT the correlation/idempotency hint: that is the conversation's
+/// session hint, identical for every turn, so keying on it replayed turn 1's
+/// reply as turn 2's. The dispatch id is minted once per publish, so a broker
+/// redelivery of the same message hits the entry while the next turn misses.
+/// `tenant` and `env` cannot contain `:` (validated), so the join is unambiguous.
+fn ledger_key(tenant: &str, env: &str, dispatch_id: Option<&str>) -> Option<String> {
+    let id = dispatch_id.filter(|id| valid_dispatch_id(id))?;
+    Some(format!("{tenant}:{env}:{id}"))
+}
+
 #[async_trait]
 impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
     async fn invoke(
@@ -153,15 +170,46 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
         tenant: &str,
         env: &str,
         target: &str,
-        _operation: &str,
+        operation: &str,
         input: Value,
         idempotency_key: Option<&str>,
     ) -> Result<InvokeOutcome> {
+        // No dispatch id: nothing safely identifies a redelivery, so no dedup.
+        self.invoke_identified(
+            tenant,
+            env,
+            target,
+            operation,
+            input,
+            DispatchIdentity {
+                idempotency_key,
+                dispatch_id: None,
+            },
+        )
+        .await
+    }
+
+    async fn invoke_identified(
+        &self,
+        tenant: &str,
+        env: &str,
+        target: &str,
+        _operation: &str,
+        input: Value,
+        ident: DispatchIdentity<'_>,
+    ) -> Result<InvokeOutcome> {
+        let idempotency_key = ident.idempotency_key;
+        // Tenant, env and session ids arrive from the wire and become Redis key
+        // segments: refuse the ones that could alias another tenant's keys.
+        crate::tenant::validate_scope_id("tenant", tenant).map_err(anyhow::Error::msg)?;
+        crate::tenant::validate_scope_id("env", env).map_err(anyhow::Error::msg)?;
+
         // --- dispatch-level idempotency (Task 2.3) ---
-        // If we have a key, check the ledger first. A hit means this is a
-        // JetStream redelivery: return the cached output without re-running
-        // the (expensive + side-effectful) LLM step.
-        if let Some(key) = idempotency_key {
+        // A hit means this is a redelivery of the SAME published message:
+        // return the cached output without re-running the (expensive +
+        // side-effectful) LLM step.
+        let ledger_key = ledger_key(tenant, env, ident.dispatch_id);
+        if let Some(key) = ledger_key.as_deref() {
             match self.ledger.get(key).await {
                 Ok(Some(cached)) => {
                     tracing::debug!(key, "dispatch ledger hit; returning cached output");
@@ -180,10 +228,6 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
             }
         }
 
-        // Tenant, env and session ids arrive from the wire and become Redis key
-        // segments: refuse the ones that could alias another tenant's keys.
-        crate::tenant::validate_scope_id("tenant", tenant).map_err(anyhow::Error::msg)?;
-        crate::tenant::validate_scope_id("env", env).map_err(anyhow::Error::msg)?;
         let user_text = extract_user_text(&input);
         let session_id = resolve_session_id(&input, idempotency_key);
         crate::tenant::validate_session_id(&session_id).map_err(anyhow::Error::msg)?;
@@ -225,7 +269,7 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
         // ledger write error is logged but does NOT fail the dispatch). A
         // timed-out / exhausted step is not cached, so a retry can succeed.
         if ok
-            && let Some(key) = idempotency_key
+            && let Some(key) = ledger_key.as_deref()
             && let Err(e) = self.ledger.record(key, outcome_output.clone()).await
         {
             tracing::warn!(key, error = %e, "dispatch ledger record failed; redelivery will re-run step");
@@ -563,7 +607,7 @@ mod tests {
         use crate::dispatch_ledger::InMemoryDispatchLedger;
 
         let ledger = Arc::new(InMemoryDispatchLedger::with(
-            "k1",
+            "acme:prod:d1",
             json!({"reply": "CACHED", "trail": [], "terminated_by": "final_reply"}),
         ));
         let invoker = RuntimeAgentDispatchInvoker::with_ledger(
@@ -572,13 +616,16 @@ mod tests {
         );
 
         let out = invoker
-            .invoke(
+            .invoke_identified(
                 "acme",
                 "prod",
                 "greeter",
                 "",
                 json!({"user_text": "hi"}),
-                Some("k1"),
+                DispatchIdentity {
+                    idempotency_key: Some("sess-k1"),
+                    dispatch_id: Some("d1"),
+                },
             )
             .await
             .expect("cached invoke succeeds");
@@ -605,26 +652,126 @@ mod tests {
         );
 
         let out = invoker
-            .invoke(
+            .invoke_identified(
                 "acme",
                 "prod",
                 "greeter",
                 "",
                 json!({"user_text": "hi"}),
-                Some("k2"),
+                DispatchIdentity {
+                    idempotency_key: Some("sess-k2"),
+                    dispatch_id: Some("d2"),
+                },
             )
             .await
             .expect("fresh invoke succeeds");
 
         assert!(out.ok);
         assert_eq!(out.output["reply"], json!("pong"), "step ran and replied");
-        let stored = ledger.stored("k2");
+        let stored = ledger.stored("acme:prod:d2");
         assert!(stored.is_some(), "result was recorded in the ledger");
         assert_eq!(
             stored.expect("stored entry present")["reply"],
             json!("pong"),
             "recorded value matches step output"
         );
+    }
+
+    /// The regression: two TURNS of one conversation share the correlation /
+    /// idempotency hint but carry different dispatch ids. Both must run; turn 2
+    /// must not replay turn 1's cached reply.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn two_turns_with_one_correlation_id_both_run() {
+        use crate::dispatch_ledger::InMemoryDispatchLedger;
+
+        let ledger = Arc::new(InMemoryDispatchLedger::with(
+            "acme:prod:turn-1",
+            json!({"reply": "TURN1", "trail": [], "terminated_by": "final_reply"}),
+        ));
+        let invoker = RuntimeAgentDispatchInvoker::with_ledger(
+            build_test_mock_runtime("greeter", "pong"),
+            ledger.clone(),
+        );
+        let turn = |dispatch_id: &'static str| DispatchIdentity {
+            idempotency_key: Some("sess-1::pack=p::flow=f"),
+            dispatch_id: Some(dispatch_id),
+        };
+
+        let second = invoker
+            .invoke_identified(
+                "acme",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "again"}),
+                turn("turn-2"),
+            )
+            .await
+            .expect("turn 2 runs");
+        assert_eq!(second.output["reply"], json!("pong"), "turn 2 ran the step");
+        assert!(ledger.stored("acme:prod:turn-2").is_some());
+
+        // Redelivery of turn 1 still dedups, and of turn 2 returns turn 2's.
+        let redelivered = invoker
+            .invoke_identified(
+                "acme",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "hi"}),
+                turn("turn-1"),
+            )
+            .await
+            .expect("redelivery");
+        assert_eq!(redelivered.output["reply"], json!("TURN1"));
+    }
+
+    /// The ledger is scoped by tenant and env: the same dispatch id under
+    /// another tenant is a miss.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn ledger_is_scoped_by_tenant_and_env() {
+        use crate::dispatch_ledger::InMemoryDispatchLedger;
+
+        let ledger = Arc::new(InMemoryDispatchLedger::with(
+            "acme:prod:d1",
+            json!({"reply": "ACME", "trail": [], "terminated_by": "final_reply"}),
+        ));
+        let invoker = RuntimeAgentDispatchInvoker::with_ledger(
+            build_test_mock_runtime("greeter", "pong"),
+            ledger,
+        );
+        let out = invoker
+            .invoke_identified(
+                "globex",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "hi"}),
+                DispatchIdentity {
+                    idempotency_key: Some("sess"),
+                    dispatch_id: Some("d1"),
+                },
+            )
+            .await
+            .err()
+            .expect("a miss reaches the step; the mock only knows tenant acme");
+        assert!(
+            format!("{out:#}").contains("agentic step failed"),
+            "{out:#}"
+        );
+    }
+
+    #[test]
+    fn ledger_key_requires_a_well_formed_dispatch_id() {
+        assert_eq!(
+            ledger_key("acme", "prod", Some("abc-1_X")).as_deref(),
+            Some("acme:prod:abc-1_X")
+        );
+        assert_eq!(ledger_key("acme", "prod", None), None);
+        assert_eq!(ledger_key("acme", "prod", Some("")), None);
+        assert_eq!(ledger_key("acme", "prod", Some("a:b")), None);
     }
 
     /// No key → no ledger interaction; step runs normally.

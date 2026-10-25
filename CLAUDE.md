@@ -714,6 +714,16 @@ For a credit-free live e2e there is an `aw-serve` bin (features `serve,test-mock
 `AW_SERVE_REPLY`). `dw.agent` (in-process) stays untouched — `agentic.call` is the
 out-of-process path.
 
+**Dispatch ledger key.** Redelivery dedup (`DispatchLedger`) is keyed
+`{tenant}:{env}:{dispatch_id}`, where `dispatch_id` is the random `Greentic-Dispatch-Id`
+header `remote_dispatch::build_request` mints once per publish (stable when the broker redelivers
+that message, different for the next turn). It is a separate header on purpose: the correlation
+id / `Greentic-Idempotency-Key` is the downstream SESSION id for the agentic/telco bridges, so a
+nonce there would reset agent memory every turn, and keying the ledger on it replayed turn 1's
+reply as turn 2's for up to an hour. A request with no (or a malformed) dispatch id from an older
+runner is not deduplicated at all. The bridge hands it to invokers through
+`AgentDispatchInvoker::invoke_identified` (default delegates to `invoke`).
+
 **Opt-in in-process co-host (`GREENTIC_AGENTIC_SERVE_INPROC`)**: a single-node
 deployment can co-host the agentic-worker service inside the main runner process
 instead of running a separate `aw-serve`. **Default OFF** — distributed deploys

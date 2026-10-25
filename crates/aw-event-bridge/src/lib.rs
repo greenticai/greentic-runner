@@ -46,6 +46,38 @@ pub struct InvokeOutcome {
     pub error: Option<DispatchError>,
 }
 
+/// Header carrying the per-dispatch id: random, minted ONCE per publish by the
+/// runner, so JetStream redelivery of the same message carries the same value
+/// while a later turn of the same conversation carries a different one.
+///
+/// It is deliberately NOT folded into the correlation id / idempotency key: the
+/// bridges reuse those as the downstream session id, so a nonce there would give
+/// every turn a fresh agent memory.
+pub const DISPATCH_ID_HEADER: &str = "Greentic-Dispatch-Id";
+
+/// Longest dispatch id accepted.
+const MAX_DISPATCH_ID_LEN: usize = 64;
+
+/// A dispatch id is used as a key segment: `[A-Za-z0-9_-]{1,64}` or it is
+/// treated as absent.
+#[must_use]
+pub fn valid_dispatch_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_DISPATCH_ID_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The identifiers of one dispatch handed to an invoker.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DispatchIdentity<'a> {
+    /// Correlation/idempotency hint (session hint; same for every turn).
+    pub idempotency_key: Option<&'a str>,
+    /// Unique per publish, stable across redelivery of that message.
+    pub dispatch_id: Option<&'a str>,
+}
+
 /// Seam over the actual agentic-worker invocation. The production impl wraps
 /// `greentic_aw_runtime::AgentRuntime`; tests use a stub.
 ///
@@ -73,6 +105,23 @@ pub trait AgentDispatchInvoker: Send + Sync {
         input: Value,
         idempotency_key: Option<&str>,
     ) -> Result<InvokeOutcome>;
+
+    /// [`Self::invoke`] with the per-dispatch identity the publisher stamped.
+    ///
+    /// The default ignores the dispatch id and calls [`Self::invoke`], so an
+    /// invoker that does not deduplicate redeliveries needs no change.
+    async fn invoke_identified(
+        &self,
+        tenant: &str,
+        env: &str,
+        target: &str,
+        operation: &str,
+        input: Value,
+        ident: DispatchIdentity<'_>,
+    ) -> Result<InvokeOutcome> {
+        self.invoke(tenant, env, target, operation, input, ident.idempotency_key)
+            .await
+    }
 
     /// The wall-clock limit one step on `target` is configured with, when the
     /// invoker knows it. A durable consumer sizes its per-message time bound
@@ -164,6 +213,8 @@ pub struct ParsedRequest {
     pub env: String,
     pub correlation: Option<String>,
     pub idempotency: Option<String>,
+    /// `Greentic-Dispatch-Id`, when present and well formed.
+    pub dispatch_id: Option<String>,
     pub request: RuntimeDispatchRequest,
 }
 
@@ -213,6 +264,7 @@ pub fn parse_request(
     // explicit header but fall back to the correlation id so the invoker always
     // has a stable session hint.
     let idempotency = get_header("Greentic-Idempotency-Key").or_else(|| correlation.clone());
+    let dispatch_id = get_header(DISPATCH_ID_HEADER).filter(|id| valid_dispatch_id(id));
     let tenant = get_header("Greentic-Tenant").unwrap_or_default();
     let env = get_header("Greentic-Env").unwrap_or_else(|| "default".to_string());
     validate_scope_id("tenant", &tenant)?;
@@ -227,6 +279,7 @@ pub fn parse_request(
         env,
         correlation,
         idempotency,
+        dispatch_id,
         request,
     })
 }
@@ -259,18 +312,11 @@ async fn dispatch(
     invoker: Arc<dyn AgentDispatchInvoker>,
     tenant: &str,
     env: &str,
-    idempotency_key: Option<&str>,
+    ident: DispatchIdentity<'_>,
     req: RuntimeDispatchRequest,
 ) -> Result<RuntimeDispatchResponse, anyhow::Error> {
     let outcome = invoker
-        .invoke(
-            tenant,
-            env,
-            &req.target,
-            &req.operation,
-            req.input,
-            idempotency_key,
-        )
+        .invoke_identified(tenant, env, &req.target, &req.operation, req.input, ident)
         .await?;
     Ok(RuntimeDispatchResponse {
         ok: outcome.ok,
@@ -288,7 +334,11 @@ pub async fn build_response(
     idempotency_key: Option<&str>,
     req: RuntimeDispatchRequest,
 ) -> RuntimeDispatchResponse {
-    match dispatch(invoker, tenant, env, idempotency_key, req).await {
+    let ident = DispatchIdentity {
+        idempotency_key,
+        dispatch_id: None,
+    };
+    match dispatch(invoker, tenant, env, ident, req).await {
         Ok(resp) => resp,
         Err(error) => failure_response(&error),
     }
@@ -365,7 +415,10 @@ pub async fn handle_message_outcome(
         invoker,
         &parsed.tenant,
         &parsed.env,
-        parsed.idempotency.as_deref(),
+        DispatchIdentity {
+            idempotency_key: parsed.idempotency.as_deref(),
+            dispatch_id: parsed.dispatch_id.as_deref(),
+        },
         parsed.request,
     )
     .await
@@ -586,6 +639,27 @@ mod tests {
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| (*v).to_string())
         }
+    }
+
+    #[test]
+    fn dispatch_id_header_is_parsed_and_validated() {
+        let payload = serde_json::to_vec(&sample_request()).unwrap();
+        let with = |id: &'static str| {
+            let headers = [("Greentic-Tenant", "acme"), (DISPATCH_ID_HEADER, id)];
+            parse_request(header_fn(&headers), &payload)
+                .unwrap()
+                .dispatch_id
+        };
+        assert_eq!(with("abc123").as_deref(), Some("abc123"));
+        assert_eq!(with("bad:id"), None, "unsafe ids are treated as absent");
+        assert_eq!(with(""), None);
+        let headers = [("Greentic-Tenant", "acme")];
+        assert_eq!(
+            parse_request(header_fn(&headers), &payload)
+                .unwrap()
+                .dispatch_id,
+            None
+        );
     }
 
     fn payload() -> Vec<u8> {
