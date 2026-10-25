@@ -15,7 +15,7 @@ mod resilience_tests;
 
 use crate::error::{AgentError, LlmError, StateError, TerminationReason};
 use crate::llm::{LlmBackend, LlmRequest};
-use crate::state::{ChatMessage, ConversationState};
+use crate::state::ChatMessage;
 use crate::telemetry::StepTelemetryCtx;
 use crate::tenant::TenantContext;
 use crate::tools::is_tool_allowed;
