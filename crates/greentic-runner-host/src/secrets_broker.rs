@@ -10,6 +10,28 @@ use greentic_secrets_lib::{SecretError, SecretsManager};
 use reqwest::Client;
 use serde::Deserialize;
 
+/// Whether `value` may be used as one segment of a `secrets://` URI built from
+/// pack-controlled input (MCP server id / auth team, SoR name). Same rule as
+/// `greentic_aw_runtime::scoped_secrets::is_safe_segment`, which is
+/// feature-gated and so cannot be called from the always-compiled pack parsers.
+pub(crate) fn is_safe_secret_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !value.starts_with('.')
+        && !value.contains("..")
+}
+
+fn is_plain_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '%' | '?' | '#' | '\\' | '/'))
+}
+
 /// Convert a canonical `secrets://{env}/{tenant}/{team}/{cat}/{name}` URI into
 /// the broker `/v1/...` request path. Path segments are preserved verbatim
 /// (the broker treats `_` as the tenant-wide team).
@@ -20,7 +42,26 @@ pub(crate) fn broker_path_from_uri(uri: &str) -> Result<String, SecretError> {
     if rest.is_empty() {
         return Err(SecretError::Backend("empty secrets uri".into()));
     }
-    Ok(format!("/v1/{rest}"))
+    // `url` collapses `.`/`..` segments (and their percent-encoded forms), so
+    // an unvalidated segment could climb out of the tenant's path. Refuse
+    // anything that is not a plain segment, then percent-encode the rest.
+    let mut path = String::from("/v1");
+    for segment in rest.split('/') {
+        if !is_plain_segment(segment) {
+            return Err(SecretError::Backend(
+                "secrets uri contains an unsafe path segment".into(),
+            ));
+        }
+        path.push('/');
+        for byte in segment.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+                path.push(char::from(byte));
+            } else {
+                path.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    Ok(path)
 }
 
 #[derive(Deserialize)]
@@ -145,6 +186,33 @@ mod tests {
     fn maps_secrets_uri_to_broker_v1_path() {
         let p = broker_path_from_uri("secrets://default/acme/_/llm/abc-123").unwrap();
         assert_eq!(p, "/v1/default/acme/_/llm/abc-123");
+    }
+
+    #[test]
+    fn rejects_traversal_and_reserved_characters_in_any_segment() {
+        for bad in ["..", ".", "%2e%2e", "%2E", "a?b", "a#b", "a\\b", "a\nb", ""] {
+            let uri = format!("secrets://default/acme/{bad}/mcp/k");
+            assert!(broker_path_from_uri(&uri).is_err(), "team {bad:?}");
+            let uri = format!("secrets://default/acme/_/mcp/{bad}");
+            assert!(broker_path_from_uri(&uri).is_err(), "key {bad:?}");
+        }
+        // A `/` inside what the caller meant as one segment adds segments;
+        // the `..` that results is still refused.
+        assert!(broker_path_from_uri("secrets://default/acme/_/mcp/../../other/_/mcp/k").is_err());
+    }
+
+    #[test]
+    fn percent_encodes_unusual_but_allowed_characters() {
+        let p = broker_path_from_uri("secrets://default/acme/_/mcp/a b").unwrap();
+        assert_eq!(p, "/v1/default/acme/_/mcp/a%20b");
+    }
+
+    #[test]
+    fn safe_secret_segment_rule() {
+        assert!(is_safe_secret_segment("srv-1.unit_x"));
+        for bad in ["", "..", ".a", "a/b", "a?b", "a#b", "%2e%2e", "a\\b"] {
+            assert!(!is_safe_secret_segment(bad), "{bad:?}");
+        }
     }
 
     #[test]

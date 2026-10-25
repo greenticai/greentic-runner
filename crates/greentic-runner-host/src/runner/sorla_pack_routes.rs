@@ -32,7 +32,12 @@ impl PackSorlaRoutes {
                 continue;
             };
             let sor = route.sor.trim();
-            if sor.is_empty() || routes.iter().any(|r| r.sor == sor) {
+            if !crate::secrets_broker::is_safe_secret_segment(sor) {
+                // The SoR name becomes a secret-path segment.
+                tracing::warn!("sorla-routes: record has an unsafe `sor`; dropped");
+                continue;
+            }
+            if routes.iter().any(|r| r.sor == sor) {
                 continue;
             }
             routes.push(PackSorlaRoute {
@@ -71,6 +76,17 @@ mod tests {
             routes.iter().next().map(|r| r.actions.clone()),
             Some(vec!["record_rent_payment".to_string()])
         );
+    }
+
+    #[test]
+    fn unsafe_sor_names_are_dropped() {
+        let bytes = br#"[
+            {"sor":".."},{"sor":"a/b"},{"sor":"%2e%2e"},{"sor":"a?b"},{"sor":"a#b"},
+            {"sor":"good"}
+        ]"#;
+        let routes = PackSorlaRoutes::from_sidecar_bytes(bytes).expect("parses");
+        let sors: Vec<&str> = routes.iter().map(|r| r.sor.as_str()).collect();
+        assert_eq!(sors, ["good"]);
     }
 
     #[test]

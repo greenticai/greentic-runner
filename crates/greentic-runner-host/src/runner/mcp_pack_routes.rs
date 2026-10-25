@@ -103,6 +103,15 @@ fn default_transport() -> String {
     "http".to_string()
 }
 
+fn route_segments_are_safe(route: &PackMcpRoute) -> bool {
+    use crate::secrets_broker::is_safe_secret_segment;
+    is_safe_secret_segment(&route.server_id)
+        && route
+            .auth_team
+            .as_deref()
+            .is_none_or(|team| team.is_empty() || is_safe_secret_segment(team))
+}
+
 /// Every route a pack declares, keyed by server id.
 #[derive(Debug, Clone, Default)]
 pub struct PackMcpRoutes {
@@ -143,6 +152,13 @@ impl PackMcpRoutes {
         let mut by_server = HashMap::new();
         for (index, record) in records.into_iter().enumerate() {
             match serde_json::from_value::<PackMcpRoute>(record) {
+                Ok(route) if !route_segments_are_safe(&route) => {
+                    // server_id and auth_team become secret-path segments.
+                    tracing::warn!(
+                        index,
+                        "mcp-routes: record has an unsafe server_id or auth_team; dropped"
+                    );
+                }
                 Ok(route) => {
                     by_server.insert(route.server_id.clone(), route);
                 }
@@ -186,6 +202,25 @@ mod tests {
             routes.get("srv-1").unwrap().auth_team.as_deref(),
             Some("sales")
         );
+    }
+
+    #[test]
+    fn records_with_traversal_in_server_id_or_auth_team_are_dropped() {
+        let routes = PackMcpRoutes::from_sidecar_bytes(
+            br#"[
+                {"server_id":"..","transport_url":"https://x/"},
+                {"server_id":"a/b","transport_url":"https://x/"},
+                {"server_id":"%2e%2e","transport_url":"https://x/"},
+                {"server_id":"a?b","transport_url":"https://x/"},
+                {"server_id":"a#b","transport_url":"https://x/"},
+                {"server_id":"bad-team","auth_team":"../other","transport_url":"https://x/"},
+                {"server_id":"bad-team2","auth_team":"a/b","transport_url":"https://x/"},
+                {"server_id":"ok","auth_team":"sales","transport_url":"https://x/"}
+            ]"#,
+        )
+        .expect("sidecar parses");
+        let ids: Vec<&str> = routes.iter().map(|r| r.server_id.as_str()).collect();
+        assert_eq!(ids, ["ok"]);
     }
 
     #[test]

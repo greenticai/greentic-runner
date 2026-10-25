@@ -20,6 +20,43 @@ async fn make_store() -> RedisAgentStateStore {
 }
 
 #[tokio::test]
+async fn refresh_reacquires_a_lapsed_unclaimed_lock_but_not_a_stolen_one() {
+    let Some(url) = redis_url() else {
+        return;
+    };
+    let store = make_store().await;
+    let tc = TenantContext::new("test-acme", "test-prod");
+    let session = format!("lapse-{}", uuid::Uuid::new_v4());
+    let lock = store
+        .acquire_lock(&tc, &session, std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let key = format!("aw:test-acme:test-prod:{session}:lock");
+    use redis::AsyncCommands;
+
+    // Lapsed and unclaimed: the explicit SET NX takes it back.
+    let _: i64 = conn.del(&key).await.unwrap();
+    lock.refresh().await.unwrap();
+    let held: Option<String> = conn.get(&key).await.unwrap();
+    assert!(held.is_some());
+
+    // Lapsed and taken by another owner: refresh must report LockLost and
+    // must not overwrite the other owner's value.
+    let _: () = conn.set(&key, "someone-else").await.unwrap();
+    let err = lock.refresh().await.unwrap_err();
+    assert!(matches!(
+        err,
+        greentic_aw_runtime::error::StateError::LockLost
+    ));
+    let val: String = conn.get(&key).await.unwrap();
+    assert_eq!(val, "someone-else");
+    let _: i64 = conn.del(&key).await.unwrap();
+}
+
+#[tokio::test]
 #[allow(clippy::panic)] // diagnostic else-branch in test — intentional
 async fn save_then_load_roundtrips_state() {
     let Some(_) = redis_url() else {

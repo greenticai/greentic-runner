@@ -38,10 +38,36 @@ pub fn secret_uri(
     if key.trim().is_empty() {
         return Err("secret key must not be empty".to_string());
     }
+    // Every segment is looked up verbatim by the secrets backend; a `..`,
+    // `/`, `?`, `#` or `%2e%2e` could otherwise step into another tenant's
+    // path. Pack-controlled values (MCP server id / auth team, SoR name)
+    // reach this function.
+    for (label, value) in [
+        ("category", category),
+        ("tenant", tenant),
+        ("team", team.unwrap_or(TENANT_DEFAULT_TEAM)),
+        ("key", key),
+    ] {
+        if !is_safe_segment(value) {
+            return Err(format!(
+                "secret {label} is not a safe secret-path segment; refusing to build a secrets uri"
+            ));
+        }
+    }
     Ok(format!(
         "secrets://{ENV_SEGMENT}/{tenant}/{}/{category}/{key}",
         team.unwrap_or(TENANT_DEFAULT_TEAM)
     ))
+}
+
+/// Whether `value` is safe to use as ONE segment of a `secrets://` URI:
+/// only `[A-Za-z0-9._-]`, non-empty, no leading dot and no `..`. This excludes
+/// `/`, backslash, `?`, `#`, `%` (so `%2e%2e`) and control characters.
+pub fn is_safe_segment(value: &str) -> bool {
+    let charset_ok = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    !value.is_empty() && charset_ok && !value.starts_with('.') && !value.contains("..")
 }
 
 /// Every URI [`read_secret_for_unit`] tries, in order:
@@ -191,6 +217,28 @@ mod tests {
     fn an_empty_category_or_key_is_a_caller_error() {
         assert!(secret_uri("", "acme", None, "k").is_err());
         assert!(secret_uri("a2a", "acme", None, "  ").is_err());
+    }
+
+    #[test]
+    fn unsafe_segments_are_refused_in_every_position() {
+        for bad in [
+            "..", "a/b", "a?b", "a#b", "%2e%2e", "a%2fb", "a\\b", ".hidden", "a\nb",
+        ] {
+            assert!(secret_uri("mcp", "acme", None, bad).is_err(), "key {bad}");
+            assert!(
+                secret_uri("mcp", "acme", Some(bad), "k").is_err(),
+                "team {bad}"
+            );
+            assert!(secret_uri("mcp", bad, None, "k").is_err(), "tenant {bad}");
+            assert!(
+                secret_uri(bad, "acme", None, "k").is_err(),
+                "category {bad}"
+            );
+            assert!(
+                secret_uri_candidates("mcp", "acme", Some(bad), None, "k").is_err(),
+                "candidates team {bad}"
+            );
+        }
     }
 
     #[test]
