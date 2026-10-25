@@ -64,6 +64,24 @@ pub mod validate;
 pub mod verify;
 pub mod wasi;
 mod wasm_limits;
+
+/// The wasmtime engine and cache [`cache::EngineProfile`] the runtime itself
+/// uses for compiled-component caching. CLI cache tools (`warmup`, `doctor`,
+/// `prune`) must use this so they act on the same cache directory as the
+/// runtime instead of a profile of a default-configured engine.
+///
+/// # Errors
+/// Returns an error if the engine cannot be built.
+pub fn runtime_cache_engine_and_profile() -> anyhow::Result<(wasmtime::Engine, cache::EngineProfile)>
+{
+    let engine = wasm_limits::build_engine()?;
+    let profile = cache::EngineProfile::from_engine(
+        &engine,
+        cache::CpuPolicy::Native,
+        wasm_limits::ENGINE_FINGERPRINT.to_string(),
+    );
+    Ok((engine, profile))
+}
 pub mod watcher;
 
 mod activity;
