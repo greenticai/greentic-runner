@@ -98,6 +98,14 @@ Things most likely to break a running deployment, in the order to check them:
 - **Affected:** unusually large pack assets.
 - **Restore:** none (limits are constants in `pack.rs`).
 
+### Pack-carried extension archives have size caps and stale staging is swept
+- **What:** an inner `extensions/*.gtxpack` is unpacked BEFORE signature verification, so it is now bounded:
+  64 MiB per entry (declared size checked, real bytes streamed through a cap), 256 MiB total, 4096 entries
+  (`pack_extensions.rs`). An archive over a cap is reported as a staging failure, not truncated. Staging slots of a
+  superseded digest of the same extension, and abandoned partial unpacks, are removed once unused for an hour.
+- **Affected:** extension archives larger than the caps (none known).
+- **Restore:** none (constants).
+
 ## Auth and routing
 
 ### Verified JWT mode, `exp` required, startup failure

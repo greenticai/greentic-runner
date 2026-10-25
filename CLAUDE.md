@@ -117,6 +117,10 @@ The pack source exists because nothing writes `GREENTIC_EXTENSIONS_DIR` inside a
 k8s or Cloud Run container: the directory scanned there is empty, so every
 extension tool an operator bound used to be dropped with a `warn` after the
 deploy reported success and after they had already supplied its credential.
+Unpacking happens BEFORE that gate, so `unpack_archive` is bounded (64 MiB/entry, 256 MiB total, 4096
+entries; real bytes streamed through a `take`, not just the declared size), and the process-wide staging root
+reclaims superseded digests of the same extension id and crashed partial unpacks after a 1h grace
+(`sweep_stale_slots`; every stage re-touches its slot).
 Pack-carried archives go through the SAME `register_loaded_from_dir` gate
 (signature + `manifest.json` ledger) — the pack is a delivery route, not a
 verification bypass. The in-pack layout is a cross-repo contract with
