@@ -215,11 +215,20 @@ pub(crate) fn router(state: ServerState) -> Router {
 }
 
 /// Per-request wall-clock limit in seconds for every route except the
-/// streaming `/agent/chat/stream`. `0` disables.
+/// [`LONG_RUNNING_PATHS`]. `0` disables.
 pub(crate) const REQUEST_TIMEOUT_ENV: &str = "GREENTIC_HTTP_REQUEST_TIMEOUT_SECS";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
-/// Routes that legitimately stay open longer than the request timeout.
-const STREAMING_PATHS: &[&str] = &["/agent/chat/stream"];
+/// Routes that legitimately stay open longer than the request timeout because
+/// their work has its own deadline: the agent loop (graceful termination, state
+/// save, lock release must not be pre-empted by a 408) and the component
+/// invocation (`GREENTIC_WASM_MAX_EXEC_SECS`; a 408 plus a client retry could
+/// repeat a side effect).
+const LONG_RUNNING_PATHS: &[&str] = &["/agent/chat", "/agent/chat/stream", "/operator/op/invoke"];
+
+/// Whether `path` is exempt from the request timeout.
+pub(crate) fn is_long_running_path(path: &str) -> bool {
+    LONG_RUNNING_PATHS.contains(&path)
+}
 
 /// `None` = disabled. Absent or unparseable falls back to the default: a
 /// malformed knob must not silently remove the limit.
@@ -232,14 +241,14 @@ pub(crate) fn request_timeout_from_raw(raw: Option<&str>) -> Option<std::time::D
 
 /// Wrap `router` so a request not answered within `timeout` gets a 408.
 /// (`tower-http` is not a dependency; this is the same behaviour as its
-/// `TimeoutLayer`, with the streaming route exempt.)
+/// `TimeoutLayer`, with the long-running routes exempt.)
 pub(crate) fn with_request_timeout(router: Router, timeout: Option<std::time::Duration>) -> Router {
     let Some(timeout) = timeout else {
         return router;
     };
     router.layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| async move {
-            if STREAMING_PATHS.contains(&req.uri().path()) {
+            if is_long_running_path(req.uri().path()) {
                 return next.run(req).await;
             }
             match tokio::time::timeout(timeout, next.run(req)).await {
@@ -394,7 +403,10 @@ mod request_timeout_tests {
         };
         let app = Router::new()
             .route("/slow", get(slow))
-            .route("/agent/chat/stream", get(slow));
+            .route("/agent/chat", get(slow))
+            .route("/agent/chat/stream", get(slow))
+            .route("/operator/op/invoke", get(slow))
+            .route("/admin/packs/status", get(slow));
         with_request_timeout(app, timeout)
     }
 
@@ -411,9 +423,24 @@ mod request_timeout_tests {
     }
 
     #[tokio::test]
-    async fn streaming_route_is_exempt() -> Result<()> {
+    async fn long_running_routes_are_exempt() -> Result<()> {
+        for path in ["/agent/chat", "/agent/chat/stream", "/operator/op/invoke"] {
+            let app = slow_app(Some(Duration::from_millis(50)));
+            assert_eq!(status(app, path).await?, StatusCode::OK, "{path}");
+            assert!(is_long_running_path(path));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_route_is_not_exempt() -> Result<()> {
         let app = slow_app(Some(Duration::from_millis(50)));
-        assert_eq!(status(app, "/agent/chat/stream").await?, StatusCode::OK);
+        assert_eq!(
+            status(app, "/admin/packs/status").await?,
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert!(!is_long_running_path("/admin/packs/status"));
+        assert!(!is_long_running_path("/healthz"));
         Ok(())
     }
 
