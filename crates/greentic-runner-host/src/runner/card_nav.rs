@@ -22,11 +22,15 @@ pub(crate) const CARD_NAV_META_KEYS: &[&str] = &["routeToCardId", "toCardId", "n
 
 /// The card-navigation target carried by `metadata`, if any.
 fn card_nav_target(metadata: &Value) -> Option<&str> {
-    CARD_NAV_META_KEYS
-        .iter()
-        .find_map(|key| metadata.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
+    // Blank values are skipped per key: a blank `routeToCardId` must not hide a
+    // valid `nextCardId` that follows it.
+    CARD_NAV_META_KEYS.iter().find_map(|key| {
+        metadata
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+    })
 }
 
 /// The flow node a card-navigation target names, if it names one.
@@ -100,6 +104,15 @@ mod tests {
                 "key {key} was not recognised"
             );
         }
+    }
+
+    #[test]
+    fn a_blank_first_key_does_not_hide_a_later_valid_one() {
+        let meta = json!({ "routeToCardId": "  ", "toCardId": "", "nextCardId": "quote_result" });
+        assert_eq!(
+            entry_node_from_card_nav(&meta, &nodes()),
+            Some("quote_result".to_string())
+        );
     }
 
     #[test]
