@@ -714,6 +714,48 @@ mod tests {
                 .contains_key(attr_keys::MESSAGING_ENDPOINT_ID)
         );
     }
+    #[test]
+    fn a_terminal_flow_error_is_not_classified_as_a_retryable_adapter_call() {
+        let terminal = crate::runner::engine::terminal_flow_error("flow_step_limit_exceeded: x")
+            .context("running flow");
+        assert!(matches!(
+            classify_flow_error(&terminal),
+            RunnerError::FlowTerminal { .. }
+        ));
+        let transient = anyhow!("upstream hiccup");
+        assert!(matches!(
+            classify_flow_error(&transient),
+            RunnerError::AdapterCall { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_step_limit_runaway_runs_the_turn_once_not_five_times() {
+        use crate::engine::policy::{RetryPolicy, retry_with_jitter};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let runs = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&runs);
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        };
+        let result = retry_with_jitter::<_, _, ()>(&policy, move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                // The same conversion `call_traced_unlocked` applies to the
+                // error `check_step_budget` raises.
+                let err = crate::runner::engine::terminal_flow_error(
+                    "flow_step_limit_exceeded: flow `f` ran more than 10000 nodes in one turn",
+                );
+                Err(classify_flow_error(&err))
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(RunnerError::FlowTerminal { .. })));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
 }
 
 pub struct StateMachineRuntime {
@@ -1328,13 +1370,7 @@ impl PackFlowAdapter {
                         );
                     }
                 }
-                return Err(RunnerError::AdapterCall {
-                    // `{:#}` flattens the full anyhow source chain; a bare
-                    // `to_string()` keeps only the outermost context and drops
-                    // the real root cause (e.g. the underlying LLM/dispatch
-                    // error behind "in-process operala dispatch … failed").
-                    reason: format!("{err:#}"),
-                });
+                return Err(classify_flow_error(&err));
             }
         };
 
@@ -1374,6 +1410,24 @@ impl PackFlowAdapter {
                 Ok((outcome, node_outputs))
             }
         }
+    }
+}
+
+/// Map a flow-run failure onto the error the state machine's whole-turn retry
+/// reads. A [`TerminalFlowError`](crate::runner::engine::TerminalFlowError) in
+/// the chain (step budget, `redirect_limit`, unknown node, ...) becomes the
+/// non-retryable [`RunnerError::FlowTerminal`]; everything else stays a
+/// retryable [`RunnerError::AdapterCall`].
+fn classify_flow_error(err: &anyhow::Error) -> RunnerError {
+    // `{:#}` flattens the full anyhow source chain; a bare `to_string()` keeps
+    // only the outermost context and drops the real root cause (e.g. the
+    // underlying LLM/dispatch error behind "in-process operala dispatch ...
+    // failed").
+    let reason = format!("{err:#}");
+    if crate::runner::engine::is_terminal_flow_error(err) {
+        RunnerError::FlowTerminal { reason }
+    } else {
+        RunnerError::AdapterCall { reason }
     }
 }
 

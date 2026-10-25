@@ -48,8 +48,9 @@ where
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) => {
-                // The effects already happened; running `op` again repeats them.
-                if matches!(err, RunnerError::PostEffectPersistence { .. }) {
+                // The effects already happened (or the failure is deterministic);
+                // running `op` again repeats them / fails the same way.
+                if err.is_terminal() {
                     return Err(err);
                 }
                 attempt += 1;

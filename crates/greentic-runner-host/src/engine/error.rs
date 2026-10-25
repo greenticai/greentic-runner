@@ -37,6 +37,23 @@ pub enum RunnerError {
     /// retried in place before this is raised.
     #[error("persisting flow state after execution failed: {reason}")]
     PostEffectPersistence { reason: String },
+
+    /// The flow failed for a reason re-running cannot fix (a routing cycle past
+    /// the step budget, `redirect_limit`, an unknown node, a missing required
+    /// variable) or after its effects ran. Never retried by
+    /// `retry_with_jitter`.
+    #[error("adapter call failed: {reason}")]
+    FlowTerminal { reason: String },
+}
+
+impl RunnerError {
+    /// Whether re-running the same adapter call is pointless or unsafe.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            RunnerError::PostEffectPersistence { .. } | RunnerError::FlowTerminal { .. }
+        )
+    }
 }
 
 /// Result alias for runner operations.

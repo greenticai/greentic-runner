@@ -613,6 +613,18 @@ turns on one session queue rather than interleave. Not fixed: the lock is
 in-process only; multi-replica deployments on a shared Redis session store still
 need a store-level compare-and-set/lease.
 
+## Round 12
+
+- **Hot reload / cron timers:** the superseded runtime's timers are now stopped cooperatively (a per-runtime
+  `CancellationToken` observed only while a timer is sleeping) instead of `JoinHandle::abort`. A tick already inside
+  its flow now runs to completion and saves its snapshot/state; only the NEXT tick is suppressed. A reload can
+  therefore briefly overlap the old runtime's in-flight cron flow with the new runtime's (never a doubled tick).
+- **Whole-turn retry:** deterministic or post-effect flow failures (`flow_step_limit_exceeded`, `redirect_limit`,
+  unknown node/flow, missing required variable, `flow.call` nesting/pause, snapshot/pack mismatch) are tagged
+  `TerminalFlowError`, reach the state machine as the new `RunnerError::FlowTerminal` and are no longer re-run by
+  `retry_with_jitter` (a step-limit runaway used to execute up to 5 x 10 000 nodes with effects). Transient
+  infrastructure errors are still retried. **Affected:** embedders matching `RunnerError` exhaustively (new variant).
+
 ## Tests and CI
 
 - Tests that used to print "skipping" and pass (offline wasm fixture build, fixture build failure) now fail. Set
