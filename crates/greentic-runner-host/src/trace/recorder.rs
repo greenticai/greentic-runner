@@ -358,6 +358,10 @@ impl ExecutionObserver for TraceRecorder {
         };
         self.emit_audit(event, &step, Outcome::Ok);
         state.buffer.push_back(step);
+        // New content since the last flush: re-arm the final flush, or a node
+        // that failed and then succeeded on retry leaves the file frozen at
+        // the failed attempt.
+        state.flushed = false;
         while state.buffer.len() > self.config.buffer_size {
             state.buffer.pop_front();
         }
@@ -411,6 +415,10 @@ impl ExecutionObserver for TraceRecorder {
         };
         self.emit_audit(event, &step, Outcome::Error);
         state.buffer.push_back(step);
+        // New content since the last flush: re-arm the final flush, or a node
+        // that failed and then succeeded on retry leaves the file frozen at
+        // the failed attempt.
+        state.flushed = false;
         while state.buffer.len() > self.config.buffer_size {
             state.buffer.pop_front();
         }
@@ -701,6 +709,41 @@ mod tests {
 
         let written = fs::read_to_string(&out_path).expect("trace file was written");
         assert!(written.contains("\"node_id\": \"n1\""));
+    }
+
+    #[test]
+    fn final_flush_overwrites_a_trace_flushed_by_an_earlier_node_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out_path = dir.path().join("trace.json");
+        let recorder = TraceRecorder::new(trace_config(out_path.clone()), trace_context());
+
+        let ctx = flow_context(Some("s1"));
+        let node = HostNode::for_test("greentic:http", Some("call"));
+        let payload = json!({"foo": "bar"});
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "n1",
+            node: &node,
+            payload: &payload,
+        };
+        // Attempt 1 fails (flushes immediately), attempt 2 succeeds.
+        recorder.on_node_start(&event);
+        recorder.on_node_error(&event, &std::io::Error::other("transient"));
+        let after_error = fs::read_to_string(&out_path)?;
+        assert!(after_error.contains("transient"));
+
+        recorder.on_node_start(&event);
+        recorder.on_node_end(&event, &json!({"ok": true}));
+        recorder.flush_success()?;
+
+        let steps = serde_json::from_str::<Value>(&fs::read_to_string(&out_path)?)?;
+        let steps = steps["steps"].as_array().cloned().unwrap_or_default();
+        assert_eq!(steps.len(), 2, "both attempts are recorded");
+        assert!(
+            steps[1]["error"].is_null(),
+            "final flush must include the successful retry"
+        );
+        Ok(())
     }
 
     #[test]
