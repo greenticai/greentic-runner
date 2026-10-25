@@ -957,7 +957,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_TRACE_OUT` | Path of the trace file. Setting it to any value turns trace capture ON; unset means `Off` (default) and nothing is written. `--trace` / `--trace-out` override it (`--trace-out` alone also turns it on). |
 | `GREENTIC_TRACE_CAPTURE_INPUTS` | Exactly `1` records each node's full invocation input (`invocation_json`) in the trace, which may contain user data; any other value, or unset, leaves inputs out. `--trace-capture-inputs on|off` overrides it. |
 | `PORT` | HTTP server port (also `--port` CLI flag) |
-| `DEFAULT_TENANT` | Fallback tenant for routing |
+| `DEFAULT_TENANT` | Fallback tenant for routing (blank = unset) |
 | `TENANT_RESOLVER` | Routing mode: host/header/jwt/env. An unsupported value (typo) fails startup via `RoutingConfig::startup_check` |
 | `ADMIN_TOKEN` | Bearer token for `/admin` endpoints (loopback-only when unset) |
 | `OPERATOR_TOKEN` | Bearer token for `POST /operator/op/invoke`; takes precedence over `ADMIN_TOKEN` for that route. With neither set the route stays open and startup logs a warning. The token is accepted from EITHER `Authorization: Bearer <token>` OR the dedicated `X-Operator-Token: <token>` header (needed when `Authorization` already carries a tenant JWT under `TENANT_RESOLVER=jwt`); both are compared in constant time |
@@ -995,6 +995,8 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_CACHE_DIR` | Root of the compiled-component cache (default `.greentic/cache/components`, relative to the working directory); entries live under `v1/<engine profile id>`. |
 | `GREENTIC_NO_CACHE` | Truthy (`1`/`true`/`TRUE`/`yes`/`YES`, exact match) disables both the memory and disk component caches. The CLI `--no-cache` flag sets it. |
 | `GREENTIC_DISABLE_CACHE` | Alias of `GREENTIC_NO_CACHE` with identical semantics; either one disables the caches. |
+
+**Blank env vars.** `GREENTIC_ENV` and `DEFAULT_TENANT` are read through `config::greentic_env()` / `config::non_blank` (trim, blank = unset) at every site; never add a raw `std::env::var("GREENTIC_ENV")`. The env-secrets gate treats blank like unset (`local` + warning).
 
 **Auth hardening.** `POST /operator/op/invoke` is guarded by a route layer (`http/auth.rs::require_operator`) that demands `Authorization: Bearer` (or `X-Operator-Token`) equal to `OPERATOR_TOKEN`, else the admin token (constant-time compare, 401 otherwise); with no token it stays open for backward compatibility and `HostServer::serve` logs a warning. `TENANT_RESOLVER=jwt` now verifies HS256 tokens when `TENANT_JWT_SECRET` is set (`TenantResolver::JwtVerified`); with no key it fails startup (`RoutingConfig::startup_check`) unless `TENANT_JWT_TRUST_GATEWAY=1` keeps the legacy decode-only `TenantResolver::Jwt`.
 

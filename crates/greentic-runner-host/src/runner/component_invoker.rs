@@ -38,7 +38,7 @@ impl PackRuntimeComponentInvoker {
     /// Construct over the operator's loaded packs + tenant. `GREENTIC_ENV`
     /// (default `local`) selects the invocation env, matching `PackRuntime`.
     pub fn new(packs: Vec<Arc<PackRuntime>>, tenant: String) -> Self {
-        let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+        let env = crate::config::greentic_env_or_local();
         Self { packs, tenant, env }
     }
 }

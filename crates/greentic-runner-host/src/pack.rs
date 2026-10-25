@@ -518,7 +518,7 @@ impl HostState {
         runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
         runtime_refs: Option<RuntimeRefsInjection>,
     ) -> Result<Self> {
-        let default_env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+        let default_env = crate::config::greentic_env_or_local();
         Ok(Self {
             pack_id,
             config,
@@ -3755,7 +3755,7 @@ impl PackRuntime {
             .manifest
             .as_ref()
             .context("pack manifest required for provider resolution")?;
-        let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+        let env = crate::config::greentic_env_or_local();
         let registry = ProviderRegistry::new(
             manifest,
             self.state_store.clone(),

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::error::Error as StdError;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -719,7 +718,7 @@ impl FlowEngine {
             flow_sources,
             messaging_provider_pack_ids,
             flow_cache: RwLock::new(flow_map),
-            default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
+            default_env: crate::config::greentic_env_or_local(),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
             approval_dispatch_handler: None,

@@ -27,7 +27,8 @@ Things most likely to break a running deployment, in the order to check them:
 7. `credential_ref` and secret segments that are not `[A-Za-z0-9._-]`.
 8. Wasm component cache (cold start after upgrade).
 9. Operators that call `POST /operator/op/invoke` without a token while `ADMIN_TOKEN` is set.
-10. `PORT=""`, `TENANT_RESOLVER=""`, `GREENTIC_ENV=""` now mean "unset" (this one is a relaxation).
+10. `PORT=""`, `TENANT_RESOLVER=""`, `GREENTIC_ENV=""`, `DEFAULT_TENANT=""` now mean "unset" (a relaxation; for
+    `SECRETS_BACKEND=env` a blank `GREENTIC_ENV` is therefore allowed like an unset one).
 
 ## Pack loading and signing
 
@@ -137,8 +138,14 @@ Things most likely to break a running deployment, in the order to check them:
   `RunnerConfig` are covered.
 - **Restore:** fix the value.
 
-### Empty `PORT`, `TENANT_RESOLVER`, `GREENTIC_ENV` are treated as unset
+### Empty `PORT`, `TENANT_RESOLVER`, `GREENTIC_ENV`, `DEFAULT_TENANT` are treated as unset
 - **What:** a relaxation. `PORT=""` used to be a fatal parse error; `--port` now skips reading `PORT` entirely.
+  `GREENTIC_ENV` and `DEFAULT_TENANT` are read through one helper (`config::greentic_env` / `non_blank`: trimmed,
+  blank = unset) at every site; before, only tenant-context building did so, while other readers used `""`
+  (ingress envelope, component ctx, default env) or failed with ``invalid env id ``` (state nodes), and the env
+  secrets gate refused `""`. The gate now treats blank exactly like unset (`local`, with the existing warning):
+  no more permissive than unset, but a deployment that set `GREENTIC_ENV=""` and relied on the refusal must set
+  a real env.
 - **Affected:** containers that template empty env vars. An invalid non-empty `PORT` is still an error.
 
 ### Invalid tenant or env identifiers fail the build
@@ -163,7 +170,7 @@ Things most likely to break a running deployment, in the order to check them:
 
 ### Secrets backend selection
 - **What:** `SECRETS_BACKEND` is `env` (default; allowed only when `GREENTIC_ENV` is `local`/`dev`/`test`
-  or unset) or `broker`; anything else errors. Pack secret lookups return `NotFound` only if every scope
+  or unset/blank) or `broker`; anything else errors. Pack secret lookups return `NotFound` only if every scope
   missed (other failures are typed errors).
 - **Restore:** n/a.
 

@@ -40,7 +40,10 @@ impl RoutingConfig {
     }
 
     pub fn from_env_with_default(default_tenant: String) -> Self {
-        let default_tenant = std::env::var("DEFAULT_TENANT").unwrap_or(default_tenant);
+        // A blank `DEFAULT_TENANT` is "not configured", like an unset one.
+        let default_tenant =
+            crate::config::non_blank(std::env::var("DEFAULT_TENANT").ok().as_deref())
+                .unwrap_or(default_tenant);
         let resolver = Self::resolver_from_value(
             std::env::var("TENANT_RESOLVER").ok().as_deref(),
             &default_tenant,
