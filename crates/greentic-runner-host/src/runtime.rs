@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
 use crate::engine::runtime::StateMachineRuntime;
-use crate::oauth::{OAuthBrokerConfig, request_resource_token};
+use crate::oauth::{OAuthBrokerConfig, request_resource_token_with_auth};
 use crate::operator_metrics::OperatorMetrics;
 use crate::operator_registry::OperatorRegistry;
 use crate::pack::{ComponentResolution, PackRuntime};
@@ -1836,7 +1836,16 @@ impl TenantRuntime {
                 "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call / telco-x.call"
             );
         }
-        let http_client = Client::builder().build()?;
+        // Guarded like the pack's blocking client: this client carries the
+        // email/OAuth broker traffic, so it must not reach link-local or
+        // cloud-metadata addresses (SSRF), including via redirects.
+        let http_guard = crate::http_guard::HttpGuard::from_env();
+        let http_client = Client::builder()
+            .dns_resolver(Arc::new(crate::http_guard::GuardedResolver {
+                guard: http_guard,
+            }))
+            .redirect(crate::http_guard::redirect_policy(http_guard))
+            .build()?;
         Ok(Arc::new(Self {
             tenant: config.tenant.clone(),
             config,
@@ -2019,7 +2028,15 @@ impl TenantRuntime {
         request: &EmailSendRequest,
     ) -> Result<()> {
         let plan = self.build_events_email_execution_plan(tenant, request)?;
-        let token = request_resource_token(self.http_client(), &plan.token_request).await?;
+        // The broker authenticates the runner with its shared secret; the
+        // un-authenticated variant would be rejected by a secured broker.
+        let shared_secret = self.oauth_config().and_then(|c| c.shared_secret);
+        let token = request_resource_token_with_auth(
+            self.http_client(),
+            &plan.token_request,
+            shared_secret.as_deref(),
+        )
+        .await?;
         self.execute_events_email_request(&token.access_token, request)
             .await
     }
