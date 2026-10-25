@@ -171,6 +171,67 @@ pub fn watchdog_cancel_target(
     Some(notice.correlation_id)
 }
 
+/// This process's replica id for the watchdog-cancel broadcast. One value per
+/// process, because the watchdog map it filters is per process: a pack reload
+/// builds a new `TenantRuntime` whose listeners must still recognise (and
+/// ignore) the notices the previous one published.
+pub fn process_cancel_origin() -> &'static str {
+    static ORIGIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(|| {
+        use rand::RngExt as _;
+        let mut bytes = [0u8; 16];
+        rand::rng().fill(&mut bytes);
+        hex::encode(bytes)
+    })
+}
+
+/// Callback invoked with a correlation id the moment a response is admitted,
+/// to tell the other replicas to retire their watchdog for it.
+pub type WatchdogNotifier = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Pure: encode a watchdog-cancel notice.
+pub fn encode_watchdog_cancel(
+    tenant: &str,
+    correlation_id: &str,
+    origin: &str,
+) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&WatchdogCancel {
+        tenant: tenant.to_string(),
+        correlation_id: correlation_id.to_string(),
+        origin: origin.to_string(),
+    })
+}
+
+/// A [`WatchdogNotifier`] that publishes on [`WATCHDOG_CANCEL_SUBJECT`] (fire
+/// and forget on the current tokio runtime) under [`process_cancel_origin`].
+pub fn nats_watchdog_notifier(client: async_nats::Client, tenant: String) -> WatchdogNotifier {
+    Arc::new(move |correlation_id: &str| {
+        let body = match encode_watchdog_cancel(&tenant, correlation_id, process_cancel_origin()) {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(%error, "could not encode watchdog cancel");
+                return;
+            }
+        };
+        let client = client.clone();
+        tokio::spawn(async move {
+            if let Err(error) = client.publish(WATCHDOG_CANCEL_SUBJECT, body.into()).await {
+                tracing::warn!(%error, "could not announce watchdog cancel");
+            }
+        });
+    })
+}
+
+/// Retire the local deadline watchdog for an ADMITTED response and tell the
+/// other replicas, at admission and before the resumed flow runs (so the
+/// notice goes out even if that run later fails).
+pub fn retire_watchdog_on_admission(notifier: Option<&WatchdogNotifier>, correlation_id: &str) {
+    crate::runner::remote_dispatch::cancel_watchdog(correlation_id);
+    if let Some(notify) = notifier {
+        notify(correlation_id);
+    }
+}
+
 /// Retire watchdogs on behalf of other replicas' admitted responses. Plain
 /// (non-queue) subscription: EVERY replica must see every notice.
 pub async fn run_watchdog_cancel_listener(
@@ -255,10 +316,6 @@ pub const MAX_CONCURRENT_RESUMES: usize = 32;
 pub struct ListenerScope {
     pub queue_group: Option<String>,
     pub tenant: Option<String>,
-    /// When set, an ADMITTED response is announced on
-    /// [`WATCHDOG_CANCEL_SUBJECT`] under this replica id so other replicas
-    /// retire their watchdog for it (needed whenever `queue_group` is set).
-    pub cancel_origin: Option<String>,
 }
 
 /// Pure: should a listener scoped to `scope_tenant` handle a message whose
@@ -307,11 +364,6 @@ pub async fn run_response_listener_scoped(
     };
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESUMES));
     let serializer = KeyedSerializer::default();
-    let announce = scope
-        .cancel_origin
-        .clone()
-        .zip(scope.tenant.clone())
-        .map(|(origin, tenant)| (client.clone(), origin, tenant));
     while let Some(msg) = subscription.next().await {
         let headers = msg.headers.as_ref();
         let get_header = |name: &str| headers.and_then(|h| h.get(name)).map(|v| v.as_str());
@@ -339,34 +391,10 @@ pub async fn run_response_listener_scoped(
                 // Per-conversation order: responses sharing a correlation id
                 // are handled one at a time, in arrival order.
                 let key = input.correlation_id.clone();
-                let announce = announce.clone();
                 serializer.submit(
                     key,
                     Box::pin(async move {
-                        let correlation_id = input.correlation_id.clone();
-                        let outcome = dispatch_to_resumer_outcome(resumer, input).await;
-                        if let (Some(ResumeOutcome::Admitted), Some((client, origin, tenant))) =
-                            (outcome, announce)
-                        {
-                            let notice = WatchdogCancel {
-                                tenant,
-                                correlation_id,
-                                origin,
-                            };
-                            match serde_json::to_vec(&notice) {
-                                Ok(body) => {
-                                    if let Err(error) = client
-                                        .publish(WATCHDOG_CANCEL_SUBJECT, body.into())
-                                        .await
-                                    {
-                                        tracing::warn!(%error, "could not announce watchdog cancel");
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, "could not encode watchdog cancel")
-                                }
-                            }
-                        }
+                        dispatch_to_resumer_outcome(resumer, input).await;
                         drop(permit);
                     }),
                 );
@@ -380,6 +408,33 @@ pub async fn run_response_listener_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_notifies_even_when_nothing_is_armed() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&seen);
+        let notifier: WatchdogNotifier = Arc::new(move |c: &str| {
+            sink.lock().unwrap().push(c.to_string());
+        });
+        retire_watchdog_on_admission(Some(&notifier), "corr-admit");
+        retire_watchdog_on_admission(None, "corr-none");
+        assert_eq!(*seen.lock().unwrap(), vec!["corr-admit".to_string()]);
+    }
+
+    #[test]
+    fn process_origin_is_stable_and_filters_own_notice() {
+        assert_eq!(process_cancel_origin(), process_cancel_origin());
+        let body = encode_watchdog_cancel("acme", "c", process_cancel_origin()).unwrap();
+        assert_eq!(
+            watchdog_cancel_target("acme", process_cancel_origin(), &body),
+            None
+        );
+        assert_eq!(
+            watchdog_cancel_target("acme", "other", &body),
+            Some("c".to_string())
+        );
+    }
+
     use greentic_types::{DispatchError, RuntimeDispatchResponse};
     use serde_json::json;
     use std::sync::Mutex;
