@@ -22,8 +22,12 @@ secrets are wired today.
   without depending on `greentic-runner-host` directly, and provides two stable
   helpers: `run_http_host` (CLI-equivalent server) and `start_embedded_host`
   (build a `RunnerHost` without wiring the HTTP server).
-- **Features** – none. The CLI/bin + bindings generator always compile; all
-  runtime behaviour is driven by the re-exported host APIs and environment.
+- **Features** – `verify` (default), `agentic-worker` (default), `telemetry`,
+  `session-redis`, `fault-injection`, `component-v0-6-introspection`,
+  `legacy-gen-bindings` (gates `greentic-gen-bindings` and
+  `greentic-runner-cli`), `desktop-agent-ephemeral`, `dev-allow-unsigned`,
+  `greentic-llm-backend`, `operala-in-process`; most forward to the host/desktop
+  crates. See `crates/greentic-runner/Cargo.toml`.
 - **CLI flags**
   - `--bindings <PATH>` (repeatable) – absolute or relative paths to tenant
     bindings files that the host loads.
@@ -108,9 +112,9 @@ secrets are wired today.
     deterministic session keys (`{tenant}:{provider}:{conversation}:{user}`).
   - `runner::adapt_*` modules implement provider-specific features (Slack button
     payload parsing, WhatsApp verify/app-secret, Webhook path policies, timer
-    cron wrappers). Provider secrets come either from env (`WHATSAPP_VERIFY_TOKEN`,
-    `WHATSAPP_APP_SECRET`, `SLACK_SIGNING_SECRET`, etc.) or from the secrets
-    host via adapters (`TELEGRAM_BOT_TOKEN`, `WEBEX_WEBHOOK_SECRET`, etc.).
+    cron wrappers). Provider secrets (e.g. `TELEGRAM_BOT_TOKEN`) are read through the
+    secrets host (`secrets.kind`), not directly from process env variables
+    named after the provider.
 - **Telemetry / secrets**
   - `boot::init` wires OTLP exporters (if the `telemetry` feature is enabled)
     based on the greentic config’s telemetry block.
@@ -193,7 +197,7 @@ port, routing, and adapter secrets.
 | `GREENTIC_ENV` | `RunnerHost::handle_activity` and `FlowEngine` defaults | Marks the logical deployment environment inserted into `TenantCtx`. Defaults to `local`. |
 | `GREENTIC_HTTP_OUTBOUND_TIMEOUT_SECS` | `http_timeout_hooks::HttpTimeoutHooks` | Ceiling (seconds) on every `wasi:http` outbound request's connect / first-byte / between-bytes timeout phases, for every component. Defaults to 30. A component's own shorter, explicitly-set timeout is never raised — only an absent or longer one is lowered to this ceiling. |
 | `OTEL_*` (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_RESOURCE_ATTRIBUTES`, etc.) | `telemetry` feature | Standard OTLP exporter configuration for spans/metrics. |
-| Provider-specific secrets (`SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`, etc.) | Adapter modules | Enable signature verification, API credentials, and message sending for the corresponding adapters. |
+| Provider-specific secrets (`TELEGRAM_BOT_TOKEN`, etc.) | Secrets host (`pack.rs` key canonicalization) | Not read as process env by host code; supplied through the configured secrets backend (the `env` backend maps secret keys to env vars). The `SLACK_SIGNING_SECRET` / `WEBEX_WEBHOOK_SECRET` / `WHATSAPP_*` variables are not read by any host code. |
 
 Bindings files also list secret IDs under each flow binding. Those IDs must be
 whitelisted in `secrets` arrays and match what components call via the host

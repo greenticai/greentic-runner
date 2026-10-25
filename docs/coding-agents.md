@@ -172,7 +172,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 Direct runner execution:
 
 ```bash
-cargo run -p greentic-runner --bin greentic-runner-cli -- \
+cargo run -p greentic-runner --features legacy-gen-bindings --bin greentic-runner-cli -- \
   --pack ./path/to/pack.gtpack \
   --input '{}'
 ```
@@ -181,7 +181,7 @@ HTTP runner host:
 
 ```bash
 cargo run -p greentic-runner -- \
-  --bindings examples/bindings/demo.yaml \
+  --bindings ./bindings/demo.gtbind \
   --port 8080
 ```
 

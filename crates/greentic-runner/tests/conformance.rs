@@ -95,6 +95,43 @@ async fn conformance_fails_when_filter_matches_no_pack() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[serial]
+async fn conformance_fails_when_entry_flow_returns_error_envelope() -> Result<()> {
+    let _backend_guard = EnvGuard::set("SECRETS_BACKEND", "env");
+    let temp = TempDir::new()?;
+    let packs_dir = temp.path().join("packs");
+    fs::create_dir_all(&packs_dir)?;
+    build_failing_conformance_pack(&packs_dir.join("messaging-conformance-failing.gtpack"))?;
+
+    for level in ["l1", "l2"] {
+        let report_path = temp.path().join(format!("report-{level}.json"));
+        let status = Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
+            .arg("conformance")
+            .arg("--packs")
+            .arg(&packs_dir)
+            .arg("--level")
+            .arg(level)
+            .arg("--report")
+            .arg(&report_path)
+            .status()
+            .context("run conformance")?;
+        assert!(
+            !status.success(),
+            "{level}: failing flow must exit non-zero"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&report_path)?)?;
+        assert_eq!(value["packs"][0]["status"], "fail", "{level}: {value}");
+        assert!(
+            value["packs"][0]["diagnostics"]
+                .to_string()
+                .contains("flow_error_envelope"),
+            "{level}: {value}"
+        );
+    }
+    Ok(())
+}
+
 fn run_conformance(packs_dir: &Path, level: &str, report: &Path) -> Result<serde_json::Value> {
     let status = Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
         .arg("conformance")
@@ -253,4 +290,127 @@ fn fixture_path(relative: &str) -> PathBuf {
         .join("..")
         .join("..")
         .join(relative)
+}
+
+fn build_failing_conformance_pack(pack_path: &Path) -> Result<()> {
+    let flow_yaml = r#"
+id: demo.flow
+type: messaging
+start: qa
+nodes:
+  qa:
+    component.exec:
+      component: qa.process
+      operation: missing-op
+      input:
+        text: "hello"
+    routing:
+      - out: true
+"#;
+    let (_bundle, flow) = load_and_validate_bundle_with_flow(flow_yaml, None)?;
+
+    let manifest = PackManifest {
+        agents: Default::default(),
+        schema_version: "1.0".into(),
+        pack_id: "messaging-conformance-failing".parse()?,
+        name: None,
+        version: Version::parse("0.0.0")?,
+        kind: PackKind::Application,
+        publisher: "test".into(),
+        components: vec![ComponentManifest {
+            id: "qa.process".parse()?,
+            version: Version::parse("0.1.0")?,
+            supports: vec![FlowKind::Messaging],
+            world: "greentic:component@0.4.0".into(),
+            profiles: ComponentProfiles::default(),
+            capabilities: ComponentCapabilities::default(),
+            configurators: None,
+            operations: Vec::new(),
+            config_schema: None,
+            resources: ResourceHints::default(),
+            dev_flows: std::collections::BTreeMap::new(),
+        }],
+        flows: vec![PackFlowEntry {
+            id: flow.id.clone(),
+            kind: flow.kind,
+            flow: flow.clone(),
+            tags: Vec::new(),
+            entrypoints: vec!["default".into()],
+        }],
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        signatures: Default::default(),
+        secret_requirements: Vec::new(),
+        bootstrap: None,
+        extensions: None,
+    };
+
+    let mut writer = ZipWriter::new(fs::File::create(pack_path).context("create failing pack")?);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let manifest_bytes = encode_pack_manifest(&manifest)?;
+    writer.start_file("manifest.cbor", options)?;
+    writer.write_all(&manifest_bytes)?;
+
+    let artifact = qa_component_artifact()?;
+    writer.start_file("components/qa.process.wasm", options)?;
+    let mut file = fs::File::open(&artifact)
+        .with_context(|| format!("open component {}", artifact.display()))?;
+    io::copy(&mut file, &mut writer)?;
+    writer.finish().context("finalise failing pack")?;
+    Ok(())
+}
+
+fn qa_component_artifact() -> Result<PathBuf> {
+    let fixtures_root = fixture_path("tests/fixtures/runner-components");
+    let target_test = fixtures_root
+        .join("target-test")
+        .join("wasm32-wasip2")
+        .join("release")
+        .join("qa_process.wasm");
+    if target_test.exists() {
+        return Ok(target_test);
+    }
+    let target_default = fixtures_root
+        .join("target")
+        .join("wasm32-wasip2")
+        .join("release")
+        .join("qa_process.wasm");
+    if target_default.exists() {
+        return Ok(target_default);
+    }
+
+    let workspace_manifest = fixtures_root.join("Cargo.toml");
+    let target_dir = fixtures_root.join("target-test");
+    let offline = env::var("CARGO_NET_OFFLINE").ok();
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
+        .arg("--release")
+        .arg("--target")
+        .arg("wasm32-wasip2")
+        .arg("--package")
+        .arg("qa_process")
+        .arg("--manifest-path")
+        .arg(&workspace_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir);
+    if matches!(offline.as_deref(), Some("true")) {
+        cmd.arg("--offline");
+    }
+    if let Some(val) = &offline {
+        cmd.env("CARGO_NET_OFFLINE", val);
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("build {}", workspace_manifest.display()))?;
+    if !status.success() {
+        anyhow::bail!("failed to build qa_process fixture");
+    }
+    if target_test.exists() {
+        return Ok(target_test);
+    }
+    anyhow::bail!(
+        "qa_process.wasm missing after fixture build: {}",
+        target_test.display()
+    )
 }

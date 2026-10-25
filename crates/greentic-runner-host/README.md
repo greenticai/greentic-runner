@@ -171,9 +171,12 @@ async fn main() -> anyhow::Result<()> {
 | `OTEL_SERVICE_NAME` | Overrides the OTLP service name advertised to the collector | `greentic-runner-host` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Explicit OTLP collector endpoint | provider preset / unset |
 | `ADMIN_TOKEN` | Bearer token required for `/admin` endpoints (loopback-only access if unset) | _unset_ |
-| `SLACK_SIGNING_SECRET` | HMAC secret for Slack Events/Interactive adapters | _unset_ |
-| `WEBEX_WEBHOOK_SECRET` | Signature key for Cisco Webex webhook validation | _unset_ |
-| `WHATSAPP_VERIFY_TOKEN` / `WHATSAPP_APP_SECRET` | Verification + signature secrets for WhatsApp Cloud API | _unset_ |
+
+> Provider secrets such as `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`,
+> `WHATSAPP_VERIFY_TOKEN` and `WHATSAPP_APP_SECRET` are **not read from process
+> env by the host**. Provider credentials are resolved through the secrets
+> backend (`SECRETS_BACKEND`; the `env` backend maps secret keys to env vars)
+> by the provider-core components that need them.
 
 ## Admin API
 

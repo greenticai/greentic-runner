@@ -299,9 +299,6 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
             std::env::set_var("GREENTIC_NO_CACHE", "1");
         }
     }
-    if run.bindings.is_empty() && run.bindings_dir.is_empty() {
-        bail!("at least one --bindings path is required");
-    }
     let (resolver, _) = build_resolver(run.config.as_deref(), run.allow_dev)?;
     let resolved = resolver.load()?;
     if run.config_explain {
@@ -309,6 +306,9 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
             greentic_config::explain(&resolved.config, &resolved.provenance, &resolved.warnings);
         println!("{}", report.text);
         return Ok(());
+    }
+    if run.bindings.is_empty() && run.bindings_dir.is_empty() {
+        bail!("at least one --bindings path is required");
     }
     let bindings =
         greentic_runner_host::gtbind::collect_gtbind_paths(&run.bindings, &run.bindings_dir)?;

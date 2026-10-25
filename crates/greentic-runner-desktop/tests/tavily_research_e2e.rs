@@ -16,11 +16,12 @@
 // fallback message. The test hard-asserts a real (non-fallback) reply when
 // compiled with `greentic-llm-backend` or when OPENAI_API_KEY is set.
 //
-// Live test — SKIPS unless an LLM key is present. DeepSeek example:
+// Live test — #[ignore]d (run with `-- --ignored`) and FAILS when its key is
+// missing instead of printing SKIP and passing. DeepSeek example:
 //   GREENTIC_LLM_API_KEY=<key> \
 //   cargo test -p greentic-runner-desktop \
 //     --features desktop-agent-ephemeral,greentic-llm-backend \
-//     tavily_research -- --nocapture
+//     tavily_research -- --ignored --nocapture
 //
 // (A real Tavily key is only needed for the agent to actually search; without
 //  it the tool call fails gracefully and the LLM still replies.)
@@ -246,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "live e2e: needs GREENTIC_LLM_API_KEY (or OPENAI_API_KEY); run with -- --ignored"]
     #[serial_test::serial]
     #[allow(unsafe_code)]
     fn tavily_research_flow_dispatches_dw_agent_e2e() {
@@ -258,13 +260,11 @@ mod tests {
                     .filter(|v| !v.is_empty())
             })
             .is_some();
-        if !have_key {
-            eprintln!(
-                "SKIP: set GREENTIC_LLM_API_KEY (+ GREENTIC_LLM_PROVIDER=deepseek \
-                 GREENTIC_LLM_MODEL=deepseek-chat) to run this live e2e."
-            );
-            return;
-        }
+        assert!(
+            have_key,
+            "set GREENTIC_LLM_API_KEY (+ GREENTIC_LLM_PROVIDER=deepseek \
+             GREENTIC_LLM_MODEL=deepseek-chat) to run this live e2e."
+        );
 
         let ext_root = TempDir::new().expect("ext tempdir");
         let tavily_installed =
@@ -409,12 +409,13 @@ mod tests {
     /// `tavily_search` tool must still resolve its `secret://tavily/api_key`
     /// reference through `StoreToolSecretsBackend` and search the live web.
     ///
-    /// Live — SKIPS unless an LLM key and `ZEROENV_TAVILY_KEY` are present.
+    /// Live — `#[ignore]`d; fails unless an LLM key and `ZEROENV_TAVILY_KEY` are present.
     ///   GREENTIC_LLM_API_KEY=<deepseek> ZEROENV_TAVILY_KEY=<tvly-…> \
     ///   cargo test -p greentic-runner-desktop \
     ///     --features desktop-agent-ephemeral,greentic-llm-backend \
-    ///     tavily_tool_secret_resolves_from_store_zero_env -- --nocapture
+    ///     tavily_tool_secret_resolves_from_store_zero_env -- --ignored --nocapture
     #[test]
+    #[ignore = "live e2e: needs GREENTIC_LLM_API_KEY + ZEROENV_TAVILY_KEY; run with -- --ignored"]
     #[serial_test::serial]
     #[allow(unsafe_code)]
     fn tavily_tool_secret_resolves_from_store_zero_env() {
@@ -430,11 +431,10 @@ mod tests {
             .ok()
             .filter(|v| !v.is_empty());
         let (Some(llm_key), Some(tavily_key)) = (llm_key, tavily_key) else {
-            eprintln!(
-                "SKIP: set GREENTIC_LLM_API_KEY + ZEROENV_TAVILY_KEY (NOT TAVILY_API_KEY) \
+            panic!(
+                "set GREENTIC_LLM_API_KEY + ZEROENV_TAVILY_KEY (NOT TAVILY_API_KEY) \
                  to run this zero-env tool-secret e2e."
             );
-            return;
         };
 
         let ext_root = TempDir::new().expect("ext tempdir");
@@ -552,12 +552,13 @@ mod tests {
     /// proves the in-process LLM backend authenticated with the store-resolved
     /// key and `tavily_search` ran with the store-resolved key.
     ///
-    /// Live — SKIPS unless `ZEROENV_LLM_KEY` and `ZEROENV_TAVILY_KEY` are present.
+    /// Live — `#[ignore]`d; fails unless `ZEROENV_LLM_KEY` and `ZEROENV_TAVILY_KEY` are present.
     ///   ZEROENV_LLM_KEY=<deepseek> ZEROENV_TAVILY_KEY=<tvly-…> \
     ///   cargo test -p greentic-runner-desktop \
     ///     --features desktop-agent-ephemeral,greentic-llm-backend \
-    ///     full_zero_env_llm_and_tavily_from_store -- --nocapture
+    ///     full_zero_env_llm_and_tavily_from_store -- --ignored --nocapture
     #[test]
+    #[ignore = "live e2e: needs ZEROENV_LLM_KEY + ZEROENV_TAVILY_KEY; run with -- --ignored"]
     #[serial_test::serial]
     #[allow(unsafe_code)]
     fn full_zero_env_llm_and_tavily_from_store() {
@@ -573,11 +574,10 @@ mod tests {
             .ok()
             .filter(|v| !v.is_empty());
         let (Some(llm_key), Some(tavily_key)) = (llm_key, tavily_key) else {
-            eprintln!(
-                "SKIP: set ZEROENV_LLM_KEY + ZEROENV_TAVILY_KEY (NOT the *_API_KEY env names) \
+            panic!(
+                "set ZEROENV_LLM_KEY + ZEROENV_TAVILY_KEY (NOT the *_API_KEY env names) \
                  to run this full zero-env e2e."
             );
-            return;
         };
 
         let ext_root = TempDir::new().expect("ext tempdir");

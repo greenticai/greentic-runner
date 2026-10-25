@@ -346,7 +346,7 @@ if [ -n "${PACK}" ]; then
          GREENTIC_AW_ADMIN_ENDPOINT="${ADMIN_URL%/}" \
          GREENTIC_AW_ADMIN_TOKEN="${DESIGNER_TOKEN}" \
          GREENTIC_AW_MCP="1" \
-         cargo run --quiet -p greentic-runner --bin greentic-runner-cli -- \
+         cargo run --quiet -p greentic-runner --features legacy-gen-bindings --bin greentic-runner-cli -- \
            --pack "${PACK}" --flow "${FLOW_ID}" --tenant "${RUNNER_TENANT}" \
            --mocks off --json --input '{"issue_id":"42"}' >"${run_out}" 2>"${WORKDIR}/run_err.log" ); then
       if grep -q '"title"' "${run_out}" && grep -q 'Bug' "${run_out}"; then

@@ -18,30 +18,33 @@ use std::{
 )]
 struct Cli {
     /// Pack archive (.gtpack)
-    #[arg(value_name = "PACK", help_heading = "Options", conflicts_with_all = ["pack_dir", "component"])]
+    #[arg(value_name = "PACK", help_heading = "Options", conflicts_with_all = ["pack_dir"])]
     pack: Option<PathBuf>,
 
     /// Pack directory that exposes pack.yaml + flow annotations
-    #[arg(long = "pack-dir", value_name = "DIR", help_heading = "Options", conflicts_with_all = ["pack", "component"])]
+    #[arg(long = "pack-dir", value_name = "DIR", help_heading = "Options", conflicts_with_all = ["pack"])]
     pack_dir: Option<PathBuf>,
 
-    /// Compiled pack component (.wasm) to inspect
-    #[arg(long, value_name = "FILE", help_heading = "Advanced options", conflicts_with_all = ["pack", "pack_dir"])]
+    /// Compiled component (.wasm) to inspect. On its own it only prints the detected
+    /// capabilities; together with a pack it enables the `--strict` capability checks
+    #[arg(long, value_name = "FILE", help_heading = "Advanced options")]
     component: Option<PathBuf>,
 
     /// Output path for the generated bindings (defaults to <PACK>.gtbind)
     #[arg(long, value_name = "FILE", help_heading = "Options")]
     out: Option<PathBuf>,
 
-    /// Try to complete missing hints with safe defaults
+    /// Ensure the base env passthrough variables are present (they are already
+    /// included by default)
     #[arg(long, help_heading = "Advanced options")]
     complete: bool,
 
-    /// Fail if information is missing instead of inferring
+    /// Fail if information is missing instead of inferring (unlisted MCP servers; with
+    /// --component also HTTP/secrets capabilities without matching hints)
     #[arg(long, help_heading = "Advanced options")]
     strict: bool,
 
-    /// Pretty-print the emitted YAML
+    /// Accepted for compatibility; the emitted YAML is always block-style
     #[arg(long, help_heading = "Advanced options")]
     pretty: bool,
 }

@@ -415,21 +415,41 @@ async fn run_pack_on_host(
         }
     };
 
-    if let Err(err) = run_result {
-        diagnostics.push(Diagnostic {
-            code: "execute_error".to_string(),
-            message: err.to_string(),
-        });
-        return Ok(Some(PackReport {
-            pack: pack_id,
-            version: pack_version,
-            level: level_label(args.level),
-            status: "fail".to_string(),
-            stage: "execute".to_string(),
-            case: None,
-            diagnostics,
-            timing_ms: timing,
-        }));
+    match run_result {
+        Err(err) => {
+            diagnostics.push(Diagnostic {
+                code: "execute_error".to_string(),
+                message: err.to_string(),
+            });
+            return Ok(Some(PackReport {
+                pack: pack_id,
+                version: pack_version,
+                level: level_label(args.level),
+                status: "fail".to_string(),
+                stage: "execute".to_string(),
+                case: None,
+                diagnostics,
+                timing_ms: timing,
+            }));
+        }
+        Ok(replies) => {
+            if let Some((kind, message)) = replies_error_envelope(&replies) {
+                diagnostics.push(Diagnostic {
+                    code: "flow_error_envelope".to_string(),
+                    message: format!("{kind}: {message}"),
+                });
+                return Ok(Some(PackReport {
+                    pack: pack_id,
+                    version: pack_version,
+                    level: level_label(args.level),
+                    status: "fail".to_string(),
+                    stage: "execute".to_string(),
+                    case: None,
+                    diagnostics,
+                    timing_ms: timing,
+                }));
+            }
+        }
     }
 
     if matches!(args.level, ConformanceLevel::L1) {
@@ -477,6 +497,22 @@ async fn run_pack_on_host(
 
     match second {
         Ok(replies) => {
+            if let Some((kind, message)) = replies_error_envelope(&replies) {
+                diagnostics.push(Diagnostic {
+                    code: "flow_error_envelope".to_string(),
+                    message: format!("{kind}: {message}"),
+                });
+                return Ok(Some(PackReport {
+                    pack: pack_id,
+                    version: pack_version,
+                    level: level_label(args.level),
+                    status: "fail".to_string(),
+                    stage: "state".to_string(),
+                    case: None,
+                    diagnostics,
+                    timing_ms: timing,
+                }));
+            }
             if !is_structured(&replies) {
                 diagnostics.push(Diagnostic {
                     code: "invalid_output".to_string(),
@@ -853,7 +889,6 @@ fn build_activity(
 
 /// Look for `error_kind` + `error_message` at any of the carrier paths an
 /// Activity reply may nest them under (`payload.metadata`, `metadata`, root).
-#[cfg(feature = "fault-injection")]
 fn extract_error_envelope(value: &Value) -> Option<(String, String)> {
     let candidates = [
         value.get("payload").and_then(|p| p.get("metadata")),
@@ -876,6 +911,16 @@ fn extract_error_envelope(value: &Value) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// Find the `error_kind`/`error_message` envelope a session flow returns as an
+/// `Ok` reply when a node fails.
+fn replies_error_envelope(replies: &[Activity]) -> Option<(String, String)> {
+    let payload = serde_json::to_value(replies).ok()?;
+    payload
+        .as_array()
+        .and_then(|arr| arr.iter().find_map(extract_error_envelope))
+        .or_else(|| extract_error_envelope(&payload))
 }
 
 fn is_structured(replies: &[Activity]) -> bool {
@@ -1063,6 +1108,21 @@ mod tests {
 
         let no_session = build_activity("pack.demo", "flow.demo", "message", None);
         assert!(no_session.session_id().is_none());
+    }
+
+    #[test]
+    fn error_envelope_is_found_in_replies_and_ignored_when_absent() {
+        let failing = vec![Activity::custom(
+            "reply",
+            serde_json::json!({"metadata": {"error_kind": "node_failed", "error_message": "boom"}}),
+        )];
+        assert_eq!(
+            replies_error_envelope(&failing),
+            Some(("node_failed".to_string(), "boom".to_string()))
+        );
+        let ok = vec![Activity::custom("reply", serde_json::json!({"ok": true}))];
+        assert_eq!(replies_error_envelope(&ok), None);
+        assert_eq!(replies_error_envelope(&[]), None);
     }
 
     #[test]

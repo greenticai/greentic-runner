@@ -67,7 +67,7 @@ Build with the fault injection feature and run conformance with a matrix file:
 
 ```bash
 cargo run -p greentic-runner --features fault-injection -- \
-  conformance --packs tests/fixtures/packs --level l2 \
+  conformance --packs <DIR_WITH_PACKS> --level l2 \
   --faults tests/fixtures/faults/basic.json --trace
 ```
 

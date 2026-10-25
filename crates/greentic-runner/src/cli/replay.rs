@@ -46,7 +46,7 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
     let pack_path = resolve_pack_path(&trace, args.pack.as_deref())?;
     let pack = load_pack(&pack_path).await?;
 
-    let target_step = args.step.map(|value| value.saturating_sub(1));
+    let target_step = resolve_target_step(args.step, trace.steps.len())?;
     let last_index = trace.steps.len().saturating_sub(1);
     let mut divergences = 0usize;
 
@@ -69,6 +69,15 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
         let output = replay_step(&pack, &trace, step, invocation)
             .await
             .with_context(|| format!("replay failed at step {}", idx + 1))?;
+
+        let Some(output) = output else {
+            println!("  host-managed step; not re-executed, output hash not compared");
+            if step.error.is_some() && args.until_failure {
+                println!("  stopping at failing step");
+                break;
+            }
+            continue;
+        };
 
         if args.compare_hashes {
             if let Some(expected) = step.output_hash.as_ref() {
@@ -98,6 +107,25 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
         bail!("replay diverged from the recorded trace at {divergences} step(s)");
     }
     Ok(())
+}
+
+/// Convert the 1-based `--step` value into a 0-based index, rejecting `0` and
+/// values beyond the end of the trace instead of silently doing nothing.
+fn resolve_target_step(step: Option<usize>, total: usize) -> Result<Option<usize>> {
+    match step {
+        None => Ok(None),
+        Some(0) => bail!("--step is 1-based; 0 is not a valid step"),
+        Some(n) if n > total => bail!("--step {n} is out of range: the trace has {total} step(s)"),
+        Some(n) => Ok(Some(n - 1)),
+    }
+}
+
+/// Steps the host executes itself (no component to re-run), so replay has no
+/// output to compare against the recorded hash.
+fn is_host_managed_step(component_id: &str) -> bool {
+    component_id.starts_with("emit.")
+        || component_id == "flow.call"
+        || component_id == "session.wait"
 }
 
 fn load_trace(path: &Path) -> Result<TraceEnvelope> {
@@ -176,18 +204,15 @@ async fn replay_step(
     trace: &TraceEnvelope,
     step: &greentic_runner_host::trace::TraceStep,
     invocation: &Value,
-) -> Result<Value> {
+) -> Result<Option<Value>> {
     let component_id = step.component_id.as_str();
     let payload = invocation.get("payload").cloned().unwrap_or(Value::Null);
 
-    if component_id == "provider.invoke" {
-        return replay_provider(pack, trace, step, &payload).await;
+    if is_host_managed_step(component_id) {
+        return Ok(None);
     }
-    if component_id.starts_with("emit.")
-        || component_id == "flow.call"
-        || component_id == "session.wait"
-    {
-        return Ok(Value::Null);
+    if component_id == "provider.invoke" {
+        return replay_provider(pack, trace, step, &payload).await.map(Some);
     }
 
     let (component_ref, operation, input, config) = if component_id == "component.exec" {
@@ -227,6 +252,7 @@ async fn replay_step(
     pack.invoke_component(&component_ref, ctx, &operation, config_json, input_json)
         .await
         .context("component invoke failed")
+        .map(Some)
 }
 
 async fn replay_provider(
@@ -329,6 +355,32 @@ mod tests {
         let expected = recorded(&json!({"a": 1}));
         let check = compare_output_hash(&json!({"a": 2}), &expected).expect("compare");
         assert!(matches!(check, HashCheck::Diverged { .. }));
+    }
+
+    #[test]
+    fn emit_flow_call_and_session_wait_are_not_re_executed() {
+        // Their recorded output hash covers the node payload, which replay
+        // cannot reproduce, so they must be skipped rather than hashed as null.
+        assert!(is_host_managed_step("emit.response"));
+        assert!(is_host_managed_step("flow.call"));
+        assert!(is_host_managed_step("session.wait"));
+        assert!(!is_host_managed_step("component.exec"));
+        assert!(!is_host_managed_step("provider.invoke"));
+        let recorded_emit = recorded(&json!({"text": "hi"}));
+        assert!(matches!(
+            compare_output_hash(&Value::Null, &recorded_emit).expect("compare"),
+            HashCheck::Diverged { .. }
+        ));
+    }
+
+    #[test]
+    fn step_selection_is_validated() {
+        assert_eq!(resolve_target_step(None, 3).expect("none"), None);
+        assert_eq!(resolve_target_step(Some(1), 3).expect("first"), Some(0));
+        assert_eq!(resolve_target_step(Some(3), 3).expect("last"), Some(2));
+        assert!(resolve_target_step(Some(0), 3).is_err());
+        assert!(resolve_target_step(Some(4), 3).is_err());
+        assert!(resolve_target_step(Some(1), 0).is_err());
     }
 
     #[test]

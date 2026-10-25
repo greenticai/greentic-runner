@@ -541,8 +541,10 @@ Things most likely to break a running deployment, in the order to check them:
 
 ## Tests and CI
 
-- Tests that used to print "skipping" and pass (offline wasm fixture build, missing `WEATHER_PACK_PATH`, fixture
-  build failure) now fail. Set the documented inputs, or run the suites that do not need them.
+- Tests that used to print "skipping" and pass (offline wasm fixture build, fixture build failure) now fail. Set
+  the documented inputs, or run the suites that do not need them. The live LLM e2e tests (`tavily_research_e2e`,
+  `weather_smoke`) are `#[ignore]`d with a reason; they run only via `-- --ignored` and then fail, not skip, when
+  their keys or inputs are missing.
 - The fault-injection integration test is gated behind its feature, and `GREENTIC_FAIL_*` env vars only work in
   builds that enable it.
 - `ci/local_check.sh` gained a `wit_sync` step (soft-skips offline outside CI) and a `host_smoke` run against a
