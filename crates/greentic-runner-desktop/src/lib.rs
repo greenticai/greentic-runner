@@ -663,6 +663,15 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                         // Successfully paused. Surface the run as Ok so
                         // greentic-start can emit the rendered card and
                         // wait for the user's next submission.
+                        //
+                        // The park now lives under the current-scheme name, so
+                        // the legacy bare file we resumed from is stale: drop
+                        // it, or a later NEW conversation with the same
+                        // session id would resurrect it.
+                        remove_migrated_legacy_snapshot(
+                            legacy_snapshot_path.as_deref(),
+                            loaded_from_legacy,
+                        );
                         RunCompletion::Ok
                     }
                 } else {
@@ -850,6 +859,8 @@ fn load_session_snapshot(
 /// files, which no current build writes and which disappear as those parks
 /// resume or expire. Anyone sharing a session state dir between untrusted
 /// session ids on such an upgrade should clear the bare `*.snapshot.json` files.
+/// (A bare file this session DID adopt is deleted once its park is re-saved
+/// under the current name, so it cannot be resurrected later.)
 fn load_legacy_session_snapshot(
     path: &Path,
     session_id: &str,
@@ -867,6 +878,26 @@ fn load_legacy_session_snapshot(
             );
             None
         }
+    }
+}
+
+/// Delete the legacy-named snapshot once its contents have been re-saved under
+/// the current name. Only acts when this session actually resumed from that
+/// file (`loaded_from_legacy`); otherwise the legacy path may be another
+/// session's live snapshot (`a/b` legacy-maps onto `a_b`), so it is left alone.
+fn remove_migrated_legacy_snapshot(legacy: Option<&Path>, loaded_from_legacy: bool) {
+    if !loaded_from_legacy {
+        return;
+    }
+    if let Some(path) = legacy
+        && let Err(err) = fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to remove migrated legacy session snapshot"
+        );
     }
 }
 
@@ -2292,6 +2323,21 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("s2.snapshot.json"), "{text}");
         assert!(text.contains("delete this file"), "{text}");
+    }
+
+    #[test]
+    fn migrated_legacy_snapshot_is_removed_only_when_ours() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let legacy = tmp.path().join("a_b.snapshot.json");
+        std::fs::write(&legacy, b"{}").expect("write");
+        // Not loaded from legacy: may be another session's park, keep it.
+        remove_migrated_legacy_snapshot(Some(&legacy), false);
+        assert!(legacy.exists());
+        remove_migrated_legacy_snapshot(Some(&legacy), true);
+        assert!(!legacy.exists());
+        // Idempotent / absent path is fine.
+        remove_migrated_legacy_snapshot(Some(&legacy), true);
+        remove_migrated_legacy_snapshot(None, true);
     }
 
     #[test]
