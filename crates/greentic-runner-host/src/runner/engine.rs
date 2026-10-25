@@ -4852,10 +4852,10 @@ fn agent_error_envelope_reply(entry: &Value) -> (String, Value) {
     if let Some(error) = error {
         payload.insert("error".to_string(), error.clone());
     }
-    if partial.is_some() {
-        if let Some(trail) = output.and_then(|o| o.get("trail")) {
-            payload.insert("trail".to_string(), trail.clone());
-        }
+    if partial.is_some()
+        && let Some(trail) = output.and_then(|o| o.get("trail"))
+    {
+        payload.insert("trail".to_string(), trail.clone());
     }
     (message, Value::Object(payload))
 }
