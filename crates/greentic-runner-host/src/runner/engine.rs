@@ -4833,7 +4833,9 @@ fn component_error(value: &Value) -> Option<(String, String)> {
 /// machine string while keeping the partial reply in `output.reply`. A
 /// non-empty `output.reply` is what the user should see; the error (and the
 /// trail, when present) stay on the payload for operators and routing. Without
-/// one, the error message is the reply, as before.
+/// one, the reply is the localized user-safe failure line
+/// ([`user_facing_flow_failure_text`]), never the machine string; the error
+/// (code and message) stays on the payload for operators either way.
 #[cfg(feature = "agentic-worker")]
 fn agent_error_envelope_reply(entry: &Value) -> (String, Value) {
     let error = entry.get("error").filter(|e| !e.is_null());
@@ -4842,19 +4844,15 @@ fn agent_error_envelope_reply(entry: &Value) -> (String, Value) {
         .and_then(|o| o.get("reply"))
         .and_then(Value::as_str)
         .filter(|reply| !reply.trim().is_empty());
-    let message = partial.map(str::to_string).unwrap_or_else(|| {
-        error
-            .and_then(|e| e.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("the agent could not respond")
-            .to_string()
-    });
+    let message = partial
+        .map(str::to_string)
+        .unwrap_or_else(|| user_facing_flow_failure_text(entry));
     let mut payload = serde_json::Map::new();
     payload.insert("reply".to_string(), Value::String(message.clone()));
+    if let Some(error) = error {
+        payload.insert("error".to_string(), error.clone());
+    }
     if partial.is_some() {
-        if let Some(error) = error {
-            payload.insert("error".to_string(), error.clone());
-        }
         if let Some(trail) = output.and_then(|o| o.get("trail")) {
             payload.insert("trail".to_string(), trail.clone());
         }
@@ -14382,7 +14380,7 @@ mod tests {
 
     #[cfg(feature = "agentic-worker")]
     #[test]
-    fn error_envelope_without_a_usable_reply_falls_back_to_the_error_message() {
+    fn error_envelope_without_a_usable_reply_shows_a_user_safe_line() {
         for output in [
             Value::Null,
             json!({ "reply": "" }),
@@ -14390,14 +14388,25 @@ mod tests {
         ] {
             let entry = json!({
                 "ok": false, "output": output,
-                "error": { "message": "boom" },
+                "error": { "code": "timeout", "message": "agent step ended without a reply: timeout" },
+                "metadata": { "locale": "id" },
             });
             let (message, payload) = agent_error_envelope_reply(&entry);
-            assert_eq!(message, "boom");
-            assert_eq!(payload, json!({ "reply": "boom" }));
+            assert!(
+                !message.contains("agent step ended") && !message.trim().is_empty(),
+                "machine string must not reach the user: {message}"
+            );
+            assert!(message.starts_with("Maaf"), "localized via i18n: {message}");
+            assert_eq!(payload["reply"], message.as_str());
+            assert_eq!(payload["error"]["code"], "timeout", "operators keep the code");
+            assert_eq!(
+                payload["error"]["message"],
+                "agent step ended without a reply: timeout"
+            );
         }
-        let (message, _) = agent_error_envelope_reply(&json!({ "ok": false }));
-        assert_eq!(message, "the agent could not respond");
+        let (message, payload) = agent_error_envelope_reply(&json!({ "ok": false }));
+        assert!(!message.trim().is_empty());
+        assert_eq!(payload["reply"], message.as_str());
     }
 
     /// Fix A (interleave guard): a user message arriving before the agent's

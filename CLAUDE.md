@@ -194,7 +194,9 @@ awaiting the next user message) — with the same `MAX_PARK_TURNS` cap and force
 behavior as the in-process path. Only a resume whose `state.entry` carries an `"ok"` key is
 treated as that response (an interleave guard — a user message arriving before the real
 response instead falls through and re-dispatches as a fresh turn), and an `{ok:false, ...}`
-error envelope surfaces `error.message` as the reply and re-parks (`LoopHere`) without
+error envelope shows the partial `output.reply` when non-empty, otherwise the localized
+user-safe line `runner.flow.execution_failed` (never the machine `error.message`, which
+stays on the payload's `error` for operators), and re-parks (`LoopHere`) without
 bumping the `MAX_PARK_TURNS` cap.
 
 **Known limitation:** the await has no deadline. A lost/never-arriving `aw-serve` response
