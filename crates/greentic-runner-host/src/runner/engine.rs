@@ -1203,6 +1203,10 @@ impl FlowEngine {
         let resumed_at = resumed_card_node(&snapshot);
         let mut state = snapshot.state;
         state.resumed_at = resumed_at;
+        // `redirect_limit` guards a loop inside ONE inbound turn. A new inbound
+        // message is a new turn, so gotos from earlier parked turns must not
+        // count against it (the 4th goto across turns used to fail).
+        state.reset_redirect_count();
         // Replace BOTH `input` AND `entry` with the new activity. The
         // routing context (built by `build_routing_context`) reads
         // `entry.input.metadata.*` for the synthesised `response.*` fields
@@ -4020,6 +4024,10 @@ impl ExecutionState {
 
     fn redirect_count(&self) -> u32 {
         self.redirect_count
+    }
+
+    fn reset_redirect_count(&mut self) {
+        self.redirect_count = 0;
     }
 
     fn increment_redirect_count(&mut self) {
@@ -9913,6 +9921,16 @@ mod tests {
             .expect("jump target");
         assert_eq!(target.flow_id, "flow.target");
         assert_eq!(target.node_id.as_str(), "node-a");
+    }
+
+    #[test]
+    fn redirect_count_resets_for_a_resumed_turn() {
+        let mut state = ExecutionState::new(Value::Null);
+        state.increment_redirect_count();
+        state.increment_redirect_count();
+        assert_eq!(state.redirect_count(), 2);
+        state.reset_redirect_count();
+        assert_eq!(state.redirect_count(), 0);
     }
 
     #[test]
