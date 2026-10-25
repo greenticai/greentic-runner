@@ -33,7 +33,10 @@ impl DiskCache {
     pub fn try_read(&self, key: &ArtifactKey) -> Result<Option<Vec<u8>>> {
         let paths = self.paths_for(key)?;
         if !paths.meta_path.exists() {
-            if paths.artifact_path.exists() {
+            // `write_entry` renames the artifact before its metadata, so an
+            // artifact without metadata may be a write in flight. Only a
+            // pair that has stayed incomplete past the grace period is junk.
+            if paths.artifact_path.exists() && older_than_grace(&paths.artifact_path) {
                 let _ = fs::remove_file(&paths.artifact_path);
             }
             return Ok(None);
@@ -60,7 +63,9 @@ impl DiskCache {
             return Ok(None);
         }
         if !paths.artifact_path.exists() {
-            self.delete_entry(&paths)?;
+            if older_than_grace(&paths.meta_path) {
+                self.delete_entry(&paths)?;
+            }
             return Ok(None);
         }
         let artifact_bytes = fs::read(&paths.artifact_path).ok();
@@ -161,19 +166,54 @@ impl DiskCache {
         Ok(total)
     }
 
+    /// Remove files nothing can ever read again: an artifact without
+    /// metadata (or the reverse), and leftover temp files from a crashed
+    /// write. Anything younger than [`INCOMPLETE_ENTRY_GRACE`] is left alone
+    /// because a writer may still be between its renames.
+    fn sweep_orphans(&self, dry_run: bool) -> PruneReport {
+        let mut report = PruneReport {
+            removed_entries: 0,
+            removed_bytes: 0,
+        };
+        let mut remove = |path: &Path| {
+            if !older_than_grace(path) {
+                return;
+            }
+            let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if dry_run || fs::remove_file(path).is_ok() {
+                report.removed_entries = report.removed_entries.saturating_add(1);
+                report.removed_bytes = report.removed_bytes.saturating_add(size);
+            }
+        };
+        if let Ok(entries) = fs::read_dir(self.root.join("artifacts")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match path.extension().and_then(|ext| ext.to_str()) {
+                    Some("cwasm") if !path.with_extension("json").exists() => remove(&path),
+                    Some("json") if !path.with_extension("cwasm").exists() => remove(&path),
+                    _ => {}
+                }
+            }
+        }
+        if let Ok(entries) = fs::read_dir(self.root.join("tmp")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    remove(&path);
+                }
+            }
+        }
+        report
+    }
+
     pub fn prune_to_limit(&self, dry_run: bool) -> Result<PruneReport> {
+        let mut report = self.sweep_orphans(dry_run);
         let Some(limit) = self.disk_max_bytes else {
-            return Ok(PruneReport {
-                removed_entries: 0,
-                removed_bytes: 0,
-            });
+            return Ok(report);
         };
         let artifacts_dir = self.root.join("artifacts");
         if !artifacts_dir.exists() {
-            return Ok(PruneReport {
-                removed_entries: 0,
-                removed_bytes: 0,
-            });
+            return Ok(report);
         }
         let mut entries = Vec::new();
         let mut total_bytes = 0u64;
@@ -217,10 +257,9 @@ impl DiskCache {
             removed_bytes = removed_bytes.saturating_add(size);
             remaining = remaining.saturating_sub(size);
         }
-        Ok(PruneReport {
-            removed_entries,
-            removed_bytes,
-        })
+        report.removed_entries = report.removed_entries.saturating_add(removed_entries);
+        report.removed_bytes = report.removed_bytes.saturating_add(removed_bytes);
+        Ok(report)
     }
 
     pub fn artifact_count(&self) -> Result<u64> {
@@ -301,6 +340,21 @@ impl DiskPaths {
         let pid = std::process::id();
         self.tmp_dir.join(format!("tmp_{}_{}_{}", pid, now, suffix))
     }
+}
+
+/// How long a half-written cache entry (or a temp file) is left alone before
+/// it counts as abandoned. Generous next to a write, which is two renames.
+pub(crate) const INCOMPLETE_ENTRY_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// True when `path` was last modified more than [`INCOMPLETE_ENTRY_GRACE`]
+/// ago. A file whose age cannot be read is treated as young, so uncertainty
+/// never deletes something a writer may own.
+fn older_than_grace(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > INCOMPLETE_ENTRY_GRACE)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
