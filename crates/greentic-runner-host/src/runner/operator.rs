@@ -1098,7 +1098,21 @@ pub async fn invoke(
         }
     };
 
-    let response = invoke_operator(&runtime, request).await;
+    // Detached so a client disconnect cannot cancel the invocation midway.
+    let response = match crate::http::agent_chat::run_detached(async move {
+        invoke_operator(&runtime, request).await
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::error!(error = %err, "operator invoke task panicked or was cancelled");
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal host failure".to_string(),
+            ));
+        }
+    };
     build_cbor_response(response)
 }
 

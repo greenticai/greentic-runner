@@ -327,7 +327,14 @@ fn short_hash(raw: &str) -> String {
 ///    a 40-byte prefix) still get different segments — and so no two
 ///    `(pack, unit)` pairs can produce one string by splitting at a different
 ///    `_unit_`;
-/// 3. a pack id whose slug is empty (punctuation only) falls back to
+/// 3. the pack id likewise carries a `sha256` suffix of the RAW id whenever
+///    its slug is lossy (differs from the id: case, punctuation, collapsed or
+///    truncated), so `my.pack` / `my_pack` cannot share an address. A pack id
+///    that is already its own slug is left unhashed. BREAKING for lossy pack
+///    ids' existing per-unit secrets (they must be re-staged); see
+///    `docs/audit-breaking-changes.md`. No read fallback to the old address:
+///    it is exactly the address the colliding ids share;
+/// 4. a pack id whose slug is empty (punctuation only) falls back to
 ///    `pack_<hash>` rather than an empty leading segment, which would put a
 ///    leading `_` in the output and break the fixed point.
 ///
@@ -341,10 +348,19 @@ pub fn unit_pack_segment(pack_id: &str, unit_id: &str) -> Option<String> {
     }
 
     let pack_slug = underscore_slug(pack_raw, UNIT_SEGMENT_SLUG_MAX);
+    // A slug that differs from the raw id (case folded, punctuation mapped to
+    // `_`, runs collapsed, or cut at the length cap) can be shared by several
+    // distinct pack ids: `my.pack` / `my_pack` / `My-Pack`, or two ids with
+    // one 40-byte prefix. Hash the RAW id in whenever the slug is lossy so
+    // those never meet on one per-unit address. A lossless slug (already
+    // `[a-z0-9_]`, canonical, within the cap) is the id itself, so it keeps
+    // its historical, unhashed address.
     let pack_part = if pack_slug.is_empty() {
         format!("pack_{}", short_hash(pack_raw))
-    } else {
+    } else if pack_slug == pack_raw {
         pack_slug
+    } else {
+        format!("{pack_slug}_{}", short_hash(pack_raw))
     };
 
     let unit_hash = short_hash(unit_raw);
@@ -883,7 +899,7 @@ mod tests {
         );
         assert_eq!(
             unit_pack_segment("pack.dw.support", "Web Assistant (prod)").expect("segment"),
-            "pack_dw_support_unit_web_assistant_prod_3ee04e3f306a"
+            "pack_dw_support_339461568342_unit_web_assistant_prod_3ee04e3f306a"
         );
     }
 
@@ -914,6 +930,30 @@ mod tests {
                 unit_pack_segment(pack_r, unit_r),
                 "`{pack_l}`/`{unit_l}` and `{pack_r}`/`{unit_r}` must not share a segment"
             );
+        }
+    }
+
+    #[test]
+    fn lossy_pack_slugs_do_not_collide_but_lossless_ids_stay_unhashed() {
+        let a = unit_pack_segment("my.pack", "u").expect("a");
+        let b = unit_pack_segment("my_pack", "u").expect("b");
+        let c = unit_pack_segment("My-Pack", "u").expect("c");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        // Lossless id: historical address, no pack hash.
+        assert!(b.starts_with("my_pack_unit_"), "got {b}");
+        let long_a = format!("{}-one", "x".repeat(44));
+        let long_b = format!("{}-two", "x".repeat(44));
+        assert_ne!(
+            unit_pack_segment(&long_a, "u"),
+            unit_pack_segment(&long_b, "u"),
+            "ids sharing a 40-byte prefix must not collide"
+        );
+        for id in ["my.pack", "My-Pack", long_a.as_str()] {
+            let seg = unit_pack_segment(id, "u").expect("seg");
+            assert_eq!(canonicalize_secret_key(&seg), seg);
+            assert_eq!(greentic_secrets_lib::spec::canonical_secret_name(&seg), seg);
         }
     }
 

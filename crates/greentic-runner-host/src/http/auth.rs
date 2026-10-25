@@ -21,6 +21,15 @@ pub struct AdminAuth {
     operator_token: Option<String>,
 }
 
+/// Normalise a configured token the way a presented bearer is normalised
+/// (trimmed): surrounding whitespace (a trailing newline from a secret file or
+/// env) is dropped, and a token that is blank after trimming counts as unset.
+pub(crate) fn normalize_token(token: Option<String>) -> Option<String> {
+    token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 impl AdminAuth {
     /// Build the admin guard.
     ///
@@ -29,16 +38,14 @@ impl AdminAuth {
     /// the same host makes every request look like loopback. Set `ADMIN_TOKEN`
     /// whenever a local proxy fronts this process.
     pub fn new(token: Option<String>) -> Self {
-        let token = token.filter(|v| !v.is_empty());
+        let token = normalize_token(token);
         if token.is_none() {
             tracing::warn!(
                 "no admin token configured: /admin and /agent endpoints accept any loopback peer; \
                  a local reverse proxy would bypass this check, set ADMIN_TOKEN to require a bearer token"
             );
         }
-        let operator_token = std::env::var("OPERATOR_TOKEN")
-            .ok()
-            .filter(|v| !v.is_empty());
+        let operator_token = normalize_token(std::env::var("OPERATOR_TOKEN").ok());
         Self {
             token,
             operator_token,
@@ -47,7 +54,7 @@ impl AdminAuth {
 
     /// Override the dedicated operator token (`OPERATOR_TOKEN`).
     pub fn with_operator_token(mut self, token: Option<String>) -> Self {
-        self.operator_token = token.filter(|v| !v.is_empty());
+        self.operator_token = normalize_token(token);
         self
     }
 
@@ -388,6 +395,27 @@ mod tests {
         assert!(!constant_time_eq(b"short", b"longer"));
         assert!(!constant_time_eq(b"", b"longer"));
         assert!(constant_time_eq(b"same", b"same"));
+    }
+
+    #[test]
+    fn configured_tokens_are_trimmed_and_blank_ones_dropped() {
+        assert_eq!(
+            normalize_token(Some("  secret\n".into())).as_deref(),
+            Some("secret")
+        );
+        assert_eq!(normalize_token(Some(" \t\n".into())), None);
+        assert_eq!(normalize_token(None), None);
+        // A token configured with a trailing newline must match the (trimmed)
+        // bearer a client presents.
+        let auth = AdminAuth::new(Some("tok\n".into())).with_operator_token(Some(" op \n".into()));
+        assert_eq!(auth.effective_operator_token(), Some("op"));
+        assert_eq!(
+            AdminAuth::new(Some("tok\n".into())).effective_operator_token(),
+            Some("tok")
+        );
+        // Whitespace-only operator token falls back to the admin token.
+        let blank_op = AdminAuth::new(Some("tok".into())).with_operator_token(Some("  ".into()));
+        assert_eq!(blank_op.effective_operator_token(), Some("tok"));
     }
 
     #[test]

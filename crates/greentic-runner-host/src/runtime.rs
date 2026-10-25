@@ -1771,6 +1771,19 @@ impl TenantRuntime {
             ));
         }
 
+        // Built BEFORE any listener task is spawned: a fallible step after the
+        // spawns would drop their JoinHandles, which detaches (not aborts) them.
+        // Guarded like the pack's blocking client: this client carries the
+        // email/OAuth broker traffic, so it must not reach link-local or
+        // cloud-metadata addresses (SSRF), including via redirects.
+        let http_guard = crate::http_guard::HttpGuard::from_env();
+        let http_client = Client::builder()
+            .dns_resolver(Arc::new(crate::http_guard::GuardedResolver {
+                guard: http_guard,
+            }))
+            .redirect(crate::http_guard::redirect_policy(http_guard))
+            .build()?;
+
         // Spawn the response listeners now that the ingress handle
         // (`state_machine`) exists. Each listener resumes paused flows by feeding
         // a synthesized ingress envelope through `StateMachineRuntime::handle`
@@ -1832,16 +1845,6 @@ impl TenantRuntime {
                 "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call / telco-x.call"
             );
         }
-        // Guarded like the pack's blocking client: this client carries the
-        // email/OAuth broker traffic, so it must not reach link-local or
-        // cloud-metadata addresses (SSRF), including via redirects.
-        let http_guard = crate::http_guard::HttpGuard::from_env();
-        let http_client = Client::builder()
-            .dns_resolver(Arc::new(crate::http_guard::GuardedResolver {
-                guard: http_guard,
-            }))
-            .redirect(crate::http_guard::redirect_policy(http_guard))
-            .build()?;
         Ok(Arc::new(Self {
             tenant: config.tenant.clone(),
             config,
@@ -1970,6 +1973,20 @@ impl TenantRuntime {
 
     pub fn register_timers(&self, handles: Vec<JoinHandle<()>>) {
         self.timer_handles.lock().extend(handles);
+    }
+
+    /// Stop this runtime's cron timers now. Used when a reload supersedes the
+    /// runtime: it may stay referenced by in-flight work for a while, and its
+    /// timers must not fire alongside the replacement's.
+    pub fn abort_timers(&self) {
+        for handle in self.timer_handles.lock().drain(..) {
+            handle.abort();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timer_count(&self) -> usize {
+        self.timer_handles.lock().len()
     }
 
     /// Read a RUNTIME-level secret, at the `_runner` pseudo-pack segment.

@@ -12,6 +12,17 @@ use tokio::time::sleep;
 use crate::engine::runtime::IngressEnvelope;
 use crate::runtime::TenantRuntime;
 
+/// Check every configured cron expression without starting anything, so a
+/// reload can reject a bad schedule BEFORE it swaps the runtime in (timers are
+/// only spawned after the swap, see `watcher::reload_once`).
+pub fn validate_timers(runtime: &TenantRuntime) -> Result<()> {
+    for timer in &runtime.config().timers {
+        Schedule::from_str(&normalize_cron(&timer.cron))
+            .with_context(|| format!("invalid cron expression for {}", timer.schedule_id()))?;
+    }
+    Ok(())
+}
+
 pub fn spawn_timers(runtime: Arc<TenantRuntime>) -> Result<Vec<JoinHandle<()>>> {
     let mut handles = Vec::new();
 
@@ -260,6 +271,28 @@ mod tests {
             err.to_string().contains("invalid cron expression"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn validate_timers_rejects_bad_cron_without_spawning_and_abort_stops_timers() {
+        let (_workspace, bad) = crate::test_support::build_test_runtime_with_timers(
+            r#"[{ flow_id: "flow.main", cron: "not a cron" }]"#,
+        )
+        .await
+        .expect("runtime");
+        assert!(validate_timers(&bad).is_err());
+
+        let (_workspace, good) = crate::test_support::build_test_runtime_with_timers(
+            r#"[{ flow_id: "flow.main", cron: "0 0 1 1 *" }]"#,
+        )
+        .await
+        .expect("runtime");
+        validate_timers(&good).expect("valid cron");
+        let handles = spawn_timers(Arc::clone(&good)).expect("spawn");
+        good.register_timers(handles);
+        // A superseded runtime stops its timers while still referenced.
+        good.abort_timers();
+        assert_eq!(good.timer_count(), 0);
     }
 
     #[tokio::test]

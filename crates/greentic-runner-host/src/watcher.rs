@@ -313,6 +313,8 @@ async fn reload_once(
     let mut next = HashMap::new();
     let mut failures: Vec<String> = Vec::new();
     let mut new_applied: HashMap<String, Vec<String>> = HashMap::new();
+    // (new runtime, the runtime it supersedes) for every tenant rebuilt this pass.
+    let mut swapped: Vec<(Arc<TenantRuntime>, Option<Arc<TenantRuntime>>)> = Vec::new();
     for (tenant, record) in resolved {
         // A failing tenant keeps its previous runtime; others still reload.
         let previous = active.load_pack(&tenant);
@@ -440,14 +442,16 @@ async fn reload_once(
                 Some(stream_observers.clone()),
             )
             .await?;
-            let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
-            runtime.register_timers(timers);
+            // Validate only: the timers are started AFTER the swap below, so
+            // the old and new runtime never both fire a cron tick.
+            adapt_timer::validate_timers(&runtime)?;
             Ok(runtime)
         }
         .await;
         match built {
             Ok(runtime) => {
                 failed_digests.lock().clear_tenant(&tenant);
+                swapped.push((Arc::clone(&runtime), previous.clone()));
                 next.insert(RuntimeKey::legacy(tenant.clone()), runtime);
                 new_applied.insert(tenant.clone(), digests);
             }
@@ -468,6 +472,21 @@ async fn reload_once(
     }
     active.replace_legacy(next);
     *applied.lock() = new_applied;
+    // Hand over cron timers: stop the superseded runtime's first, then start
+    // the new one's, so a tick is fired by exactly one of them.
+    for (runtime, previous) in swapped {
+        if let Some(previous) = previous {
+            previous.abort_timers();
+        }
+        match adapt_timer::spawn_timers(Arc::clone(&runtime)) {
+            Ok(timers) => runtime.register_timers(timers),
+            Err(err) => {
+                let tenant = runtime.config().tenant.clone();
+                tracing::error!(tenant = %tenant, error = %format!("{err:#}"), "failed to start timers after reload");
+                failures.push(format!("{tenant}: timers: {err:#}"));
+            }
+        }
+    }
     if !failures.is_empty() {
         return Err(anyhow!(
             "pack reload failed for {} tenant(s): {}",
