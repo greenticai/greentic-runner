@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-greentic-runner is the production runtime for the Greentic platform. It loads `.gtpack` archives containing WebAssembly components and flow definitions, exposes HTTP ingress adapters for messaging providers (Telegram, Teams, Slack, WebChat, Webex, WhatsApp, generic webhook, timer/cron), and executes flows with pause/resume session semantics. The workspace produces three binaries (`greentic-runner`, `greentic-runner-cli`, `greentic-gen-bindings`) and a library crate (`greentic_runner`). Workspace version 1.2.0-dev.0.
+greentic-runner is the production runtime for the Greentic platform. It loads `.gtpack` archives containing WebAssembly components and flow definitions, normalizes inbound messaging-provider events (Telegram, Teams, Slack, WebChat, Webex, WhatsApp, generic webhook, timer/cron) into flow runs, and executes flows with pause/resume session semantics. The workspace produces three binaries (`greentic-runner`, `greentic-runner-cli`, `greentic-gen-bindings`) and a library crate (`greentic_runner`). Workspace version 1.2.0-dev.0.
 
 ## Build & Test
 
@@ -55,7 +55,7 @@ Note that `-p <crate>` is not a faithful reduction of a workspace build here: fe
 crates/
   greentic-runner/           # Binary + public library (thin CLI wrapper)
   greentic-runner-host/      # Core runtime (~29K lines): pack loading, flow engine,
-                             #   ingress adapters, session/state, admin API
+                             #   ingress normalization (adapt_*), session/state, admin API
   greentic-runner-desktop/   # Desktop CLI integration
   runner-core/               # Pack resolution, signing verification, cache helpers
   greentic-aw-runtime/       # Agentic-worker runtime (Plan-Act-Observe loop) +
@@ -837,7 +837,7 @@ Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 
 
 | Module | Responsibility |
 |--------|---------------|
-| `http/mod.rs` | Axum router assembly (ingress adapters, admin, health) |
+| `http/mod.rs` | Module declarations only (`admin`, `agent_chat`, `agent_stream`, `auth`, `health`). The Axum router is assembled in `runner/mod.rs::router`: `/healthz`, `/admin/*`, `/agent/chat*`, `/operator/op/invoke`, `/sql/*`. Provider webhook ingress is NOT registered there; the per-provider `Activity` normalization lives in the `runner/adapt_*` modules and `activity.rs`, and the HTTP receivers for provider webhooks are hosted outside this router |
 | `http/admin.rs` | Admin API endpoints |
 | `http/auth.rs` | `AdminAuth` extractor: bearer-token or loopback-only gating for admin routes |
 | `http/health.rs` | Health/readiness probes |
@@ -924,6 +924,13 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_AW_REDIS_URL` | Agentic-worker Redis state store. **Optional** — the worker defaults to an in-memory backend when unset; set this (or `GREENTIC_AW_STATE_BACKEND=disk`) for durable / multi-instance state. |
 | `GREENTIC_SESSION_REDIS_URL` | Opt-in (default unset = in-memory): Redis URL for the parked-flow SESSION store. Needs a keyspace: `GREENTIC_RUNNER_SESSION_NAMESPACE` or `GREENTIC_ENV` (-> `greentic:session:<env>`); wait TTL `GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS` (default 24h, `0` = none). Independent of the state var. Connect failure or missing keyspace is a hard startup error, never a memory fallback. An embedder's `HostBuilder::with_storage` wins over env. **Multi-replica deployments need this (and the state var) for `session.wait` to resume on a different pod.** |
 | `GREENTIC_STATE_REDIS_URL` | Opt-in (default unset = in-memory): Redis URL for the flow STATE store (keys already scoped by env/tenant by greentic-state). Independent of the session var; same hard-error and embedder-wins rules. |
+| `GREENTIC_FLOW_STATE_TTL_SECS` | Seconds before a flow-state entry written through `StateStoreHost` expires. Unset/`0` = never expires (on Redis that leaves permanent keys for abandoned conversations). A value above `u32::MAX` is clamped to `u32::MAX` with a warning; an unparsable value is warned about and ignored |
+| `SECRETS_BACKEND` | Secrets manager for host secrets: `env` (default; only allowed when `GREENTIC_ENV` is `local`/`dev`/`test`, or unset, which assumes `local`) or `broker`. Anything else is an error. MCP credentials only resolve under `broker` (or a manager the host injects) |
+| `SECRETS_BROKER_ENDPOINT` | Base URL of the greentic-secrets-broker, required when `SECRETS_BACKEND=broker` (trailing `/` trimmed). Requests go to `/v1/<env>/<tenant>/<team>/<category>/<name>`; every segment is validated (no `.`/`..`, `/`, `?`, `#`, `%`, `\\` or control characters) and percent-encoded |
+| `SECRETS_BROKER_TOKEN` | Bearer token sent to the broker (may be empty for an unauthenticated broker) |
+| `SECRETS_CACHE_TTL_SECS` | TTL of the in-process secrets read cache (`CachingSecretsManager`); default `300` |
+| `SECRETS_CACHE_MAX_ENTRIES` | LRU capacity of that cache; default `512`, `0`/invalid falls back to the default |
+| `GREENTIC_OAUTH_BROKER_SHARED_SECRET` | Shared secret sent as `Authorization: Bearer` on OAuth broker token requests (including the email-send path). Overrides `oauth.shared_secret` from the host config; never logged |
 | `GREENTIC_PRESENT_PROVIDER_AS_USER` | Opt-in (default OFF): restore the legacy presentation in which a component invoked by a flow with no verified caller is told the PROVIDER id as its `user` / `user_id`. See "What a component is told about its caller" above. Truthy = `1`/`true`/`yes`/`on`. |
 | `GREENTIC_WASM_MAX_EXEC_SECS` | Per-invocation wall-clock deadline for a guest component (epoch interruption, 1s granularity). Default `300`; `0` disables. A trap surfaces as an ordinary invocation error. |
 | `GREENTIC_WASM_MAX_MEMORY_MB` | Cap on any one guest linear memory. Default `1024`; `0` disables. Table/instance counts are always capped at generous fixed values. |
@@ -934,7 +941,9 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 
 **Auth hardening.** `POST /operator/op/invoke` is guarded by a route layer (`http/auth.rs::require_operator`) that demands `Authorization: Bearer` (or `X-Operator-Token`) equal to `OPERATOR_TOKEN`, else the admin token (constant-time compare, 401 otherwise); with no token it stays open for backward compatibility and `HostServer::serve` logs a warning. `TENANT_RESOLVER=jwt` now verifies HS256 tokens when `TENANT_JWT_SECRET` is set (`TenantResolver::JwtVerified`); with no key it fails startup (`RoutingConfig::startup_check`) unless `TENANT_JWT_TRUST_GATEWAY=1` keeps the legacy decode-only `TenantResolver::Jwt`.
 
-Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
+**Provider secrets are not env vars the runner reads.** `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET` and `TELEGRAM_BOT_TOKEN` appear nowhere in the runner's source apart from test fixtures: no host code reads them. They are only secret NAMES a provider component may request through the `secrets-store` import, which canonicalizes the key (`TELEGRAM_BOT_TOKEN` -> `telegram_bot_token`, `secrets::canonicalize_secret_key`) and resolves it through the configured `SECRETS_BACKEND`.
+
+**Route guards.** `/admin/packs/status`, `/admin/packs/reload`, `/admin/capabilities`, `POST /agent/chat` and `POST /agent/chat/stream` all take the `AdminGuard` extractor: `ADMIN_TOKEN` bearer when set, otherwise loopback peers only (403 for anything else). `/healthz` is open, `/operator/op/invoke` uses the operator guard above, and `/sql/*` authenticates through the SQL gateway.
 
 ## Workspace Features
 
