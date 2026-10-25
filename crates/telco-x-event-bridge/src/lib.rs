@@ -110,6 +110,10 @@ const MAX_SCOPE_ID_LEN: usize = 128;
 /// be acquired within wait window"); see [`is_lock_contention`].
 const LOCK_CONTENTION_MARKER: &str = "session lock could not be acquired";
 
+/// Substring of `AgentError::StateUnavailable`'s `Display` (state backend did
+/// not answer; nothing ran or was saved). Retryable like a busy session.
+const STATE_UNAVAILABLE_MARKER: &str = "agent state temporarily unavailable";
+
 /// Error an invoker can return when the target session is busy (another turn
 /// holds its lock). A busy session is never dropped silently: the bridge
 /// publishes a `session_busy` error response so the parked caller is not left
@@ -130,9 +134,10 @@ impl std::error::Error for LockContention {}
 #[must_use]
 pub fn is_lock_contention(error: &anyhow::Error) -> bool {
     error.downcast_ref::<LockContention>().is_some()
-        || error
-            .chain()
-            .any(|cause| cause.to_string().contains(LOCK_CONTENTION_MARKER))
+        || error.chain().any(|cause| {
+            let text = cause.to_string();
+            text.contains(LOCK_CONTENTION_MARKER) || text.contains(STATE_UNAVAILABLE_MARKER)
+        })
 }
 
 /// What became of one request message; drives the JetStream ack decision.
@@ -397,23 +402,124 @@ pub async fn handle_message(
 /// worker rather than fanned out to every replica.
 pub const QUEUE_GROUP: &str = "telco-x-workers";
 
+/// Most requests handled at once. Past this the bridge answers `overloaded`
+/// instead of spawning another task: with no cap a burst (or a slow
+/// downstream) grew tasks without bound.
+pub const MAX_INFLIGHT: usize = 256;
+
+/// Upper bound on handling ONE request. Without it a hung invoker held its
+/// task (and in-flight slot) forever.
+pub const HANDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Error code published when the in-flight cap refused a request.
+pub const OVERLOADED_CODE: &str = "overloaded";
+
+/// Take an in-flight slot, or `None` when [`MAX_INFLIGHT`] are taken.
+fn admit(permits: &Arc<tokio::sync::Semaphore>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    permits.clone().try_acquire_owned().ok()
+}
+
+/// Run `fut` for at most `limit`; `None` when it did not finish in time.
+async fn within<T>(
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::time::timeout(limit, fut).await.ok()
+}
+
+/// Publish an error response for an already-received request message, echoing
+/// its correlation id and scope headers. Returns `Ok(false)` without
+/// publishing when the message carries no correlation id (nobody is waiting).
+pub async fn publish_error_for_message(
+    client: &async_nats::Client,
+    msg: &async_nats::Message,
+    code: &str,
+    message: String,
+) -> Result<bool> {
+    let header = |name: &str| -> Option<String> {
+        msg.headers
+            .as_ref()
+            .and_then(|header_map| header_map.get(name))
+            .map(|value| value.as_str().to_string())
+    };
+    let Some(correlation) = header("Greentic-Correlation-Id") else {
+        return Ok(false);
+    };
+    let tenant = header("Greentic-Tenant");
+    let env = header("Greentic-Env");
+    let scope = response_scope(tenant.as_deref(), env.as_deref());
+    publish_response(
+        client,
+        Some(&correlation),
+        scope.as_ref().map(|(t, e)| (t.as_str(), e.as_str())),
+        &error_response(code, message),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Handle one request under [`HANDLE_TIMEOUT`]; on expiry the caller gets a
+/// `timeout` response instead of waiting out its own deadline.
+async fn handle_bounded(
+    client: &async_nats::Client,
+    invoker: Arc<dyn TelcoXDispatchInvoker>,
+    msg: async_nats::Message,
+) {
+    let for_error = msg.clone();
+    match within(HANDLE_TIMEOUT, handle_message(client, invoker, msg)).await {
+        Some(Ok(())) => {}
+        Some(Err(error)) => tracing::error!(%error, "event bridge failed to handle request"),
+        None => {
+            tracing::error!(timeout = ?HANDLE_TIMEOUT, "telco-x handler exceeded its time bound");
+            if let Err(error) = publish_error_for_message(
+                client,
+                &for_error,
+                "timeout",
+                format!("telco-x request handling exceeded {HANDLE_TIMEOUT:?}"),
+            )
+            .await
+            {
+                tracing::warn!(%error, "could not publish timeout response");
+            }
+        }
+    }
+}
+
 /// Subscribe to the request subject as part of [`QUEUE_GROUP`] and serve
-/// forever (one spawned task per message).
+/// forever (one spawned task per message, at most [`MAX_INFLIGHT`] at once,
+/// each bounded by [`HANDLE_TIMEOUT`]).
 pub async fn run_bridge(
     client: async_nats::Client,
     invoker: Arc<dyn TelcoXDispatchInvoker>,
 ) -> Result<()> {
     use futures_util::StreamExt;
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
     let mut subscriber = client
         .queue_subscribe(request_topic(RUNTIME_NAME), QUEUE_GROUP.to_string())
         .await?;
     while let Some(msg) = subscriber.next().await {
+        let Some(permit) = admit(&permits) else {
+            tracing::warn!(
+                max = MAX_INFLIGHT,
+                "event bridge at its in-flight cap; refusing a request"
+            );
+            if let Err(error) = publish_error_for_message(
+                &client,
+                &msg,
+                OVERLOADED_CODE,
+                "the telco-x service is at capacity; retry shortly".to_string(),
+            )
+            .await
+            {
+                tracing::warn!(%error, "could not publish overload response");
+            }
+            continue;
+        };
         let client = client.clone();
         let invoker = invoker.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_message(&client, invoker, msg).await {
-                tracing::error!(%error, "event bridge failed to handle request");
-            }
+            let _slot = permit;
+            handle_bounded(&client, invoker, msg).await;
         });
     }
     Ok(())
@@ -605,6 +711,32 @@ mod tests {
             .context("agent step failed");
         assert!(is_lock_contention(&wrapped));
         assert!(!is_lock_contention(&anyhow::anyhow!("boom")));
+        assert!(is_lock_contention(&anyhow::anyhow!(
+            "agent state temporarily unavailable: redis error: down"
+        )));
+    }
+
+    #[test]
+    fn the_in_flight_cap_admits_up_to_the_limit_then_refuses() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let first = admit(&permits);
+        let second = admit(&permits);
+        assert!(first.is_some() && second.is_some());
+        assert!(admit(&permits).is_none(), "a third request is refused");
+        drop(first);
+        assert!(admit(&permits).is_some(), "a freed slot is reusable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_that_overruns_its_bound_is_cut_off() {
+        let slow = within(std::time::Duration::from_secs(5), async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            1
+        })
+        .await;
+        assert_eq!(slow, None);
+        let fast = within(std::time::Duration::from_secs(5), async { 2 }).await;
+        assert_eq!(fast, Some(2));
     }
 
     #[test]

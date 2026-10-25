@@ -359,6 +359,47 @@ async fn a_resume_payload_completes_the_flow_and_continues_the_loop() {
     assert!(state.pending_tool.is_none());
 }
 
+/// A flow that parks on the LAST iteration of the budget (`max_iter` is 4)
+/// must still be answered after the user's resume: the resumed turn gets at
+/// least one iteration, or the loop range is empty and the user never hears
+/// back.
+#[tokio::test]
+async fn a_flow_parked_on_the_last_iteration_still_gets_a_reply_after_resume() {
+    let llm = Arc::new(RecordingLlm::new(vec![
+        tool_calls(vec![call("c1", "lookup")]),
+        tool_calls(vec![call("c2", "lookup")]),
+        tool_calls(vec![call("c3", "lookup")]),
+        tool_calls(vec![call("c4", "form")]),
+        final_reply("booked"),
+    ]));
+    let flows = Arc::new(ScriptedFlows::new(
+        vec![
+            FlowInvokeOutcome::Completed(json!({ "n": 1 })),
+            FlowInvokeOutcome::Completed(json!({ "n": 2 })),
+            FlowInvokeOutcome::Completed(json!({ "n": 3 })),
+            waiting("A"),
+        ],
+        vec![FlowInvokeOutcome::Completed(json!({ "room": "101" }))],
+    ));
+    let h = harness(llm.clone(), flows.clone());
+
+    let parked = h.step("book me a room", None).await;
+    assert_eq!(parked.terminated_by, TerminationReason::AwaitingToolInput);
+    let state = h.state().await;
+    assert_eq!(
+        state.pending_tool.as_ref().map(|p| p.iterations_used),
+        Some(4),
+        "parked on the last iteration of a 4-iteration budget"
+    );
+
+    let out = h
+        .step("", Some(json!({ "metadata": { "action": "submit" } })))
+        .await;
+    assert_eq!(out.terminated_by, TerminationReason::FinalReply);
+    assert_eq!(out.reply, "booked");
+    assert_eq!(llm.calls(), 5, "the resumed turn called the model once");
+}
+
 /// A flow that parks again re-suspends with the new snapshot and card, without
 /// calling the LLM.
 #[tokio::test]

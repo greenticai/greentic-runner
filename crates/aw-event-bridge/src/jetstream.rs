@@ -340,7 +340,7 @@ async fn publish_final_error(client: &async_nats::Client, core: &async_nats::Mes
 
 /// The agent's configured step timeout for the request in `core`, if the
 /// invoker knows it. An unparsable request yields `None` (default bound).
-async fn step_timeout_of(
+pub(crate) async fn step_timeout_of(
     invoker: &Arc<dyn AgentDispatchInvoker>,
     core: &async_nats::Message,
 ) -> Option<Duration> {

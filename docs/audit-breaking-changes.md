@@ -246,9 +246,14 @@ Things most likely to break a running deployment, in the order to check them:
 - **What:** optional expiry for flow-state entries. Unset/`0` keeps the old never-expire behaviour. A value above
   `u32::MAX` is clamped with a warning (it used to disable the TTL).
 
-### Redis agent lock refresh
-- **What:** refreshing a Redis lock no longer recreates a key that already expired, and a lapsed unclaimed
-  lock is re-acquired. LLM calls keep the session lock alive.
+### Agent session lock refresh (Redis, memory, disk)
+- **What:** refreshing the session lock no longer recreates a key that already expired. A lapse is `LockLost`
+  and the turn aborts WITHOUT saving: an absent key does not mean nobody ran in the gap (another turn may have
+  taken the lock, saved newer state and released it), and the old "re-acquire a lapsed unclaimed lock" let the
+  stale holder overwrite that state. LLM calls, `flow:` tools and every other tool dispatch keep the lock alive
+  (`limits.timeout` may exceed the 90 s TTL). The post-LLM-error save is also skipped when the lock is gone.
+- **Affected:** a turn whose lock lapsed (stalled backend, process pause longer than 90 s) now fails with
+  `LockLost` and is not persisted; before, it sometimes "recovered" and clobbered a newer turn.
 
 ## Agentic workers and dispatch
 
@@ -296,6 +301,58 @@ Things most likely to break a running deployment, in the order to check them:
   sensitive `key=value` pairs.
 - **Affected:** log/audit consumers that read raw payloads or compared hashes across restarts.
 - **Restore:** none. Raw payloads live in the run trace (`GREENTIC_TRACE_OUT`).
+
+### State load failure no longer starts an empty conversation
+- **What:** any session-state load error used to be logged and the turn ran on an EMPTY state, so the
+  end-of-turn save (and the opening-message short-circuit) overwrote the stored conversation. Only a stored
+  state or a genuinely missing key may start a turn now. A backend error (Redis blip) returns the new
+  `AgentError::StateUnavailable` (`"agent state temporarily unavailable"`), which both event bridges treat like a
+  busy session: JetStream Naks with backoff, core NATS answers `session_busy`. Undecodable or too-new state
+  (`Decode`, `SchemaIncompatible`) returns `AgentError::StateLoad` and is NOT retried; nothing is saved.
+- **Affected:** callers matching `AgentError` exhaustively (new variant). Operators see failed turns during a
+  Redis outage instead of silent conversation resets.
+
+### Guardrail evaluation runs on the blocking pool
+- **What:** the inbound/outbound guardrail chains (`run_chain_blocking`) and the attachment text guard no longer
+  run the synchronous WASM evaluator on an async worker. A panicking evaluator fails closed (`internal`).
+
+### LLM error classes
+- **What:** the greentic-llm backend maps 5xx/408 to `ServiceUnavailable` and transport errors to `Transport`
+  (both retryable by `RetryingLlmBackend`); only 4xx/auth/config stay `BadRequest`. The OpenAI backend no longer
+  has a whole-request timeout: the blocking path has a 45 s per-request timeout, the streaming path bounds the
+  response head (45 s) and each chunk gap (60 s), so long streams are no longer cut. A reply without a `usage`
+  object counts 0 tokens instead of failing to decode. (`llm_extension` is unchanged: its bridge returns only a
+  string error, so there is no status to classify.)
+
+### Registry URL paths and dispatch targets
+- **What:** agent and graph ids are percent-encoded into admin-registry URLs, `.`/`..` ids are refused, and the
+  dispatch `target` is validated (slash, backslash, `?`, `#`, `%`, `..`, whitespace, control characters, over
+  256 bytes are rejected with a non-retryable error) before any config lookup.
+- **Affected:** agent ids containing those characters (none are valid registry ids).
+
+### Bounded in-memory state
+- **What:** the in-process short-term memory provider caps keys (256 B), values (16 KiB), entries (100) and bytes
+  (256 KiB) per session and keeps 10 000 sessions (LRU eviction); beyond a cap `remember` returns a
+  `LimitExceeded` tool error. The memory and redb KV backends sweep expired entries on a write cadence (memory:
+  every max(256, len) writes; redb: every 1024 writes), so finished sessions no longer accumulate. The redb file
+  does not shrink (freed pages are reused).
+- **Affected:** agents that store more than the caps in short-term memory.
+
+### A2A, MCP store pull, parallel graph resume
+- **What:** an A2A rejection (JSON-RPC error or HTTP 4xx other than 401/403/429) of a message that named a task
+  retries once with the context only; the SendMessage reply body is capped at 4 MiB. MCP store pulls are
+  serialised per `component_ref`, the artifact download has connect/read/total timeouts (10 s/30 s/300 s) and a
+  first local-wasm pull has its own 300 s budget instead of the 5 s probe. Parallel-region checkpoints persist
+  per-branch visit counts (`BranchCursor.visits`, serde default, no schema bump) so a looping branch resumes at
+  the next attempt. A flow tool parked on the last iteration gets one iteration after resume. History truncation
+  keeps `System` messages. Known, not done: store-pull cache paths are still keyed by `component_ref` only (two
+  tenants pinning different digests of one ref re-pull each time and can run the other's verified version).
+
+### Event bridge back-pressure
+- **What:** core-NATS `run_bridge` (agentic and telco-x) allows at most 256 requests in flight (beyond that the
+  caller gets an `overloaded` error response) and bounds each handler (the agent's step timeout plus margin for
+  agentic, 240 s for telco-x) with a `timeout` response. Billing emits and long-term ingest are detached under a
+  64-slot, 30 s gate; work that finds no free slot is dropped with a warning.
 
 ## CLI
 

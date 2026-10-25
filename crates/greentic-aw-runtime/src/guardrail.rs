@@ -329,6 +329,76 @@ pub enum ChainOutcome {
     },
 }
 
+/// [`run_chain`] on the blocking pool.
+///
+/// A real evaluator ([`ExtRuntimeGuardrailEvaluator`]) runs a WASM component
+/// synchronously, so calling it on an async worker thread stalls every other
+/// task scheduled there. The chain, direction and ordering are unchanged. A
+/// panic inside an evaluator fails CLOSED (a `Denied` with code `internal`)
+/// rather than unwinding the turn or silently passing the content.
+pub async fn run_chain_blocking(
+    chain: &[ResolvedGuardrail],
+    direction: GuardrailDirection,
+    content: String,
+    ctx: &GuardrailRunCtx,
+    evaluator: std::sync::Arc<dyn GuardrailEvaluator>,
+) -> ChainOutcome {
+    if chain.is_empty() {
+        // Nothing to evaluate: no WASM, so no reason to hop threads.
+        return run_chain(chain, direction, content, ctx, evaluator.as_ref());
+    }
+    let chain_owned = chain.to_vec();
+    let ctx_owned = ctx.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        run_chain(
+            &chain_owned,
+            direction,
+            content,
+            &ctx_owned,
+            evaluator.as_ref(),
+        )
+    })
+    .await;
+    match joined {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!(error = %e, "guardrail chain task failed; failing closed");
+            let info = GuardrailDenyInfo {
+                code: "internal".into(),
+                message: "A required guardrail is unavailable.".into(),
+                details: None,
+            };
+            let observation = GuardrailObservation {
+                cap_id: String::new(),
+                extension_id: String::new(),
+                direction,
+                code: info.code.clone(),
+                action: GuardrailAction::Blocked,
+            };
+            ChainOutcome::Denied {
+                info,
+                direction,
+                observation,
+            }
+        }
+    }
+}
+
+/// Run `f` (blocking guardrail work) without stalling the async executor
+/// when the caller is a synchronous trait method reached from async code
+/// ([`crate::attachment_guard::AttachmentTextGuard::check`]). On a
+/// multi-thread runtime the worker is handed off via `block_in_place`; on a
+/// current-thread runtime (or outside one) `f` simply runs inline, since
+/// `block_in_place` would panic there and no other worker exists to unblock.
+pub(crate) fn in_place_blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// Run a chain of guardrails over content in the specified direction.
 ///
 /// # Behavior
@@ -879,6 +949,99 @@ mod tests {
         ) {
             ChainOutcome::Denied { info, .. } => assert_eq!(info.code, "internal"),
             other => panic!("mandatory error must fail closed, got {other:?}"),
+        }
+    }
+
+    /// Sleeps (blocking the calling thread) like a WASM guardrail would.
+    struct SlowEvaluator;
+    impl GuardrailEvaluator for SlowEvaluator {
+        fn evaluate(
+            &self,
+            _extension_id: &str,
+            _input: &GuardrailInput,
+        ) -> Result<GuardrailVerdict, GuardrailInvokeError> {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(GuardrailVerdict::Update("redacted".into()))
+        }
+    }
+
+    /// The evaluator blocks its thread for 300 ms; on a current-thread runtime
+    /// a ticker task must keep running meanwhile, which only holds when the
+    /// chain runs on the blocking pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_chain_blocking_does_not_stall_the_executor() {
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let out = run_chain_blocking(
+            &[g("ext", false)],
+            GuardrailDirection::Inbound,
+            "hello".into(),
+            &ctx(),
+            std::sync::Arc::new(SlowEvaluator),
+        )
+        .await;
+        ticker.abort();
+        match out {
+            ChainOutcome::Pass { content, .. } => assert_eq!(content, "redacted"),
+            other => panic!("expected pass, got {other:?}"),
+        }
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::SeqCst) >= 5,
+            "executor was stalled while the guardrail ran"
+        );
+    }
+
+    struct PanickingEvaluator;
+    impl GuardrailEvaluator for PanickingEvaluator {
+        fn evaluate(
+            &self,
+            _extension_id: &str,
+            _input: &GuardrailInput,
+        ) -> Result<GuardrailVerdict, GuardrailInvokeError> {
+            panic!("wasm host panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn run_chain_blocking_fails_closed_when_the_evaluator_panics() {
+        let out = run_chain_blocking(
+            &[g("ext", false)],
+            GuardrailDirection::Outbound,
+            "hello".into(),
+            &ctx(),
+            std::sync::Arc::new(PanickingEvaluator),
+        )
+        .await;
+        match out {
+            ChainOutcome::Denied {
+                info, direction, ..
+            } => {
+                assert_eq!(info.code, "internal");
+                assert_eq!(direction, GuardrailDirection::Outbound);
+            }
+            other => panic!("a panicking evaluator must fail closed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_chain_blocking_preserves_order_and_update_threading() {
+        let out = run_chain_blocking(
+            &[],
+            GuardrailDirection::Inbound,
+            "same".into(),
+            &ctx(),
+            std::sync::Arc::new(AcceptAllEvaluator),
+        )
+        .await;
+        match out {
+            ChainOutcome::Pass { content, .. } => assert_eq!(content, "same"),
+            other => panic!("expected pass, got {other:?}"),
         }
     }
 }

@@ -294,6 +294,19 @@ embeddings URL and each index search URL) therefore also call `HttpGuard::check_
 gap: `greentic-a2a`'s `CardCache` agent-card GET uses its own unguarded client. `runtime.rs`'s broker
 client talks to fixed provider endpoints, not pack-supplied URLs.
 
+### Agent state and lock invariants (greentic-aw-runtime)
+
+Rules that fail silently if changed. (1) A state `load` error must never start an empty turn: only `Ok` or a
+missing key does; a backend error is `AgentError::StateUnavailable` (its `Display` carries
+`STATE_UNAVAILABLE_MARKER`, which `aw-event-bridge` / `telco-x-event-bridge` `is_lock_contention` matches to
+redeliver or answer `session_busy`), undecodable / too-new state is non-retryable `StateLoad`. (2) A session lock
+refresh that finds the key absent is `LockLost`, never a re-acquire: another turn may have run and saved in the
+gap. `ensure_lock_held` runs before every end-of-turn save, and `keep_alive` wraps every long await (LLM, `flow:`
+tool, generic tool dispatch). (3) Guardrail WASM goes through `guardrail::run_chain_blocking` (blocking pool,
+fail-closed on a task panic); never call `run_chain` directly from async code. (4) Detached side effects go
+through `background::BackgroundGate` (cap + timeout), not a bare `tokio::spawn`. (5) The core-NATS bridges cap
+in-flight requests (`MAX_INFLIGHT`) and bound each handler. See `docs/audit-breaking-changes.md`.
+
 ### Knowledge retrieval backends
 
 An agent's `Knowledge` implementation is a chain of wrappers around whatever is

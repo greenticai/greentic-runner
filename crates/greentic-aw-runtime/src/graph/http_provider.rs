@@ -71,7 +71,15 @@ impl HttpGraphProvider {
         _tenant: &TenantContext,
         graph_id: &str,
     ) -> Result<GraphConfig, ConfigError> {
-        let url = format!("{}/api/v1/designer/agent-graphs/{graph_id}", self.base_url);
+        // `..` stays a traversal step even percent-encoded: never send it.
+        if crate::tenant::is_dot_segment(graph_id) {
+            return Err(ConfigError::AgentNotFound(graph_id.to_string()));
+        }
+        let url = format!(
+            "{}/api/v1/designer/agent-graphs/{}",
+            self.base_url,
+            crate::tenant::percent_encode_segment(graph_id)
+        );
         let resp = self
             .client
             .get(&url)
@@ -455,6 +463,25 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             2,
             "separate tenants must not share a cache entry for the same graph_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_graph_id_cannot_steer_the_request_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let provider = HttpGraphProvider::new(server.uri(), "tok");
+        let tenant = TenantContext::new("t", "e");
+        let _ = provider
+            .graph_config(&tenant, "../tenant/me/mcp-servers")
+            .await;
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].url.path(),
+            "/api/v1/designer/agent-graphs/..%2Ftenant%2Fme%2Fmcp-servers"
         );
     }
 }

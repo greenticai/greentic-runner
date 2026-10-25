@@ -261,3 +261,53 @@ async fn stale_marker_triggers_repull_on_upgrade() {
         "the marker must be rewritten to the new pinned digest"
     );
 }
+
+/// Concurrent pulls of one ref are serialised: the second waits for the first
+/// and then finds a current cache instead of downloading and rewriting the
+/// sidecar/wasm/marker triple underneath it.
+#[tokio::test]
+#[serial_test::serial]
+async fn concurrent_pulls_of_one_ref_download_once() {
+    let signing = SigningKey::from_bytes(&[21u8; 32]);
+    let signed_describe = sign_describe_like_store(&sample_describe(), &signing);
+    let archive = build_gtxpack(&signed_describe, b"fake-wasm-bytes");
+    let digest = hex_sha256(&archive);
+    let server = mock_store(archive).await;
+
+    let cache = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", cache.path());
+        std::env::set_var(STORE_URL_ENV, server.uri());
+        std::env::set_var(TRUSTED_SIGNERS_ENV, pubkey_env_value(&signing));
+    }
+
+    let (a, b, c) = tokio::join!(
+        ensure_cached("router_echo", "1.0.0", &digest),
+        ensure_cached("router_echo", "1.0.0", &digest),
+        ensure_cached("router_echo", "1.0.0", &digest),
+    );
+    let downloads = server.received_requests().await.unwrap().len();
+    let dest = cache.path().join("router_echo.wasm");
+    let current = cache_is_current(&dest, &digest);
+    unsafe {
+        std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+        std::env::remove_var(STORE_URL_ENV);
+        std::env::remove_var(TRUSTED_SIGNERS_ENV);
+    }
+
+    a.unwrap();
+    b.unwrap();
+    c.unwrap();
+    assert_eq!(downloads, 1, "the pull lock must dedupe concurrent pulls");
+    assert!(current);
+}
+
+/// Different refs do not share a lock.
+#[test]
+fn pull_locks_are_per_component_ref() {
+    let a1 = pull_lock("alpha");
+    let a2 = pull_lock("alpha");
+    let b = pull_lock("beta");
+    assert!(std::sync::Arc::ptr_eq(&a1, &a2));
+    assert!(!std::sync::Arc::ptr_eq(&a1, &b));
+}

@@ -226,6 +226,9 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
         // segments: refuse the ones that could alias another tenant's keys.
         crate::tenant::validate_scope_id("tenant", tenant).map_err(anyhow::Error::msg)?;
         crate::tenant::validate_scope_id("env", env).map_err(anyhow::Error::msg)?;
+        // The target becomes an admin-registry URL path segment: refuse one
+        // that could steer it (a deterministic, non-retryable rejection).
+        crate::tenant::validate_target_id(target).map_err(anyhow::Error::msg)?;
 
         // --- dispatch-level idempotency (Task 2.3) ---
         // A hit means this is a redelivery of the SAME published message:
@@ -308,6 +311,9 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
     }
 
     async fn step_timeout(&self, tenant: &str, env: &str, target: &str) -> Option<Duration> {
+        if crate::tenant::validate_target_id(target).is_err() {
+            return None;
+        }
         let tenant_ctx = TenantContext::new(tenant, env);
         match self
             .runtime
@@ -847,5 +853,33 @@ mod tests {
         assert_eq!(out.output["reply"], json!("pong"));
         // No key → nothing recorded.
         assert!(ledger.stored("k-absent").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_path_steering_target_is_refused_before_any_config_lookup() {
+        let runtime = build_test_mock_runtime("greeter", "pong");
+        let invoker = RuntimeAgentDispatchInvoker::new(runtime);
+        let refused = invoker
+            .invoke(
+                "acme",
+                "prod",
+                "../tenant/me/mcp-servers",
+                "",
+                json!({"user_text": "ping"}),
+                Some("sess-1"),
+            )
+            .await
+            .err();
+        assert!(refused.is_some(), "a path-steering target must be refused");
+        let message = refused.map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("target"), "{message}");
+        // Non-retryable: not classified as a busy / unavailable session.
+        assert!(!message.contains("temporarily unavailable"));
+        assert!(
+            invoker
+                .step_timeout("acme", "prod", "../tenant/me/mcp-servers")
+                .await
+                .is_none()
+        );
     }
 }

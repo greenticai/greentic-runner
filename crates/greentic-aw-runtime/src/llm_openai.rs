@@ -21,6 +21,13 @@ use crate::tool_wire_name::{ToolNameCodec, wire_tool_name};
 /// indefinitely. Overridable only in tests for fast, deterministic checks.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// TCP connect bound for every request.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on a blocking completion as a whole, and on the wait for a streaming
+/// response's head. NOT applied to a streaming body (see `STREAM_IDLE_TIMEOUT`).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Endpoint used when [`ENV_BASE_URL`] names none.
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
@@ -39,6 +46,7 @@ pub struct OpenAiLlmBackend {
     api_key: String,
     base_url: String,
     client: Client,
+    request_timeout: Duration,
 }
 
 impl OpenAiLlmBackend {
@@ -65,8 +73,13 @@ impl OpenAiLlmBackend {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
+            request_timeout: REQUEST_TIMEOUT,
+            // No whole-request `.timeout()`: it would also cut a long
+            // streaming body after deltas were already emitted (not
+            // retryable). The blocking path sets a per-request timeout, the
+            // streaming path bounds time-to-first-byte and each chunk gap.
             client: Client::builder()
-                .timeout(Duration::from_secs(45))
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         }
@@ -163,7 +176,10 @@ struct OaToolDef<'a> {
 #[derive(Deserialize)]
 struct OaResponse {
     choices: Vec<OaChoice>,
-    usage: OaUsage,
+    /// Some OpenAI-compatible endpoints omit `usage`: that must not fail an
+    /// otherwise good reply (tokens then count as 0).
+    #[serde(default)]
+    usage: Option<OaUsage>,
 }
 
 #[derive(Deserialize)]
@@ -193,7 +209,9 @@ struct OaToolFnIn {
 
 #[derive(Deserialize)]
 struct OaUsage {
+    #[serde(default)]
     prompt_tokens: u32,
+    #[serde(default)]
     completion_tokens: u32,
 }
 
@@ -226,6 +244,7 @@ impl LlmBackend for OpenAiLlmBackend {
                 .post(&url)
                 .bearer_auth(&self.api_key)
                 .json(&body)
+                .timeout(self.request_timeout)
                 .send()
                 .await
                 .map_err(|e| LlmError::Transport(e.to_string()))?;
@@ -266,8 +285,8 @@ impl LlmBackend for OpenAiLlmBackend {
             Ok(LlmResponse {
                 content: choice.message.content,
                 tool_calls,
-                tokens_in: oa.usage.prompt_tokens,
-                tokens_out: oa.usage.completion_tokens,
+                tokens_in: oa.usage.as_ref().map_or(0, |u| u.prompt_tokens),
+                tokens_out: oa.usage.as_ref().map_or(0, |u| u.completion_tokens),
             })
         })
     }
@@ -311,8 +330,12 @@ impl LlmBackend for OpenAiLlmBackend {
                 .post(&url)
                 .bearer_auth(&self.api_key)
                 .json(&body)
-                .send()
+                .send();
+            // Bound only the wait for the response head; the body is bounded
+            // per chunk below, never as a whole.
+            let resp = tokio::time::timeout(self.request_timeout, resp)
                 .await
+                .map_err(|_| LlmError::Transport("response header timeout".into()))?
                 .map_err(|e| LlmError::Transport(e.to_string()))?;
             let status = resp.status();
             // A non-2xx response is an error body, not an SSE stream — read
@@ -1034,5 +1057,115 @@ mod tests {
             !all.contains("secret-plan") && !all.contains("artifact://"),
             "{all}"
         );
+    }
+
+    fn plain_req() -> LlmRequest {
+        LlmRequest {
+            system_prompt: "sys".into(),
+            history: vec![ChatMessage::User {
+                content: "hi".into(),
+                attachments: Vec::new(),
+            }],
+            tools: vec![],
+            provider: crate::config::LlmProviderRef {
+                provider: "openai".into(),
+                model: "m".into(),
+                credential_ref: None,
+            },
+            turn_attachments: Default::default(),
+            attachment_text_guard: None,
+        }
+    }
+
+    /// One-shot HTTP server: reads the request, then runs `respond` on the
+    /// socket. Returns its base URL.
+    async fn serve_once<F, Fut>(respond: F) -> String
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            // The request is small and sent in one go; one read drains it.
+            let _ = sock.read(&mut buf).await;
+            respond(sock).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_usage_is_accepted() {
+        use tokio::io::AsyncWriteExt;
+        let body = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let url = serve_once(move |mut sock| async move {
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        })
+        .await;
+        let backend = OpenAiLlmBackend::with_base_url("k", url);
+        let out = backend.complete(plain_req()).await.unwrap();
+        assert_eq!(out.content.as_deref(), Some("ok"));
+        assert_eq!((out.tokens_in, out.tokens_out), (0, 0));
+    }
+
+    /// The stream outlives the per-request timeout; only idle gaps are bounded,
+    /// so the full reply arrives (a whole-request timeout would cut it).
+    #[tokio::test]
+    async fn a_long_stream_is_not_cut_by_the_request_timeout() {
+        use tokio::io::AsyncWriteExt;
+        let url = serve_once(|mut sock| async move {
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            for word in ["a", "b", "c", "d", "e", "f"] {
+                let line = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{word}\"}}}}]}}\n\n"
+                );
+                sock.write_all(line.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            sock.write_all(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        let mut backend = OpenAiLlmBackend::with_base_url("k", url);
+        backend.request_timeout = Duration::from_millis(250);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+        let out = backend
+            .complete_streaming(
+                plain_req(),
+                Box::new(move |chunk: &str| sink.lock().unwrap().push_str(chunk)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content.as_deref(), Some("abcdef"));
+        assert_eq!(seen.lock().unwrap().as_str(), "abcdef");
+        assert_eq!(out.tokens_out, 2);
+    }
+
+    #[tokio::test]
+    async fn the_blocking_path_still_times_out() {
+        let url = serve_once(|sock| async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(sock);
+        })
+        .await;
+        let mut backend = OpenAiLlmBackend::with_base_url("k", url);
+        backend.request_timeout = Duration::from_millis(150);
+        let err = backend.complete(plain_req()).await.unwrap_err();
+        assert!(matches!(err, LlmError::Transport(_)), "{err:?}");
     }
 }

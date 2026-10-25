@@ -17,7 +17,8 @@ use crate::tenant::TenantContext;
 
 use super::types::{
     CATALOG_TTL, MCP_ROLE_AGENTIC_WORKER, McpCallerIdentity, McpPackRoute, McpRoute,
-    McpToolCatalog, McpToolEntry, PROBE_TIMEOUT, ParsedServer, Transport, WireBody, call_timeout,
+    McpToolCatalog, McpToolEntry, PROBE_TIMEOUT, PULL_TIMEOUT, ParsedServer, Transport, WireBody,
+    call_timeout,
 };
 
 /// Per-tenant, TTL-gated source of agentic-worker MCP tool catalogs.
@@ -397,6 +398,34 @@ impl McpToolSource {
         server: &ParsedServer,
         tenant_key: &str,
     ) {
+        // The first pull of a local-wasm component downloads and verifies an
+        // artifact, which the probe's 5 s "is it reachable" budget cannot
+        // cover: it would be cancelled mid-download and retried (and cancelled)
+        // on every catalog build. Pull under its own budget first; the probe
+        // below then only lists tools from the cached wasm.
+        if server.transport == Transport::LocalWasm {
+            match tokio::time::timeout(PULL_TIMEOUT, ensure_server_cached(server)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        tenant = %tenant_key,
+                        server = %server.id,
+                        error = %e,
+                        "mcp server probe failed; skipping its tools"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        tenant = %tenant_key,
+                        server = %server.id,
+                        "mcp local-wasm pull timed out after {}s; skipping its tools",
+                        PULL_TIMEOUT.as_secs()
+                    );
+                    return;
+                }
+            }
+        }
         match tokio::time::timeout(PROBE_TIMEOUT, list_server_tools(server)).await {
             Ok(Ok(defs)) => ingest_server_tools(catalog, server, &defs),
             Ok(Err(e)) => tracing::warn!(
@@ -413,6 +442,32 @@ impl McpToolSource {
             ),
         }
     }
+}
+
+/// Lazy store-pull for a `local-wasm` server: make sure its wasm is downloaded
+/// and verified. Needs both version and digest on the wire row; a missing field
+/// is a pull failure so the server is skipped rather than running an
+/// unverified wasm.
+async fn ensure_server_cached(server: &ParsedServer) -> Result<(), String> {
+    let component = server
+        .component_ref
+        .as_deref()
+        .ok_or_else(|| "local-wasm server missing component_ref".to_string())?;
+    let version = server.component_version.as_deref().ok_or_else(|| {
+        format!(
+            "local-wasm server '{}' missing component_version; cannot pull",
+            component
+        )
+    })?;
+    let digest = server.component_digest.as_deref().ok_or_else(|| {
+        format!(
+            "local-wasm server '{}' missing component_digest; cannot pull",
+            component
+        )
+    })?;
+    crate::mcp_store_pull::ensure_cached(component, version, digest)
+        .await
+        .map_err(|e| format!("local-wasm store-pull failed for '{}': {e}", component))
 }
 
 /// Parse the `{servers:[...]}` wire body into [`ParsedServer`]s.
@@ -620,25 +675,9 @@ async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, Str
                 .component_ref
                 .as_deref()
                 .ok_or_else(|| "local-wasm server missing component_ref".to_string())?;
-            // Lazy store-pull: ensure the wasm is downloaded and verified before
-            // listing tools. Requires both version and digest to be present on
-            // the wire row; a missing field is treated as a pull failure so the
-            // server is skipped rather than silently running an unverified wasm.
-            let version = server.component_version.as_deref().ok_or_else(|| {
-                format!(
-                    "local-wasm server '{}' missing component_version; cannot pull",
-                    component
-                )
-            })?;
-            let digest = server.component_digest.as_deref().ok_or_else(|| {
-                format!(
-                    "local-wasm server '{}' missing component_digest; cannot pull",
-                    component
-                )
-            })?;
-            crate::mcp_store_pull::ensure_cached(component, version, digest)
-                .await
-                .map_err(|e| format!("local-wasm store-pull failed for '{}': {e}", component))?;
+            // Normally a cache hit: `probe_server` pulls first, under its own
+            // budget. This still pulls when a caller lists without probing.
+            ensure_server_cached(server).await?;
             let tools = crate::mcp_local::local_list_tools(component).await;
             Ok(tools
                 .into_iter()

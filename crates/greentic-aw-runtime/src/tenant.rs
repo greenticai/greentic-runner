@@ -169,6 +169,26 @@ pub fn validate_scope_id(kind: &str, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reject a dispatch `target` (agent id) taken from the wire before it is
+/// used to look a config up: empty, over-long, or containing `/`, `\\`, `?`,
+/// `#`, `%`, `..`, whitespace or a control character. Such a value could only
+/// ever be an attempt to steer a request path, never a real agent id.
+pub fn validate_target_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("target is empty".to_string());
+    }
+    if id.len() > MAX_ID_LEN {
+        return Err(format!("target is longer than {MAX_ID_LEN} bytes"));
+    }
+    if id.contains(['/', '\\', '?', '#', '%'])
+        || id.contains("..")
+        || id.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("target contains a forbidden character".to_string());
+    }
+    Ok(())
+}
+
 /// Longest session id accepted from an untrusted source.
 pub(crate) const MAX_SESSION_ID_LEN: usize = 512;
 
@@ -192,8 +212,17 @@ pub fn validate_session_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `segment` is `.` or `..`: a path-traversal step that no amount of
+/// percent-encoding neutralises (URL parsers decode `%2E` before resolving it).
+pub fn is_dot_segment(segment: &str) -> bool {
+    matches!(segment, "." | "..")
+}
+
 /// Percent-encode one URL path segment (RFC 3986 unreserved characters pass
 /// through), so an id can never add `/`, `?` or `..` to a request path.
+///
+/// A segment of only dots (`.` / `..`) survives encoding and URL parsers treat
+/// even `%2E%2E` as a traversal step, so use [`is_dot_segment`] to refuse it.
 pub fn percent_encode_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
@@ -236,6 +265,31 @@ mod tests {
         assert_eq!(percent_encode_segment("acme-1_x.y"), "acme-1_x.y");
         assert_eq!(percent_encode_segment("a/b?c#d e"), "a%2Fb%3Fc%23d%20e");
         assert_eq!(percent_encode_segment("é"), "%C3%A9");
+        assert_eq!(percent_encode_segment("a..b"), "a..b");
+        assert!(is_dot_segment("..") && is_dot_segment("."));
+        assert!(!is_dot_segment("a..b") && !is_dot_segment(""));
+    }
+
+    #[test]
+    fn target_ids_that_could_steer_a_path_are_rejected() {
+        for ok in ["bot", "8d2f0c1e-recipe", "agent_1.v2", "a:b"] {
+            assert!(validate_target_id(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "../tenant/me/mcp-servers",
+            "a/b",
+            "a?x=1",
+            "a#f",
+            "a%2Fb",
+            "..",
+            "a\\b",
+            "a b",
+            "a\nb",
+        ] {
+            assert!(validate_target_id(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_target_id(&"x".repeat(MAX_ID_LEN + 1)).is_err());
     }
 
     #[test]

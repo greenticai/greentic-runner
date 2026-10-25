@@ -15,7 +15,7 @@ mod resilience_tests;
 
 use crate::error::{AgentError, LlmError, StateError, TerminationReason};
 use crate::llm::{LlmBackend, LlmRequest};
-use crate::state::{ChatMessage, ConversationState};
+use crate::state::ChatMessage;
 use crate::telemetry::StepTelemetryCtx;
 use crate::tenant::TenantContext;
 use crate::tools::is_tool_allowed;
@@ -204,15 +204,19 @@ async fn run_step_scoped(
         .await
         .map_err(|e| match e {
             crate::error::StateError::LockTimeout(_) => AgentError::LockTimeout,
-            other => AgentError::StateLoad(other),
+            other => AgentError::from_state_error(other),
         })?;
 
-    // --- Load state (best-effort; empty on failure) ---
+    // --- Load state ---
+    // Only a stored state or a genuinely missing key (the store returns an
+    // empty state for that) may start the turn. Any other failure (backend
+    // blip, undecodable or too-new state) aborts WITHOUT saving: starting
+    // empty would let the end-of-turn save overwrite the stored conversation.
     let mut state = match runtime.state_store.load(&tenant, session_id).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, "state load failed; proceeding with empty state");
-            ConversationState::empty(&tenant, session_id)
+            warn!(error = %e, "state load failed; aborting the turn without saving");
+            return Err(AgentError::from_state_error(e));
         }
     };
     // --- Opening-message short-circuit ---
@@ -350,13 +354,15 @@ async fn run_step_scoped(
     let user_message = if resuming.is_some() {
         crate::flow_suspend::last_user_text(&state)
     } else {
-        let user_text = match crate::guardrail::run_chain(
+        let user_text = match crate::guardrail::run_chain_blocking(
             &guardrail_chain,
             crate::guardrail::GuardrailDirection::Inbound,
             message.text,
             &guardrail_ctx,
-            runtime.guardrail_evaluator.as_ref(),
-        ) {
+            runtime.guardrail_evaluator.clone(),
+        )
+        .await
+        {
             crate::guardrail::ChainOutcome::Pass {
                 content,
                 observations,
@@ -642,10 +648,19 @@ async fn run_step_scoped(
     // across turns or conversations (it holds bytes fetched under this turn's
     // authorisation).
     let turn_attachments = crate::attachments_materialize::TurnAttachments::for_turn();
+    // A turn resumed from a park continues the parked turn's budget, but gets
+    // at least one iteration: a flow that parked on the LAST iteration
+    // (`first_iter == max_iter`) would otherwise leave an empty range and the
+    // user's answer would never get a reply.
+    let iter_end = if first_iter > 0 {
+        config.limits.max_iter.max(first_iter.saturating_add(1))
+    } else {
+        config.limits.max_iter
+    };
     let iter_range = if suspension.is_some() {
         0..0
     } else {
-        first_iter..config.limits.max_iter
+        first_iter..iter_end
     };
 
     for iter in iter_range {
@@ -753,7 +768,12 @@ async fn run_step_scoped(
                 // Persist the (bounded) history so far; a failed save is
                 // logged, not swallowed.
                 state.truncate_history(config.limits.max_history_turns);
-                if let Err(save_err) = runtime.state_store.save(&tenant, session_id, &state).await {
+                // A lapsed lock means a newer turn may own the session: do
+                // not save over it.
+                if ensure_lock_held(&lock).await.is_ok()
+                    && let Err(save_err) =
+                        runtime.state_store.save(&tenant, session_id, &state).await
+                {
                     warn!(error = %save_err, "state save failed after llm error");
                 }
                 record_error_exit(
@@ -1105,13 +1125,19 @@ async fn run_step_scoped(
                     // remote side effect that is NOT recorded in any ledger, so
                     // a retried turn can perform it again. Tools with side
                     // effects must be idempotent.
+                    // `limits.timeout` may exceed the 90 s lock TTL, so the
+                    // lock is kept alive while the call is pending.
                     match tokio::time::timeout(
                         remaining,
-                        catalogs.dispatch(
-                            runtime.ext_runtime.clone(),
-                            call.clone(),
-                            &tenant,
-                            Some(&mut state.a2a),
+                        crate::lock_keepalive::keep_alive(
+                            &lock,
+                            crate::lock_keepalive::LOCK_KEEPALIVE_INTERVAL,
+                            catalogs.dispatch(
+                                runtime.ext_runtime.clone(),
+                                call.clone(),
+                                &tenant,
+                                Some(&mut state.a2a),
+                            ),
                         ),
                     )
                     .await
@@ -1232,13 +1258,15 @@ async fn run_step_scoped(
         terminated_by,
         TerminationReason::FinalReply | TerminationReason::ConversationEnded
     ) {
-        let reply = match crate::guardrail::run_chain(
+        let reply = match crate::guardrail::run_chain_blocking(
             &guardrail_chain,
             crate::guardrail::GuardrailDirection::Outbound,
             reply,
             &guardrail_ctx,
-            runtime.guardrail_evaluator.as_ref(),
-        ) {
+            runtime.guardrail_evaluator.clone(),
+        )
+        .await
+        {
             crate::guardrail::ChainOutcome::Pass {
                 content,
                 observations,
@@ -1298,7 +1326,9 @@ async fn run_step_scoped(
                         source_description: Some("agentic-worker turn".into()),
                         reference_time: chrono::Utc::now(),
                     };
-                    tokio::spawn(async move {
+                    // Bounded: a slow memory backend must not pile up one task
+                    // (holding the whole episode) per turn.
+                    crate::background::long_term_gate().try_spawn("long-term ingest", async move {
                         if let Err(e) = memory.ingest_episode(&ctx, episode).await {
                             warn!(error = %e, "background long-term ingest failed");
                         }

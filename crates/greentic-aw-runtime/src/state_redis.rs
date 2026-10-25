@@ -24,10 +24,9 @@ const LOCK_TTL_SECS: i64 = 90;
 const LOCK_POLL_MS: u64 = 50;
 
 /// Lua: refresh the lock TTL only if we still own it (value matches). A
-/// missing key or a different owner both return 0 (lock lost): the script must
-/// never create the key, or a lock that lapsed and was taken by another turn
-/// could be silently stolen back. Re-acquiring a lapsed-but-unclaimed lock is
-/// the caller's explicit `SET NX` (see `RedisSessionLock::refresh`).
+/// missing key or a different owner both return 0 (lock lost): the lock is
+/// never re-created, because a lapsed lock may have been taken, used and
+/// released by another turn whose newer state our stale copy would overwrite.
 const REFRESH_LUA: &str = r#"
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -190,24 +189,11 @@ impl SessionLockInner for RedisSessionLock {
             if refreshed == 1 {
                 return Ok(());
             }
-            // The key is absent (TTL lapsed during a long LLM call) or held
-            // by another owner. `SET NX` takes it back only when nobody else
-            // has; failing means another owner holds it, i.e. the lock is lost.
-            let taken: Option<String> = redis::cmd("SET")
-                .arg(&self.key)
-                .arg(&self.value)
-                .arg("NX")
-                .arg("EX")
-                .arg(LOCK_TTL_SECS)
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| StateError::Redis(format!("refresh set nx: {e}")))?;
-            if taken.is_some() {
-                tracing::warn!("session lock had lapsed unclaimed; re-acquired");
-                Ok(())
-            } else {
-                Err(StateError::LockLost)
-            }
+            // Absent (the TTL lapsed) or held by another owner. Both are a
+            // lost lock: an absent key does NOT mean nobody ran in the gap
+            // (another turn may have taken it, saved and released), so it is
+            // never re-acquired here and the step aborts without saving.
+            Err(StateError::LockLost)
         })
     }
 

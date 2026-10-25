@@ -995,3 +995,126 @@ async fn text_and_an_answer_both_travel_and_an_empty_answer_is_ignored() {
         );
     }
 }
+
+// --- Stale task ids and reply size ----------------------------------------
+
+use wiremock::matchers::body_partial_json;
+
+/// Park turn 1 on `input-required` (task `t-1`, context `ctx-1`), then make
+/// the agent refuse any message that names `t-1` with `refusal`, while a
+/// message without it succeeds.
+async fn agent_that_forgot_its_task(
+    refusal: ResponseTemplate,
+) -> (MockServer, std::sync::Arc<A2aToolCatalog>, A2aContinuations) {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_in_context(
+            "t-1",
+            "ctx-1",
+            "TASK_STATE_INPUT_REQUIRED",
+            "Which city?",
+        )))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .and(body_partial_json(
+            json!({"params": {"message": {"taskId": "t-1"}}}),
+        ))
+        .respond_with(refusal)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": {"task": {
+                "id": "t-2",
+                "contextId": "ctx-1",
+                "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [{"parts": [{"text": "Hotel Diagonal"}]}]
+            }}
+        })))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+    let catalog = source_for(vec![("travel", server.uri())]).catalog().await;
+    let mut state = A2aContinuations::default();
+    let first = catalog
+        .dispatch_in_conversation("travel", &json!("hotel"), &acme(), &mut state, at(0))
+        .await;
+    assert_eq!(first["status"], "input_required", "got: {first}");
+    (server, catalog, state)
+}
+
+#[tokio::test]
+async fn a_json_rpc_refusal_of_a_stale_task_id_retries_once_without_it() {
+    let (server, catalog, mut state) =
+        agent_that_forgot_its_task(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": {"code": -32001, "message": "task not found"}
+        })))
+        .await;
+
+    let second = catalog
+        .dispatch_in_conversation("travel", &json!("Barcelona"), &acme(), &mut state, at(30))
+        .await;
+    assert_eq!(second["status"], "completed", "got: {second}");
+
+    let sent = sent_references(&server).await;
+    assert_eq!(sent.len(), 3, "first call, refused call, one retry");
+    assert_eq!(sent[1], (Some("ctx-1".into()), Some("t-1".into())));
+    assert_eq!(
+        sent[2],
+        (Some("ctx-1".into()), None),
+        "the retry keeps the context and drops the stale task id"
+    );
+}
+
+#[tokio::test]
+async fn an_http_4xx_refusal_of_a_stale_task_id_retries_once_without_it() {
+    let (server, catalog, mut state) = agent_that_forgot_its_task(ResponseTemplate::new(404)).await;
+
+    let second = catalog
+        .dispatch_in_conversation("travel", &json!("Barcelona"), &acme(), &mut state, at(30))
+        .await;
+    assert_eq!(second["status"], "completed", "got: {second}");
+    assert_eq!(sent_references(&server).await.len(), 3);
+}
+
+#[tokio::test]
+async fn a_server_error_is_not_blamed_on_the_task_id_and_is_not_retried() {
+    let (server, catalog, mut state) = agent_that_forgot_its_task(ResponseTemplate::new(503)).await;
+
+    let second = catalog
+        .dispatch_in_conversation("travel", &json!("Barcelona"), &acme(), &mut state, at(30))
+        .await;
+    assert_eq!(second["status"], "error", "got: {second}");
+    assert_eq!(
+        sent_references(&server).await.len(),
+        2,
+        "no retry for a 5xx"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_reply_body_is_refused_instead_of_buffered() {
+    let server = MockServer::start().await;
+    mount_card(&server).await;
+    Mock::given(method("POST"))
+        .and(path(RPC_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(5 * 1024 * 1024)))
+        .mount(&server)
+        .await;
+
+    let source = source_for(vec![("recipe", server.uri())]);
+    let err = source
+        .call("recipe", "hi")
+        .await
+        .expect_err("an oversized body must be refused");
+    assert!(err.contains("larger than"), "got: {err}");
+}

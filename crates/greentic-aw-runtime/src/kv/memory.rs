@@ -13,10 +13,37 @@ struct Entry {
     expires_at: Instant,
 }
 
+/// Fewest writes between two sweeps of expired entries.
+const MIN_WRITES_PER_SWEEP: usize = 256;
+
+#[derive(Default)]
+struct State {
+    map: HashMap<String, Entry>,
+    /// Writes since the last sweep of expired entries.
+    writes_since_sweep: usize,
+}
+
+impl State {
+    /// Count one write and, once at least `max(MIN_WRITES_PER_SWEEP, len)`
+    /// writes have happened since the last sweep, drop every expired entry.
+    ///
+    /// Without this an entry nobody reads again (a finished session's
+    /// `ConversationState`, kept 7 days) would stay forever. Scaling the
+    /// interval with the map size keeps the O(n) sweep amortised O(1) per
+    /// write.
+    fn note_write(&mut self, now: Instant) {
+        self.writes_since_sweep += 1;
+        if self.writes_since_sweep >= MIN_WRITES_PER_SWEEP.max(self.map.len()) {
+            self.writes_since_sweep = 0;
+            self.map.retain(|_, entry| entry.expires_at > now);
+        }
+    }
+}
+
 /// Ephemeral in-process key-value store.
 #[derive(Default)]
 pub struct MemoryKv {
-    map: Mutex<HashMap<String, Entry>>,
+    state: Mutex<State>,
 }
 
 impl MemoryKv {
@@ -25,25 +52,46 @@ impl MemoryKv {
         Self::default()
     }
 
+    /// Number of stored entries, expired-but-unswept ones included.
+    #[cfg(test)]
+    fn stored_len(&self) -> usize {
+        self.state.lock().map(|s| s.map.len()).unwrap_or(0)
+    }
+
     /// Lock the map and run `f` with the current instant.
     ///
-    /// Expiry is handled lazily per key: each accessor treats a touched key
-    /// whose `expires_at` has passed as absent and removes just that key. There
-    /// is no global sweep (that was O(n) on every op), so an untouched but
-    /// expired key may linger until it is next accessed — an accepted tradeoff
-    /// for this ephemeral in-process backend. Returns a `StateError::Redis` on
-    /// mutex poisoning (kept as `Redis` so the loop's existing error handling is
-    /// unchanged).
+    /// Expiry is handled two ways: each accessor treats a touched key whose
+    /// `expires_at` has passed as absent and removes just that key, and every
+    /// write counts toward a periodic sweep of all expired entries (see
+    /// [`State::note_write`]), so keys nobody touches again do not accumulate.
+    /// Returns a `StateError::Redis` on mutex poisoning (kept as `Redis` so the
+    /// loop's existing error handling is unchanged).
     fn with_map<R>(
         &self,
         f: impl FnOnce(&mut HashMap<String, Entry>, Instant) -> R,
     ) -> Result<R, crate::error::StateError> {
         let now = Instant::now();
         let mut guard = self
-            .map
+            .state
             .lock()
             .map_err(|e| crate::error::StateError::Redis(format!("memory kv poisoned: {e}")))?;
-        Ok(f(&mut guard, now))
+        Ok(f(&mut guard.map, now))
+    }
+
+    /// [`with_map`](Self::with_map) for a mutation that adds or replaces an
+    /// entry: also drives the periodic expired-entry sweep.
+    fn with_map_write<R>(
+        &self,
+        f: impl FnOnce(&mut HashMap<String, Entry>, Instant) -> R,
+    ) -> Result<R, crate::error::StateError> {
+        let now = Instant::now();
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|e| crate::error::StateError::Redis(format!("memory kv poisoned: {e}")))?;
+        let out = f(&mut guard.map, now);
+        guard.note_write(now);
+        Ok(out)
     }
 }
 
@@ -64,7 +112,7 @@ impl AwKv for MemoryKv {
 
     fn set_ex<'a>(&'a self, key: &'a str, val: Vec<u8>, ttl: Duration) -> KvFut<'a, ()> {
         Box::pin(async move {
-            self.with_map(|map, now| {
+            self.with_map_write(|map, now| {
                 map.insert(
                     key.to_string(),
                     Entry {
@@ -86,7 +134,7 @@ impl AwKv for MemoryKv {
 
     fn set_nx<'a>(&'a self, key: &'a str, val: Vec<u8>, ttl: Duration) -> KvFut<'a, bool> {
         Box::pin(async move {
-            self.with_map(|map, now| {
+            self.with_map_write(|map, now| {
                 // An expired entry counts as absent, so a new lock may be taken.
                 let occupied = map.get(key).is_some_and(|entry| entry.expires_at > now);
                 if occupied {
@@ -151,7 +199,7 @@ impl AwKv for MemoryKv {
 
     fn incr_by<'a>(&'a self, key: &'a str, delta: u64, ttl: Duration) -> KvFut<'a, u64> {
         Box::pin(async move {
-            self.with_map(|map, now| {
+            self.with_map_write(|map, now| {
                 let current = map
                     .get(key)
                     .filter(|e| e.expires_at > now)
@@ -198,6 +246,51 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(kv.get("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn expired_entries_nobody_reads_again_are_swept_by_writes() {
+        let kv = MemoryKv::new();
+        for i in 0..100 {
+            kv.set_ex(&format!("dead{i}"), b"v".to_vec(), Duration::from_millis(1))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Never read again; only further writes can reclaim them.
+        for i in 0..MIN_WRITES_PER_SWEEP {
+            kv.set_ex(&format!("live{i}"), b"v".to_vec(), Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            kv.stored_len(),
+            MIN_WRITES_PER_SWEEP,
+            "the 100 expired entries must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_live_entries() {
+        let kv = MemoryKv::new();
+        kv.set_ex("keep", b"v".to_vec(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        for i in 0..(MIN_WRITES_PER_SWEEP * 2) {
+            kv.set_ex(&format!("k{i}"), b"v".to_vec(), Duration::from_millis(1))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Writes to one key do not grow the map, so the sweep (due once the
+        // write count reaches the map size) must fire within these.
+        for _ in 0..(MIN_WRITES_PER_SWEEP * 4) {
+            kv.set_ex("tick", b"v".to_vec(), Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+        assert_eq!(kv.get("keep").await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(kv.stored_len(), 2, "only `keep` and `tick` are live");
     }
 
     #[tokio::test]

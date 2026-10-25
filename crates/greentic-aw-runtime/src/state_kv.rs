@@ -123,19 +123,11 @@ impl SessionLockInner for KvSessionLock {
             if ok {
                 return Ok(());
             }
-            // The key is absent (TTL lapsed during a long LLM call) or held by
-            // another owner. Absent and unclaimed: take it back, nobody else
-            // ran in the gap. `set_nx` failing means another owner holds it.
-            if self
-                .kv
-                .set_nx(&self.key, self.token.clone().into_bytes(), LOCK_TTL)
-                .await?
-            {
-                tracing::warn!("session lock had lapsed unclaimed; re-acquired");
-                Ok(())
-            } else {
-                Err(StateError::LockLost)
-            }
+            // Absent (the TTL lapsed) or held by another owner. An absent key
+            // does NOT mean nobody ran in the gap (another turn may have
+            // taken it, saved and released), so it is never re-acquired here:
+            // the step aborts without saving its stale state.
+            Err(StateError::LockLost)
         })
     }
 
@@ -201,7 +193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_reacquires_a_lapsed_unclaimed_lock() {
+    async fn refresh_reports_lock_lost_when_the_lock_lapsed() {
         let kv: Arc<dyn AwKv> = Arc::new(MemoryKv::new());
         let s = KvAgentStateStore::new(kv.clone());
         let t = TenantContext::new("acme", "prod");
@@ -209,12 +201,42 @@ mod tests {
             .acquire_lock(&t, "sess", Duration::from_millis(10))
             .await
             .unwrap();
-        // Simulate the TTL lapsing.
+        // Simulate the TTL lapsing with nobody else having taken it.
         kv.del(&lock_key(&t, "sess")).await.unwrap();
-        held.refresh().await.unwrap();
-        // The lock is ours again: a second taker must time out.
-        let err = s.acquire_lock(&t, "sess", Duration::from_millis(20)).await;
-        assert!(matches!(err, Err(StateError::LockTimeout(_))));
+        assert!(matches!(held.refresh().await, Err(StateError::LockLost)));
+        // The lock was not silently re-created.
+        assert!(kv.get(&lock_key(&t, "sess")).await.unwrap().is_none());
+    }
+
+    /// Stale-holder interleaving: A's lock lapses, B takes it, saves newer
+    /// state and releases; A's refresh must report the loss (so the loop
+    /// aborts before its stale save) instead of re-taking the free key.
+    #[tokio::test]
+    async fn lapsed_holder_cannot_retake_after_another_turn_ran() {
+        let kv: Arc<dyn AwKv> = Arc::new(MemoryKv::new());
+        let s = KvAgentStateStore::new(kv.clone());
+        let t = TenantContext::new("acme", "prod");
+        let a = s
+            .acquire_lock(&t, "sess", Duration::from_millis(10))
+            .await
+            .unwrap();
+        kv.del(&lock_key(&t, "sess")).await.unwrap();
+        {
+            let b = s
+                .acquire_lock(&t, "sess", Duration::from_millis(10))
+                .await
+                .unwrap();
+            let mut newer = ConversationState::empty(&t, "sess");
+            newer.messages.push(ChatMessage::User {
+                content: "newer".into(),
+                attachments: Vec::new(),
+            });
+            s.save(&t, "sess", &newer).await.unwrap();
+            drop(b);
+        }
+        // Let B's detached release run.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(a.refresh().await, Err(StateError::LockLost)));
     }
 
     #[tokio::test]

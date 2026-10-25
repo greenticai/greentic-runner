@@ -50,20 +50,162 @@ pub trait MemoryProvider: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<MemoryRecord>, MemoryError>> + Send + 'a>>;
 }
 
+/// Longest accepted memory key, in bytes.
+pub const MAX_KEY_BYTES: usize = 256;
+/// Longest accepted memory value, in bytes.
+pub const MAX_VALUE_BYTES: usize = 16 * 1024;
+/// Most distinct keys one `(tenant, session)` may hold.
+pub const MAX_ENTRIES_PER_SESSION: usize = 100;
+/// Most key + value bytes one `(tenant, session)` may hold.
+pub const MAX_BYTES_PER_SESSION: usize = 256 * 1024;
+/// Most `(tenant, session)` buckets kept; past this the least recently used
+/// session is evicted whole.
+pub const MAX_SESSIONS: usize = 10_000;
+
+/// Caps of an [`InMemoryMemoryProvider`]. The defaults are the `MAX_*`
+/// constants above; a model can call `remember` in a loop and sessions are
+/// attacker-chosen, so nothing here may grow without bound.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryLimits {
+    pub max_key_bytes: usize,
+    pub max_value_bytes: usize,
+    pub max_entries_per_session: usize,
+    pub max_bytes_per_session: usize,
+    pub max_sessions: usize,
+}
+
+impl Default for MemoryLimits {
+    fn default() -> Self {
+        Self {
+            max_key_bytes: MAX_KEY_BYTES,
+            max_value_bytes: MAX_VALUE_BYTES,
+            max_entries_per_session: MAX_ENTRIES_PER_SESSION,
+            max_bytes_per_session: MAX_BYTES_PER_SESSION,
+            max_sessions: MAX_SESSIONS,
+        }
+    }
+}
+
+/// Everything one `(tenant, session)` remembers.
+#[derive(Default)]
+struct Bucket {
+    entries: HashMap<String, MemoryRecord>,
+    bytes: usize,
+    /// Logical clock value of the last read or write (LRU order).
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct Inner {
+    sessions: HashMap<(String, String), Bucket>,
+    clock: u64,
+}
+
 /// In-memory provider keyed by `(tenant, session, key)`. Always compiled (like
 /// [`crate::config_provider::InMemoryConfigProvider`]); used by tests and the
-/// designer playground. Lock-poisoning maps to [`MemoryError::Backend`] — no
-/// `unwrap`/`expect` in this non-test code.
+/// designer playground. Bounded by [`MemoryLimits`]. Lock-poisoning maps to
+/// [`MemoryError::Backend`] — no `unwrap`/`expect` in this non-test code.
 #[derive(Default)]
 pub struct InMemoryMemoryProvider {
-    entries: Mutex<HashMap<(String, String, String), MemoryRecord>>,
+    inner: Mutex<Inner>,
+    limits: MemoryLimits,
 }
 
 impl InMemoryMemoryProvider {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A provider with explicit caps (tests use small ones).
+    pub fn with_limits(limits: MemoryLimits) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner::default()),
+            limits,
         }
+    }
+
+    fn store(
+        &self,
+        tenant: &TenantContext,
+        session_id: &str,
+        record: MemoryRecord,
+    ) -> Result<(), MemoryError> {
+        let limits = self.limits;
+        if record.key.len() > limits.max_key_bytes {
+            return Err(MemoryError::LimitExceeded(format!(
+                "key is longer than {} bytes",
+                limits.max_key_bytes
+            )));
+        }
+        if record.value.len() > limits.max_value_bytes {
+            return Err(MemoryError::LimitExceeded(format!(
+                "value is longer than {} bytes",
+                limits.max_value_bytes
+            )));
+        }
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MemoryError::Backend("memory mutex poisoned".to_string()))?;
+        let inner = &mut *guard;
+        inner.clock += 1;
+        let now = inner.clock;
+        let bucket_key = (tenant.key_prefix(), session_id.to_string());
+        if !inner.sessions.contains_key(&bucket_key) && inner.sessions.len() >= limits.max_sessions
+        {
+            // Evict the least recently used session whole.
+            let oldest = inner
+                .sessions
+                .iter()
+                .min_by_key(|(_, b)| b.last_used)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                inner.sessions.remove(&oldest);
+            }
+        }
+        let bucket = inner.sessions.entry(bucket_key).or_default();
+        bucket.last_used = now;
+        let new_size = record.key.len() + record.value.len();
+        let existing = bucket
+            .entries
+            .get(&record.key)
+            .map(|old| old.key.len() + old.value.len());
+        if existing.is_none() && bucket.entries.len() >= limits.max_entries_per_session {
+            return Err(MemoryError::LimitExceeded(format!(
+                "at most {} entries per session",
+                limits.max_entries_per_session
+            )));
+        }
+        let old_size = existing.unwrap_or(0);
+        if bucket.bytes.saturating_sub(old_size) + new_size > limits.max_bytes_per_session {
+            return Err(MemoryError::LimitExceeded(format!(
+                "at most {} bytes per session",
+                limits.max_bytes_per_session
+            )));
+        }
+        bucket.bytes = bucket.bytes.saturating_sub(old_size) + new_size;
+        bucket.entries.insert(record.key.clone(), record);
+        Ok(())
+    }
+
+    fn load(
+        &self,
+        tenant: &TenantContext,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<MemoryRecord>, MemoryError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MemoryError::Backend("memory mutex poisoned".to_string()))?;
+        let inner = &mut *guard;
+        inner.clock += 1;
+        let now = inner.clock;
+        let bucket_key = (tenant.key_prefix(), session_id.to_string());
+        Ok(inner.sessions.get_mut(&bucket_key).and_then(|bucket| {
+            bucket.last_used = now;
+            bucket.entries.get(key).cloned()
+        }))
     }
 }
 
@@ -74,18 +216,7 @@ impl MemoryProvider for InMemoryMemoryProvider {
         session_id: &'a str,
         record: MemoryRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), MemoryError>> + Send + 'a>> {
-        let key = (
-            tenant.key_prefix(),
-            session_id.to_string(),
-            record.key.clone(),
-        );
-        let result = self
-            .entries
-            .lock()
-            .map_err(|_| MemoryError::Backend("memory mutex poisoned".to_string()))
-            .map(|mut entries| {
-                entries.insert(key, record);
-            });
+        let result = self.store(tenant, session_id, record);
         Box::pin(async move { result })
     }
 
@@ -95,16 +226,7 @@ impl MemoryProvider for InMemoryMemoryProvider {
         session_id: &'a str,
         query: &'a MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Option<MemoryRecord>, MemoryError>> + Send + 'a>> {
-        let key = (
-            tenant.key_prefix(),
-            session_id.to_string(),
-            query.key.clone(),
-        );
-        let result = self
-            .entries
-            .lock()
-            .map_err(|_| MemoryError::Backend("memory mutex poisoned".to_string()))
-            .map(|entries| entries.get(&key).cloned());
+        let result = self.load(tenant, session_id, &query.key);
         Box::pin(async move { result })
     }
 }
@@ -196,5 +318,91 @@ mod tests {
             .await
             .unwrap();
         assert!(other.is_none());
+    }
+
+    fn rec(key: &str, value: &str) -> MemoryRecord {
+        MemoryRecord {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn small() -> MemoryLimits {
+        MemoryLimits {
+            max_key_bytes: 8,
+            max_value_bytes: 16,
+            max_entries_per_session: 3,
+            max_bytes_per_session: 40,
+            max_sessions: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_key_or_value_is_refused() {
+        let p = InMemoryMemoryProvider::with_limits(small());
+        let t = tenant();
+        let err = p
+            .remember(&t, "s", rec("123456789", "v"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::LimitExceeded(_)));
+        let err = p
+            .remember(&t, "s", rec("k", &"x".repeat(17)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::LimitExceeded(_)));
+    }
+
+    #[tokio::test]
+    async fn entry_count_per_session_is_capped_but_overwrite_is_allowed() {
+        let p = InMemoryMemoryProvider::with_limits(small());
+        let t = tenant();
+        for k in ["a", "b", "c"] {
+            p.remember(&t, "s", rec(k, "v")).await.unwrap();
+        }
+        let err = p.remember(&t, "s", rec("d", "v")).await.unwrap_err();
+        assert!(matches!(err, MemoryError::LimitExceeded(_)));
+        // Replacing an existing key does not add an entry.
+        p.remember(&t, "s", rec("a", "w")).await.unwrap();
+        // Another session is unaffected.
+        p.remember(&t, "other", rec("d", "v")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bytes_per_session_are_capped_and_replacement_frees_the_old_size() {
+        let p = InMemoryMemoryProvider::with_limits(small());
+        let t = tenant();
+        // 2 + 16 = 18 bytes each: two fit under 40, a third does not.
+        p.remember(&t, "s", rec("k1", &"x".repeat(16)))
+            .await
+            .unwrap();
+        p.remember(&t, "s", rec("k2", &"x".repeat(16)))
+            .await
+            .unwrap();
+        let err = p
+            .remember(&t, "s", rec("k3", &"x".repeat(16)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::LimitExceeded(_)));
+        // Shrinking k1 frees room for k3.
+        p.remember(&t, "s", rec("k1", "x")).await.unwrap();
+        p.remember(&t, "s", rec("k3", &"x".repeat(16)))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn least_recently_used_session_is_evicted_past_the_session_cap() {
+        let p = InMemoryMemoryProvider::with_limits(small());
+        let t = tenant();
+        p.remember(&t, "s1", rec("k", "1")).await.unwrap();
+        p.remember(&t, "s2", rec("k", "2")).await.unwrap();
+        // Touch s1 so s2 is the least recently used.
+        let q = MemoryQuery { key: "k".into() };
+        assert!(p.recall(&t, "s1", &q).await.unwrap().is_some());
+        p.remember(&t, "s3", rec("k", "3")).await.unwrap();
+        assert!(p.recall(&t, "s2", &q).await.unwrap().is_none(), "evicted");
+        assert!(p.recall(&t, "s1", &q).await.unwrap().is_some());
+        assert!(p.recall(&t, "s3", &q).await.unwrap().is_some());
     }
 }

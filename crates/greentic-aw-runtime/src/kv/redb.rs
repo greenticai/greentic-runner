@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadableTable, TableDefinition};
@@ -16,10 +17,42 @@ use crate::error::StateError;
 // value layout: first 8 bytes = expiry unix-millis (big-endian), remainder = payload.
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("aw_kv");
 
+/// Writes between two sweeps of expired rows. The sweep scans the table, so it
+/// is amortised over many writes rather than run on each one.
+const WRITES_PER_SWEEP: u64 = 1024;
+
 /// Embedded on-disk key-value store.
 #[derive(Clone)]
 pub struct RedbKv {
     db: Arc<Database>,
+    /// Write operations since open; every `WRITES_PER_SWEEP`th also deletes
+    /// expired rows in its transaction.
+    writes: Arc<AtomicU64>,
+}
+
+/// Whether a stored frame is expired (or too short to carry an expiry).
+fn is_expired(stored: &[u8], now: u64) -> bool {
+    match stored.get(..8).and_then(|b| <[u8; 8]>::try_from(b).ok()) {
+        Some(bytes) => u64::from_be_bytes(bytes) <= now,
+        None => true,
+    }
+}
+
+/// Delete every expired row of `table`. Without this a row nobody reads again
+/// (a finished session's state, kept 7 days) would stay in the file forever.
+fn sweep_expired(table: &mut redb::Table<'_, &str, &[u8]>, now: u64) -> Result<usize, StateError> {
+    let mut expired: Vec<String> = Vec::new();
+    for item in table.iter().map_err(backend)? {
+        let (key, value) = item.map_err(backend)?;
+        if is_expired(value.value(), now) {
+            expired.push(key.value().to_string());
+        }
+    }
+    let count = expired.len();
+    for key in expired {
+        table.remove(key.as_str()).map_err(backend)?;
+    }
+    Ok(count)
 }
 
 fn now_ms() -> u64 {
@@ -67,7 +100,30 @@ impl RedbKv {
             let _ = write.open_table(TABLE).map_err(backend)?;
         }
         write.commit().map_err(backend)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            writes: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Delete expired rows now (also run periodically by writes).
+    #[cfg(test)]
+    fn sweep_now(&self) -> Result<usize, StateError> {
+        let write = self.db.begin_write().map_err(backend)?;
+        let removed = {
+            let mut table = write.open_table(TABLE).map_err(backend)?;
+            sweep_expired(&mut table, now_ms())?
+        };
+        write.commit().map_err(backend)?;
+        Ok(removed)
+    }
+
+    /// Number of stored rows, expired-but-unswept ones included.
+    #[cfg(test)]
+    fn stored_len(&self) -> Result<u64, StateError> {
+        let read = self.db.begin_read().map_err(backend)?;
+        let table = read.open_table(TABLE).map_err(backend)?;
+        Ok(table.iter().map_err(backend)?.count() as u64)
     }
 
     fn read_live(&self, key: &str) -> Result<Option<Vec<u8>>, StateError> {
@@ -109,6 +165,11 @@ impl RedbKv {
                         .insert(key, frame(expires_at_ms, &payload).as_slice())
                         .map_err(backend)?;
                 }
+            }
+            if self.writes.fetch_add(1, Ordering::Relaxed) % WRITES_PER_SWEEP
+                == WRITES_PER_SWEEP - 1
+            {
+                sweep_expired(&mut table, now)?;
             }
         }
         write.commit().map_err(backend)?;
@@ -249,6 +310,41 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(kv.get("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_expired_rows_and_keeps_live_ones() {
+        let (kv, _dir) = temp_kv();
+        for i in 0..10 {
+            kv.set_ex(&format!("dead{i}"), b"v".to_vec(), Duration::from_millis(1))
+                .await
+                .unwrap();
+        }
+        kv.set_ex("live", b"v".to_vec(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(kv.stored_len().unwrap(), 11, "expired rows linger unread");
+        assert_eq!(kv.sweep_now().unwrap(), 10);
+        assert_eq!(kv.stored_len().unwrap(), 1);
+        assert_eq!(kv.get("live").await.unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn writes_sweep_expired_rows_without_any_explicit_call() {
+        let (kv, _dir) = temp_kv();
+        for i in 0..10 {
+            kv.set_ex(&format!("dead{i}"), b"v".to_vec(), Duration::from_millis(1))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..WRITES_PER_SWEEP {
+            kv.set_ex("tick", b"v".to_vec(), Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+        assert_eq!(kv.stored_len().unwrap(), 1, "only `tick` remains");
     }
 
     #[tokio::test]
