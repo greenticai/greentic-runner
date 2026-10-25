@@ -203,6 +203,14 @@ Things most likely to break a running deployment, in the order to check them:
   - New opt-ins: `GREENTIC_HTTP_DENY_PRIVATE=1` (also block loopback/RFC1918/CGNAT/ULA) and
     `GREENTIC_WASI_HTTP_ENFORCE_POLICY=1` (make `wasi:http` honour `http_enabled = false`).
 
+### Outbound guard on MCP, A2A and knowledge-index URLs
+- **What:** the host `http-client` policy now also applies to URLs a pack or tenant config names for the
+  agentic lane: MCP `transport_url` (resolved and checked before connecting), A2A routes, and the
+  chronicle-index knowledge endpoint. Link-local and cloud-metadata destinations are refused with
+  "blocked by outbound http policy"; loopback and private ranges stay allowed. MCP redirects and a DNS
+  answer that changes between the pre-flight and the connect are not covered (no hook in `greentic-mcp-client`).
+- **Restore:** `GREENTIC_HTTP_ALLOW_METADATA=1`; `GREENTIC_HTTP_DENY_PRIVATE=1` is the stricter opt-in.
+
 ### Fault injection needs the feature
 - **What:** the `GREENTIC_FAIL_*` variables only take effect in builds with the `fault-injection` feature.
   Production builds ignore them.

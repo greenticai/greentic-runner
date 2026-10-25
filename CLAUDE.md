@@ -811,6 +811,18 @@ park saved for `a_b`. Accepted residual risk, behaviour intentionally unchanged 
 `load_legacy_session_snapshot`); it drains as old parks resume or expire, and nothing writes bare
 files any more.
 
+**Pack/config-controlled URLs in the agentic lane use the same policy.** The pure IP classification and
+env policy (`HttpGuard`: link-local/metadata refused, loopback/private allowed by default,
+`GREENTIC_HTTP_ALLOW_METADATA` / `GREENTIC_HTTP_DENY_PRIVATE`) live in `runner_core::net_guard`, shared by
+`http_guard.rs` and `greentic-aw-runtime::outbound_guard`. Applied to: MCP `transport_url` (pack
+`mcp-routes.json` or admin row) via `check_endpoint` right before `McpHttpClient::new`; the A2A client
+(guarded resolver, redirects off); and the `knowledge_index` client (guarded resolver + redirect policy).
+`McpHttpClient` builds its own `reqwest` client with no hook, so for MCP the check is a resolve-then-validate
+pre-flight: a DNS-rebinding answer that differs on connect, and redirects, are NOT covered until
+`greentic-mcp-client` exposes a resolver/redirect seam (egress-filter at the network layer if that matters).
+The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtime 0.12. Other clients
+(admin/billing/OAuth/sorx route docs/approval inbox) target operator-set URLs and are not guarded.
+
 ### Pack Hot-Reload
 
 Full list of user-visible and breaking changes from the audit branch: `docs/audit-breaking-changes.md`.
