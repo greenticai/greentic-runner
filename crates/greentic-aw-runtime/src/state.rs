@@ -162,10 +162,24 @@ pub const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 /// by a small JSON object the model can read, carrying a prefix of the
 /// original text.
 pub fn cap_tool_result(result: serde_json::Value) -> serde_json::Value {
+    cap_tool_result_for(result, "")
+}
+
+/// [`cap_tool_result`] that names the tool in the warning it logs when it
+/// replaces a result with a preview. The model sees only the preview, so
+/// without a log line an operator debugging "the agent ignored my big
+/// response" has no trace of the cut.
+pub fn cap_tool_result_for(result: serde_json::Value, tool_name: &str) -> serde_json::Value {
     let text = result.to_string();
     if text.len() <= MAX_TOOL_RESULT_BYTES {
         return result;
     }
+    tracing::warn!(
+        tool = %tool_name,
+        original_bytes = text.len(),
+        limit_bytes = MAX_TOOL_RESULT_BYTES,
+        "tool result exceeds the history cap; the model receives a truncated preview"
+    );
     let mut cut = MAX_TOOL_RESULT_BYTES;
     while !text.is_char_boundary(cut) {
         cut -= 1;

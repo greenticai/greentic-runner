@@ -1052,7 +1052,7 @@ async fn run_step_scoped(
                         observer.on_tool_result(&call.tool_name, &call.call_id, &cached);
                         state.messages.push(ChatMessage::Tool {
                             call_id: call.call_id.clone(),
-                            content: crate::state::cap_tool_result(cached),
+                            content: crate::state::cap_tool_result_for(cached, &call.tool_name),
                         });
                         trail.push(AgentStep::ToolCallReused {
                             name: call.tool_name.clone(),
@@ -1239,7 +1239,7 @@ async fn run_step_scoped(
 
                 state.messages.push(ChatMessage::Tool {
                     call_id: call.call_id.clone(),
-                    content: crate::state::cap_tool_result(result.clone()),
+                    content: crate::state::cap_tool_result_for(result.clone(), &call.tool_name),
                 });
                 trail.push(AgentStep::ToolCall {
                     name: call.tool_name.clone(),
