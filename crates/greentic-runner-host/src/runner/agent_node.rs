@@ -2302,6 +2302,16 @@ mod aw {
             Some(remote_tool_secrets.clone()),
             unit.as_deref(),
         );
+        // The same MCP source feeds the main runtime and every nested playbook
+        // turn, so a skill whose allow-list names an MCP tool can call it.
+        let mcp = mcp_source_from_env(Some(remote_tool_secrets.clone())).or_else(|| {
+            mcp_source_from_packs(
+                &packs,
+                &tenant,
+                Some(remote_tool_secrets.clone()),
+                unit.as_deref(),
+            )
+        });
         // A playbook's own turn gets every source above and deliberately NOT a
         // playbook one, so a skill cannot call a skill — see `playbook_turn`.
         let playbooks = crate::runner::playbook_turn::playbook_source_from_packs(
@@ -2313,11 +2323,12 @@ mod aw {
                 telemetry: telemetry.clone(),
                 token_meter: token_meter.clone(),
                 ledger: ledger.clone(),
-                mcp: None,
+                mcp: mcp.clone(),
                 components: components.clone(),
                 flows: flows.clone(),
                 sorla: sorla.clone(),
                 a2a: a2a.clone(),
+                billing_meter: billing_meter.clone(),
             },
         );
 
@@ -2346,14 +2357,7 @@ mod aw {
             // A per-server merge (pack fills only the servers the admin catalog
             // lacks) is a strictly better v2 and is out of scope: it needs a
             // merge rule for a server present in both with different URLs.
-            mcp_source_from_env(Some(remote_tool_secrets.clone())).or_else(|| {
-                mcp_source_from_packs(
-                    &packs,
-                    &tenant,
-                    Some(remote_tool_secrets.clone()),
-                    unit.as_deref(),
-                )
-            }),
+            mcp,
         )
         .with_component_source(components)
         .with_flow_source(flows)

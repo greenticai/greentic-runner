@@ -61,6 +61,11 @@ pub struct PlaybookTurnHost {
     pub flows: Option<Arc<FlowToolSource>>,
     pub sorla: Option<Arc<greentic_aw_runtime::SorlaToolSource>>,
     pub a2a: Option<Arc<greentic_aw_runtime::A2aToolSource>>,
+    /// The calling worker's billing meter. `None` leaves the nested runtime on
+    /// its no-op meter, so a skill's LLM spend would go unmetered and the
+    /// credit gate would never fire for it. The project dimension rides on the
+    /// request's `TenantContext`, so nothing else is needed to attribute it.
+    pub billing_meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
 }
 
 /// Say once per playbook that its tier was not checked.
@@ -201,6 +206,17 @@ pub fn build_turn(host: PlaybookTurnHost) -> PlaybookTurnFn {
             .with_flow_source(host.flows.clone())
             .with_sorla_source(host.sorla.clone())
             .with_a2a_source(host.a2a.clone());
+            // Same mandatory-guardrail policy as the calling worker: without it
+            // the nested runtime ran with no platform guardrails at all.
+            let runtime = crate::runner::agent_node::attach_guardrails(
+                runtime,
+                host.ext_runtime.clone(),
+                Vec::new(),
+            );
+            let runtime = match host.billing_meter.clone() {
+                Some(meter) => runtime.with_billing_meter(meter),
+                None => runtime,
+            };
 
             let out = runtime
                 .step(req.tenant.clone(), &session_id, &agent_id, input_for(&req))
@@ -344,6 +360,7 @@ mod tests {
             flows: None,
             sorla: None,
             a2a: None,
+            billing_meter: None,
         };
         // Compiles only while the struct has exactly these fields; the absence
         // of a `playbooks` one is the property.
@@ -390,6 +407,7 @@ mod tests {
             flows: None,
             sorla: None,
             a2a: None,
+            billing_meter: None,
         };
         let outer_llm = Arc::new(MockLlmBackend::new(vec![
             Ok(LlmResponse {
