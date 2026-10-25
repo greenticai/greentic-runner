@@ -1218,8 +1218,22 @@ mod aw {
         "WHATSAPP_VERIFY_TOKEN",
         "WHATSAPP_APP_SECRET",
         "TELEGRAM_BOT_TOKEN",
+        // Host infrastructure endpoints/credentials the runner itself reads:
+        // the shared Redis (may embed a password) and the OTLP exporter
+        // (headers commonly carry an auth token).
+        "REDIS_URL",
+        "OTLP_ENDPOINT",
+        "OTLP_HEADERS",
     ];
-    const ENV_SECRET_DENY_PREFIXES: &[&str] = &["GREENTIC_", "TENANT_JWT_"];
+    /// `SECRETS_BROKER_*` (`secret://secrets/broker/token` -> the host's own
+    /// secrets-broker bearer), `SECRETS_*` (backend selector and cache knobs),
+    /// `PACK_*` (pack trust key and verification switches).
+    ///
+    /// Deliberately NOT denied: `OPENAI_API_KEY`. The runner reads it as its
+    /// LLM fallback, but `secret://openai/api_key` is the documented way for an
+    /// extension tool to get its own OpenAI key from the env, and flipping this
+    /// to an allow-list would break that same fallback for every other tool.
+    const ENV_SECRET_DENY_PREFIXES: &[&str] = &["GREENTIC_", "TENANT_JWT_", "SECRETS_", "PACK_"];
 
     pub(crate) fn env_secret_name_is_denied(name: &str) -> bool {
         ENV_SECRET_DENY_EXACT.contains(&name)
@@ -3242,6 +3256,12 @@ mod aw {
                 "secret://tenant/jwt/secret",
                 "secret://greentic/llm/api/key",
                 "secret://telegram/bot/token",
+                "secret://secrets/broker/token",
+                "secret://secrets/broker/endpoint",
+                "secret://secrets/backend",
+                "secret://pack/public/key",
+                "secret://redis/url",
+                "secret://otlp/headers",
             ] {
                 let name = env_var_name_for_secret(denied);
                 assert!(
