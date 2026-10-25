@@ -261,11 +261,18 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn env_truthy(name: &str) -> bool {
+/// Whether an env value is truthy: `1`/`true`/`yes`/`on`, case-insensitively and
+/// ignoring surrounding whitespace (like every other boolean env parser in the
+/// host, so `TRUE` / `On` are not silently rejected).
+fn is_truthy_value(value: Option<&str>) -> bool {
     matches!(
-        std::env::var(name).ok().as_deref().map(str::trim),
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
+}
+
+fn env_truthy(name: &str) -> bool {
+    is_truthy_value(std::env::var(name).ok().as_deref())
 }
 
 impl TenantResolver {
@@ -531,6 +538,17 @@ mod tests {
         let expected = std::env::var("DEFAULT_TENANT").unwrap_or_else(|_| "custom".into());
         let cfg = RoutingConfig::from_env_with_default("custom".into());
         assert_eq!(cfg.default_tenant, expected);
+    }
+
+    #[test]
+    fn truthy_values_are_case_insensitive() {
+        for yes in ["1", "true", "TRUE", "True", "yes", "YES", "on", "On", " on "] {
+            assert!(is_truthy_value(Some(yes)), "{yes:?}");
+        }
+        for no in ["", "0", "false", "off", "no", "2", "truee", "enable"] {
+            assert!(!is_truthy_value(Some(no)), "{no:?}");
+        }
+        assert!(!is_truthy_value(None));
     }
 
     #[test]
