@@ -110,8 +110,10 @@ pub const MAX_DELIVER: i64 = 6;
 /// 31 min) is about 40 deliveries at the 60s delay cap.
 pub const CONSUMER_MAX_DELIVER: i64 = 100;
 
-/// Most stream sequences [`ErrorAttempts`] tracks at once; a full table is
-/// cleared (the counts are best effort, [`CONSUMER_MAX_DELIVER`] still bounds).
+/// Most stream sequences [`ErrorAttempts`] tracks at once. When full, the
+/// OLDEST tracked sequence is evicted (the counts are best effort,
+/// [`CONSUMER_MAX_DELIVER`] still bounds); the rest keep their counts, so a
+/// poison pill mid-way through its budget is not reset by unrelated traffic.
 const ERROR_ATTEMPTS_CAP: usize = 4096;
 
 /// Per-process count of handler-error attempts, keyed by stream sequence.
@@ -122,31 +124,88 @@ const ERROR_ATTEMPTS_CAP: usize = 4096;
 /// [`CONSUMER_MAX_DELIVER`] deliveries in total.
 #[derive(Debug, Default)]
 pub struct ErrorAttempts {
-    counts: std::sync::Mutex<std::collections::HashMap<u64, i64>>,
+    inner: std::sync::Mutex<AttemptTable>,
+}
+
+#[derive(Debug, Default)]
+struct AttemptTable {
+    counts: std::collections::HashMap<u64, i64>,
+    /// Tracked sequences, oldest first (every key of `counts` appears once).
+    order: std::collections::VecDeque<u64>,
 }
 
 impl ErrorAttempts {
+    fn table(&self) -> std::sync::MutexGuard<'_, AttemptTable> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Record one more handler error for `sequence`; returns the new count.
     pub fn record(&self, sequence: u64) -> i64 {
-        let mut counts = self
-            .counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if counts.len() >= ERROR_ATTEMPTS_CAP && !counts.contains_key(&sequence) {
-            counts.clear();
+        let mut table = self.table();
+        if !table.counts.contains_key(&sequence) {
+            while table.counts.len() >= ERROR_ATTEMPTS_CAP {
+                match table.order.pop_front() {
+                    Some(oldest) => {
+                        table.counts.remove(&oldest);
+                    }
+                    None => break,
+                }
+            }
+            table.order.push_back(sequence);
         }
-        let count = counts.entry(sequence).or_insert(0);
+        let count = table.counts.entry(sequence).or_insert(0);
         *count = count.saturating_add(1);
         *count
     }
 
     /// Forget `sequence` (the message was acked or terminated).
     pub fn clear(&self, sequence: u64) {
-        self.counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&sequence);
+        let mut table = self.table();
+        // Most settlements are successes that never recorded anything; only a
+        // tracked sequence pays for the scan of `order`.
+        if table.counts.remove(&sequence).is_some() {
+            table.order.retain(|tracked| *tracked != sequence);
+        }
     }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.table().counts.len()
+    }
+
+    #[cfg(test)]
+    fn count(&self, sequence: u64) -> Option<i64> {
+        self.table().counts.get(&sequence).copied()
+    }
+}
+
+/// Count the outcome of one delivery and decide how to settle it: record a
+/// handler error against `sequence`, ask [`settlement`], and forget the sequence
+/// unless the message will be redelivered (a Nak keeps its count). Returns the
+/// settlement and the error attempt number (`0` when the result was not an
+/// error). Apart from `handle_one` so the record -> settle -> clear wiring is
+/// testable without NATS.
+fn settle_delivery(
+    attempts: &ErrorAttempts,
+    result: &Result<Disposition>,
+    sequence: Option<u64>,
+    delivered: i64,
+) -> (AckKind, i64) {
+    let error_attempt = match (result, sequence) {
+        (Err(_), Some(sequence)) => attempts.record(sequence),
+        // No sequence to key on: this is the last delivery.
+        (Err(_), None) => MAX_DELIVER,
+        _ => 0,
+    };
+    let kind = settlement(result, delivered, error_attempt);
+    if let Some(sequence) = sequence
+        && !matches!(kind, AckKind::Nak(_))
+    {
+        attempts.clear(sequence);
+    }
+    (kind, error_attempt)
 }
 
 fn error_attempts() -> &'static ErrorAttempts {
@@ -423,18 +482,7 @@ async fn handle_one(
             Ok(Disposition::Rejected)
         }
     };
-    let error_attempt = match (&result, sequence) {
-        (Err(_), Some(sequence)) => error_attempts().record(sequence),
-        // No sequence to key on: this is the last delivery (see above).
-        (Err(_), None) => MAX_DELIVER,
-        _ => 0,
-    };
-    let kind = settlement(&result, delivered, error_attempt);
-    if let Some(sequence) = sequence
-        && !matches!(kind, AckKind::Nak(_))
-    {
-        error_attempts().clear(sequence);
-    }
+    let (kind, error_attempt) = settle_delivery(error_attempts(), &result, sequence, delivered);
     if let Err(handle_err) = &result {
         tracing::error!(
             error = %handle_err,
@@ -614,10 +662,92 @@ mod tests {
         assert_eq!(attempts.record(8), 1);
         attempts.clear(7);
         assert_eq!(attempts.record(7), 1);
-        for sequence in 100..(100 + ERROR_ATTEMPTS_CAP as u64 + 5) {
+        // Clearing something never recorded is a no-op.
+        attempts.clear(999);
+        assert_eq!(attempts.len(), 2);
+    }
+
+    #[test]
+    fn a_full_table_evicts_only_the_oldest_sequence() {
+        let attempts = ErrorAttempts::default();
+        // Sequence 1 is the oldest (3 attempts spent); 2 has spent 2.
+        for _ in 0..3 {
+            attempts.record(1);
+        }
+        for _ in 0..2 {
+            attempts.record(2);
+        }
+        for sequence in 3..=(ERROR_ATTEMPTS_CAP as u64) {
             attempts.record(sequence);
         }
-        assert!(attempts.counts.lock().unwrap().len() <= ERROR_ATTEMPTS_CAP);
+        assert_eq!(attempts.len(), ERROR_ATTEMPTS_CAP);
+        // One more new sequence evicts exactly the oldest (1)...
+        let newcomer = ERROR_ATTEMPTS_CAP as u64 + 1;
+        assert_eq!(attempts.record(newcomer), 1);
+        assert_eq!(attempts.len(), ERROR_ATTEMPTS_CAP);
+        assert_eq!(attempts.count(1), None, "oldest entry evicted");
+        // ...and every other poison pill keeps its count.
+        assert_eq!(attempts.count(2), Some(2));
+        assert_eq!(attempts.count(3), Some(1));
+        assert_eq!(attempts.count(newcomer), Some(1));
+        // An already-tracked sequence never evicts anything.
+        assert_eq!(attempts.record(2), 3);
+        assert_eq!(attempts.len(), ERROR_ATTEMPTS_CAP);
+        assert_eq!(attempts.count(3), Some(1));
+    }
+
+    #[test]
+    fn cleared_then_rerecorded_sequence_is_not_evicted_early() {
+        let attempts = ErrorAttempts::default();
+        attempts.record(1);
+        attempts.record(2);
+        attempts.clear(1);
+        attempts.record(1); // now the newest: order = [2, 1]
+        for sequence in 3..(ERROR_ATTEMPTS_CAP as u64 + 2) {
+            attempts.record(sequence);
+        }
+        // The table overflowed by one: 2 (oldest) goes, 1 stays.
+        assert_eq!(attempts.count(2), None);
+        assert_eq!(attempts.count(1), Some(1));
+    }
+
+    #[test]
+    fn settle_delivery_counts_errors_until_the_budget_then_terms_and_clears() {
+        let attempts = ErrorAttempts::default();
+        let failing = || -> Result<Disposition> { Err(anyhow::anyhow!("publish failed")) };
+        for attempt in 1..MAX_DELIVER {
+            let (kind, counted) = settle_delivery(&attempts, &failing(), Some(42), attempt);
+            assert_eq!(counted, attempt);
+            assert!(matches!(kind, AckKind::Nak(_)), "attempt {attempt}");
+            assert_eq!(attempts.count(42), Some(attempt), "a Nak keeps the count");
+        }
+        let (kind, counted) = settle_delivery(&attempts, &failing(), Some(42), MAX_DELIVER);
+        assert_eq!(counted, MAX_DELIVER);
+        assert!(matches!(kind, AckKind::Term));
+        assert_eq!(
+            attempts.count(42),
+            None,
+            "a terminated message is forgotten"
+        );
+    }
+
+    #[test]
+    fn settle_delivery_clears_on_success_and_busy_does_not_spend_the_budget() {
+        let attempts = ErrorAttempts::default();
+        let failing = || -> Result<Disposition> { Err(anyhow::anyhow!("boom")) };
+        settle_delivery(&attempts, &failing(), Some(5), 1);
+        assert_eq!(attempts.count(5), Some(1));
+        let (kind, counted) = settle_delivery(&attempts, &Ok(Disposition::Busy), Some(5), 2);
+        assert_eq!(counted, 0);
+        assert!(matches!(kind, AckKind::Nak(_)));
+        assert_eq!(attempts.count(5), Some(1));
+        let (kind, _) = settle_delivery(&attempts, &Ok(Disposition::Handled), Some(5), 3);
+        assert!(matches!(kind, AckKind::Ack));
+        assert_eq!(attempts.count(5), None);
+        // No sequence on an error: last delivery, terminated.
+        let (kind, counted) = settle_delivery(&attempts, &failing(), None, 1);
+        assert_eq!(counted, MAX_DELIVER);
+        assert!(matches!(kind, AckKind::Term));
     }
 
     #[test]

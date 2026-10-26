@@ -900,8 +900,12 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
   `RunnerError::PostEffectPersistence`, which `retry_with_jitter` does not retry.
 - **A failed effectful node is terminal too.** `drive_flow` sets its effects flag when a `performs_external_effect` node
   succeeds AND when one fails (except `flow.call`, whose nested `drive_flow` classifies itself), so a transient failure
-  after a partial effect is never whole-turn retried. A pre-effect transient failure of such a node is not retried either
-  (conservative); `terminal_after_effects` keeps the full `{err:#}` chain in the reason.
+  after a partial effect is never whole-turn retried. The default is conservative (an unmarked error sets the flag), but
+  a failure wrapped with `engine::pre_effect(err)` (`PreEffectError`: proven to precede every effect, e.g. no handler
+  configured, `provider.invoke` before `invoke_provider`, a NATS request that was never published) does not, so a
+  transient one still retries. Mark only what is provable; an earlier completed effect still makes the turn terminal.
+  `terminal_after_effects` keeps only the OUTERMOST message in the reason (it reaches `metadata.error_message`, user
+  facing) and logs the full `{err:#}` chain at `warn`.
 - **`redirect_count` (`flow.goto`) is per turn**, reset on resume. `drive_flow` also caps one turn at
   `MAX_STEPS_PER_TURN` (10,000) nodes.
 - **`RunnerHost` installs `DiscardSessionHost`** as the engine-level `SessionHost`; the store-backed host was
@@ -935,7 +939,7 @@ Two retry layers re-run a failed turn from its start: the engine's own loop (`ex
 - **After an effect, a failure is terminal.** `drive_flow` tracks whether a node that performs an external effect
   has succeeded in THIS run (`NodeKind::performs_external_effect`: `provider.invoke`, `flow.call`, `dw.agent`,
   `dw.agent_graph`, `sorla/operala/agentic/telco-x/approval.call`, `mcp`, `a2a`, `media.create`); any later failure
-  of the run is rewrapped by `terminal_after_effects` (message kept, cause chain logged at `warn`) so neither layer
+  of the run is rewrapped by `terminal_after_effects` (outermost message kept, cause chain logged at `warn`) so neither layer
   repeats the effect. Failures BEFORE any such node keep their classification, so transient failures still retry.
   Not counted, on purpose: `emit.*` (only appends to the turn's egress, dropped on failure), `var.set`, `state.get`,
   `state.set` (an overwrite is idempotent), `session.wait`, `flow.goto`. **Known limitations:** generic component

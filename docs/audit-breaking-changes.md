@@ -874,3 +874,28 @@ marked `#[non_exhaustive]`.**
   environment** (use `packs.cache_dir`, `packs.source` and `packs.trust.public_keys` in greentic-config);
   `PACK_VERIFY_STRICT=0` does not disable verification when a trust key is configured;
   `GREENTIC_HEAVY_WASM=1` does not run `#[ignore]`d tests on a bare `cargo test --workspace`.
+
+## Round 15
+
+- **Round 14 note refined: a pre-effect failure of an effectful node retries again, when it is PROVEN pre-effect.**
+  Round 14 made every `Err` of the 11 effect kinds set the effects flag, so even a provider 503 before the request
+  was sent became terminal. Failures are now marked with `engine::pre_effect(err)` (a `PreEffectError` wrapper: same
+  `Display`, the wrapped error stays visible to `should_retry` / `is_terminal_flow_error`) where nothing can have left
+  the host yet, and `drive_flow_tracked` leaves the flag alone for them. The default is unchanged: an unmarked error
+  sets the flag. Marked: `provider.invoke` everything before `invoke_provider` (payload, `in_map`, validation,
+  binding, `BeforeToolCall` fault); no `AgentNodeHandler` / `GraphNodeHandler` / `RemoteDispatchHandler` configured
+  and the `dw.agent` session derivation; `NatsDispatcher::dispatch` request-build and publish failures (nothing was
+  sent); the `a2a` pack lookup; the `aw` agent handler's audit-context build before `runtime.step`. Not marked
+  (cannot be proven cheaply): the provider call itself, a custom `RemoteDispatchHandler` (the approval inbox), a
+  `dw.agent` handler that fails after it ran. The shipped `aw` handler turns an LLM 429 / agent error into an `Ok`
+  node output (`terminated_by: "error"`), so it never reaches this path as an `Err`. `mcp`, `media.create` and
+  `sorla` HTTP report failure as values, not errors. An earlier completed effect still makes any later failure of the
+  turn terminal, marked or not.
+- **`FlowTerminal.reason` is the outermost message again** (reverts the round 14 `{err:#}` change). That string reaches
+  the user-facing failure envelope (`metadata.error_message`), and a cause chain can carry a URL or host. The full chain
+  is logged at `warn` in `terminal_after_effects`; operators read it there.
+- **JetStream `ErrorAttempts` evicts the oldest sequence** when its 4096-entry table is full, instead of clearing every
+  count (which reset a poison pill's budget to zero). `settle_delivery` holds the record -> settle -> clear wiring
+  and is unit-tested without NATS.
+- **Test-only:** the oversize-warning limiter (`greentic-aw-runtime::state`) is an instance (`WarnLimiter`), so its test
+  no longer races other tests over the process-wide state.
