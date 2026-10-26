@@ -103,6 +103,16 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// No proxy: `HTTP(S)_PROXY` / `ALL_PROXY` in the environment must not
+    /// reroute these loopback requests.
+    fn direct() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
+    }
+
     fn agent_config_json() -> serde_json::Value {
         serde_json::json!({
             "agent_id": "bot",
@@ -123,7 +133,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let tenant = TenantContext::new("t", "e");
         let cfg = provider.agent_config(&tenant, "bot").await.unwrap();
         assert_eq!(cfg.agent_id, "bot");
@@ -138,7 +148,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "ghost").await;
         assert!(matches!(result, Err(ConfigError::AgentNotFound(_))));
@@ -151,7 +161,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Internal(_))));
@@ -164,7 +174,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("{not json"))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Misconfigured(_))));
@@ -178,15 +188,6 @@ mod tests {
             .mount(&server)
             .await;
         let tenant = TenantContext::new("t", "e");
-        // No proxy: HTTP(S)_PROXY / ALL_PROXY in the environment must not
-        // reroute these loopback requests.
-        let direct = || {
-            reqwest::Client::builder()
-                .no_proxy()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default()
-        };
         let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let decode = provider.agent_config(&tenant, "bot").await.unwrap_err();
         let text = decode.to_string();
@@ -214,7 +215,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_bad");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_bad", direct());
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Misconfigured(_))));
@@ -227,7 +228,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "tok");
+        let provider = HttpConfigProvider::with_client(server.uri(), "tok", direct());
         let tenant = TenantContext::new("t", "e");
         let err = provider
             .agent_config(&tenant, "../tenant/me/mcp-servers")

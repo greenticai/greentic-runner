@@ -753,17 +753,22 @@ async fn recreate_consumer(
     attempt: &mut u32,
     faults: &mut ConsecutiveFaults,
 ) {
-    match ensure_consumer(client).await {
+    let (escalated, next) = recreate_backoff(*attempt);
+    *attempt = next;
+    let delay = match ensure_consumer(client).await {
         Ok(fresh) => {
             *consumer = fresh;
             faults.clear();
+            // The durable is back: pull again almost at once. The counter
+            // still escalated above, so a fault that survives the
+            // re-creation climbs to the cap on the next round.
+            backoff_delay(0)
         }
         Err(create_error) => {
             tracing::warn!(error = %create_error, "re-creating durable consumer failed");
+            escalated
         }
-    }
-    let (delay, next) = recreate_backoff(*attempt);
-    *attempt = next;
+    };
     tokio::time::sleep(delay).await;
 }
 

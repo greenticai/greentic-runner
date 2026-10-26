@@ -33,7 +33,7 @@ pub fn redact_url(url: &str) -> String {
 ///
 /// - the authority ends at the first `/`, `?` or `#` after the scheme. When
 ///   every `@` in the URL sits inside that authority, they are userinfo: it is
-///   masked as `[redacted]@` and the host after the LAST `@` is shown.
+///   masked as `[redacted]@` and the host after the LAST `@` inside the authority is shown (an `@` after the authority hides the host too).
 /// - when an `@` appears AFTER the authority ends (`https://h/cb?token=a@b`,
 ///   `https://h/users/@me`, or a password with a raw delimiter such as
 ///   `https://u:p?w@h/`) the URL is ambiguous: it could be an `@` in a
