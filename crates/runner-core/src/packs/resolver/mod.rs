@@ -101,7 +101,27 @@ pub(crate) fn strip_url_suffix(message: &str) -> String {
     match message.find(" for url (") {
         Some(start) => {
             let tail = &message[start + " for url (".len()..];
-            match tail.find(')') {
+            // Balance parentheses so a URL containing a literal `(...)` pair
+            // is removed whole instead of stopping at its first `)`. An
+            // unbalanced remainder drops everything after the suffix start
+            // (fail-closed). A lone literal `)` in the URL is still ambiguous
+            // and ends the suffix early.
+            let mut depth = 1usize;
+            let mut end = None;
+            for (index, ch) in tail.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match end {
                 Some(end) => format!("{}{}", &message[..start], &tail[end + 1..]),
                 None => message[..start].to_string(),
             }
@@ -291,6 +311,20 @@ mod download_cap_tests {
             assert!(!chain.contains("amazonaws"), "{chain}");
             assert!(chain.contains("error decoding response body"), "{chain}");
         }
+    }
+
+    #[test]
+    fn strip_url_suffix_handles_parentheses_inside_the_url() {
+        use super::strip_url_suffix;
+        assert_eq!(
+            strip_url_suffix("failed for url (https://h/a(1).gtpack?sig=SECRET): reset"),
+            "failed: reset"
+        );
+        assert_eq!(
+            strip_url_suffix("failed for url (https://h/a(1.gtpack?sig=SECRET"),
+            "failed"
+        );
+        assert_eq!(strip_url_suffix("plain"), "plain");
     }
 
     #[test]

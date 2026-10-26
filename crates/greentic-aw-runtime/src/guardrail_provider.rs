@@ -89,7 +89,7 @@ impl HttpGuardrailPolicy {
                 .json::<PolicyResp>()
                 .await
                 .map(|p| p.guardrails)
-                .map_err(|e| format!("decode: {e}")),
+                .map_err(|e| format!("decode: {}", e.without_url())),
             other => Err(format!("status {other}")),
         }
     }

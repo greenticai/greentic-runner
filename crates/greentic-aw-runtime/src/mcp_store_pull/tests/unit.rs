@@ -255,6 +255,24 @@ async fn collect_capped_stops_a_chunked_body_with_no_content_length() {
 }
 
 #[tokio::test]
+async fn collect_capped_messages_never_carry_the_url_query() {
+    let url = "https://store/x.gtxpack?X-Amz-Signature=SECRET";
+    let over: Vec<Result<Vec<u8>, String>> = vec![Ok(vec![0; 16])];
+    let integrity = collect_capped(futures::stream::iter(over), 4, url)
+        .await
+        .expect_err("over the cap");
+    let broken: Vec<Result<Vec<u8>, String>> = vec![Err("reset".to_string())];
+    let network = collect_capped(futures::stream::iter(broken), 4, url)
+        .await
+        .expect_err("stream error");
+    for error in [integrity, network] {
+        let text = error.to_string();
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(text.contains("https://store/x.gtxpack"), "{text}");
+    }
+}
+
+#[tokio::test]
 async fn collect_capped_reports_a_stream_error_as_network() {
     let chunks: Vec<Result<Vec<u8>, String>> = vec![Ok(vec![1; 2]), Err("reset".to_string())];
     let error = collect_capped(futures::stream::iter(chunks), 100, "http://store/x")

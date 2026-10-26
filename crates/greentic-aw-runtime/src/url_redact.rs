@@ -27,6 +27,23 @@ pub fn redact_url(url: &str) -> String {
     parts.join(",")
 }
 
+/// Reduce an HTTP(S) request URL to `scheme://host[:port]/path` for logs and
+/// error text: userinfo, query string and fragment are dropped, because a
+/// presigned URL carries its credential in the query and a basic-auth URL in
+/// the userinfo. Fail-closed for the query: everything from the first `?` or
+/// `#` goes.
+pub fn redact_http_url(url: &str) -> String {
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    let base = &url[..cut];
+    let scheme_end = scheme_len(base).unwrap_or(0);
+    let rest = &base[scheme_end..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{}[redacted]{}", &base[..scheme_end], &rest[at..]),
+        None => base.to_string(),
+    }
+}
+
 /// Length of the `scheme://` prefix of `s`, if it has a valid one.
 fn scheme_len(s: &str) -> Option<usize> {
     let idx = s.find("://")?;
@@ -48,6 +65,23 @@ fn redact_one(part: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_url_loses_query_fragment_and_userinfo() {
+        assert_eq!(
+            redact_http_url("https://store.example/a/b.gtxpack?X-Amz-Signature=abc&x=1#frag"),
+            "https://store.example/a/b.gtxpack"
+        );
+        assert_eq!(
+            redact_http_url("https://user:pw@store.example:8443/a?token=t"),
+            "https://[redacted]@store.example:8443/a"
+        );
+        assert_eq!(
+            redact_http_url("http://store/x"),
+            "http://store/x",
+            "a clean URL is unchanged"
+        );
+    }
 
     #[test]
     fn userinfo_is_masked() {

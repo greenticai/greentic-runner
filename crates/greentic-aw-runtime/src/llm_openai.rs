@@ -259,7 +259,7 @@ impl LlmBackend for OpenAiLlmBackend {
             let oa: OaResponse = resp
                 .json()
                 .await
-                .map_err(|e| LlmError::Decode(e.to_string()))?;
+                .map_err(|e| LlmError::Decode(e.without_url().to_string()))?;
             let choice = oa
                 .choices
                 .into_iter()

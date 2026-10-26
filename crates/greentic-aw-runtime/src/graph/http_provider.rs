@@ -99,10 +99,9 @@ impl HttpGraphProvider {
                 // Any failure — invalid JSON, wrong schemaVersion, structural
                 // validation error — is `Misconfigured` (mirrors HttpConfigProvider's
                 // `.json::<AgentConfig>()` decode-error → Misconfigured mapping).
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| ConfigError::Misconfigured(format!("graph config read: {e}")))?;
+                let body = resp.text().await.map_err(|e| {
+                    ConfigError::Misconfigured(format!("graph config read: {}", e.without_url()))
+                })?;
                 GraphConfig::from_json(&body)
                     .map_err(|e| ConfigError::Misconfigured(format!("graph config decode: {e}")))
             }

@@ -494,6 +494,9 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
         .timeout(DOWNLOAD_TOTAL_TIMEOUT)
         .build()
         .map_err(|e| StorePullError::Network(format!("build http client: {e}")))?;
+    // Error text names the URL without its query (presigned signature) or
+    // userinfo.
+    let shown = crate::url_redact::redact_http_url(url);
     let mut request = client.get(url);
     if let Ok(token) = std::env::var(STORE_TOKEN_ENV)
         && !token.is_empty()
@@ -503,11 +506,11 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
     let response = request
         .send()
         .await
-        .map_err(|e| StorePullError::Network(format!("GET {url}: {}", e.without_url())))?;
+        .map_err(|e| StorePullError::Network(format!("GET {shown}: {}", e.without_url())))?;
     let status = response.status();
     if !status.is_success() {
         return Err(StorePullError::Network(format!(
-            "GET {url} returned HTTP {status}"
+            "GET {shown} returned HTTP {status}"
         )));
     }
     // Pre-flight: reject oversized artifacts before buffering the body.
@@ -515,10 +518,16 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
         && content_length > MAX_ARTIFACT_BYTES
     {
         return Err(StorePullError::Integrity(format!(
-            "artifact at {url} claims Content-Length {content_length} which exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
+            "artifact at {shown} claims Content-Length {content_length} which exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
         )));
     }
-    collect_capped(response.bytes_stream(), MAX_ARTIFACT_BYTES, url).await
+    use futures::StreamExt as _;
+    // `reqwest::Error` Display appends ` for url (...)`: strip it before it
+    // reaches `collect_capped`'s message.
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|e| e.without_url().to_string()));
+    collect_capped(Box::pin(stream), MAX_ARTIFACT_BYTES, url).await
 }
 
 /// Collect a body chunk by chunk, failing as soon as the running total passes
@@ -537,6 +546,7 @@ where
 {
     use futures::StreamExt as _;
 
+    let url = crate::url_redact::redact_http_url(url);
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk =
