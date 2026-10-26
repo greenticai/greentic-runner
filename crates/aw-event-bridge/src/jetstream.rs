@@ -38,17 +38,80 @@ pub fn agentic_consumer_config() -> consumer::pull::Config {
         ack_policy: consumer::AckPolicy::Explicit,
         max_deliver: CONSUMER_MAX_DELIVER,
         ack_wait: ACK_WAIT,
-        // Server-side ceiling on unacked deliveries, equal to the in-process cap
-        // ([`crate::MAX_INFLIGHT`]). The pull loop never holds more permits than
-        // this, so the server stops handing this consumer more work while every
-        // slot is busy. The default (1000) is looser than the cap.
+        // Server-side ceiling on unacked deliveries, with headroom over the
+        // in-process cap ([`crate::MAX_INFLIGHT`]); see [`MAX_ACK_PENDING`].
         max_ack_pending: MAX_ACK_PENDING,
         ..Default::default()
     }
 }
 
-/// `max_ack_pending` of the durable: the in-flight cap, as the `i64` the wire uses.
-pub const MAX_ACK_PENDING: i64 = crate::MAX_INFLIGHT as i64;
+/// `max_ack_pending` of the durable, as the `i64` the wire uses: twice the
+/// in-process cap ([`crate::MAX_INFLIGHT`]).
+///
+/// The limit is CONSUMER-WIDE, so it is shared by every replica (a fleet-wide
+/// ceiling, not a per-replica one), and a message counts against it from
+/// delivery until its ack, including the delay after a busy or error Nak, when
+/// it holds no permit. Equal to the in-process cap it would leave no room for
+/// those waiting redeliveries and a fleet of N replicas would split a single
+/// cap's worth of slots between them. The permits, not this number, bound the
+/// work one process runs at once.
+pub const MAX_ACK_PENDING: i64 = 2 * crate::MAX_INFLIGHT as i64;
+
+/// Fixed retry delay when the server answers a pull `409` (the consumer is at
+/// `max_ack_pending`, fleet-wide): the condition is expected under load and
+/// clears as soon as any replica acks, so it is not escalated like a fault.
+pub const MAX_ACK_PENDING_RETRY: Duration = Duration::from_millis(500);
+
+/// Floor of the pause after a pull that returned no message (`404` no
+/// messages / `408` request timeout end the batch without an error), so an
+/// idle or throttled stream cannot turn the loop into a hot spin.
+pub const EMPTY_BATCH_FLOOR: Duration = Duration::from_millis(50);
+
+/// How a pull-stream error item is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullFault {
+    /// `409`: the consumer reached `max_ack_pending`. Short fixed retry.
+    MaxAckPending,
+    /// Anything else: exponential [`backoff_delay`].
+    Other,
+}
+
+/// Classify the error async-nats yields for an unexpected pull status. The
+/// `Batch` stream formats it as `"error while processing messages from the
+/// stream: 409, Some(\"Exceeded MaxAckPending\")"` (a boxed `io::Error`), so
+/// the status code and the server's description are all there is to match.
+#[must_use]
+pub fn classify_pull_error(message: &str) -> PullFault {
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("maxackpending")
+        || lowered.contains("max_ack_pending")
+        || lowered.contains("max ack pending")
+        || lowered.contains("stream: 409")
+    {
+        PullFault::MaxAckPending
+    } else {
+        PullFault::Other
+    }
+}
+
+/// Pause before the next pull: nothing after a batch that delivered messages,
+/// else [`EMPTY_BATCH_FLOOR`] plus up to the same again, derived from `entropy`
+/// so replicas do not poll in lockstep.
+#[must_use]
+pub fn empty_batch_delay(received: usize, entropy: u32) -> Duration {
+    if received > 0 {
+        return Duration::ZERO;
+    }
+    let floor = u64::try_from(EMPTY_BATCH_FLOOR.as_millis()).unwrap_or(50);
+    EMPTY_BATCH_FLOOR + Duration::from_millis(u64::from(entropy) % floor.max(1))
+}
+
+fn jitter_entropy() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0)
+}
 
 /// Most messages requested in one pull (and so held in the client buffer).
 const PULL_BATCH: usize = 16;
@@ -442,16 +505,34 @@ pub async fn run_bridge_jetstream(
             .await;
         match pulled {
             Ok(mut messages) => {
+                let mut received = 0usize;
+                let mut paused = false;
                 while let Some(item) = messages.next().await {
                     let js_msg = match item {
                         Ok(m) => m,
                         Err(error) => {
-                            tracing::warn!(%error, "jetstream message error; continuing");
-                            tokio::time::sleep(backoff_delay(attempt)).await;
-                            attempt = attempt.saturating_add(1);
+                            paused = true;
+                            match classify_pull_error(&error.to_string()) {
+                                PullFault::MaxAckPending => {
+                                    // The server is healthy, just full: not a
+                                    // fault, so no warn and no escalation.
+                                    tracing::debug!(
+                                        %error,
+                                        "consumer at max_ack_pending; retrying shortly"
+                                    );
+                                    attempt = 0;
+                                    tokio::time::sleep(MAX_ACK_PENDING_RETRY).await;
+                                }
+                                PullFault::Other => {
+                                    tracing::warn!(%error, "jetstream message error; continuing");
+                                    tokio::time::sleep(backoff_delay(attempt)).await;
+                                    attempt = attempt.saturating_add(1);
+                                }
+                            }
                             continue;
                         }
                     };
+                    received += 1;
                     attempt = 0;
                     let Some(permit) = slots.pop() else {
                         // Cannot happen (the pull is capped at `slots.len()`);
@@ -465,6 +546,13 @@ pub async fn run_bridge_jetstream(
                         let _slot = permit;
                         handle_one(client, invoker, js_msg).await;
                     });
+                }
+                if !paused {
+                    let delay = empty_batch_delay(received, jitter_entropy());
+                    if !delay.is_zero() {
+                        drop(slots);
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
             Err(error) => {
@@ -657,13 +745,49 @@ mod tests {
     }
 
     #[test]
-    fn consumer_caps_unacked_deliveries_at_the_inflight_cap() {
+    fn consumer_ack_pending_has_headroom_over_the_inflight_cap() {
         let cfg = agentic_consumer_config();
-        assert_eq!(cfg.max_ack_pending, crate::MAX_INFLIGHT as i64);
+        assert!(
+            cfg.max_ack_pending > crate::MAX_INFLIGHT as i64,
+            "Nak'd messages hold ack-pending without a permit"
+        );
+        assert_eq!(cfg.max_ack_pending, 2 * crate::MAX_INFLIGHT as i64);
         assert!(
             cfg.max_ack_pending < 1000,
             "tighter than the server default"
         );
+    }
+
+    #[test]
+    fn a_409_max_ack_pending_status_is_a_short_fixed_retry() {
+        let wire = "error while processing messages from the stream: 409, Some(\"Exceeded MaxAckPending\")";
+        assert_eq!(classify_pull_error(wire), PullFault::MaxAckPending);
+        let bare = "error while processing messages from the stream: 409, None";
+        assert_eq!(classify_pull_error(bare), PullFault::MaxAckPending);
+        assert!(MAX_ACK_PENDING_RETRY >= Duration::from_millis(250));
+        assert!(MAX_ACK_PENDING_RETRY <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn other_pull_errors_keep_the_escalating_backoff() {
+        for wire in [
+            "error while processing messages from the stream: 503, Some(\"JetStream unavailable\")",
+            "error while processing messages from the stream: 400, Some(\"Bad Request\")",
+            "no responders",
+        ] {
+            assert_eq!(classify_pull_error(wire), PullFault::Other, "{wire}");
+        }
+    }
+
+    #[test]
+    fn an_empty_batch_pauses_within_the_floor_window_and_a_full_one_does_not() {
+        for entropy in [0, 1, 49, 50, 999_999_999, u32::MAX] {
+            let delay = empty_batch_delay(0, entropy);
+            assert!(delay >= EMPTY_BATCH_FLOOR, "{delay:?}");
+            assert!(delay < EMPTY_BATCH_FLOOR * 2, "{delay:?}");
+        }
+        assert_eq!(empty_batch_delay(1, 7), Duration::ZERO);
+        assert_eq!(empty_batch_delay(16, 7), Duration::ZERO);
     }
 
     #[tokio::test]
