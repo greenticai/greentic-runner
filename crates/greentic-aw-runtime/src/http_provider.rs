@@ -30,6 +30,14 @@ impl HttpConfigProvider {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
+        Self::with_client(base_url, token, client)
+    }
+
+    fn with_client(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
@@ -170,7 +178,16 @@ mod tests {
             .mount(&server)
             .await;
         let tenant = TenantContext::new("t", "e");
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        // No proxy: HTTP(S)_PROXY / ALL_PROXY in the environment must not
+        // reroute these loopback requests.
+        let direct = || {
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default()
+        };
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let decode = provider.agent_config(&tenant, "bot").await.unwrap_err();
         let text = decode.to_string();
         assert!(text.contains("agent config decode"), "{text}");
@@ -178,7 +195,11 @@ mod tests {
         assert!(!text.contains(&server.uri()), "{text}");
 
         // Nothing listens on port 1: the send itself fails.
-        let provider = HttpConfigProvider::new("http://127.0.0.1:1/secret-path", "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(
+            "http://127.0.0.1:1/secret-path",
+            "gtc_live_x",
+            direct(),
+        );
         let send = provider.agent_config(&tenant, "bot").await.unwrap_err();
         let text = send.to_string();
         assert!(text.contains("agent registry request failed"), "{text}");

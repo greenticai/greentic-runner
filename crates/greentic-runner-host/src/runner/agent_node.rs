@@ -1343,6 +1343,17 @@ mod aw {
         // per-signal `OTEL_EXPORTER_OTLP_*HEADERS` names are covered in
         // [`env_secret_name_is_denied`].
         "OTEL_EXPORTER_OTLP_HEADERS",
+        // Proxy URLs routinely embed `user:pass@` (the lowercase spellings
+        // are folded by `env_secret_name_is_denied`). `NO_PROXY` is a host
+        // list, not a secret, and stays resolvable.
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        // Sentry DSN carries the project ingest key; `GIT_ASKPASS` and
+        // `DOCKER_CONFIG` point at a credential helper / registry auth dir.
+        "SENTRY_DSN",
+        "GIT_ASKPASS",
+        "DOCKER_CONFIG",
     ];
     /// Prefix families of host configuration and ambient credentials a tool's
     /// `secret://` reference may never resolve to.
@@ -1408,6 +1419,10 @@ mod aw {
     ];
 
     pub(crate) fn env_secret_name_is_denied(name: &str) -> bool {
+        // `env_var_name_for_secret` already upper-cases; fold here too so a
+        // caller passing `https_proxy` cannot slip past the exact list.
+        let upper = name.to_ascii_uppercase();
+        let name = upper.as_str();
         // `AZURE_<SERVICE>_CONNECTION_STRING` embeds an account key.
         (name.starts_with("AZURE_") && name.ends_with("_CONNECTION_STRING"))
             // `OTEL_EXPORTER_OTLP_HEADERS` and its per-signal forms
@@ -3478,6 +3493,12 @@ mod aw {
                 "secret://google/access_token",
                 "secret://mongodb/uri",
                 "secret://amqp/url",
+                "secret://http/proxy",
+                "secret://https/proxy",
+                "secret://all/proxy",
+                "secret://sentry/dsn",
+                "secret://git/askpass",
+                "secret://docker/config",
             ] {
                 let name = env_var_name_for_secret(denied);
                 assert!(
@@ -3485,7 +3506,11 @@ mod aw {
                     "{denied} -> {name} must be refused"
                 );
             }
+            for lower in ["http_proxy", "https_proxy", "all_proxy"] {
+                assert!(env_secret_name_is_denied(lower), "{lower} must be refused");
+            }
             for ok in [
+                "secret://no/proxy",
                 "secret://tavily/api_key",
                 "secret://openai/api_key",
                 "secret://google/api_key",

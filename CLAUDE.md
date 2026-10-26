@@ -882,18 +882,26 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
 
 - Tool-secret env deny-list also covers `AWS_BEARER_*`, `AWS_SECURITY_*`, `AWS_ACCESS_KEY*`, `ARM_*`, `CLOUDSDK_*`, `GOOGLE_OAUTH_*`, `AZURE_*_CONNECTION_STRING`, `AZURE_CREDENTIALS`, `AZURE_DEVOPS_EXT_PAT`; `AWS_REGION`, `AWS_PROFILE`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and third-party `*_API_KEY` stay usable.
 - JetStream pull errors (`aw-event-bridge`): only a description naming `MaxAckPending` is the quiet 500 ms retry; other `409`s warn and back off; `Consumer Deleted` re-runs `ensure_consumer` (the "consumer not found" branch was dead code, removed in Round 21). `ensure_consumer` only RAISES a finite `max_ack_pending`; **Round 20 claimed it "never lowers" it, which was wrong** for an unlimited (`-1`/`0`) value and on the `get_or_create` error path (both fixed in Round 21), so a rolling deploy does not flap it.
-- Error text for MCP store pulls uses `url_redact::redact_http_url(url)` (no userinfo/query/fragment); reqwest body/decode errors use `without_url()` before `to_string()`.
+- Error text for MCP store pulls uses `url_redact::redact_http_url(url)` (no userinfo/query/fragment; superseded in Round 21/22: origin only, see below); reqwest body/decode errors use `without_url()` before `to_string()`.
 - See `docs/audit-breaking-changes.md` (Round 20).
 
 ### Round 21 notes
 
-- `aw-event-bridge` JetStream: a durable deleted while the loop is idle (or blocked in `acquire_batch`) is never answered `Consumer Deleted`; the pull gets `503`/no responders. `classify_pull_error` now returns `PullFault::Unavailable` for that, and `ConsecutiveFaults` re-runs `ensure_consumer` after `RECREATE_AFTER_FAULTS` (3) pull failures in a row (`Other`/`Unavailable` items or a failed `.messages()` open). A delivered message, a clean empty batch or a `409 MaxAckPending` clears the count; a failed re-creation keeps it. Acks of messages in flight at re-creation hit the old consumer's delivery and are ignored: the message is redelivered and absorbed by the dispatch ledger (only when the invoker was built `with_ledger`; the serve default is `NoopDispatchLedger`) or held off by the session lock; the delivery count restarts, the busy age budget does not.
+- `aw-event-bridge` JetStream: a durable deleted while the loop is idle (or blocked in `acquire_batch`) is never answered `Consumer Deleted`; the pull gets `503`/no responders. `classify_pull_error` now returns `PullFault::Unavailable` for that, and `ConsecutiveFaults` re-runs `ensure_consumer` after `RECREATE_AFTER_FAULTS` (3) pull failures in a row (`Other`/`Unavailable` items or a failed `.messages()` open). A delivered message, a clean empty batch or a `409 MaxAckPending` clears the count; a failed re-creation keeps it. Acks of messages in flight at re-creation hit the old consumer's delivery and are ignored: the message is redelivered and absorbed by the dispatch ledger (only with a real ledger: Noop unless `GREENTIC_AW_REDIS_URL` + `redis` backend, where `agent_node::serve_agentic` installs `RedisDispatchLedger`; `serve()` / `RuntimeAgentDispatchInvoker::new` default to Noop; and the old-delivery acks are ignored only if the durable was really deleted) or held off by the session lock; the delivery count restarts, the busy age budget does not.
 - `ensure_consumer` converges from the durable's REAL config on the error path (`consumer_info` -> `converged_consumer_config`), never `agentic_consumer_config()` blindly; `converged_consumer_config` keeps an unlimited `max_ack_pending` (`<= 0`, sent as `-1`) and any value above 512.
-- `url_redact::redact_http_url` now returns the ORIGIN only (`scheme://[redacted]@host:port`, plus `/…` if there was a path/query/fragment); everything up to the last `@` after the scheme is userinfo, so raw `/?#` in a password cannot leak. `HttpConfigProvider` (`http_provider.rs`) strips the URL from reqwest errors.
+- `url_redact::redact_http_url` now returns the ORIGIN only (`scheme://[redacted]@host:port`, plus `/…` if there was a path/query/fragment); the "last `@`" rule was superseded in Round 22. `HttpConfigProvider` (`http_provider.rs`) strips the URL from reqwest errors.
 - `runner_core::packs::resolver::strip_url_suffix` no longer counts parentheses: the URL ends at the first `"): "` or a closing `)` at the end of the message, else everything from ` for url (` on is dropped.
 - Tool-secret env deny-list adds `OTEL_EXPORTER_OTLP_*HEADERS`, `IDENTITY_HEADER`/`IDENTITY_ENDPOINT`, `MSI_SECRET`/`MSI_ENDPOINT`, the `VAULT_` prefix, `REDIS_PASSWORD`, `PGPASSFILE`, `GOOGLE_CREDENTIALS`, `GOOGLE_ACCESS_TOKEN`, `MONGODB_URI`, `AMQP_URL`. `*_API_KEY`, `GITHUB_TOKEN`/`GH_TOKEN`/`HF_TOKEN`, `AWS_REGION`/`AWS_PROFILE`, `AZURE_TENANT_ID`/`AZURE_CLIENT_ID` stay usable.
 - The directory-pack `read_pack_file` 64 MiB cap (`MAX_ARCHIVE_ENTRY_READ_BYTES`, same as archive entries) came from `c573decf` (Round 19), not Round 20.
 - See `docs/audit-breaking-changes.md` (Round 21).
+
+### Round 22 notes
+
+- `aw-event-bridge` JetStream: `recreate_consumer` no longer resets the backoff `attempt` (`recreate_backoff` escalates on success and failure); only a received message, a cleanly ended pull or `409 MaxAckPending` resets it. A persistent non-durable fault now climbs to the 30 s cap instead of cycling every ~2 s.
+- `url_redact::redact_http_url`: authority ends at the first `/?#`; an `@` after it makes the URL ambiguous and only `scheme://[redacted]` is shown (never a host or suffix). `@` all inside the authority is userinfo (`scheme://[redacted]@host`).
+- Tool-secret env deny-list adds `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (case-folded), `SENTRY_DSN`, `GIT_ASKPASS`, `DOCKER_CONFIG`; `NO_PROXY` stays allowed.
+- `HttpConfigProvider::with_client` lets the URL-leak test use a `.no_proxy()` client.
+- See `docs/audit-breaking-changes.md` (Round 22).
 
 ### Engine and tool-secret rules (round 11)
 
