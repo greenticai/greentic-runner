@@ -1028,18 +1028,55 @@ marked `#[non_exhaustive]`.**
 - **JetStream pull `409` is no longer always "max ack pending" (F2, `aw-event-bridge`).** Only a description naming
   `MaxAckPending` / `max_ack_pending` / `max ack pending` takes the quiet 500 ms retry. Any other `409` (`Exceeded
   MaxWaiting`, `Exceeded MaxRequestBatch/Expires/MaxBytes`, `Consumer is push based`, a bare `409`) warns and
-  escalates the backoff. `Consumer Deleted` / `consumer not found` re-runs `ensure_consumer` to re-create the durable.
+  escalates the backoff. `Consumer Deleted` re-runs `ensure_consumer` to re-create the durable (`consumer not found` never reaches the classifier; removed in Round 21).
 - **MCP store pull and decode errors no longer carry the URL (F3, `greentic-aw-runtime`).** Messages from
   `download_artifact` / `collect_capped` name `scheme://host/path` only (new `url_redact::redact_http_url`: userinfo,
   query and fragment dropped), and body/decode errors in the MCP admin source, graph registry, OpenAI backend and
   guardrail policy go through `without_url()` first. The Round 19 claim that the store pull was covered was
   inaccurate. Known gap unchanged: `greentic-a2a` `CardCache`.
-- **`max_ack_pending` is only ever raised (F4).** `ensure_consumer` converges an existing durable only when its finite
-  `max_ack_pending` is BELOW 512 (and keeps a larger value when it updates for `ack_wait`/`max_deliver`), so a rolling
-  deploy no longer flaps 512 <-> 256 from the new build's side. An older build still lowers it to 256 on its own start.
+- **`max_ack_pending` is only raised for a finite value below 512 (F4).** `ensure_consumer` converges an existing
+  durable only when its finite `max_ack_pending` is BELOW 512 (and keeps a larger value when it updates for
+  `ack_wait`/`max_deliver`), so a rolling deploy no longer flaps 512 <-> 256 from the new build's side. (The original
+  wording here said it "never lowers"; that was wrong for an unlimited value and for the `get_or_create` error path,
+  both fixed in Round 21.) An older build still lowers it to 256 on its own start.
   The warning names `max_ack_pending`.
 - **Pack download error scrubbing balances parentheses (F5a).** `strip_url_suffix` removes a `" for url (...)"` suffix
   whose URL contains balanced `( )`. A lone literal `)` in the URL still ends the suffix early.
-- **Directory packs: `read_pack_file` is capped at 64 MiB per file (F5b).** `PackRuntime::read_pack_file` for a
+- **Directory packs: `read_pack_file` is capped at 64 MiB per file (F5b).** Introduced by commit `c573decf` (Round 19
+  work), not by a Round 20 commit. `PackRuntime::read_pack_file` for a
   materialised pack DIRECTORY uses the same `MAX_ARCHIVE_ENTRY_READ_BYTES` (64 MiB) bound as an archive entry.
   **Affected:** a directory pack with a sidecar or asset over 64 MiB now reads as missing (`None`, with a warning).
+
+## Round 21
+
+- **A JetStream durable deleted while idle is re-created (F1, `aw-event-bridge`).** `Consumer Deleted` only reaches the
+  pull loop when a pull was in flight; otherwise the next pull is answered `503` / no responders, which used to be a
+  warn + backoff forever (the bridge stayed dead until restart). `PullFault::Unavailable` is new, and
+  `ConsecutiveFaults` re-runs `ensure_consumer` after 3 pull failures in a row (including a failed `.messages()` open),
+  with backoff; a delivered message, a clean empty batch or `409 MaxAckPending` resets the count. The dead
+  "consumer not found" branch is gone (async-nats ends a pull on `404`).
+- **`ensure_consumer` no longer forces 512 on the error path (F2/F3).** When `get_or_create_consumer` fails, the
+  existing durable is read (`consumer_info`) and converged with `converged_consumer_config`, so a larger
+  `max_ack_pending` is kept; an unlimited one (`<= 0`) stays unlimited (`-1`) instead of being lowered to 512
+  when `ack_wait`/`max_deliver` were also stale. The warning no longer claims the "config differs".
+- **Messages in flight at a consumer re-creation (F4).** Their ack/progress/term address the old consumer and are
+  ignored, so the message is redelivered. The dispatch ledger (`{tenant}:{env}:{dispatch_id}`, same header on the
+  redelivery) absorbs it when the invoker has a real ledger (`with_ledger`; the serve default is the no-op ledger), and
+  a turn still running is held off by the session lock. The delivery counter restarts (a fresh `CONSUMER_MAX_DELIVER`
+  budget for that message); the busy age budget is publish-time based and does not reset.
+- **`redact_http_url` is origin-only and handles raw delimiters in userinfo (F5).** Output is
+  `scheme://[redacted]@host:port` (userinfo only if present) plus `/…` when a path, query or fragment existed. The
+  path is dropped on purpose (token-in-path URLs). Everything up to the LAST `@` after the scheme is credential, so
+  `https://u:p?w@h/` no longer leaks `u:p`; an `@` inside a path or query is also read as userinfo (wrong host
+  shown, never a leak). **Affected:** store-pull error text no longer names the artifact path.
+- **Agent registry errors drop the URL (F6).** `HttpConfigProvider` send and decode errors, and the worker metering
+  warning, go through `without_url()`.
+- **`strip_url_suffix` is fail-closed (F7, `runner-core`).** No parenthesis counting: the URL ends at the first
+  `"): "` or at a `)` closing the message; otherwise everything from `" for url ("` on is dropped. Lone `(` and `)`
+  in a key no longer leak the signature.
+- **Tool-secret env deny-list (F8).** Additionally denied: any `OTEL_EXPORTER_OTLP_*HEADERS`, `IDENTITY_HEADER`,
+  `IDENTITY_ENDPOINT`, `MSI_SECRET`, `MSI_ENDPOINT`, prefix `VAULT_`, `REDIS_PASSWORD`, `PGPASSFILE`,
+  `GOOGLE_CREDENTIALS`, `GOOGLE_ACCESS_TOKEN`, `MONGODB_URI`, `AMQP_URL`. Kept usable by decision: `*_API_KEY`,
+  `GITHUB_TOKEN`, `GH_TOKEN`, `HF_TOKEN`, `AWS_REGION`, `AWS_PROFILE`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`.
+  `AZURE_SQL_*`/Cosmos names were not added (no fixed credential name). **Affected:** a tool reading one of the newly
+  denied names through `secret://` now gets "not found".

@@ -97,36 +97,30 @@ pub fn redact_locator(locator: &str) -> String {
 /// Drop reqwest's `" for url (<url>)"` Display suffix from one error message.
 /// The URL may be a presigned S3 / Azure SAS locator, so its query must never
 /// reach an error chain.
+///
+/// The URL is never parsed for balanced parentheses (a key may hold a lone `(`
+/// or `)` that no counting can tell from the closing one). Instead the URL ends
+/// at the first `"): "` (reqwest's own separator before a chained reason), else
+/// at a `)` that closes the whole message. A URL is not allowed a raw space, so
+/// `"): "` cannot occur inside it. When neither is found the end is unknown and
+/// everything from the suffix start on is dropped (fail-closed). Further
+/// `" for url ("` suffixes in the remainder are removed the same way.
 pub(crate) fn strip_url_suffix(message: &str) -> String {
-    match message.find(" for url (") {
-        Some(start) => {
-            let tail = &message[start + " for url (".len()..];
-            // Balance parentheses so a URL containing a literal `(...)` pair
-            // is removed whole instead of stopping at its first `)`. An
-            // unbalanced remainder drops everything after the suffix start
-            // (fail-closed). A lone literal `)` in the URL is still ambiguous
-            // and ends the suffix early.
-            let mut depth = 1usize;
-            let mut end = None;
-            for (index, ch) in tail.char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = Some(index);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            match end {
-                Some(end) => format!("{}{}", &message[..start], &tail[end + 1..]),
-                None => message[..start].to_string(),
-            }
-        }
-        None => message.to_string(),
+    const MARKER: &str = " for url (";
+    let Some(start) = message.find(MARKER) else {
+        return message.to_string();
+    };
+    let tail = &message[start + MARKER.len()..];
+    let rest = if let Some(end) = tail.find("): ") {
+        Some(&tail[end + 1..])
+    } else if tail.ends_with(')') {
+        Some("")
+    } else {
+        None
+    };
+    match rest {
+        Some(rest) => format!("{}{}", &message[..start], strip_url_suffix(rest)),
+        None => message[..start].to_string(),
     }
 }
 
@@ -325,6 +319,32 @@ mod download_cap_tests {
             "failed"
         );
         assert_eq!(strip_url_suffix("plain"), "plain");
+    }
+
+    #[test]
+    fn strip_url_suffix_is_fail_closed_for_lone_parentheses() {
+        use super::strip_url_suffix;
+        for message in [
+            "failed for url (https://h/a).gtpack?sig=SECRET)",
+            "failed for url (https://h/a).gtpack?sig=SECRET): reset",
+            "failed for url (https://h/a(.gtpack?sig=SECRET)",
+            "failed for url (https://h/a(.gtpack?sig=SECRET): reset",
+            "failed for url (https://h/a(.gtpack?sig=SECRET",
+            "failed for url (https://h/a).gtpack?sig=SECRET",
+        ] {
+            let out = strip_url_suffix(message);
+            assert!(!out.contains("SECRET"), "{message} -> {out}");
+            assert!(!out.contains("sig="), "{message} -> {out}");
+            assert!(out.starts_with("failed"), "{out}");
+        }
+        assert_eq!(
+            strip_url_suffix("failed for url (https://h/a).gtpack?sig=SECRET): reset"),
+            "failed: reset"
+        );
+        assert_eq!(
+            strip_url_suffix("failed for url (https://h/a(.gtpack?sig=SECRET)"),
+            "failed"
+        );
     }
 
     #[test]

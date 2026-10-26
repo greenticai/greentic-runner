@@ -27,21 +27,40 @@ pub fn redact_url(url: &str) -> String {
     parts.join(",")
 }
 
-/// Reduce an HTTP(S) request URL to `scheme://host[:port]/path` for logs and
-/// error text: userinfo, query string and fragment are dropped, because a
-/// presigned URL carries its credential in the query and a basic-auth URL in
-/// the userinfo. Fail-closed for the query: everything from the first `?` or
-/// `#` goes.
+/// Reduce an HTTP(S) request URL to its ORIGIN for logs and error text:
+/// `scheme://host[:port]`, plus `/…` when the URL had a path, query or
+/// fragment. Fail-closed on every part that can carry a credential:
+///
+/// - the userinfo (basic auth) is masked as `[redacted]@`. Like [`redact_url`],
+///   everything up to the LAST `@` after the scheme is credential, so a raw
+///   `/`, `?` or `#` inside the password (`https://u:p?w@h/`) cannot end the
+///   authority early and leak the front of it. The price is that an `@` in a
+///   path or query (`/@me`, `?mail=a@b`) also reads as userinfo and the text
+///   after it is shown as the host: wrong but never a leak.
+/// - the path is dropped, not shown: webhook-style endpoints and some stores
+///   embed a token in it (`/bot<TOKEN>/file`), and the query (presigned
+///   signature) and fragment go the same way. The caller already names the
+///   artifact it was fetching; the origin says which server failed.
 pub fn redact_http_url(url: &str) -> String {
-    let cut = url.find(['?', '#']).unwrap_or(url.len());
-    let base = &url[..cut];
-    let scheme_end = scheme_len(base).unwrap_or(0);
-    let rest = &base[scheme_end..];
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
-        Some(at) => format!("{}[redacted]{}", &base[..scheme_end], &rest[at..]),
-        None => base.to_string(),
+    let scheme_end = scheme_len(url).unwrap_or(0);
+    let rest = &url[scheme_end..];
+    let (masked, after_userinfo) = match rest.rfind('@') {
+        Some(at) => (true, &rest[at + 1..]),
+        None => (false, rest),
+    };
+    let origin_end = after_userinfo
+        .find(['/', '?', '#'])
+        .unwrap_or(after_userinfo.len());
+    let remainder = &after_userinfo[origin_end..];
+    let mut out = String::from(&url[..scheme_end]);
+    if masked {
+        out.push_str("[redacted]@");
     }
+    out.push_str(&after_userinfo[..origin_end]);
+    if !remainder.is_empty() && remainder != "/" {
+        out.push_str("/…");
+    }
+    out
 }
 
 /// Length of the `scheme://` prefix of `s`, if it has a valid one.
@@ -67,20 +86,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_url_loses_query_fragment_and_userinfo() {
+    fn http_url_is_reduced_to_its_origin() {
         assert_eq!(
             redact_http_url("https://store.example/a/b.gtxpack?X-Amz-Signature=abc&x=1#frag"),
-            "https://store.example/a/b.gtxpack"
+            "https://store.example/…"
         );
         assert_eq!(
             redact_http_url("https://user:pw@store.example:8443/a?token=t"),
-            "https://[redacted]@store.example:8443/a"
+            "https://[redacted]@store.example:8443/…"
         );
-        assert_eq!(
-            redact_http_url("http://store/x"),
-            "http://store/x",
-            "a clean URL is unchanged"
-        );
+        assert_eq!(redact_http_url("http://store"), "http://store");
+        assert_eq!(redact_http_url("http://store/"), "http://store");
+        assert_eq!(redact_http_url("http://store?t=1"), "http://store/…");
+    }
+
+    #[test]
+    fn http_url_path_embedded_secret_is_dropped() {
+        let out = redact_http_url("https://api.example/bot123:SECRET/file.gtxpack");
+        assert_eq!(out, "https://api.example/…");
+        assert!(!out.contains("SECRET"));
+    }
+
+    #[test]
+    fn http_url_raw_delimiters_in_userinfo_do_not_leak() {
+        for (input, secret) in [
+            ("https://u:p?w@h/", "p?w"),
+            ("https://u:p#w@h/x", "p#w"),
+            ("https://u:pa/ss@h:8443/x?y=1", "pa"),
+            ("https://u:p@ss@h/x", "ss"),
+            ("https://u:pa?ss@h", "ss"),
+        ] {
+            let out = redact_http_url(input);
+            assert!(!out.contains(secret), "{out} leaks {secret}");
+            assert!(out.starts_with("https://[redacted]@h"), "{out}");
+        }
+        assert_eq!(redact_http_url("https://u:p?w@h/"), "https://[redacted]@h");
+    }
+
+    #[test]
+    fn http_url_at_sign_in_path_is_fail_closed() {
+        let out = redact_http_url("https://h/users/@me?k=v");
+        assert_eq!(out, "https://[redacted]@me/…");
     }
 
     #[test]

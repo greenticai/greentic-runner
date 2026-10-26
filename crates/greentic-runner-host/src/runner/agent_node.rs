@@ -1324,28 +1324,58 @@ mod aw {
         "AZURE_USERNAME",
         "AZURE_PASSWORD",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CREDENTIALS",
+        "GOOGLE_ACCESS_TOKEN",
+        // Azure managed identity (App Service / Functions / Container Apps):
+        // `IDENTITY_HEADER` is the secret that authorises a token request to
+        // `IDENTITY_ENDPOINT`; `MSI_*` is the legacy pair.
+        "IDENTITY_HEADER",
+        "IDENTITY_ENDPOINT",
+        "MSI_SECRET",
+        "MSI_ENDPOINT",
+        // Datastore/broker credentials and connection strings (these embed a
+        // password in the URI).
+        "REDIS_PASSWORD",
+        "PGPASSFILE",
+        "MONGODB_URI",
+        "AMQP_URL",
+        // The OTLP exporter headers carry the collector auth token; the
+        // per-signal `OTEL_EXPORTER_OTLP_*HEADERS` names are covered in
+        // [`env_secret_name_is_denied`].
+        "OTEL_EXPORTER_OTLP_HEADERS",
     ];
-    /// `SECRETS_BROKER_*` (`secret://secrets/broker/token` -> the host's own
-    /// secrets-broker bearer), `SECRETS_*` (backend selector and cache knobs),
-    /// `PACK_*` (pack trust key and verification switches).
+    /// Prefix families of host configuration and ambient credentials a tool's
+    /// `secret://` reference may never resolve to.
     ///
-    /// Deliberately NOT denied: `OPENAI_API_KEY`. The runner reads it as its
-    /// LLM fallback, but `secret://openai/api_key` is the documented way for an
-    /// extension tool to get its own OpenAI key from the env, and flipping this
-    /// to an allow-list would break that same fallback for every other tool.
+    /// Host configuration: `GREENTIC_*`, `TENANT_JWT_*`, `SECRETS_*` (backend
+    /// selector, `SECRETS_BROKER_*` broker bearer, cache knobs) and `PACK_*`
+    /// (pack trust key and verification switches).
     ///
-    /// Ambient cloud/infra credentials of the runner's own identity are denied
-    /// too, but only the families that carry that identity: `AWS_SECRET_*`,
+    /// Cloud identity of the runner's own process: `AWS_SECRET_*`,
     /// `AWS_SESSION_*`, `AWS_CONTAINER_*`, `AWS_WEB_IDENTITY_*`, `AWS_SHARED_*`,
-    /// `AZURE_FEDERATED_*`, `AZURE_CLIENT_CERTIFICATE_*`, `AZURE_STORAGE_*`,
-    /// `GOOGLE_CLOUD_*`, `GOOGLE_OAUTH_*`, `GCP_*`, `CLOUDSDK_*`, `ARM_*`, `AWS_BEARER_*`, `AWS_SECURITY_*`, `AWS_ACCESS_KEY*`, `AZURE_*_CONNECTION_STRING`, plus the exact names above, and the
-    /// `DATABASE_*`, `NATS_*`, `POSTGRES_*`, `MYSQL_*`, `KUBERNETES_*`
-    /// connection settings. Third-party API keys that merely share a vendor
-    /// prefix stay usable as tool secrets: `GOOGLE_API_KEY` (Gemini),
-    /// `AZURE_OPENAI_API_KEY`, `GITHUB_TOKEN` and `GH_TOKEN` are the natural
-    /// names for a tool's own key. `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` are
-    /// identifiers, not secrets, and are left alone as well.
+    /// `AWS_BEARER_*`, `AWS_SECURITY_*`, `AWS_ACCESS_KEY*`, `AZURE_FEDERATED_*`,
+    /// `AZURE_CLIENT_CERTIFICATE_*`, `AZURE_STORAGE_*`, `ARM_*`, `GOOGLE_CLOUD_*`,
+    /// `GOOGLE_OAUTH_*`, `GCP_*`, `CLOUDSDK_*`. `VAULT_*` is denied whole
+    /// (`VAULT_TOKEN` is the credential; `VAULT_ADDR`/`VAULT_NAMESPACE` come
+    /// with it, and a tool that needs its own Vault should use the secrets
+    /// backend instead).
+    ///
+    /// Connection settings of the runner's infrastructure: `DATABASE_*`,
+    /// `NATS_*`, `POSTGRES_*`, `MYSQL_*`, `KUBERNETES_*`. Beyond the prefixes,
+    /// the exact names above and `AZURE_*_CONNECTION_STRING` are denied, and so
+    /// is any `OTEL_EXPORTER_OTLP_*HEADERS` name.
+    ///
+    /// Deliberately NOT denied (a documented decision): `OPENAI_API_KEY` (the
+    /// runner reads it as its LLM fallback, but `secret://openai/api_key` is the
+    /// documented way for a tool to get its own OpenAI key from the env, and an
+    /// allow-list would break that fallback for every other tool); third-party
+    /// API keys that merely share a vendor prefix (`GOOGLE_API_KEY` for Gemini,
+    /// `AZURE_OPENAI_API_KEY`, any `*_API_KEY`); `GITHUB_TOKEN`, `GH_TOKEN` and
+    /// `HF_TOKEN`, the natural names for a tool's own token; and identifiers
+    /// rather than secrets: `AWS_REGION`, `AWS_PROFILE`, `AZURE_TENANT_ID`,
+    /// `AZURE_CLIENT_ID`.
     const ENV_SECRET_DENY_PREFIXES: &[&str] = &[
+        "VAULT_",
         "GREENTIC_",
         "TENANT_JWT_",
         "SECRETS_",
@@ -1380,6 +1410,9 @@ mod aw {
     pub(crate) fn env_secret_name_is_denied(name: &str) -> bool {
         // `AZURE_<SERVICE>_CONNECTION_STRING` embeds an account key.
         (name.starts_with("AZURE_") && name.ends_with("_CONNECTION_STRING"))
+            // `OTEL_EXPORTER_OTLP_HEADERS` and its per-signal forms
+            // (`..._TRACES_HEADERS`, `..._METRICS_HEADERS`, `..._LOGS_HEADERS`).
+            || (name.starts_with("OTEL_EXPORTER_OTLP_") && name.contains("HEADERS"))
             || ENV_SECRET_DENY_EXACT.contains(&name)
             || ENV_SECRET_DENY_PREFIXES
                 .iter()
@@ -3430,6 +3463,21 @@ mod aw {
                 "secret://arm/subscription_id",
                 "secret://google/oauth/access_token",
                 "secret://cloudsdk/auth/access_token",
+                "secret://otel/exporter/otlp/headers",
+                "secret://otel/exporter/otlp/traces/headers",
+                "secret://otel/exporter/otlp/logs/headers",
+                "secret://identity/header",
+                "secret://identity/endpoint",
+                "secret://msi/secret",
+                "secret://msi/endpoint",
+                "secret://vault/token",
+                "secret://vault/addr",
+                "secret://redis/password",
+                "secret://pgpassfile",
+                "secret://google/credentials",
+                "secret://google/access_token",
+                "secret://mongodb/uri",
+                "secret://amqp/url",
             ] {
                 let name = env_var_name_for_secret(denied);
                 assert!(
@@ -3450,6 +3498,10 @@ mod aw {
                 "secret://azure/client_id",
                 "secret://anthropic/api_key",
                 "secret://alarm/key",
+                "secret://hf/token",
+                "secret://otel/exporter/otlp/endpoint",
+                "secret://identity/provider",
+                "secret://vaulted/key",
             ] {
                 let name = env_var_name_for_secret(ok);
                 assert!(!env_secret_name_is_denied(&name), "{ok} -> {name}");

@@ -268,7 +268,8 @@ async fn collect_capped_messages_never_carry_the_url_query() {
     for error in [integrity, network] {
         let text = error.to_string();
         assert!(!text.contains("SECRET"), "{text}");
-        assert!(text.contains("https://store/x.gtxpack"), "{text}");
+        assert!(text.contains("https://store"), "{text}");
+        assert!(!text.contains("x.gtxpack"), "path is not shown: {text}");
     }
 }
 
