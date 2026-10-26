@@ -135,6 +135,13 @@ fn compound_credential_keys_are_redacted() {
         ("retry with key=hunter2 now", "hunter2"),
         ("X-Amz-Signature=deadbeef", "deadbeef"),
         (r#"{"client_credential": "zzz9"}"#, "zzz9"),
+        ("accountkey=Zm9vYmFy", "Zm9vYmFy"),
+        ("AccountKey=Zm9vYmFy", "Zm9vYmFy"),
+        ("signingkey: s1gn", "s1gn"),
+        ("encryptionkey=3ncr", "3ncr"),
+        (r#"{"sessionKey": "sk-1234"}"#, "sk-1234"),
+        (r#"{"storageKey": "stor-9"}"#, "stor-9"),
+        ("clientKey=cl13nt", "cl13nt"),
     ] {
         let out = redact(input);
         assert!(!out.contains(secret), "{input} -> {out}");
@@ -151,6 +158,10 @@ fn ordinary_keys_survive_the_substring_match() {
         "signal: terminated",
         "author: bob",
         "status: 502",
+        "session_id: 7f3a",
+        "sessionId=7f3a",
+        "monkey=banana",
+        "hotkey: ctrl",
     ] {
         assert_eq!(redact(input), input, "over-redacted: {input}");
     }

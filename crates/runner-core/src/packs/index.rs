@@ -58,7 +58,10 @@ impl Index {
                 if let (Some(cap), Some(len)) = (cap, response.content_length())
                     && len > cap
                 {
-                    bail!("index {url} is {len} bytes, over the {cap} byte limit");
+                    bail!(
+                        "index {} is {len} bytes, over the {cap} byte limit",
+                        super::resolver::redact_locator(url.as_str())
+                    );
                 }
                 let mut bytes = Vec::new();
                 copy_capped(&mut response, &mut bytes, cap, "index")
@@ -301,5 +304,40 @@ mod name_tests {
                 "{good:?} must be accepted"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_error_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// A server that announces a body far over the default index cap and hangs up.
+    fn oversized_index_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn oversized_index_error_does_not_leak_the_url_query() {
+        let port = oversized_index_server();
+        let url = url::Url::parse(&format!(
+            "http://127.0.0.1:{port}/index.json?X-Amz-Signature=SECRET123"
+        ))
+        .expect("url");
+        let err = Index::load(&IndexLocation::Remote(url)).expect_err("over the cap");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("byte limit"), "{chain}");
+        assert!(!chain.contains("SECRET123"), "{chain}");
     }
 }

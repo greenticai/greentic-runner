@@ -291,12 +291,12 @@ pub(crate) async fn invoke_sor(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("sorx invoke request failed: {e}"))?;
+        .map_err(|e| format!("sorx invoke request failed: {}", e.without_url()))?;
     let status = resp.status();
     let text = resp
         .text()
         .await
-        .map_err(|e| format!("sorx invoke response read failed: {e}"))?;
+        .map_err(|e| format!("sorx invoke response read failed: {}", e.without_url()))?;
     let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
     match status.as_u16() {

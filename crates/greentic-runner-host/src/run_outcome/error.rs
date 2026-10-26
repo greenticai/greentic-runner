@@ -65,6 +65,10 @@ const SENSITIVE_SUBSTRINGS: &[&str] = &[
     "accesskey",
     "privatekey",
     "secretkey",
+    "accountkey",
+    "signingkey",
+    "encryptionkey",
+    "sessionkey",
 ];
 
 /// Segments that are sensitive only as a COMPLETE segment: too short or too
@@ -77,6 +81,9 @@ const SENSITIVE_SEGMENTS: &[&str] = &[
 
 /// True when `key` (an identifier of `[A-Za-z0-9_-]`) names a credential.
 fn is_sensitive_key(key: &str) -> bool {
+    if is_camel_case_key_suffix(key) {
+        return true;
+    }
     let key = key.to_ascii_lowercase();
     // Only the LAST segment names what the value is: `bot_token`,
     // `x-amz-security-token`, `x-goog-api-key` are credentials, while
@@ -87,6 +94,21 @@ fn is_sensitive_key(key: &str) -> bool {
     };
     SENSITIVE_SEGMENTS.contains(&last)
         || (last != "tokens" && SENSITIVE_SUBSTRINGS.iter().any(|n| last.contains(n)))
+}
+
+/// True for a camelCase identifier whose final word is `Key` (`storageKey`,
+/// `clientKey`, `StorageAccountKey`). A plain lowercase `ends_with("key")` would
+/// also hit `monkey` / `hotkey`; the capital `K` after a lowercase letter marks
+/// a word boundary instead. `session_id` / `sessionId` do not end in `Key`.
+fn is_camel_case_key_suffix(key: &str) -> bool {
+    let last = key.rsplit(['-', '_']).next().unwrap_or(key);
+    let Some(prefix) = last.strip_suffix("Key") else {
+        return false;
+    };
+    prefix
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 /// The `error` object of a v2 run-outcome event. Serialised `snake_case`.

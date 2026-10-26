@@ -83,7 +83,7 @@ impl HttpGuardrailPolicy {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| format!("request failed: {}", e.without_url()))?;
         match resp.status().as_u16() {
             200 => resp
                 .json::<PolicyResp>()

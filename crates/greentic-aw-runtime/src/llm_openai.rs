@@ -247,7 +247,7 @@ impl LlmBackend for OpenAiLlmBackend {
                 .timeout(self.request_timeout)
                 .send()
                 .await
-                .map_err(|e| LlmError::Transport(e.to_string()))?;
+                .map_err(|e| LlmError::Transport(e.without_url().to_string()))?;
             let status = resp.status();
             if status.is_server_error() {
                 return Err(LlmError::ServiceUnavailable);
@@ -336,7 +336,7 @@ impl LlmBackend for OpenAiLlmBackend {
             let resp = tokio::time::timeout(self.request_timeout, resp)
                 .await
                 .map_err(|_| LlmError::Transport("response header timeout".into()))?
-                .map_err(|e| LlmError::Transport(e.to_string()))?;
+                .map_err(|e| LlmError::Transport(e.without_url().to_string()))?;
             let status = resp.status();
             // A non-2xx response is an error body, not an SSE stream — read
             // it whole and map exactly like the blocking path.
@@ -357,7 +357,7 @@ impl LlmBackend for OpenAiLlmBackend {
                 .await
                 .map_err(|_| LlmError::Transport("stream idle timeout".into()))?
             {
-                let bytes = chunk.map_err(|e| LlmError::Transport(e.to_string()))?;
+                let bytes = chunk.map_err(|e| LlmError::Transport(e.without_url().to_string()))?;
                 for line in line_buf.push_bytes(&bytes) {
                     if let Some(text) = acc.push_line(&line)? {
                         on_delta(&text);

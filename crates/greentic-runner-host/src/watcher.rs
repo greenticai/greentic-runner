@@ -280,10 +280,6 @@ pub async fn start_pack_watcher_with_policy(
     Ok((watcher, handle))
 }
 
-/// Refresh the cached archives of a runtime kept although its republish failed
-/// to build. Its old digest is no longer resolved, so nothing else would bump
-/// the archive mtime and the next successful store could prune it from under
-/// the live runtime.
 /// An error chain for a log line, the reload failure list or `/admin/packs/status`
 /// `last_error`. A pack locator may be a presigned S3 / Azure SAS URL, so URL
 /// userinfo and queries (and credential pairs) are redacted.
@@ -291,6 +287,10 @@ pub(crate) fn redact_chain(err: &anyhow::Error) -> String {
     crate::run_outcome::error::redact(&format!("{err:#}"))
 }
 
+/// Refresh the cached archives of a runtime kept although its republish failed
+/// to build. Its old digest is no longer resolved, so nothing else would bump
+/// the archive mtime and the next successful store could prune it from under
+/// the live runtime.
 fn keep_archives_alive(manager: &PackManager, runtime: &TenantRuntime) {
     for pack in runtime.all_packs() {
         if let Some(path) = pack.archive_path() {

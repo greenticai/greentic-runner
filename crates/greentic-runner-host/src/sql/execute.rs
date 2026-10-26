@@ -857,6 +857,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_cte_write_is_refused_on_read_only_and_writable_pools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("cte.db");
+        {
+            let rw = sqlx::sqlite::SqlitePool::connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("rw pool");
+            sqlx::query("CREATE TABLE t (id INTEGER)")
+                .execute(&rw)
+                .await
+                .expect("create");
+            sqlx::query("INSERT INTO t VALUES (1), (2)")
+                .execute(&rw)
+                .await
+                .expect("seed");
+            rw.close().await;
+        }
+        let dsn = format!("sqlite://{}", db.display());
+        for read_only in [true, false] {
+            let pool = crate::sql::pool::build(Engine::Sqlite, &dsn, read_only)
+                .await
+                .expect("pool");
+            for sql in [
+                "WITH x AS (SELECT 1) DELETE FROM t",
+                "WITH x AS (SELECT 1) INSERT INTO t VALUES (9)",
+                "WITH x AS (SELECT 1) UPDATE t SET id = 0",
+            ] {
+                let err = run(Engine::Sqlite, &pool, sql, 10).await;
+                assert!(err.is_err(), "read_only={read_only}: {sql} must fail");
+            }
+            let ok = run(Engine::Sqlite, &pool, "SELECT count(*) AS n FROM t", 10)
+                .await
+                .expect("select still works");
+            assert_eq!(ok.rows[0][0], serde_json::json!(2), "read_only={read_only}");
+            let cte = run(
+                Engine::Sqlite,
+                &pool,
+                "WITH x AS (SELECT id FROM t) SELECT count(*) FROM x",
+                10,
+            )
+            .await
+            .expect("read-only CTE still works");
+            assert_eq!(cte.row_count, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn sqlite_engine_pool_mismatch_returns_err() {
         // Using a Sqlite pool but passing Engine::Postgres should return an error.
         let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:")

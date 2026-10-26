@@ -1310,11 +1310,17 @@ mod aw {
         // Ambient credentials of common tooling the runner process may inherit.
         "PGPASSWORD",
         "KUBECONFIG",
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
         "NPM_TOKEN",
         "CARGO_REGISTRY_TOKEN",
         "SSH_AUTH_SOCK",
+        // The runner's own cloud identity (see the prefix list below for the
+        // families). Exact names only where a prefix would also catch a
+        // legitimate third-party key.
+        "AWS_ACCESS_KEY_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_USERNAME",
+        "AZURE_PASSWORD",
+        "GOOGLE_APPLICATION_CREDENTIALS",
     ];
     /// `SECRETS_BROKER_*` (`secret://secrets/broker/token` -> the host's own
     /// secrets-broker bearer), `SECRETS_*` (backend selector and cache knobs),
@@ -1326,17 +1332,30 @@ mod aw {
     /// to an allow-list would break that same fallback for every other tool.
     ///
     /// Ambient cloud/infra credentials of the runner's own identity are denied
-    /// too (`AWS_*`, `AZURE_*`, `GOOGLE_*`, `GCP_*`, `DATABASE_*`, `NATS_*`,
-    /// `POSTGRES_*`, `MYSQL_*`, `KUBERNETES_*`): a pack must not read the
-    /// host's cloud keys or connection strings through `secret://aws/...`.
+    /// too, but only the families that carry that identity: `AWS_SECRET_*`,
+    /// `AWS_SESSION_*`, `AWS_CONTAINER_*`, `AWS_WEB_IDENTITY_*`, `AWS_SHARED_*`,
+    /// `AZURE_FEDERATED_*`, `AZURE_CLIENT_CERTIFICATE_*`, `AZURE_STORAGE_*`,
+    /// `GOOGLE_CLOUD_*`, `GCP_*`, plus the exact names above, and the
+    /// `DATABASE_*`, `NATS_*`, `POSTGRES_*`, `MYSQL_*`, `KUBERNETES_*`
+    /// connection settings. Third-party API keys that merely share a vendor
+    /// prefix stay usable as tool secrets: `GOOGLE_API_KEY` (Gemini),
+    /// `AZURE_OPENAI_API_KEY`, `GITHUB_TOKEN` and `GH_TOKEN` are the natural
+    /// names for a tool's own key. `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` are
+    /// identifiers, not secrets, and are left alone as well.
     const ENV_SECRET_DENY_PREFIXES: &[&str] = &[
         "GREENTIC_",
         "TENANT_JWT_",
         "SECRETS_",
         "PACK_",
-        "AWS_",
-        "AZURE_",
-        "GOOGLE_",
+        "AWS_SECRET_",
+        "AWS_SESSION_",
+        "AWS_CONTAINER_",
+        "AWS_WEB_IDENTITY_",
+        "AWS_SHARED_",
+        "AZURE_FEDERATED_",
+        "AZURE_CLIENT_CERTIFICATE_",
+        "AZURE_STORAGE_",
+        "GOOGLE_CLOUD_",
         "GCP_",
         "DATABASE_",
         "NATS_",
@@ -3374,12 +3393,17 @@ mod aw {
                 "secret://otlp/headers",
                 "secret://aws/secret_access_key",
                 "secret://aws/session_token",
+                "secret://aws/access_key_id",
+                "secret://aws/container/credentials_full_uri",
+                "secret://aws/web_identity_token_file",
                 "secret://azure/client_secret",
+                "secret://azure/federated/token_file",
+                "secret://azure/storage/key",
                 "secret://google/application_credentials",
+                "secret://google/cloud/project",
                 "secret://gcp/project",
                 "secret://database/url",
                 "secret://nats/url",
-                "secret://github/token",
                 "secret://kubeconfig",
             ] {
                 let name = env_var_name_for_secret(denied);
@@ -3388,8 +3412,17 @@ mod aw {
                     "{denied} -> {name} must be refused"
                 );
             }
-            for ok in ["secret://tavily/api_key", "secret://openai/api_key"] {
-                assert!(!env_secret_name_is_denied(&env_var_name_for_secret(ok)));
+            for ok in [
+                "secret://tavily/api_key",
+                "secret://openai/api_key",
+                "secret://google/api_key",
+                "secret://azure/openai/api_key",
+                "secret://github/token",
+                "secret://gh/token",
+                "secret://aws/region",
+            ] {
+                let name = env_var_name_for_secret(ok);
+                assert!(!env_secret_name_is_denied(&name), "{ok} -> {name}");
             }
         }
 
