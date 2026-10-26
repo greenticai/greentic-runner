@@ -496,7 +496,9 @@ mod aw {
             if let Some(sink) = &self.audit_sink {
                 observers.push(Arc::new(AgentAuditObserver::new(
                     sink.clone(),
-                    tenant_ctx_for_audit(tenant_id, env_id)?,
+                    // Before `runtime.step`: nothing has run yet.
+                    tenant_ctx_for_audit(tenant_id, env_id)
+                        .map_err(crate::runner::engine::pre_effect)?,
                     agent_id.to_string(),
                     session_id.to_string(),
                 )));

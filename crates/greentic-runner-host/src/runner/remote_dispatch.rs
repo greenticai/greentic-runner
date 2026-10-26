@@ -321,7 +321,10 @@ impl RemoteDispatchHandler for NatsDispatcher {
             _ => None,
         };
 
-        let built = build_request(&request)?;
+        // Nothing has been sent when the request cannot even be built or the
+        // publish is refused, so both are provably pre-effect: a transient one
+        // still lets the flow retry the turn (see `engine::pre_effect`).
+        let built = build_request(&request).map_err(crate::runner::engine::pre_effect)?;
 
         // Arm the deadline watchdog BEFORE the request is on the wire: a fast
         // response can be admitted before this task resumes, and its cancel
@@ -365,7 +368,7 @@ impl RemoteDispatchHandler for NatsDispatcher {
             if let Some((key, generation)) = armed {
                 disarm_watchdog(&key, generation);
             }
-            return Err(error.into());
+            return Err(crate::runner::engine::pre_effect(error));
         }
 
         Ok(built.action)

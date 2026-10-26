@@ -177,7 +177,7 @@ pub fn cap_tool_result_for(result: serde_json::Value, tool_name: &str) -> serde_
     // A chatty tool would otherwise log at warn on every oversize call. Warn at
     // most once per `OVERSIZE_WARN_INTERVAL_SECS` per process; the rest are debug.
     let tool = log_safe_tool_name(tool_name);
-    if oversize_warn_due(now_epoch_secs()) {
+    if OVERSIZE_WARN.due(now_epoch_secs()) {
         tracing::warn!(
             tool = %tool,
             original_bytes = text.len(),
@@ -207,26 +207,44 @@ pub fn cap_tool_result_for(result: serde_json::Value, tool_name: &str) -> serde_
 /// Minimum spacing of the oversize-tool-result `warn` (per process).
 const OVERSIZE_WARN_INTERVAL_SECS: u64 = 60;
 
-/// Epoch second of the last oversize warning; `0` = never.
-static LAST_OVERSIZE_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Process-wide limiter for the oversize warning. The limiter is a value (not
+/// bare statics + functions) so a test can own an instance instead of racing
+/// every other test that goes through [`cap_tool_result_for`].
+static OVERSIZE_WARN: WarnLimiter = WarnLimiter::new(OVERSIZE_WARN_INTERVAL_SECS);
+
+/// Lets one event through per `interval_secs`.
+struct WarnLimiter {
+    interval_secs: u64,
+    /// Epoch second of the last permitted event; `0` = never.
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl WarnLimiter {
+    const fn new(interval_secs: u64) -> Self {
+        Self {
+            interval_secs,
+            last: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Whether the event may be emitted at `now`; claims the slot when so.
+    fn due(&self, now: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.last.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < self.interval_secs {
+            return false;
+        }
+        self.last
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+}
 
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
-}
-
-/// Whether the oversize warning may be emitted at `now`; claims the slot when so.
-fn oversize_warn_due(now: u64) -> bool {
-    use std::sync::atomic::Ordering;
-    let last = LAST_OVERSIZE_WARN.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < OVERSIZE_WARN_INTERVAL_SECS {
-        return false;
-    }
-    LAST_OVERSIZE_WARN
-        .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
 }
 
 /// A tool name (model- or pack-chosen) made safe for a log line: control and
@@ -445,13 +463,14 @@ pub trait SessionLockInner: Send + Sync {
 mod tests {
     #[test]
     fn oversize_warning_is_rate_limited() {
-        // Serialise against the other test touching the static.
+        // A private limiter: no shared static, so other tests that call
+        // `cap_tool_result_for` in parallel cannot disturb it.
+        let limiter = super::WarnLimiter::new(super::OVERSIZE_WARN_INTERVAL_SECS);
         let base = 1_000_000;
-        super::LAST_OVERSIZE_WARN.store(0, std::sync::atomic::Ordering::Relaxed);
-        assert!(super::oversize_warn_due(base), "first is due");
-        assert!(!super::oversize_warn_due(base + 1), "inside the interval");
-        assert!(!super::oversize_warn_due(base + 59));
-        assert!(super::oversize_warn_due(base + 60), "interval elapsed");
+        assert!(limiter.due(base), "first is due");
+        assert!(!limiter.due(base + 1), "inside the interval");
+        assert!(!limiter.due(base + 59));
+        assert!(limiter.due(base + 60), "interval elapsed");
     }
 
     #[test]

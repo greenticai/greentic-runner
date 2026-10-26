@@ -487,6 +487,10 @@ impl NodeKind {
     /// Whether a FAILED run of this node may already have changed something
     /// outside the turn. Same set as [`Self::performs_external_effect`] except
     /// `flow.call`, whose nested `drive_flow` classifies its own failure.
+    ///
+    /// This is only the default: a failure marked [`pre_effect`] (proven to
+    /// precede every effect of the node) does not count, see the failure site in
+    /// `drive_flow_tracked`.
     fn may_have_partial_effect_on_failure(&self) -> bool {
         !matches!(self, NodeKind::FlowCall) && self.performs_external_effect()
     }
@@ -497,8 +501,11 @@ impl NodeKind {
 /// a second approval request, a second upload). Failures before any effect keep
 /// their classification, so a transient failure there still retries.
 ///
-/// The message (`to_string()`) is preserved; the full cause chain is logged
-/// here because the rebuilt error no longer carries it.
+/// The rebuilt error carries only the OUTERMOST message (`err.to_string()`),
+/// the same text the error had before, because that string reaches the
+/// user-facing failure envelope (`metadata.error_message`) and a cause chain can
+/// name a host or URL. The full chain (`{err:#}`) goes to the operator log here,
+/// the only place it is still available.
 fn terminal_after_effects(err: anyhow::Error, effects_performed: bool) -> anyhow::Error {
     if !effects_performed || is_terminal_flow_error(&err) {
         return err;
@@ -507,8 +514,7 @@ fn terminal_after_effects(err: anyhow::Error, effects_performed: bool) -> anyhow
         error = %format!("{err:#}"),
         "flow failed after an earlier node performed an external effect; the turn is not re-run"
     );
-    // `{:#}` keeps the whole cause chain (the root cause is usually the useful part).
-    terminal_flow_error(format!("{err:#}"))
+    terminal_flow_error(err.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -1482,7 +1488,14 @@ impl FlowEngine {
                     // nested `drive_flow` tracks its own effects and has already
                     // made the failure terminal when it had any. Errors that are
                     // not retryable anyway (validation, config) are unaffected.
-                    if node.kind.may_have_partial_effect_on_failure() {
+                    //
+                    // A failure PROVEN to precede every effect (marked with
+                    // `pre_effect`: no handler configured, a payload that did not
+                    // validate, a request that was never published) leaves the
+                    // flag alone, so a transient one of those still retries. The
+                    // default stays conservative: an unmarked error sets it.
+                    if node.kind.may_have_partial_effect_on_failure() && !is_pre_effect_error(&err)
+                    {
                         *effects_performed = true;
                     }
                     return Err(FlowFailure {
@@ -2166,13 +2179,15 @@ impl FlowEngine {
         let handler = self
             .agent_node_handler
             .as_ref()
-            .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")?;
+            .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")
+            .map_err(pre_effect)?;
         // Inside a `flow:` tool the flow context has no session; the nested
         // agent then runs under the session the tool call derived
         // (`nested_flow`), never `""` (one conversation shared by every user
         // of the tenant) and never the caller's (whose lock it holds).
         let session_owned = crate::runner::nested_flow::agent_session_for(ctx.session_id)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::msg)
+            .map_err(pre_effect)?;
         let session_id = session_owned.as_str();
         let started = std::time::Instant::now();
         let mut result = handler
@@ -2651,7 +2666,7 @@ impl FlowEngine {
         let payload_agent = crate::runner::a2a_node::agent_from_payload(&payload);
         let agent_id = payload_agent.as_deref().unwrap_or(agent_id);
 
-        let pack = self.pack_for_flow(ctx)?;
+        let pack = self.pack_for_flow(ctx).map_err(pre_effect)?;
         let pack_id = pack.metadata().pack_id.to_string();
 
         // `message` must be configured. Refused as a value rather than as a
@@ -2790,9 +2805,12 @@ impl FlowEngine {
         resume_at_self: bool,
         decision_token: Option<String>,
     ) -> Result<DispatchOutcome> {
-        let handler = self.dispatch_handler_for(runtime).with_context(|| {
-            format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
-        })?;
+        let handler = self
+            .dispatch_handler_for(runtime)
+            .with_context(|| {
+                format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
+            })
+            .map_err(pre_effect)?;
 
         let await_mode = payload
             .get("await")
@@ -2912,9 +2930,13 @@ impl FlowEngine {
         graph_id: &str,
         payload: Value,
     ) -> Result<NodeOutput> {
-        let handler = self.graph_node_handler.as_ref().context(
-            "DwAgentGraph node dispatched but no GraphNodeHandler configured on FlowEngine",
-        )?;
+        let handler = self
+            .graph_node_handler
+            .as_ref()
+            .context(
+                "DwAgentGraph node dispatched but no GraphNodeHandler configured on FlowEngine",
+            )
+            .map_err(pre_effect)?;
         let session_id = ctx.session_id.unwrap_or("");
         let result = handler
             .execute(
@@ -3521,13 +3543,17 @@ impl FlowEngine {
             out_map: Value,
         }
 
-        let payload: ProviderPayload =
-            serde_json::from_value(payload).context("invalid payload for provider.invoke")?;
+        // Every `?` below up to `invoke_provider` precedes the provider call, so
+        // each failure is marked `pre_effect`: nothing has left the host yet.
+        let payload: ProviderPayload = serde_json::from_value(payload)
+            .context("invalid payload for provider.invoke")
+            .map_err(pre_effect)?;
         let op = payload
             .op
             .as_deref()
             .filter(|v| !v.trim().is_empty())
-            .with_context(|| "provider.invoke requires an op")?
+            .with_context(|| "provider.invoke requires an op")
+            .map_err(pre_effect)?
             .to_string();
 
         let prev = state
@@ -3550,13 +3576,14 @@ impl FlowEngine {
                     allow_pointer: true,
                 },
             )
-            .context("failed to render provider.invoke in_map")?
+            .context("failed to render provider.invoke in_map")
+            .map_err(pre_effect)?
         } else if !payload.input.is_null() {
             payload.input
         } else {
             Value::Null
         };
-        let input_json = serde_json::to_vec(&input_value)?;
+        let input_json = serde_json::to_vec(&input_value).map_err(pre_effect)?;
 
         self.validate_tool(
             ctx,
@@ -3565,15 +3592,18 @@ impl FlowEngine {
             payload.provider_type.as_deref(),
             &op,
             &input_value,
-        )?;
+        )
+        .map_err(pre_effect)?;
 
         let key = FlowKey {
             pack_id: ctx.pack_id.to_string(),
             flow_id: ctx.flow_id.to_string(),
         };
-        let pack_idx = *self.flow_sources.get(&key).with_context(|| {
-            format!("flow {} (pack {}) not registered", ctx.flow_id, ctx.pack_id)
-        })?;
+        let pack_idx = *self
+            .flow_sources
+            .get(&key)
+            .with_context(|| format!("flow {} (pack {}) not registered", ctx.flow_id, ctx.pack_id))
+            .map_err(pre_effect)?;
         let pack = Arc::clone(&self.packs[pack_idx]);
         let binding = pack.resolve_provider(
             payload.provider_id.as_deref(),
@@ -3593,7 +3623,7 @@ impl FlowEngine {
             return Ok(output);
         }
 
-        let binding = binding?;
+        let binding = binding.map_err(pre_effect)?;
         let exec_ctx = component_exec_ctx(ctx, node_id);
         #[cfg(feature = "fault-injection")]
         {
@@ -3603,7 +3633,9 @@ impl FlowEngine {
                 node_id: Some(node_id),
                 attempt: ctx.attempt,
             };
-            maybe_fail(FaultPoint::BeforeToolCall, fault_ctx).map_err(injected_error)?;
+            maybe_fail(FaultPoint::BeforeToolCall, fault_ctx)
+                .map_err(injected_error)
+                .map_err(pre_effect)?;
         }
         let provider_metric_id = payload
             .provider_id
@@ -10155,19 +10187,145 @@ mod tests {
         assert!(is_terminal_flow_error(&after));
         assert!(!should_retry(&after));
         assert_eq!(after.to_string(), "internal timeout: unavailable");
-        // The root cause survives the rebuild.
-        let chained = anyhow::Error::new(TransientFlowError("connection reset".into()))
-            .context("sorla.call failed");
+        // Only the outermost message survives the rebuild: the cause chain
+        // (which can name a host or URL) goes to the operator log, never into
+        // the text that reaches the user-facing failure envelope.
+        let chained = anyhow::Error::new(TransientFlowError(
+            "connect to https://internal.example:8443/x refused".into(),
+        ))
+        .context("sorla.call failed");
         let rebuilt = terminal_after_effects(chained, true);
         assert!(is_terminal_flow_error(&rebuilt));
-        assert!(
-            rebuilt.to_string().contains("sorla.call failed"),
-            "{rebuilt}"
+        assert_eq!(rebuilt.to_string(), "sorla.call failed");
+        assert!(!format!("{rebuilt:#}").contains("internal.example"));
+    }
+
+    #[test]
+    fn pre_effect_marker_keeps_message_and_inner_classification() {
+        let marked = pre_effect(
+            anyhow::Error::new(TransientFlowError("429 slow down".into())).context("llm call"),
         );
+        assert!(is_pre_effect_error(&marked));
+        assert_eq!(marked.to_string(), "llm call");
+        // The wrapped error's own type is still visible to the classifiers.
+        assert!(should_retry(&marked));
+        let with_ctx = marked.context("outer");
+        assert!(is_pre_effect_error(&with_ctx));
+        assert!(should_retry(&with_ctx));
+        // A terminal error stays terminal when marked.
+        assert!(is_terminal_flow_error(&pre_effect(terminal_flow_error(
+            "x"
+        ))));
+        // Unmarked errors are not pre-effect.
+        assert!(!is_pre_effect_error(&anyhow!("plain")));
+    }
+
+    type DispatchStep = fn() -> Result<crate::runner::remote_dispatch::RemoteDispatchAction>;
+
+    /// Scripted dispatcher: call N returns `script[N]` (the last repeats).
+    struct ScriptedDispatch {
+        calls: std::sync::atomic::AtomicUsize,
+        script: Vec<DispatchStep>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runner::remote_dispatch::RemoteDispatchHandler for ScriptedDispatch {
+        async fn dispatch(
+            &self,
+            _request: crate::runner::remote_dispatch::RemoteDispatch,
+        ) -> Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.script[n.min(self.script.len() - 1)])()
+        }
+    }
+
+    fn dispatched() -> Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+        Ok(crate::runner::remote_dispatch::RemoteDispatchAction::Dispatched)
+    }
+    fn transient_pre_effect() -> Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+        Err(pre_effect(
+            anyhow::Error::new(TransientFlowError("broker 503".into())).context("publish"),
+        ))
+    }
+    fn transient_unproven() -> Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+        Err(anyhow::Error::new(TransientFlowError("broker 503".into())).context("publish"))
+    }
+
+    /// Drive a chain of `agentic.call` nodes (fire-and-forget) against a
+    /// scripted dispatcher; return the failure and the number of dispatches.
+    fn drive_dispatch_chain(
+        handler: Option<Vec<DispatchStep>>,
+        nodes: usize,
+    ) -> (anyhow::Error, usize) {
+        let mut engine = jump_test_engine();
+        let scripted = handler.map(|script| {
+            Arc::new(ScriptedDispatch {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                script,
+            })
+        });
+        engine.remote_dispatch_handler = scripted
+            .clone()
+            .map(|h| h as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>);
+        let ids: Vec<String> = (0..nodes).map(|i| format!("n{i}")).collect();
+        let specs: Vec<(&str, &str, Value)> = ids
+            .iter()
+            .map(|id| (id.as_str(), "agentic.call", json!({ "await": false })))
+            .collect();
+        let flow = chain_flow("chain.flow", &specs);
+        let rt = Runtime::new().unwrap();
+        let ctx = jump_ctx("chain.flow");
+        let failure = match rt.block_on(engine.drive_flow(
+            &ctx,
+            flow,
+            ExecutionState::new(Value::Null),
+            None,
+            "chain.flow".to_string(),
+        )) {
+            Ok(_) => panic!("the chain must fail"),
+            Err(failure) => failure,
+        };
+        let count = scripted
+            .map(|h| h.calls.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0);
+        (failure.error, count)
+    }
+
+    #[test]
+    fn effect_node_failing_before_any_effect_is_retried() {
+        let (err, calls) = drive_dispatch_chain(Some(vec![transient_pre_effect]), 1);
+        assert_eq!(calls, 1);
+        assert!(!is_terminal_flow_error(&err), "{err:#}");
+        assert!(should_retry(&err), "{err:#}");
+    }
+
+    #[test]
+    fn effect_node_with_no_handler_configured_stays_retryable() {
+        let (err, _) = drive_dispatch_chain(None, 1);
         assert!(
-            rebuilt.to_string().contains("connection reset"),
-            "{rebuilt}"
+            err.to_string().contains("no RemoteDispatchHandler"),
+            "{err}"
         );
+        assert!(!is_terminal_flow_error(&err), "{err:#}");
+    }
+
+    #[test]
+    fn effect_node_failure_that_is_not_proven_pre_effect_is_terminal() {
+        let (err, calls) = drive_dispatch_chain(Some(vec![transient_unproven]), 1);
+        assert_eq!(calls, 1);
+        assert!(is_terminal_flow_error(&err), "{err:#}");
+        assert!(!should_retry(&err));
+    }
+
+    #[test]
+    fn failure_after_a_completed_effect_is_terminal_even_if_pre_effect_for_its_node() {
+        // n0 dispatches (an effect); n1 then fails with a transient error its
+        // own node can prove precedes ITS effects. n0's effect still counts, so
+        // the turn must not be re-run (which would dispatch n0 again).
+        let (err, calls) = drive_dispatch_chain(Some(vec![dispatched, transient_pre_effect]), 2);
+        assert_eq!(calls, 2);
+        assert!(is_terminal_flow_error(&err), "{err:#}");
+        assert!(!should_retry(&err));
     }
 
     #[test]
@@ -16236,6 +16394,57 @@ fn lift_node_error(output: Value, failure: Option<&(String, NodeOutput)>) -> Val
 #[error("{0}")]
 pub struct TransientFlowError(pub String);
 
+/// Wraps an error that is PROVEN to have happened before the failing node did
+/// anything outside the turn (nothing was published, no tool or provider call
+/// was made). The engine reads the marker to leave `effects_performed` unset
+/// for that failure, so a transient pre-effect error still retries the turn.
+/// Display is the wrapped error's, unchanged; its cause chain stays reachable
+/// to [`should_retry`] / [`is_terminal_flow_error`] (see `error_causes`).
+#[derive(Debug)]
+pub struct PreEffectError(anyhow::Error);
+
+impl std::fmt::Display for PreEffectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for PreEffectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The wrapped error itself is NOT repeated as a source (its message is
+        // this error's Display); `error_causes` looks inside instead.
+        self.0.source()
+    }
+}
+
+/// Mark `err` as having occurred before any external effect of the node. Use it
+/// only where that is provable; when in doubt, do not (the default is to assume
+/// the node may have done part of its work).
+pub fn pre_effect(err: impl Into<anyhow::Error>) -> anyhow::Error {
+    anyhow::Error::new(PreEffectError(err.into()))
+}
+
+/// Whether `err` was marked with [`pre_effect`] (at any depth of its chain).
+pub fn is_pre_effect_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<PreEffectError>())
+}
+
+/// Every cause in `err`, looking through [`PreEffectError`] wrappers into the
+/// error they wrap (which `source()` deliberately skips).
+fn error_causes(err: &anyhow::Error) -> Vec<&(dyn std::error::Error + 'static)> {
+    fn walk<'a>(err: &'a anyhow::Error, out: &mut Vec<&'a (dyn std::error::Error + 'static)>) {
+        for cause in err.chain() {
+            out.push(cause);
+            if let Some(wrapped) = cause.downcast_ref::<PreEffectError>() {
+                walk(&wrapped.0, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(err, &mut out);
+    out
+}
+
 /// Marks a failure as terminal: deterministic (a routing cycle, an unknown
 /// node, a missing required variable) or raised after side effects already ran
 /// (a step budget spent). Re-running the turn cannot help and would repeat the
@@ -16254,7 +16463,9 @@ pub(crate) fn terminal_flow_error(message: impl Into<String>) -> anyhow::Error {
 
 /// Whether any cause in the chain is a [`TerminalFlowError`].
 pub fn is_terminal_flow_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| cause.is::<TerminalFlowError>())
+    error_causes(err)
+        .into_iter()
+        .any(|cause| cause.is::<TerminalFlowError>())
 }
 
 /// Retry transient failures: anything typed as transient (an explicit
@@ -16267,7 +16478,7 @@ fn should_retry(err: &anyhow::Error) -> bool {
     if is_terminal_flow_error(err) {
         return false;
     }
-    let typed = err.chain().any(|cause| {
+    let typed = error_causes(err).into_iter().any(|cause| {
         if cause.is::<TransientFlowError>() || cause.is::<tokio::time::error::Elapsed>() {
             return true;
         }
