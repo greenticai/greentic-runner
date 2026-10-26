@@ -1110,7 +1110,7 @@ marked `#[non_exhaustive]`.**
 
 ## Round 24
 
-- **`ConsumerGone` re-creation keeps the escalated pause (`aw-event-bridge`).** The Round 23 shortcut (short pause
+- **`ConsumerGone` re-creation keeps the escalated pause (`aw-event-bridge`).** The short-pause shortcut introduced after Round 22 (short pause
   after a successful re-creation) made a durable that something keeps deleting cycle about twice a second. The pause is
   now decided by the pure `recreate_delay(created, fast_on_success, escalated)`: short only for a successful
   re-creation that followed a run of faults; `ConsumerGone` and failed attempts take the escalated delay.
