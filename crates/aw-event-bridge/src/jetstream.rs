@@ -72,7 +72,12 @@ pub const EMPTY_BATCH_FLOOR: Duration = Duration::from_millis(50);
 pub enum PullFault {
     /// `409`: the consumer reached `max_ack_pending`. Short fixed retry.
     MaxAckPending,
-    /// Anything else: exponential [`backoff_delay`].
+    /// A message saying the durable consumer itself is gone (deleted, not
+    /// found): the loop re-runs [`ensure_consumer`] to re-create it.
+    ConsumerGone,
+    /// Anything else (including every OTHER `409`: `Exceeded MaxWaiting`,
+    /// `Exceeded MaxRequestBatch`/`Expires`/`MaxBytes`, `Consumer is push
+    /// based`): warn and escalate with [`backoff_delay`].
     Other,
 }
 
@@ -83,12 +88,15 @@ pub enum PullFault {
 #[must_use]
 pub fn classify_pull_error(message: &str) -> PullFault {
     let lowered = message.to_ascii_lowercase();
+    // Only the server's own description of the ack-pending ceiling counts: a
+    // bare `409` also carries other conditions that must stay loud.
     if lowered.contains("maxackpending")
         || lowered.contains("max_ack_pending")
         || lowered.contains("max ack pending")
-        || lowered.contains("stream: 409")
     {
         PullFault::MaxAckPending
+    } else if lowered.contains("consumer deleted") || lowered.contains("consumer not found") {
+        PullFault::ConsumerGone
     } else {
         PullFault::Other
     }
@@ -169,19 +177,43 @@ pub async fn ensure_consumer(
     // a turn and would redeliver (and double-run) it. Converge it in place.
     if ack_wait_is_stale(consumer.cached_info().config.ack_wait)
         || consumer.cached_info().config.max_deliver != CONSUMER_MAX_DELIVER
-        || consumer.cached_info().config.max_ack_pending != MAX_ACK_PENDING
+        || max_ack_pending_needs_raise(consumer.cached_info().config.max_ack_pending)
     {
         tracing::warn!(
-            existing = ?consumer.cached_info().config.ack_wait,
-            wanted = ?ACK_WAIT,
-            "agentic-workers consumer ack_wait or max_deliver is stale; updating"
+            existing_ack_wait = ?consumer.cached_info().config.ack_wait,
+            wanted_ack_wait = ?ACK_WAIT,
+            existing_max_ack_pending = consumer.cached_info().config.max_ack_pending,
+            wanted_max_ack_pending = MAX_ACK_PENDING,
+            "agentic-workers consumer ack_wait, max_deliver or max_ack_pending is stale; updating"
         );
         return stream
-            .update_consumer(agentic_consumer_config())
+            .update_consumer(converged_consumer_config(
+                consumer.cached_info().config.max_ack_pending,
+            ))
             .await
             .context("update agentic-workers consumer ack_wait");
     }
     Ok(consumer)
+}
+
+/// Whether an existing durable's `max_ack_pending` is a finite limit BELOW
+/// the target and so should be raised. A larger (or unlimited, `<= 0`) value
+/// is left alone: during a rolling deploy an older build wants a smaller
+/// number, and converging both ways would flap the durable between builds.
+#[must_use]
+pub fn max_ack_pending_needs_raise(existing: i64) -> bool {
+    existing > 0 && existing < MAX_ACK_PENDING
+}
+
+/// The config to converge an existing durable to: ours, but never lowering a
+/// finite `max_ack_pending` an operator or a newer build already set higher.
+#[must_use]
+pub fn converged_consumer_config(existing_max_ack_pending: i64) -> consumer::pull::Config {
+    let mut config = agentic_consumer_config();
+    if existing_max_ack_pending > MAX_ACK_PENDING {
+        config.max_ack_pending = existing_max_ack_pending;
+    }
+    config
 }
 
 /// Whether an existing durable's `ack_wait` differs from the one we require.
@@ -485,7 +517,7 @@ pub async fn run_bridge_jetstream(
     client: async_nats::Client,
     invoker: Arc<dyn AgentDispatchInvoker>,
 ) -> Result<()> {
-    let consumer = ensure_consumer(&client).await?;
+    let mut consumer = ensure_consumer(&client).await?;
     let permits = Arc::new(tokio::sync::Semaphore::new(crate::MAX_INFLIGHT));
     let mut attempt: u32 = 0;
     loop {
@@ -522,6 +554,23 @@ pub async fn run_bridge_jetstream(
                                     );
                                     attempt = 0;
                                     tokio::time::sleep(MAX_ACK_PENDING_RETRY).await;
+                                }
+                                PullFault::ConsumerGone => {
+                                    tracing::warn!(%error, "durable consumer is gone; re-creating");
+                                    match ensure_consumer(&client).await {
+                                        Ok(fresh) => {
+                                            consumer = fresh;
+                                            attempt = 0;
+                                        }
+                                        Err(create_error) => {
+                                            tracing::warn!(error = %create_error, "re-creating durable consumer failed");
+                                            attempt = attempt.saturating_add(1);
+                                        }
+                                    }
+                                    tokio::time::sleep(backoff_delay(attempt)).await;
+                                    // The current pull belongs to the dead
+                                    // consumer: abandon it and open a new one.
+                                    break;
                                 }
                                 PullFault::Other => {
                                     tracing::warn!(%error, "jetstream message error; continuing");
@@ -762,8 +811,10 @@ mod tests {
     fn a_409_max_ack_pending_status_is_a_short_fixed_retry() {
         let wire = "error while processing messages from the stream: 409, Some(\"Exceeded MaxAckPending\")";
         assert_eq!(classify_pull_error(wire), PullFault::MaxAckPending);
-        let bare = "error while processing messages from the stream: 409, None";
-        assert_eq!(classify_pull_error(bare), PullFault::MaxAckPending);
+        assert_eq!(
+            classify_pull_error("stream: 409, Some(\"Exceeded MaxAckPending\")"),
+            PullFault::MaxAckPending
+        );
         assert!(MAX_ACK_PENDING_RETRY >= Duration::from_millis(250));
         assert!(MAX_ACK_PENDING_RETRY <= Duration::from_secs(1));
     }
@@ -774,9 +825,41 @@ mod tests {
             "error while processing messages from the stream: 503, Some(\"JetStream unavailable\")",
             "error while processing messages from the stream: 400, Some(\"Bad Request\")",
             "no responders",
+            "error while processing messages from the stream: 409, None",
+            "error while processing messages from the stream: 409, Some(\"Exceeded MaxWaiting\")",
+            "error while processing messages from the stream: 409, Some(\"Exceeded MaxRequestBatch of 10\")",
+            "error while processing messages from the stream: 409, Some(\"Exceeded MaxRequestExpires of 1s\")",
+            "error while processing messages from the stream: 409, Some(\"Exceeded MaxRequestMaxBytes of 1024\")",
+            "error while processing messages from the stream: 409, Some(\"Consumer is push based\")",
         ] {
             assert_eq!(classify_pull_error(wire), PullFault::Other, "{wire}");
         }
+    }
+
+    #[test]
+    fn a_deleted_consumer_is_not_max_ack_pending_and_triggers_recreate() {
+        for wire in [
+            "error while processing messages from the stream: 409, Some(\"Consumer Deleted\")",
+            "error while processing messages from the stream: 404, Some(\"consumer not found\")",
+        ] {
+            assert_eq!(classify_pull_error(wire), PullFault::ConsumerGone, "{wire}");
+        }
+    }
+
+    #[test]
+    fn max_ack_pending_is_only_ever_raised() {
+        assert!(max_ack_pending_needs_raise(MAX_ACK_PENDING / 2));
+        assert!(!max_ack_pending_needs_raise(MAX_ACK_PENDING));
+        assert!(!max_ack_pending_needs_raise(MAX_ACK_PENDING * 2));
+        assert!(!max_ack_pending_needs_raise(-1));
+        assert_eq!(
+            converged_consumer_config(MAX_ACK_PENDING * 2).max_ack_pending,
+            MAX_ACK_PENDING * 2
+        );
+        assert_eq!(
+            converged_consumer_config(MAX_ACK_PENDING / 2).max_ack_pending,
+            MAX_ACK_PENDING
+        );
     }
 
     #[test]

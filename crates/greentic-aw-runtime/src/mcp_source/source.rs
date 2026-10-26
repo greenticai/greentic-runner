@@ -405,7 +405,7 @@ impl McpToolSource {
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| format!("decode failed: {e}"))?;
+            .map_err(|e| format!("decode failed: {}", e.without_url()))?;
         parse_rows_with(body, tenant_key, &self.token_provider)
     }
 

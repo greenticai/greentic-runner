@@ -878,6 +878,14 @@ pre-flight: a DNS-rebinding answer that differs on connect, and redirects, are N
 The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtime 0.12. Other clients
 (admin/billing/OAuth/sorx route docs/approval inbox) target operator-set URLs and are not guarded.
 
+### Round 20 notes
+
+- Tool-secret env deny-list also covers `AWS_BEARER_*`, `AWS_SECURITY_*`, `AWS_ACCESS_KEY*`, `ARM_*`, `CLOUDSDK_*`, `GOOGLE_OAUTH_*`, `AZURE_*_CONNECTION_STRING`, `AZURE_CREDENTIALS`, `AZURE_DEVOPS_EXT_PAT`; `AWS_REGION`, `AWS_PROFILE`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and third-party `*_API_KEY` stay usable.
+- JetStream pull errors (`aw-event-bridge`): only a description naming `MaxAckPending` is the quiet 500 ms retry; other `409`s warn and back off; `Consumer Deleted`/`consumer not found` re-runs `ensure_consumer`. `ensure_consumer` only RAISES a finite `max_ack_pending` (never lowers it), so a rolling deploy does not flap it.
+- Error text for MCP store pulls uses `url_redact::redact_http_url(url)` (no userinfo/query/fragment); reqwest body/decode errors use `without_url()` before `to_string()`.
+- `PackRuntime::read_pack_file` on a DIRECTORY pack is capped at 64 MiB per file (`MAX_ARCHIVE_ENTRY_READ_BYTES`), same as archive entries.
+- See `docs/audit-breaking-changes.md` (Round 20).
+
 ### Engine and tool-secret rules (round 11)
 
 - **Tool-secret env fallback has a deny-list.** `secret://a/b` maps to env var `A_B` for local runs
