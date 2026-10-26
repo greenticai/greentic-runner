@@ -884,10 +884,14 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
   (`agent_node::env_secret_lookup`), but host configuration resolves as not found
   (`env_secret_name_is_denied`): the exact names `ADMIN_TOKEN`, `OPERATOR_TOKEN`, `PACK_PUBLIC_KEY`,
   `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`,
-  `TELEGRAM_BOT_TOKEN`, `REDIS_URL`, `OTLP_ENDPOINT`, `OTLP_HEADERS`, `PGPASSWORD`, `KUBECONFIG`, `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`,
+  `TELEGRAM_BOT_TOKEN`, `REDIS_URL`, `OTLP_ENDPOINT`, `OTLP_HEADERS`, `PGPASSWORD`, `KUBECONFIG`, `NPM_TOKEN`,
   `CARGO_REGISTRY_TOKEN`, `SSH_AUTH_SOCK`, and any name with the prefix `GREENTIC_`,
-  `TENANT_JWT_`, `SECRETS_`, `PACK_`, or (ambient cloud/infra credentials, round 18) `AWS_`, `AZURE_`, `GOOGLE_`,
-  `GCP_`, `DATABASE_`, `NATS_`, `POSTGRES_`, `MYSQL_`, `KUBERNETES_`. Extend `ENV_SECRET_DENY_EXACT` / `ENV_SECRET_DENY_PREFIXES` when a new
+  `TENANT_JWT_`, `SECRETS_`, `PACK_`, or (ambient cloud/infra credentials, narrowed in round 19) the exact names
+  `AWS_ACCESS_KEY_ID`, `AZURE_CLIENT_SECRET`, `AZURE_USERNAME`, `AZURE_PASSWORD`, `GOOGLE_APPLICATION_CREDENTIALS`
+  and the prefixes `AWS_SECRET_`, `AWS_SESSION_`, `AWS_CONTAINER_`, `AWS_WEB_IDENTITY_`, `AWS_SHARED_`,
+  `AZURE_FEDERATED_`, `AZURE_CLIENT_CERTIFICATE_`, `AZURE_STORAGE_`, `GOOGLE_CLOUD_`, `GCP_`, `DATABASE_`, `NATS_`,
+  `POSTGRES_`, `MYSQL_`, `KUBERNETES_`. Third-party API keys sharing a vendor prefix (`GOOGLE_API_KEY`,
+  `AZURE_OPENAI_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`) and the non-secret `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` are NOT denied. Extend `ENV_SECRET_DENY_EXACT` / `ENV_SECRET_DENY_PREFIXES` when a new
   host-level env secret is introduced. `OPENAI_API_KEY` is deliberately NOT denied.
 - **Tool-extension HTTP client** (`build_tool_http_client`): `redirect::Policy::none()` plus the `http_guard`
   address policy on DNS (a reqwest-0.12 resolver, since the ext-runtime pins 0.12 and `GuardedResolver` targets 0.13).
@@ -974,7 +978,7 @@ Two retry layers re-run a failed turn from its start: the engine's own loop (`ex
 
 **Known limitation: a failed resume after admission leaves the wait without a timeout.** `RuntimeSessionResumer::resume_checked` retires the deadline watchdog at admission, before `handle` runs. If `handle` then fails with an infrastructure error (resume-store read/save, `PostEffectPersistence`) the response is spent and no watchdog remains, so a still-parked wait has no timeout and the user hears nothing until they message again (`dispatch_to_resumer_outcome` logs it at `error`). Not re-armed on purpose: the original deadline is not recorded, a synthetic `timeout` would resume the park and repeat effects after a post-effect failure, and an approval would also need its nonce/`decision_token`. A fix needs the deadline persisted with the park.
 
-**Backpressure (aw-event-bridge JetStream path).** `run_bridge_jetstream` takes a `MAX_INFLIGHT` semaphore slot before each pull (`fetch().max_messages(<slots>)`), so unread messages stay in the stream; the durable's `max_ack_pending` equals `MAX_INFLIGHT` and `ensure_consumer` converges a stale one. Pulling a message without a slot would let it sit unacked, with no progress acks, past `ack_wait` and run twice.
+**Backpressure (aw-event-bridge JetStream path).** `run_bridge_jetstream` takes a `MAX_INFLIGHT` semaphore slot before each pull (`fetch().max_messages(<slots>)`), so unread messages stay in the stream; the durable's `max_ack_pending` is `2 * MAX_INFLIGHT` and `ensure_consumer` converges a stale one. That limit is CONSUMER-WIDE, so it is a fleet-wide ceiling shared by every replica, not a per-replica cap; the headroom is for Nak'd (busy/error) messages, which hold ack-pending without a permit. A pull answered `409` (`Exceeded MaxAckPending`, async-nats surfaces it as a stream error item) is retried after a fixed 500 ms (`classify_pull_error`), at `debug`, without escalating the backoff; a pull that returns no message pauses 50-100 ms (`empty_batch_delay`) so an idle stream cannot hot-loop. Pulling a message without a slot would let it sit unacked, with no progress acks, past `ack_wait` and run twice.
 
 **Bounded intake of pack-carried extensions and store artifacts.** `pack_extensions::stage_from_packs` stages one archive at a time (read, stage, release) and caps a pass at 64 entries / 512 MiB total (`stage_bounded`; over-cap entries become `StagingFailure`s). `mcp_store_pull::download_artifact` streams the body through `collect_capped` against `MAX_ARTIFACT_BYTES`; never use `response.bytes()` there.
 

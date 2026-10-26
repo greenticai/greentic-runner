@@ -984,3 +984,34 @@ marked `#[non_exhaustive]`.**
 - **Store pull body is capped while streaming (`mcp_store_pull`).** `download_artifact` reads the body chunk by
   chunk and fails with `Integrity` once `MAX_ARTIFACT_BYTES` is passed, instead of buffering a chunked body
   with no `Content-Length` first.
+
+## Round 19
+
+- **JetStream agentic consumer: `max_ack_pending` is `2 * MAX_INFLIGHT` (512) and is fleet-wide (`aw-event-bridge`).**
+  The limit is a property of the durable consumer, shared by EVERY replica, not a per-replica cap, and a message
+  holds ack-pending from delivery until its ack, including the delay after a busy/error Nak when it has no permit.
+  Equal to `MAX_INFLIGHT` there was no headroom for those waiting redeliveries. `ensure_consumer` converges an
+  existing durable (was 256). The earlier Round 18b wording ("per replica") was wrong. A pull answered `409`
+  (`Exceeded MaxAckPending`; async-nats 0.47 yields it as a stream error item) is now retried after a fixed 500 ms at
+  `debug`, without escalating the 0.5s..30s backoff. A pull that returns no message (`404`/`408`) pauses
+  50-100 ms (`empty_batch_delay`) instead of re-fetching at once.
+- **SQLite SQL gateway: `query_only` is on for every pool (M3).** The statement-shape guard reads only the first keyword,
+  so `WITH t AS (SELECT 1) DELETE FROM x` passed on a `read_only: false` pool. `PRAGMA query_only = ON` is now set
+  whatever `read_only` says. **Affected:** a `read_only: false` SQLite connection can no longer write through the gateway
+  (the gateway only reads).
+- **Tool-secret env deny-list is narrowed (M4).** `AWS_`, `AZURE_`, `GOOGLE_` and the exact `GITHUB_TOKEN` / `GH_TOKEN`
+  blocked natural names for a tool's own key. Denied now: exact `AWS_ACCESS_KEY_ID`, `AZURE_CLIENT_SECRET`,
+  `AZURE_USERNAME`, `AZURE_PASSWORD`, `GOOGLE_APPLICATION_CREDENTIALS` and prefixes `AWS_SECRET_`, `AWS_SESSION_`,
+  `AWS_CONTAINER_`, `AWS_WEB_IDENTITY_`, `AWS_SHARED_`, `AZURE_FEDERATED_`, `AZURE_CLIENT_CERTIFICATE_`,
+  `AZURE_STORAGE_`, `GOOGLE_CLOUD_`, `GCP_`. **Affected (loosened):** `GOOGLE_API_KEY`, `AZURE_OPENAI_API_KEY`,
+  `GITHUB_TOKEN`, `GH_TOKEN`, `AWS_REGION`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` resolve again. Note `GITHUB_TOKEN` in
+  a GitHub Actions runner is ambient: do not run the runner with a repo token in its env.
+- **Error-text redaction (L1, L3).** `run_outcome::error` also redacts `accountkey`, `signingkey`, `encryptionkey`,
+  `sessionkey` and camelCase `...Key` keys (`storageKey`); `session_id` is not. Pack index oversize errors and a failed
+  pack/index body read no longer carry the request URL (`copy_capped` flattens the `io::Error` chain without
+  `" for url (...)"`); more reqwest transport errors in aw-runtime and the host now use `without_url()`
+  (MCP store pull, MCP admin source, OpenAI backend, graph registry, guardrail policy, sorx invoke).
+- **Pack-carried extension staging reads under the remaining budget (L5/L6).** `stage_bounded` hands the reader the
+  bytes left in the 512 MiB aggregate (`PackRuntime::read_pack_file_capped`), so an over-budget entry is refused while it
+  is read, not after it was loaded whole. The tests drive `stage_bounded` (the production path) instead of a
+  separate `cfg(test)` copy.
