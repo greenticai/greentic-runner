@@ -946,7 +946,7 @@ marked `#[non_exhaustive]`.**
   `Ocp-Apim-Subscription-Key` and a bare `key=` are now redacted; `secret_missing`, `max_tokens`, `design`, `signal`,
   `keyboard` are not. Not covered: the `dst.` prefix of `agent_audit` (a `.` is not a key byte here).
 - **Tool-secret env deny-list grows (F7).** `secret://aws/...`, `azure`, `google`, `gcp`, `database`, `nats`, `postgres`,
-  `mysql`, `kubernetes` (prefixes `AWS_`, `AZURE_`, `GOOGLE_`, `GCP_`, `DATABASE_`, `NATS_`, `POSTGRES_`, `MYSQL_`,
+  `mysql`, `kubernetes` (**narrowed in Round 19 M4, extended in Rounds 20-22; the current list is in `agent_node.rs` and CLAUDE.md**) (prefixes `AWS_`, `AZURE_`, `GOOGLE_`, `GCP_`, `DATABASE_`, `NATS_`, `POSTGRES_`, `MYSQL_`,
   `KUBERNETES_`) and the exact names `PGPASSWORD`, `KUBECONFIG`, `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`,
   `CARGO_REGISTRY_TOKEN`, `SSH_AUTH_SOCK` now resolve as not found. **Affected:** an extension tool that read its key from
   such an env var; seal it as a real secret instead.
@@ -1086,9 +1086,11 @@ marked `#[non_exhaustive]`.**
   reset the backoff `attempt` and the fault count on every successful `ensure_consumer`, but `get_or_create_consumer`
   returns an existing durable unchanged, so a fault that is not a missing durable (stable `409 MaxWaiting`, `400`,
   `503` while the consumer is alive) cycled about every 2 s (0.5, 1, 0.5, ...) with two API calls per cycle instead of
-  escalating to 30 s. Now a re-creation escalates the backoff on success and failure alike (pure
+  escalating to 30 s. Now the backoff counter escalates on every re-creation, success and failure alike (pure
   `recreate_backoff`), and `attempt` is reset only by proof of life: a received message, a cleanly ended pull, or
-  `409 MaxAckPending`. The fault count still resets on a successful re-creation. The claim that acks to the old
+  `409 MaxAckPending`. The fault count still resets on a successful re-creation. The PAUSE after a successful re-creation that followed a run of faults
+  is short (`backoff_delay(0)`, Round 24: pure `recreate_delay`) so recovery after an outage is not stalled; a
+  `ConsumerGone` re-creation and any failed one take the escalated delay. The claim that acks to the old
   delivery are ignored holds only when the durable was really deleted; if `get_or_create` returned the existing one
   the deliveries stay valid.
 - **`redact_http_url` no longer leaks a suffix after an `@` in the path or query (F2).** CONFIRMED:
@@ -1099,9 +1101,19 @@ marked `#[non_exhaustive]`.**
 - **Dispatch-ledger wording (F3).** The serve default is not always no-op: `agent_node::serve_agentic` installs
   `RedisDispatchLedger` when `GREENTIC_AW_REDIS_URL` is set with the `redis` backend; `serve()` and
   `RuntimeAgentDispatchInvoker::new` default to `NoopDispatchLedger`. Round 20 F3 and Round 21 F5 are marked superseded.
-- **Test determinism (F4).** `HttpConfigProvider` has a test-only-used `with_client`; the URL-leak test builds a
-  `.no_proxy()` client so `HTTP(S)_PROXY` / `ALL_PROXY` in the environment cannot change the result.
+- **Test determinism (F4).** `HttpConfigProvider::with_client` lets every wiremock test build a `.no_proxy()`
+  client (`direct()`), so `HTTP(S)_PROXY` / `ALL_PROXY` in the environment cannot change a result.
 - **Tool-secret env deny-list (F5).** Adds exact `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (proxy URLs embed
   `user:pass@`), `SENTRY_DSN`, `GIT_ASKPASS`, `DOCKER_CONFIG`. `env_secret_name_is_denied` now upper-cases its input so
   lowercase spellings (`https_proxy`) are covered. `NO_PROXY` is a host list and stays allowed. **Affected:** a tool
   reading one of these through `secret://` now gets "not found".
+
+## Round 24
+
+- **`ConsumerGone` re-creation keeps the escalated pause (`aw-event-bridge`).** The Round 23 shortcut (short pause
+  after a successful re-creation) made a durable that something keeps deleting cycle about twice a second. The pause is
+  now decided by the pure `recreate_delay(created, fast_on_success, escalated)`: short only for a successful
+  re-creation that followed a run of faults; `ConsumerGone` and failed attempts take the escalated delay.
+- **Additive public API not listed above:** `runner_core::net_guard` (shared SSRF classification),
+  `runner_core::{PackPolicy, join_public_keys}` re-exports, `greentic_aw_runtime::{url_redact, scoped_secrets}`
+  modules. They add surface only and do not change the semver recommendation.

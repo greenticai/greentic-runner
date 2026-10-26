@@ -660,6 +660,7 @@ pub async fn run_bridge_jetstream(
                                         &mut consumer,
                                         &mut attempt,
                                         &mut faults,
+                                        false,
                                     )
                                     .await;
                                     // The current pull belongs to the dead
@@ -676,6 +677,7 @@ pub async fn run_bridge_jetstream(
                                             &mut consumer,
                                             &mut attempt,
                                             &mut faults,
+                                            true,
                                         )
                                         .await;
                                         break;
@@ -718,7 +720,8 @@ pub async fn run_bridge_jetstream(
                 tracing::warn!(%error, "open jetstream pull failed");
                 drop(slots);
                 if faults.record() {
-                    recreate_consumer(&client, &mut consumer, &mut attempt, &mut faults).await;
+                    recreate_consumer(&client, &mut consumer, &mut attempt, &mut faults, true)
+                        .await;
                 } else {
                     tokio::time::sleep(backoff_delay(attempt)).await;
                     attempt = attempt.saturating_add(1);
@@ -743,33 +746,46 @@ fn recreate_backoff(attempt: u32) -> (Duration, u32) {
     (backoff_delay(attempt), attempt.saturating_add(1))
 }
 
+/// The pause after a re-creation attempt. After a SUCCESSFUL re-creation that
+/// followed a run of faults (`fast_on_success`), pull again almost at once: the
+/// durable is back, and the escalated delay would only stall recovery after an
+/// outage. A `ConsumerGone` re-creation is not given that shortcut, so a
+/// durable that something keeps deleting climbs to the cap instead of cycling
+/// twice a second. A failed attempt always takes the escalated delay.
+#[must_use]
+fn recreate_delay(created: bool, fast_on_success: bool, escalated: Duration) -> Duration {
+    if created && fast_on_success {
+        backoff_delay(0)
+    } else {
+        escalated
+    }
+}
+
 /// Re-run [`ensure_consumer`] and swap in the fresh handle. On success the
 /// fault count resets (the next re-creation needs a new run of faults) but the
-/// backoff keeps escalating; on failure the fault count is kept so the next
-/// fault retries, after a backoff.
+/// backoff counter keeps escalating; on failure the fault count is kept so the
+/// next fault retries, after a backoff. See [`recreate_delay`] for the pause.
 async fn recreate_consumer(
     client: &async_nats::Client,
     consumer: &mut consumer::Consumer<consumer::pull::Config>,
     attempt: &mut u32,
     faults: &mut ConsecutiveFaults,
+    fast_on_success: bool,
 ) {
     let (escalated, next) = recreate_backoff(*attempt);
     *attempt = next;
-    let delay = match ensure_consumer(client).await {
+    let created = match ensure_consumer(client).await {
         Ok(fresh) => {
             *consumer = fresh;
             faults.clear();
-            // The durable is back: pull again almost at once. The counter
-            // still escalated above, so a fault that survives the
-            // re-creation climbs to the cap on the next round.
-            backoff_delay(0)
+            true
         }
         Err(create_error) => {
             tracing::warn!(error = %create_error, "re-creating durable consumer failed");
-            escalated
+            false
         }
     };
-    tokio::time::sleep(delay).await;
+    tokio::time::sleep(recreate_delay(created, fast_on_success, escalated)).await;
 }
 
 async fn handle_one(
@@ -1021,6 +1037,15 @@ mod tests {
         faults.clear();
         assert_eq!(faults.count(), 0);
         assert!(!faults.record(), "a successful pull restarts the count");
+    }
+
+    #[test]
+    fn recreate_delay_is_fast_only_after_a_successful_fault_run_recreation() {
+        let escalated = Duration::from_secs(30);
+        assert_eq!(recreate_delay(true, true, escalated), backoff_delay(0));
+        assert_eq!(recreate_delay(true, false, escalated), escalated);
+        assert_eq!(recreate_delay(false, true, escalated), escalated);
+        assert_eq!(recreate_delay(false, false, escalated), escalated);
     }
 
     #[test]
