@@ -1015,3 +1015,31 @@ marked `#[non_exhaustive]`.**
   bytes left in the 512 MiB aggregate (`PackRuntime::read_pack_file_capped`), so an over-budget entry is refused while it
   is read, not after it was loaded whole. The tests drive `stage_bounded` (the production path) instead of a
   separate `cfg(test)` copy.
+
+## Round 20
+
+- **Tool-secret env deny-list covers the credentials the Round 19 narrowing dropped (F1).** Additionally denied:
+  prefixes `AWS_BEARER_` (`AWS_BEARER_TOKEN_BEDROCK`), `AWS_SECURITY_` (`AWS_SECURITY_TOKEN`), `AWS_ACCESS_KEY`
+  (legacy `AWS_ACCESS_KEY` and `AWS_ACCESS_KEY_ID`), `ARM_` (Terraform/azurerm service principal), `CLOUDSDK_`,
+  `GOOGLE_OAUTH_`; exact `AZURE_CREDENTIALS`, `AZURE_ACCESS_TOKEN`, `AZURE_DEVOPS_EXT_PAT`; and any
+  `AZURE_*_CONNECTION_STRING`. Still allowed: `AWS_REGION`, `AWS_PROFILE`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
+  third-party `*_API_KEY`. **Affected:** a tool that read one of the newly denied names through `secret://` now gets
+  "not found"; supply it through the secrets backend instead.
+- **JetStream pull `409` is no longer always "max ack pending" (F2, `aw-event-bridge`).** Only a description naming
+  `MaxAckPending` / `max_ack_pending` / `max ack pending` takes the quiet 500 ms retry. Any other `409` (`Exceeded
+  MaxWaiting`, `Exceeded MaxRequestBatch/Expires/MaxBytes`, `Consumer is push based`, a bare `409`) warns and
+  escalates the backoff. `Consumer Deleted` / `consumer not found` re-runs `ensure_consumer` to re-create the durable.
+- **MCP store pull and decode errors no longer carry the URL (F3, `greentic-aw-runtime`).** Messages from
+  `download_artifact` / `collect_capped` name `scheme://host/path` only (new `url_redact::redact_http_url`: userinfo,
+  query and fragment dropped), and body/decode errors in the MCP admin source, graph registry, OpenAI backend and
+  guardrail policy go through `without_url()` first. The Round 19 claim that the store pull was covered was
+  inaccurate. Known gap unchanged: `greentic-a2a` `CardCache`.
+- **`max_ack_pending` is only ever raised (F4).** `ensure_consumer` converges an existing durable only when its finite
+  `max_ack_pending` is BELOW 512 (and keeps a larger value when it updates for `ack_wait`/`max_deliver`), so a rolling
+  deploy no longer flaps 512 <-> 256 from the new build's side. An older build still lowers it to 256 on its own start.
+  The warning names `max_ack_pending`.
+- **Pack download error scrubbing balances parentheses (F5a).** `strip_url_suffix` removes a `" for url (...)"` suffix
+  whose URL contains balanced `( )`. A lone literal `)` in the URL still ends the suffix early.
+- **Directory packs: `read_pack_file` is capped at 64 MiB per file (F5b).** `PackRuntime::read_pack_file` for a
+  materialised pack DIRECTORY uses the same `MAX_ARCHIVE_ENTRY_READ_BYTES` (64 MiB) bound as an archive entry.
+  **Affected:** a directory pack with a sidecar or asset over 64 MiB now reads as missing (`None`, with a warning).
