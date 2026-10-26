@@ -828,7 +828,7 @@ the awaiting flow stays parked until its watchdog fires (forever with no deadlin
 redelivered while the message is younger than `busy_budget(step_timeout)` (handle timeout + 60 s, at most 31 min),
 measured from the message's publish time; every Nak counts against the server's `max_deliver`, so the consumer's is
 now the backstop `CONSUMER_MAX_DELIVER` (100) and `MAX_DELIVER` (6) is the application cap for handler ERRORS only. Handler errors are
-counted per stream sequence in-process (`jetstream::ErrorAttempts`), not from the delivery count, so busy Naks do not spend
+counted per stream sequence in-process (`jetstream::ErrorAttempts`, least-recently-recorded eviction), not from the delivery count, so busy Naks do not spend
 that budget; if `info()` fails the delivery is settled as the last one.
 
 ### What a component is told about its caller
@@ -904,8 +904,12 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
   a failure wrapped with `engine::pre_effect(err)` (`PreEffectError`: proven to precede every effect, e.g. no handler
   configured, `provider.invoke` before `invoke_provider`, a NATS request that was never published) does not, so a
   transient one still retries. Mark only what is provable; an earlier completed effect still makes the turn terminal.
-  `terminal_after_effects` keeps only the OUTERMOST message in the reason (it reaches `metadata.error_message`, user
-  facing) and logs the full `{err:#}` chain at `warn`.
+  `terminal_after_effects` rebuilds the error as a `TerminalFlowError` whose `Display` is only the OUTERMOST message
+  (it reaches `metadata.error_message`, user facing) but whose `source()` keeps the original causes, so `{err:#}` /
+  `anyhow_chain_text` (operator log, redacted run error, `FlowTerminal.reason`) still see the root cause; never put
+  `err:#` into a user-facing string. The full chain is also logged at `warn`. A deterministic pre-effect error whose
+  message echoes input (`tenant_ctx_for_audit`) is a `terminal_flow_error` so `should_retry`'s text heuristic cannot
+  retry it; other deterministic errors containing "internal"/"unavailable"/"timeout" can still be retried (known).
 - **`redirect_count` (`flow.goto`) is per turn**, reset on resume. `drive_flow` also caps one turn at
   `MAX_STEPS_PER_TURN` (10,000) nodes.
 - **`RunnerHost` installs `DiscardSessionHost`** as the engine-level `SessionHost`; the store-backed host was
@@ -939,7 +943,7 @@ Two retry layers re-run a failed turn from its start: the engine's own loop (`ex
 - **After an effect, a failure is terminal.** `drive_flow` tracks whether a node that performs an external effect
   has succeeded in THIS run (`NodeKind::performs_external_effect`: `provider.invoke`, `flow.call`, `dw.agent`,
   `dw.agent_graph`, `sorla/operala/agentic/telco-x/approval.call`, `mcp`, `a2a`, `media.create`); any later failure
-  of the run is rewrapped by `terminal_after_effects` (outermost message kept, cause chain logged at `warn`) so neither layer
+  of the run is rewrapped by `terminal_after_effects` (outermost message as `Display`, causes kept as `source()`) so neither layer
   repeats the effect. Failures BEFORE any such node keep their classification, so transient failures still retry.
   Not counted, on purpose: `emit.*` (only appends to the turn's egress, dropped on failure), `var.set`, `state.get`,
   `state.set` (an overwrite is idempotent), `session.wait`, `flow.goto`. **Known limitations:** generic component

@@ -401,10 +401,18 @@ mod aw {
         tenant_id: &str,
         env_id: &str,
     ) -> Result<greentic_types::TenantCtx> {
-        let env = greentic_types::EnvId::from_str(env_id)
-            .map_err(|err| anyhow::anyhow!("invalid env id `{env_id}`: {err}"))?;
-        let tenant = greentic_types::TenantId::from_str(tenant_id)
-            .map_err(|err| anyhow::anyhow!("invalid tenant id `{tenant_id}`: {err}"))?;
+        // A bad id is deterministic, and its message echoes the id, which can
+        // contain a word `should_retry`'s text heuristic treats as transient
+        // ("internal", "timeout", ...). Terminal, so re-running the turn is
+        // never attempted for it.
+        let env = greentic_types::EnvId::from_str(env_id).map_err(|err| {
+            crate::runner::engine::terminal_flow_error(format!("invalid env id `{env_id}`: {err}"))
+        })?;
+        let tenant = greentic_types::TenantId::from_str(tenant_id).map_err(|err| {
+            crate::runner::engine::terminal_flow_error(format!(
+                "invalid tenant id `{tenant_id}`: {err}"
+            ))
+        })?;
         Ok(greentic_types::TenantCtx::new(env, tenant))
     }
 
@@ -4609,6 +4617,35 @@ mod aw {
             let ctx = super::tenant_ctx_for_audit("acme", "prod").expect("valid ids");
             assert_eq!(ctx.tenant.as_str(), "acme");
             assert_eq!(ctx.env.as_str(), "prod");
+        }
+
+        #[tokio::test]
+        async fn invalid_ids_fail_pre_effect_and_terminal_before_the_runtime_steps() {
+            // The id echoes into the message and contains words the retry text
+            // heuristic reads as transient; the failure must still be terminal
+            // and proven pre-effect (nothing ran, nothing to repeat).
+            let runtime = runtime_with_scripted_remember_call("t1", "e1");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let handler =
+                RuntimeAgentNodeHandler::new(runtime, Some(AuditSink::from_sender(tx)), None, None);
+            let err = handler
+                .execute(
+                    "internal timeout unavailable!",
+                    "e1",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "hi"}),
+                    false,
+                    None,
+                )
+                .await
+                .expect_err("an invalid tenant id must fail");
+            assert!(crate::runner::engine::is_pre_effect_error(&err), "{err:#}");
+            assert!(
+                crate::runner::engine::is_terminal_flow_error(&err),
+                "{err:#}"
+            );
+            assert!(rx.try_recv().is_err(), "no step ran, so no audit event");
         }
 
         #[test]

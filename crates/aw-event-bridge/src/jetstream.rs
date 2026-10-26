@@ -111,7 +111,7 @@ pub const MAX_DELIVER: i64 = 6;
 pub const CONSUMER_MAX_DELIVER: i64 = 100;
 
 /// Most stream sequences [`ErrorAttempts`] tracks at once. When full, the
-/// OLDEST tracked sequence is evicted (the counts are best effort,
+/// LEAST RECENTLY RECORDED sequence is evicted (a repeat error refreshes it) (the counts are best effort,
 /// [`CONSUMER_MAX_DELIVER`] still bounds); the rest keep their counts, so a
 /// poison pill mid-way through its budget is not reset by unrelated traffic.
 const ERROR_ATTEMPTS_CAP: usize = 4096;
@@ -130,7 +130,7 @@ pub struct ErrorAttempts {
 #[derive(Debug, Default)]
 struct AttemptTable {
     counts: std::collections::HashMap<u64, i64>,
-    /// Tracked sequences, oldest first (every key of `counts` appears once).
+    /// Tracked sequences, least recently recorded first (every key of `counts` appears once).
     order: std::collections::VecDeque<u64>,
 }
 
@@ -144,7 +144,13 @@ impl ErrorAttempts {
     /// Record one more handler error for `sequence`; returns the new count.
     pub fn record(&self, sequence: u64) -> i64 {
         let mut table = self.table();
-        if !table.counts.contains_key(&sequence) {
+        if table.counts.contains_key(&sequence) {
+            // Refresh recency: move to the back without duplicating the key.
+            if let Some(pos) = table.order.iter().position(|tracked| *tracked == sequence) {
+                table.order.remove(pos);
+            }
+            table.order.push_back(sequence);
+        } else {
             while table.counts.len() >= ERROR_ATTEMPTS_CAP {
                 match table.order.pop_front() {
                     Some(oldest) => {
@@ -694,6 +700,28 @@ mod tests {
         assert_eq!(attempts.record(2), 3);
         assert_eq!(attempts.len(), ERROR_ATTEMPTS_CAP);
         assert_eq!(attempts.count(3), Some(1));
+    }
+
+    #[test]
+    fn recording_again_refreshes_recency_without_duplicating() {
+        let attempts = ErrorAttempts::default();
+        attempts.record(1);
+        attempts.record(2);
+        attempts.record(1); // 1 is now the most recent: order = [2, 1]
+        assert_eq!(
+            attempts.table().order.iter().copied().collect::<Vec<_>>(),
+            [2, 1]
+        );
+        for sequence in 3..(ERROR_ATTEMPTS_CAP as u64 + 1) {
+            attempts.record(sequence);
+        }
+        assert_eq!(attempts.len(), ERROR_ATTEMPTS_CAP);
+        // One more new sequence evicts 2 (least recent), not the refreshed 1.
+        attempts.record(ERROR_ATTEMPTS_CAP as u64 + 1);
+        assert_eq!(attempts.count(2), None);
+        assert_eq!(attempts.count(1), Some(2));
+        let tracked = attempts.table().order.len();
+        assert_eq!(tracked, attempts.len());
     }
 
     #[test]

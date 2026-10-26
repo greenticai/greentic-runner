@@ -304,6 +304,12 @@ impl NatsDispatcher {
     }
 }
 
+/// Mark a failure that happened before anything reached the wire, so a
+/// transient one still lets the flow retry the turn.
+fn pre_effect_failure(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    crate::runner::engine::pre_effect(error)
+}
+
 #[async_trait]
 impl RemoteDispatchHandler for NatsDispatcher {
     async fn dispatch(&self, request: RemoteDispatch) -> Result<RemoteDispatchAction> {
@@ -324,7 +330,7 @@ impl RemoteDispatchHandler for NatsDispatcher {
         // Nothing has been sent when the request cannot even be built or the
         // publish is refused, so both are provably pre-effect: a transient one
         // still lets the flow retry the turn (see `engine::pre_effect`).
-        let built = build_request(&request).map_err(crate::runner::engine::pre_effect)?;
+        let built = build_request(&request).map_err(pre_effect_failure)?;
 
         // Arm the deadline watchdog BEFORE the request is on the wire: a fast
         // response can be admitted before this task resumes, and its cancel
@@ -368,7 +374,7 @@ impl RemoteDispatchHandler for NatsDispatcher {
             if let Some((key, generation)) = armed {
                 disarm_watchdog(&key, generation);
             }
-            return Err(crate::runner::engine::pre_effect(error));
+            return Err(pre_effect_failure(error));
         }
 
         Ok(built.action)
@@ -394,6 +400,64 @@ mod tests {
             deadline_ms: Some(1000),
             decision_token: None,
         }
+    }
+
+    #[test]
+    fn pre_effect_failure_marks_without_changing_the_message() {
+        let err = pre_effect_failure(anyhow::anyhow!("publish refused"));
+        assert!(crate::runner::engine::is_pre_effect_error(&err));
+        assert_eq!(err.to_string(), "publish refused");
+    }
+
+    /// Minimal NATS stand-in that completes the handshake (answers `PING`).
+    async fn fake_nats_server() -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (read, mut write) = stream.into_split();
+            let info = r#"INFO {"server_id":"fake","server_name":"fake","version":"2.10.0","proto":1,"max_payload":1024,"headers":true,"host":"127.0.0.1","port":0}"#;
+            if write
+                .write_all(format!("{info}\r\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("PING") && write.write_all(b"PONG\r\n").await.is_err() {
+                    return;
+                }
+            }
+        });
+        format!("nats://{addr}")
+    }
+
+    /// A publish the client refuses (here: an invalid subject)
+    /// fails `dispatch` as a pre-effect error and leaves no watchdog armed.
+    #[tokio::test]
+    async fn a_refused_publish_is_pre_effect_and_disarms_the_watchdog() {
+        let url = fake_nats_server().await;
+        let client = async_nats::connect(url).await.expect("fake server connect");
+        let dispatcher = NatsDispatcher::new(client);
+        let mut request = sample(DispatchMode::Await);
+        request.correlation_id = "corr-refused-publish".into();
+        // A subject with whitespace fails the client's subject validation,
+        // after the watchdog was armed and before anything is sent.
+        request.runtime = "bad runtime".into();
+        let err = dispatcher
+            .dispatch(request)
+            .await
+            .expect_err("an oversized publish is refused");
+        assert!(crate::runner::engine::is_pre_effect_error(&err), "{err:#}");
+        assert!(
+            !watchdog_pending("corr-refused-publish"),
+            "the watchdog armed before the publish is disarmed"
+        );
     }
 
     #[tokio::test]

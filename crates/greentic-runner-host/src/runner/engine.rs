@@ -501,11 +501,12 @@ impl NodeKind {
 /// a second approval request, a second upload). Failures before any effect keep
 /// their classification, so a transient failure there still retries.
 ///
-/// The rebuilt error carries only the OUTERMOST message (`err.to_string()`),
-/// the same text the error had before, because that string reaches the
-/// user-facing failure envelope (`metadata.error_message`) and a cause chain can
-/// name a host or URL. The full chain (`{err:#}`) goes to the operator log here,
-/// the only place it is still available.
+/// The rebuilt error's `Display` is only the OUTERMOST message
+/// (`err.to_string()`), the same text the error had before, because that string
+/// reaches the user-facing failure envelope (`metadata.error_message`) and a
+/// cause chain can name a host or URL. The original causes are kept as its
+/// `source()`, so `{err:#}` and `anyhow_chain_text` (operator log, redacted run
+/// error) still see the root cause.
 fn terminal_after_effects(err: anyhow::Error, effects_performed: bool) -> anyhow::Error {
     if !effects_performed || is_terminal_flow_error(&err) {
         return err;
@@ -514,7 +515,7 @@ fn terminal_after_effects(err: anyhow::Error, effects_performed: bool) -> anyhow
         error = %format!("{err:#}"),
         "flow failed after an earlier node performed an external effect; the turn is not re-run"
     );
-    terminal_flow_error(err.to_string())
+    terminal_flow_error_from(err)
 }
 
 #[derive(Clone, Debug)]
@@ -10196,8 +10197,25 @@ mod tests {
         .context("sorla.call failed");
         let rebuilt = terminal_after_effects(chained, true);
         assert!(is_terminal_flow_error(&rebuilt));
+        // User-facing text: outermost only.
         assert_eq!(rebuilt.to_string(), "sorla.call failed");
-        assert!(!format!("{rebuilt:#}").contains("internal.example"));
+        // Operator/redaction paths: the root cause is kept, not duplicated.
+        assert_eq!(
+            format!("{rebuilt:#}"),
+            "sorla.call failed: connect to https://internal.example:8443/x refused"
+        );
+        assert_eq!(
+            crate::run_outcome::error::anyhow_chain_text(&rebuilt),
+            "sorla.call failed\ncaused by: connect to https://internal.example:8443/x refused"
+        );
+        // The retry classifiers still see the typed cause but the terminal
+        // marker wins.
+        assert!(!should_retry(&rebuilt));
+        fn assert_send_sync<T: Send + Sync + 'static>(_: &T) {}
+        assert_send_sync(&TerminalFlowError {
+            message: String::new(),
+            original: None,
+        });
     }
 
     #[test]
@@ -10300,13 +10318,60 @@ mod tests {
     }
 
     #[test]
-    fn effect_node_with_no_handler_configured_stays_retryable() {
+    fn effect_node_with_no_handler_is_a_pre_effect_config_error_that_is_not_retried() {
+        // A missing handler is deterministic configuration: re-running the turn
+        // cannot help, so it must not retry (its text names none of the
+        // transient words `should_retry` looks for). It is also provably before
+        // any effect, so it is marked `pre_effect` and does not become a
+        // "terminal after effects" failure.
         let (err, _) = drive_dispatch_chain(None, 1);
         assert!(
             err.to_string().contains("no RemoteDispatchHandler"),
             "{err}"
         );
+        assert!(is_pre_effect_error(&err), "{err:#}");
         assert!(!is_terminal_flow_error(&err), "{err:#}");
+        assert!(!should_retry(&err), "{err:#}");
+    }
+
+    /// Drive one node of `component` on an engine with nothing registered and
+    /// return its failure.
+    fn drive_single_failing_node(component: &str, input: Value) -> anyhow::Error {
+        let engine = jump_test_engine();
+        let flow = chain_flow("chain.flow", &[("n0", component, input)]);
+        let rt = Runtime::new().unwrap();
+        let ctx = jump_ctx("chain.flow");
+        match rt.block_on(engine.drive_flow(
+            &ctx,
+            flow,
+            ExecutionState::new(Value::Null),
+            None,
+            "chain.flow".to_string(),
+        )) {
+            Ok(_) => panic!("the node must fail"),
+            Err(failure) => failure.error,
+        }
+    }
+
+    #[test]
+    fn provider_invoke_failures_before_the_call_are_pre_effect() {
+        // Payload that does not parse, missing op, and an unregistered flow
+        // (the binding lookup) all precede the provider call.
+        for input in [
+            json!({"op": 5}),
+            json!({}),
+            json!({"op": "send", "input": {"a": 1}}),
+        ] {
+            let err = drive_single_failing_node("provider.invoke", input.clone());
+            assert!(is_pre_effect_error(&err), "{input}: {err:#}");
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a2a_without_a_registered_pack_fails_pre_effect() {
+        let err = drive_single_failing_node("a2a", json!({"agent": "x", "message": "hi"}));
+        assert!(is_pre_effect_error(&err), "{err:#}");
     }
 
     #[test]
@@ -16452,13 +16517,52 @@ fn error_causes(err: &anyhow::Error) -> Vec<&(dyn std::error::Error + 'static)> 
 /// whole-turn `retry_with_jitter` re-runs it; the state machine sees it as
 /// [`RunnerError::FlowTerminal`](crate::engine::error::RunnerError::FlowTerminal).
 /// The `Display` text is the bare message, so existing message assertions hold.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct TerminalFlowError(pub String);
+///
+/// It may carry the error it replaced ([`terminal_flow_error_from`]). `Display`
+/// stays the OUTERMOST message only, because `to_string()` is what reaches the
+/// user-facing failure envelope and a cause chain can name a host or URL;
+/// `source()` exposes the original causes so `{err:#}` and
+/// `anyhow_chain_text` (operator logs, the redacted run error) still see the
+/// root cause.
+#[derive(Debug)]
+pub struct TerminalFlowError {
+    message: String,
+    original: Option<anyhow::Error>,
+}
+
+impl std::fmt::Display for TerminalFlowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TerminalFlowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The original's own message is this error's Display, so skip it and
+        // continue with ITS causes (same trick as `PreEffectError`).
+        self.original.as_ref().and_then(|err| {
+            let top: &(dyn std::error::Error + 'static) = err.as_ref();
+            top.source()
+        })
+    }
+}
 
 /// Build an `anyhow::Error` carrying a [`TerminalFlowError`].
 pub(crate) fn terminal_flow_error(message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(TerminalFlowError(message.into()))
+    anyhow::Error::new(TerminalFlowError {
+        message: message.into(),
+        original: None,
+    })
+}
+
+/// Make `err` terminal while keeping its cause chain reachable through
+/// `source()` (see [`TerminalFlowError`]); `Display` is `err`'s outermost
+/// message, unchanged.
+pub(crate) fn terminal_flow_error_from(err: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(TerminalFlowError {
+        message: err.to_string(),
+        original: Some(err),
+    })
 }
 
 /// Whether any cause in the chain is a [`TerminalFlowError`].

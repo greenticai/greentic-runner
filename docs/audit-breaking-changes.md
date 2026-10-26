@@ -10,7 +10,7 @@ Sections: [Upgrade checklist](#upgrade-checklist) | [Pack loading and signing](#
 [Auth and routing](#auth-and-routing) | [Sandbox and outbound](#sandbox-and-outbound) |
 [Storage](#storage) | [Agentic workers and dispatch](#agentic-workers-and-dispatch) |
 [CLI](#cli) | [Desktop harness](#desktop-harness) | [HTTP surface and telemetry](#http-surface-and-telemetry) |
-[Providers and SQL](#providers-and-sql) | [Round 13](#round-13) |
+[Providers and SQL](#providers-and-sql) | [Round 13](#round-13) | [Round 16](#round-16) |
 [Changes missing from earlier rounds](#changes-missing-from-earlier-rounds) | [Rust API changes](#rust-api-changes) |
 [Tests and CI](#tests-and-ci)
 
@@ -750,7 +750,9 @@ Follow-ups to the round-12 audit. Each entry is a behaviour change; none bumps a
   read-only `dw.agent`, still counts as effectful, because the host cannot cheaply tell. **Affected:** a flow whose
   first effectful node fails transiently now fails the turn instead of retrying it.
 - **`FlowTerminal.reason` keeps the root cause.** `terminal_after_effects` rebuilt the error from `err.to_string()`
-  (outermost context only); it now uses `{err:#}`, so the reason reads `outer: cause: root cause`.
+  (outermost context only), so the root cause was lost. (Round 14 first claimed a `{err:#}` reason; round 15 reverted
+  that and round 16 settled it: the cause chain is kept as the error's `source()` while `Display` stays the outermost
+  message, see [Round 16](#round-16).)
 - **JetStream handler-error budget no longer counts busy Naks (`aw-event-bridge`).** `settlement` held `delivered >=
   MAX_DELIVER` against handler errors, but a busy Nak is also a delivery, so a request that waited out a long turn
   had no retries left for its first handler error. Handler errors are now counted separately
@@ -893,9 +895,33 @@ marked `#[non_exhaustive]`.**
   turn terminal, marked or not.
 - **`FlowTerminal.reason` is the outermost message again** (reverts the round 14 `{err:#}` change). That string reaches
   the user-facing failure envelope (`metadata.error_message`), and a cause chain can carry a URL or host. The full chain
-  is logged at `warn` in `terminal_after_effects`; operators read it there.
-- **JetStream `ErrorAttempts` evicts the oldest sequence** when its 4096-entry table is full, instead of clearing every
+  is logged at `warn` in `terminal_after_effects`. (Round 16: the chain is also kept as `source()`, see
+  [Round 16](#round-16); the user-facing text is unchanged.)
+- **JetStream `ErrorAttempts` evicts the oldest-inserted sequence** (round 16: now least recently recorded) when its 4096-entry table is full, instead of clearing every
   count (which reset a poison pill's budget to zero). `settle_delivery` holds the record -> settle -> clear wiring
   and is unit-tested without NATS.
 - **Test-only:** the oversize-warning limiter (`greentic-aw-runtime::state`) is an instance (`WarnLimiter`), so its test
   no longer races other tests over the process-wide state.
+
+## Round 16
+
+- **`terminal_after_effects` no longer drops the root cause.** It rebuilt the error as a bare `TerminalFlowError(String)`,
+  so the `Err` path (`RunOutcomeBuilder::failed` via `anyhow_chain_text`, and `classify_flow_error`'s `{err:#}`) saw only
+  the outermost message. `TerminalFlowError` now carries the original `anyhow::Error` (Send + Sync + 'static) and exposes
+  its causes through `source()`. `Display` is still ONLY the outermost message, so `to_string()` (the user-facing
+  `metadata.error_message`) cannot leak a host or URL, while `{err:#}`, `anyhow_chain_text` and the redacted run error now
+  read `outer: cause: root cause`. **Affected:** `FlowTerminal.reason` and operator-side run errors for failures after an
+  effect are longer (they gain the causes). `TerminalFlowError`'s field is no longer public; use `terminal_flow_error` /
+  `terminal_flow_error_from`.
+- **`jetstream::ErrorAttempts` evicts by recency.** `record` on an already-tracked sequence moves it to the back of the
+  eviction order (no duplicate in the deque), so an actively failing poison pill is not evicted before an idle one.
+- **Invalid tenant/env id in the agent audit context is terminal.** `tenant_ctx_for_audit` failures (the message echoes
+  the id) are now `TerminalFlowError`s, so the text heuristic in `should_retry` ("internal", "timeout", ...) can never
+  retry them. They stay `pre_effect` at the `dw.agent` / `dw.agent_graph` call sites (nothing ran).
+- **Known limitation:** `should_retry`'s text heuristic can still retry any OTHER deterministic pre-effect error whose
+  message happens to contain "internal", "unavailable", "timeout" or "transient" (for example a pack or flow id that
+  contains one). Mark such errors with `terminal_flow_error` where they are raised.
+- **Tests only:** the pre-effect marking points (provider.invoke payload / op / binding, `a2a` pack lookup, missing
+  `RemoteDispatchHandler`, `NatsDispatcher` publish failure, invalid audit ids) are pinned. A missing
+  `RemoteDispatchHandler` is a deterministic, pre-effect configuration error: not retried, and it does not set the
+  effects flag.
