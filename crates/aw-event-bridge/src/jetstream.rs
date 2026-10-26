@@ -595,12 +595,16 @@ pub fn settlement(result: &Result<Disposition>, delivered: i64, error_attempts: 
 ///
 /// **What a re-creation does to messages in flight.** Their `ack` / progress /
 /// `term` were addressed to the OLD consumer's delivery, which no longer
-/// exists, so the server ignores them and the message is redelivered by the
+/// exists (only when the durable was really deleted; if `get_or_create`
+/// returned the existing one, deliveries stay valid), so the server ignores
+/// them and the message is redelivered by the
 /// new consumer (a work-queue stream still holds it). The redelivery is
 /// absorbed by the dispatch ledger (`greentic_aw_runtime::dispatch_ledger`,
 /// keyed `{tenant}:{env}:{dispatch_id}`, the same `Greentic-Dispatch-Id` on the
-/// redelivered message) when the invoker was built `with_ledger` (the default
-/// `NoopDispatchLedger` does not deduplicate), and a turn still running is
+/// redelivered message) when the ledger is real: `agent_node::serve_agentic` installs
+/// `RedisDispatchLedger` when `GREENTIC_AW_REDIS_URL` is set and the backend is
+/// `redis`, otherwise (and for `serve()` / `RuntimeAgentDispatchInvoker::new`)
+/// the default `NoopDispatchLedger` does not deduplicate; and a turn still running is
 /// held off by the session lock (busy -> Nak). The new consumer's delivery
 /// count restarts at 1, so [`CONSUMER_MAX_DELIVER`] is a fresh budget for such a
 /// message; the busy age budget is measured from the publish time and does not
@@ -702,6 +706,7 @@ pub async fn run_bridge_jetstream(
                 if !paused {
                     // A pull that ended cleanly was answered by the consumer.
                     faults.clear();
+                    attempt = 0;
                     let delay = empty_batch_delay(received, jitter_entropy());
                     if !delay.is_zero() {
                         drop(slots);
@@ -724,9 +729,24 @@ pub async fn run_bridge_jetstream(
     }
 }
 
+/// Backoff for one re-creation: the pause to take now and the escalated
+/// attempt counter to carry forward.
+///
+/// A successful [`ensure_consumer`] does NOT prove the fault is gone:
+/// `get_or_create_consumer` returns an existing durable unchanged, so a fault
+/// that is not a missing durable (a stable 409 MaxWaiting, 400, 503 while the
+/// consumer is alive) survives it. The counter therefore escalates on success
+/// and failure alike (up to the 30s cap) and is reset only by proof of life
+/// (a received message or a cleanly ended pull), never by the re-creation.
+#[must_use]
+fn recreate_backoff(attempt: u32) -> (Duration, u32) {
+    (backoff_delay(attempt), attempt.saturating_add(1))
+}
+
 /// Re-run [`ensure_consumer`] and swap in the fresh handle. On success the
-/// fault count and backoff reset; on failure both are kept so the next fault
-/// retries, after a backoff.
+/// fault count resets (the next re-creation needs a new run of faults) but the
+/// backoff keeps escalating; on failure the fault count is kept so the next
+/// fault retries, after a backoff.
 async fn recreate_consumer(
     client: &async_nats::Client,
     consumer: &mut consumer::Consumer<consumer::pull::Config>,
@@ -736,15 +756,15 @@ async fn recreate_consumer(
     match ensure_consumer(client).await {
         Ok(fresh) => {
             *consumer = fresh;
-            *attempt = 0;
             faults.clear();
         }
         Err(create_error) => {
             tracing::warn!(error = %create_error, "re-creating durable consumer failed");
-            *attempt = attempt.saturating_add(1);
         }
     }
-    tokio::time::sleep(backoff_delay(*attempt)).await;
+    let (delay, next) = recreate_backoff(*attempt);
+    *attempt = next;
+    tokio::time::sleep(delay).await;
 }
 
 async fn handle_one(
@@ -996,6 +1016,22 @@ mod tests {
         faults.clear();
         assert_eq!(faults.count(), 0);
         assert!(!faults.record(), "a successful pull restarts the count");
+    }
+
+    #[test]
+    fn recreate_backoff_escalates_instead_of_resetting() {
+        let mut attempt = 0;
+        let mut delays = Vec::new();
+        for _ in 0..10 {
+            let (delay, next) = recreate_backoff(attempt);
+            assert!(next > attempt, "the counter never resets on re-creation");
+            delays.push(delay);
+            attempt = next;
+        }
+        assert_eq!(delays[0], backoff_delay(0));
+        assert!(delays.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*delays.last().unwrap_or(&Duration::ZERO), BACKOFF_MAX);
+        assert_eq!(recreate_backoff(u32::MAX).1, u32::MAX);
     }
 
     #[test]

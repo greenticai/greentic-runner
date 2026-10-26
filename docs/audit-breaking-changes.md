@@ -1030,7 +1030,7 @@ marked `#[non_exhaustive]`.**
   MaxWaiting`, `Exceeded MaxRequestBatch/Expires/MaxBytes`, `Consumer is push based`, a bare `409`) warns and
   escalates the backoff. `Consumer Deleted` re-runs `ensure_consumer` to re-create the durable (`consumer not found` never reaches the classifier; removed in Round 21).
 - **MCP store pull and decode errors no longer carry the URL (F3, `greentic-aw-runtime`).** Messages from
-  `download_artifact` / `collect_capped` name `scheme://host/path` only (new `url_redact::redact_http_url`: userinfo,
+  `download_artifact` / `collect_capped` name `scheme://host/path` only (superseded in Round 21: the path is now dropped, origin only) (new `url_redact::redact_http_url`: userinfo,
   query and fragment dropped), and body/decode errors in the MCP admin source, graph registry, OpenAI backend and
   guardrail policy go through `without_url()` first. The Round 19 claim that the store pull was covered was
   inaccurate. Known gap unchanged: `greentic-a2a` `CardCache`.
@@ -1061,14 +1061,13 @@ marked `#[non_exhaustive]`.**
   when `ack_wait`/`max_deliver` were also stale. The warning no longer claims the "config differs".
 - **Messages in flight at a consumer re-creation (F4).** Their ack/progress/term address the old consumer and are
   ignored, so the message is redelivered. The dispatch ledger (`{tenant}:{env}:{dispatch_id}`, same header on the
-  redelivery) absorbs it when the invoker has a real ledger (`with_ledger`; the serve default is the no-op ledger), and
+  redelivery) absorbs it when the invoker has a real ledger (`with_ledger`; `agent_node::serve_agentic` installs `RedisDispatchLedger` when `GREENTIC_AW_REDIS_URL` is set and the backend is `redis`, otherwise it is the no-op ledger, as is the default of `serve()` / `RuntimeAgentDispatchInvoker::new`; superseded in Round 22 for the wording "serve default is no-op"), and
   a turn still running is held off by the session lock. The delivery counter restarts (a fresh `CONSUMER_MAX_DELIVER`
   budget for that message); the busy age budget is publish-time based and does not reset.
 - **`redact_http_url` is origin-only and handles raw delimiters in userinfo (F5).** Output is
   `scheme://[redacted]@host:port` (userinfo only if present) plus `/…` when a path, query or fragment existed. The
-  path is dropped on purpose (token-in-path URLs). Everything up to the LAST `@` after the scheme is credential, so
-  `https://u:p?w@h/` no longer leaks `u:p`; an `@` inside a path or query is also read as userinfo (wrong host
-  shown, never a leak). **Affected:** store-pull error text no longer names the artifact path.
+  path is dropped on purpose (token-in-path URLs). (The "everything up to the LAST `@`" rule described here was
+  wrong for `https://h/cb?token=abc@def`, which leaked `def`; superseded in Round 22.) **Affected:** store-pull error text no longer names the artifact path.
 - **Agent registry errors drop the URL (F6).** `HttpConfigProvider` send and decode errors, and the worker metering
   warning, go through `without_url()`.
 - **`strip_url_suffix` is fail-closed (F7, `runner-core`).** No parenthesis counting: the URL ends at the first
@@ -1080,3 +1079,29 @@ marked `#[non_exhaustive]`.**
   `GITHUB_TOKEN`, `GH_TOKEN`, `HF_TOKEN`, `AWS_REGION`, `AWS_PROFILE`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`.
   `AZURE_SQL_*`/Cosmos names were not added (no fixed credential name). **Affected:** a tool reading one of the newly
   denied names through `secret://` now gets "not found".
+
+## Round 22
+
+- **JetStream re-creation no longer defeats the backoff (F1, `aw-event-bridge`).** CONFIRMED. `recreate_consumer`
+  reset the backoff `attempt` and the fault count on every successful `ensure_consumer`, but `get_or_create_consumer`
+  returns an existing durable unchanged, so a fault that is not a missing durable (stable `409 MaxWaiting`, `400`,
+  `503` while the consumer is alive) cycled about every 2 s (0.5, 1, 0.5, ...) with two API calls per cycle instead of
+  escalating to 30 s. Now a re-creation escalates the backoff on success and failure alike (pure
+  `recreate_backoff`), and `attempt` is reset only by proof of life: a received message, a cleanly ended pull, or
+  `409 MaxAckPending`. The fault count still resets on a successful re-creation. The claim that acks to the old
+  delivery are ignored holds only when the durable was really deleted; if `get_or_create` returned the existing one
+  the deliveries stay valid.
+- **`redact_http_url` no longer leaks a suffix after an `@` in the path or query (F2).** CONFIRMED:
+  `https://h/cb?token=abc@def` rendered `https://[redacted]@def/…`. The authority now ends at the first `/`, `?` or
+  `#`. If every `@` is inside it they are userinfo (`https://[redacted]@host`); if any `@` appears after it the URL is
+  ambiguous (path/query `@`, or a password with a raw delimiter such as `https://u:p?w@h/`) and only
+  `scheme://[redacted]` is shown, no host. **Affected:** such URLs no longer show a host in error text.
+- **Dispatch-ledger wording (F3).** The serve default is not always no-op: `agent_node::serve_agentic` installs
+  `RedisDispatchLedger` when `GREENTIC_AW_REDIS_URL` is set with the `redis` backend; `serve()` and
+  `RuntimeAgentDispatchInvoker::new` default to `NoopDispatchLedger`. Round 20 F3 and Round 21 F5 are marked superseded.
+- **Test determinism (F4).** `HttpConfigProvider` has a test-only-used `with_client`; the URL-leak test builds a
+  `.no_proxy()` client so `HTTP(S)_PROXY` / `ALL_PROXY` in the environment cannot change the result.
+- **Tool-secret env deny-list (F5).** Adds exact `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (proxy URLs embed
+  `user:pass@`), `SENTRY_DSN`, `GIT_ASKPASS`, `DOCKER_CONFIG`. `env_secret_name_is_denied` now upper-cases its input so
+  lowercase spellings (`https_proxy`) are covered. `NO_PROXY` is a host list and stays allowed. **Affected:** a tool
+  reading one of these through `secret://` now gets "not found".

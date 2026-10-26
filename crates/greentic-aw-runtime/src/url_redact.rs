@@ -31,12 +31,15 @@ pub fn redact_url(url: &str) -> String {
 /// `scheme://host[:port]`, plus `/…` when the URL had a path, query or
 /// fragment. Fail-closed on every part that can carry a credential:
 ///
-/// - the userinfo (basic auth) is masked as `[redacted]@`. Like [`redact_url`],
-///   everything up to the LAST `@` after the scheme is credential, so a raw
-///   `/`, `?` or `#` inside the password (`https://u:p?w@h/`) cannot end the
-///   authority early and leak the front of it. The price is that an `@` in a
-///   path or query (`/@me`, `?mail=a@b`) also reads as userinfo and the text
-///   after it is shown as the host: wrong but never a leak.
+/// - the authority ends at the first `/`, `?` or `#` after the scheme. When
+///   every `@` in the URL sits inside that authority, they are userinfo: it is
+///   masked as `[redacted]@` and the host after the LAST `@` is shown.
+/// - when an `@` appears AFTER the authority ends (`https://h/cb?token=a@b`,
+///   `https://h/users/@me`, or a password with a raw delimiter such as
+///   `https://u:p?w@h/`) the URL is ambiguous: it could be an `@` in a
+///   path/query, or userinfo whose password contains a delimiter. Nothing is
+///   guessed: only `scheme://[redacted]` is shown, no host, so no suffix of a
+///   secret can appear either way. (This also covers `https://u:p@h/x?m=a@b`.)
 /// - the path is dropped, not shown: webhook-style endpoints and some stores
 ///   embed a token in it (`/bot<TOKEN>/file`), and the query (presigned
 ///   signature) and fragment go the same way. The caller already names the
@@ -44,19 +47,21 @@ pub fn redact_url(url: &str) -> String {
 pub fn redact_http_url(url: &str) -> String {
     let scheme_end = scheme_len(url).unwrap_or(0);
     let rest = &url[scheme_end..];
-    let (masked, after_userinfo) = match rest.rfind('@') {
-        Some(at) => (true, &rest[at + 1..]),
-        None => (false, rest),
-    };
-    let origin_end = after_userinfo
-        .find(['/', '?', '#'])
-        .unwrap_or(after_userinfo.len());
-    let remainder = &after_userinfo[origin_end..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let remainder = &rest[authority_end..];
     let mut out = String::from(&url[..scheme_end]);
-    if masked {
-        out.push_str("[redacted]@");
+    if remainder.contains('@') {
+        out.push_str("[redacted]");
+        return out;
     }
-    out.push_str(&after_userinfo[..origin_end]);
+    match authority.rfind('@') {
+        Some(at) => {
+            out.push_str("[redacted]@");
+            out.push_str(&authority[at + 1..]);
+        }
+        None => out.push_str(authority),
+    }
     if !remainder.is_empty() && remainder != "/" {
         out.push_str("/…");
     }
@@ -113,20 +118,29 @@ mod tests {
             ("https://u:p?w@h/", "p?w"),
             ("https://u:p#w@h/x", "p#w"),
             ("https://u:pa/ss@h:8443/x?y=1", "pa"),
-            ("https://u:p@ss@h/x", "ss"),
             ("https://u:pa?ss@h", "ss"),
         ] {
             let out = redact_http_url(input);
             assert!(!out.contains(secret), "{out} leaks {secret}");
-            assert!(out.starts_with("https://[redacted]@h"), "{out}");
+            assert_eq!(out, "https://[redacted]", "{input}");
         }
-        assert_eq!(redact_http_url("https://u:p?w@h/"), "https://[redacted]@h");
+        let out = redact_http_url("https://u:p@ss@h/x");
+        assert_eq!(out, "https://[redacted]@h/…");
+        assert!(!out.contains("ss"));
     }
 
     #[test]
-    fn http_url_at_sign_in_path_is_fail_closed() {
-        let out = redact_http_url("https://h/users/@me?k=v");
-        assert_eq!(out, "https://[redacted]@me/…");
+    fn http_url_at_sign_after_the_authority_shows_no_host() {
+        for (input, leaked) in [
+            ("https://h/cb?token=abc@def", "def"),
+            ("https://h/cb?mail=a@evil.com", "evil"),
+            ("https://h/users/@me?k=v", "me"),
+            ("https://u:p@h/x?m=a@b", "u:p"),
+        ] {
+            let out = redact_http_url(input);
+            assert_eq!(out, "https://[redacted]", "{input}");
+            assert!(!out.contains(leaked), "{out} leaks {leaked}");
+        }
     }
 
     #[test]
