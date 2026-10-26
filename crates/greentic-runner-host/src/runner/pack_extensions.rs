@@ -446,6 +446,7 @@ fn sweep_stale_slots(root: &Path, keep: &Path, grace: std::time::Duration) {
 ///
 /// One unreadable archive must not cost an operator the other tools they bound,
 /// and it must not vanish either — hence two lists rather than a `Result`.
+#[cfg(test)]
 pub(crate) fn stage_archives<I>(entries: I) -> PackExtensions
 where
     I: IntoIterator<Item = (String, Vec<u8>)>,
