@@ -990,7 +990,8 @@ mod aw {
             // reach `run_one_agent_turn`/`run_one_supervisor_turn`, which feed
             // them into the shared `run_agent_step` seam that builds the
             // `AgentAuditObserver` (EPIC-B B-3b Task 2).
-            let real_tenant = tenant_ctx_for_audit(tenant_id, env_id)?;
+            let real_tenant = tenant_ctx_for_audit(tenant_id, env_id)
+                .map_err(crate::runner::engine::pre_effect)?;
             // Per-run conversation scope: the per-visit agent state is stored
             // under this tenant, so two sessions (or graphs) running the same
             // node must not address the same stored conversation.
