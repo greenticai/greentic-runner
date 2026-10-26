@@ -4336,6 +4336,15 @@ impl PackRuntime {
     /// which is logged). Used for sidecar files (`agent-graph.json`) and bundled
     /// assets (`knowledge_corpus.json`, `assets/knowledge/*.txt`).
     pub fn read_pack_file(&self, name: &str) -> Option<Vec<u8>> {
+        self.read_pack_file_capped(name, MAX_ARCHIVE_ENTRY_READ_BYTES)
+    }
+
+    /// [`read_pack_file`](Self::read_pack_file) with a caller-chosen ceiling
+    /// (never above [`MAX_ARCHIVE_ENTRY_READ_BYTES`]). An entry larger than
+    /// `limit` yields `None` after at most `limit + 1` bytes were read, so a
+    /// caller with a budget never holds an over-budget entry in memory.
+    pub fn read_pack_file_capped(&self, name: &str, limit: u64) -> Option<Vec<u8>> {
+        let limit = limit.min(MAX_ARCHIVE_ENTRY_READ_BYTES);
         // Materialized pack directory (root holds manifest.cbor + sidecars/assets).
         if self.path.is_dir() {
             // `name` can come from pack-authored content (a corpus sidecar's
@@ -4351,7 +4360,9 @@ impl PackRuntime {
                 }
             };
             if let Some(candidate) = confined {
-                match std::fs::read(&candidate) {
+                match File::open(&candidate)
+                    .and_then(|mut file| read_to_end_bounded(&mut file, limit))
+                {
                     Ok(bytes) => return Some(bytes),
                     Err(error) => {
                         tracing::warn!(
@@ -4393,7 +4404,7 @@ impl PackRuntime {
             }
         };
         match archive.by_name(name) {
-            Ok(mut entry) => match read_to_end_bounded(&mut entry, MAX_ARCHIVE_ENTRY_READ_BYTES) {
+            Ok(mut entry) => match read_to_end_bounded(&mut entry, limit) {
                 Ok(bytes) => Some(bytes),
                 Err(error) => {
                     tracing::warn!(

@@ -441,29 +441,6 @@ fn sweep_stale_slots(root: &Path, keep: &Path, grace: std::time::Duration) {
     }
 }
 
-/// Stage every `(entry_name, bytes)` pair, recording per-archive failures
-/// instead of aborting on the first one.
-///
-/// One unreadable archive must not cost an operator the other tools they bound,
-/// and it must not vanish either — hence two lists rather than a `Result`.
-#[cfg(test)]
-pub(crate) fn stage_archives<I>(entries: I) -> PackExtensions
-where
-    I: IntoIterator<Item = (String, Vec<u8>)>,
-{
-    let mut out = PackExtensions::default();
-    for (entry_name, bytes) in entries {
-        match stage_one(&entry_name, &bytes) {
-            Ok(staged) => out.staged.push(staged),
-            Err(error) => out.failures.push(StagingFailure {
-                entry_name,
-                reason: format!("{error:#}"),
-            }),
-        }
-    }
-    out
-}
-
 /// Collect and stage every extension archive the loaded packs carry.
 ///
 /// Entry names are deduplicated across packs, FIRST PACK WINS — the same rule
@@ -483,7 +460,7 @@ pub(crate) fn stage_from_packs(packs: &[Arc<PackRuntime>]) -> PackExtensions {
     }
     stage_bounded(
         candidates,
-        |name, pack| pack.read_pack_file(name),
+        |name, pack, limit| pack.read_pack_file_capped(name, limit),
         MAX_PACK_EXT_ENTRIES,
         MAX_PACK_EXT_TOTAL_BYTES,
     )
@@ -501,9 +478,15 @@ const MAX_PACK_EXT_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// resident memory grew with the number of entries. Entries past `max_entries`
 /// or past the `max_total_bytes` aggregate are recorded as failures (visible,
 /// never silently dropped) and not staged.
+///
+/// `read` gets the bytes still available in the aggregate budget and must not
+/// return more than that: an entry over budget is refused WHILE it is read (at
+/// most budget + 1 bytes resident), not after it was read whole. The total is
+/// checked again on what came back, so a reader that ignores the limit still
+/// cannot overspend. This is the one staging path: the tests drive it too.
 fn stage_bounded<T>(
     candidates: Vec<(String, T)>,
-    read: impl Fn(&str, &T) -> Option<Vec<u8>>,
+    read: impl Fn(&str, &T, u64) -> Option<Vec<u8>>,
     max_entries: usize,
     max_total_bytes: u64,
 ) -> PackExtensions {
@@ -517,10 +500,13 @@ fn stage_bounded<T>(
             });
             continue;
         }
-        let Some(bytes) = read(&entry_name, &source) else {
+        let remaining = max_total_bytes.saturating_sub(total);
+        let Some(bytes) = read(&entry_name, &source, remaining) else {
             out.failures.push(StagingFailure {
                 entry_name,
-                reason: "the pack lists this entry but it could not be read".to_string(),
+                reason: format!(
+                    "the pack lists this entry but it could not be read within the {remaining} bytes left for this pass"
+                ),
             });
             continue;
         };
@@ -680,6 +666,21 @@ mod tests {
             writer.write_all(bytes).expect("write entry");
         }
         writer.finish().expect("finish zip").into_inner()
+    }
+
+    /// Stage in-memory archives through the PRODUCTION path ([`stage_bounded`],
+    /// the same function `stage_from_packs` runs), so the tests below cannot
+    /// drift from it. Only the byte source differs.
+    fn stage_archives<I>(entries: I) -> PackExtensions
+    where
+        I: IntoIterator<Item = (String, Vec<u8>)>,
+    {
+        stage_bounded(
+            entries.into_iter().collect(),
+            |_, bytes, limit| (bytes.len() as u64 <= limit).then(|| bytes.clone()),
+            usize::MAX,
+            u64::MAX,
+        )
     }
 
     fn describe_bytes(id: &str) -> Vec<u8> {
@@ -868,7 +869,7 @@ mod tests {
             .collect();
         let out = stage_bounded(
             candidates,
-            |_, id| {
+            |_, id, _| {
                 reads.set(reads.get() + 1);
                 Some(extension_archive(id))
             },
@@ -887,17 +888,60 @@ mod tests {
         let candidates: Vec<(String, ())> = (0..3)
             .map(|n| (format!("extensions/b{n}.gtxpack"), ()))
             .collect();
-        let out = stage_bounded(candidates, |_, ()| Some(archive.clone()), 10, one * 2);
+        let out = stage_bounded(candidates, |_, (), _| Some(archive.clone()), 10, one * 2);
         assert_eq!(out.staged.len(), 2);
         assert_eq!(out.failures.len(), 1);
         assert!(out.failures[0].reason.contains("in total"));
     }
 
     #[test]
+    fn the_reader_is_given_the_remaining_budget_not_the_whole_one() {
+        use std::cell::RefCell;
+
+        let archive = extension_archive("acme.budget");
+        let one = archive.len() as u64;
+        let seen = RefCell::new(Vec::new());
+        let candidates: Vec<(String, ())> = (0..3)
+            .map(|n| (format!("extensions/r{n}.gtxpack"), ()))
+            .collect();
+        let out = stage_bounded(
+            candidates,
+            |_, (), limit| {
+                seen.borrow_mut().push(limit);
+                (archive.len() as u64 <= limit).then(|| archive.clone())
+            },
+            10,
+            one * 2 + 1,
+        );
+        assert_eq!(*seen.borrow(), vec![one * 2 + 1, one + 1, 1]);
+        assert_eq!(out.staged.len(), 2);
+        assert_eq!(out.failures.len(), 1, "the over-budget read is refused");
+    }
+
+    #[test]
+    fn an_over_budget_pack_entry_is_refused_while_it_is_read() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(&extensions).expect("mkdir");
+        std::fs::write(extensions.join("big.gtxpack"), vec![0u8; 4096]).expect("write");
+        let pack = crate::pack::tests::pack_runtime_for_dir(dir.path());
+        assert_eq!(
+            pack.read_pack_file_capped("extensions/big.gtxpack", 4096)
+                .map(|bytes| bytes.len()),
+            Some(4096)
+        );
+        assert_eq!(
+            pack.read_pack_file_capped("extensions/big.gtxpack", 4095),
+            None,
+            "one byte over the limit must not be returned"
+        );
+    }
+
+    #[test]
     fn an_unreadable_listed_entry_is_a_failure_not_a_gap() {
         let out = stage_bounded(
             vec![("extensions/gone.gtxpack".to_string(), ())],
-            |_, ()| None,
+            |_, (), _| None,
             10,
             u64::MAX,
         );
