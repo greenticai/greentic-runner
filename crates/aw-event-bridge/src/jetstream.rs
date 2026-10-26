@@ -94,20 +94,65 @@ pub fn ack_wait_is_stale(existing: Duration) -> bool {
     existing != ACK_WAIT
 }
 
-/// Application-level redelivery cap for HANDLER ERRORS (poison-pill guard): on
-/// this delivery an erroring request is answered and terminated.
+/// Application-level cap on HANDLER-ERROR attempts (poison-pill guard): on this
+/// failed attempt an erroring request is answered and terminated.
 ///
-/// This is no longer the consumer's `max_deliver` ([`CONSUMER_MAX_DELIVER`]).
-/// Every Nak counts against the server-enforced limit, so a busy session (the
-/// user's next message arriving while a long turn still runs) used up the
-/// 6 deliveries in ~160s and got `session_busy` while the first turn was
-/// healthy. Busy redelivery is now bounded by message age ([`busy_budget`]).
+/// It counts handler ERRORS only (see [`ErrorAttempts`]), not deliveries: a busy
+/// Nak is also a delivery, and a request that waited out a long turn used to
+/// arrive at its first handler error with its whole budget already spent. This is
+/// not the consumer's `max_deliver` either ([`CONSUMER_MAX_DELIVER`]); busy
+/// redelivery is bounded by message age ([`busy_budget`]).
 pub const MAX_DELIVER: i64 = 6;
 
 /// Server-side `max_deliver` of the durable consumer: an absolute backstop
-/// above anything the age-based busy budget can reach (the longest budget,
-/// ~32 min at the 60s delay cap, is ~40 deliveries).
+/// above anything the age-based busy budget plus [`MAX_DELIVER`] error attempts
+/// can reach. The longest busy budget (30 min handler ceiling + 60s margin =
+/// 31 min) is about 40 deliveries at the 60s delay cap.
 pub const CONSUMER_MAX_DELIVER: i64 = 100;
+
+/// Most stream sequences [`ErrorAttempts`] tracks at once; a full table is
+/// cleared (the counts are best effort, [`CONSUMER_MAX_DELIVER`] still bounds).
+const ERROR_ATTEMPTS_CAP: usize = 4096;
+
+/// Per-process count of handler-error attempts, keyed by stream sequence.
+///
+/// Process-local on purpose: JetStream only reports total deliveries, and a Nak
+/// cannot carry a counter. A redelivery that lands on another replica starts
+/// from zero, which grants extra error retries but never more than
+/// [`CONSUMER_MAX_DELIVER`] deliveries in total.
+#[derive(Debug, Default)]
+pub struct ErrorAttempts {
+    counts: std::sync::Mutex<std::collections::HashMap<u64, i64>>,
+}
+
+impl ErrorAttempts {
+    /// Record one more handler error for `sequence`; returns the new count.
+    pub fn record(&self, sequence: u64) -> i64 {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if counts.len() >= ERROR_ATTEMPTS_CAP && !counts.contains_key(&sequence) {
+            counts.clear();
+        }
+        let count = counts.entry(sequence).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// Forget `sequence` (the message was acked or terminated).
+    pub fn clear(&self, sequence: u64) {
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&sequence);
+    }
+}
+
+fn error_attempts() -> &'static ErrorAttempts {
+    static ATTEMPTS: std::sync::OnceLock<ErrorAttempts> = std::sync::OnceLock::new();
+    ATTEMPTS.get_or_init(ErrorAttempts::default)
+}
 
 /// Extra time on top of the handle timeout before a busy request is answered
 /// `session_busy`: covers the holder finishing right at its bound plus the
@@ -219,12 +264,14 @@ pub fn busy_policy(delivered: i64, age: Duration, budget: Duration) -> BusyPolic
     }
 }
 
-/// Time since the message was published, from its JetStream info (zero when the
-/// clocks disagree or the info is unavailable).
-fn message_age(js_msg: &jetstream::Message) -> Duration {
-    let Ok(info) = js_msg.info() else {
-        return Duration::ZERO;
-    };
+/// Time since the message was published (zero when the clocks disagree).
+///
+/// Measured from the PUBLISH time, so time spent in the stream backlog counts
+/// against the busy budget. That is deliberate: the caller's own wait started at
+/// publish, so a request that already queued for longer than the budget is
+/// answered `session_busy` on its first busy delivery instead of being parked
+/// even longer.
+fn message_age(info: &jetstream::message::Info<'_>) -> Duration {
     let published_secs = u64::try_from(info.published.unix_timestamp()).unwrap_or(0);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -244,14 +291,21 @@ pub fn should_ack(handle_result: &Result<()>) -> bool {
 /// `Term` stops redelivery of a request that can never succeed (or has no
 /// delivery left). A handler error is Nak'd with a short delay rather than left
 /// to wait out `ack_wait`.
+///
+/// `delivered` is the TOTAL delivery count (busy Naks included; it sizes the busy
+/// delay and drives the [`CONSUMER_MAX_DELIVER`] backstop). `error_attempts` is
+/// the number of handler errors so far including this one; only it is held
+/// against [`MAX_DELIVER`].
 #[must_use]
-pub fn settlement(result: &Result<Disposition>, delivered: i64) -> AckKind {
+pub fn settlement(result: &Result<Disposition>, delivered: i64, error_attempts: i64) -> AckKind {
     match result {
         Ok(Disposition::Handled) => AckKind::Ack,
         // Session busy and no response sent: redeliver later, never ack.
         Ok(Disposition::Busy) => AckKind::Nak(Some(busy_redeliver_delay(delivered))),
         Ok(Disposition::Rejected) => AckKind::Term,
-        Err(_) if delivered >= MAX_DELIVER => AckKind::Term,
+        Err(_) if error_attempts >= MAX_DELIVER || delivered >= CONSUMER_MAX_DELIVER => {
+            AckKind::Term
+        }
         Err(_) => AckKind::Nak(Some(ERROR_REDELIVER_DELAY)),
     }
 }
@@ -311,9 +365,25 @@ async fn handle_one(
     let core = js_msg.message.clone();
     // On the last allowed delivery there is no redelivery left to lean on, so a
     // busy session must be answered instead of Nak'd into the void.
-    let delivered = js_msg.info().map(|info| info.delivered).unwrap_or(1);
+    let (delivered, sequence, age) = match js_msg.info() {
+        Ok(info) => (
+            info.delivered,
+            Some(info.stream_sequence),
+            message_age(&info),
+        ),
+        Err(error) => {
+            // Without delivery metadata neither backstop can count, so a Nak
+            // could redeliver forever. Treat the budget as spent: a busy
+            // session is answered and a handler error is terminated.
+            tracing::warn!(
+                %error,
+                "jetstream message info unavailable; settling this delivery as the last"
+            );
+            (CONSUMER_MAX_DELIVER, None, Duration::ZERO)
+        }
+    };
     let step_timeout = step_timeout_of(&invoker, &core).await;
-    let busy = busy_policy(delivered, message_age(&js_msg), busy_budget(step_timeout));
+    let busy = busy_policy(delivered, age, busy_budget(step_timeout));
     let handle_timeout = handle_timeout_for(step_timeout);
     let handling = tokio::time::timeout(
         handle_timeout,
@@ -353,14 +423,26 @@ async fn handle_one(
             Ok(Disposition::Rejected)
         }
     };
-    let kind = settlement(&result, delivered);
+    let error_attempt = match (&result, sequence) {
+        (Err(_), Some(sequence)) => error_attempts().record(sequence),
+        // No sequence to key on: this is the last delivery (see above).
+        (Err(_), None) => MAX_DELIVER,
+        _ => 0,
+    };
+    let kind = settlement(&result, delivered, error_attempt);
+    if let Some(sequence) = sequence
+        && !matches!(kind, AckKind::Nak(_))
+    {
+        error_attempts().clear(sequence);
+    }
     if let Err(handle_err) = &result {
         tracing::error!(
             error = %handle_err,
             delivered,
+            error_attempt,
             "agentic handler failed; settling for redelivery"
         );
-        if delivered >= MAX_DELIVER {
+        if matches!(kind, AckKind::Term) {
             // Last delivery: nothing will retry, so do not leave the caller
             // waiting for a response that never comes.
             publish_final_error(&client, &core, &handle_err.to_string()).await;
@@ -478,20 +560,20 @@ mod tests {
     #[test]
     fn settlement_acks_naks_and_terms() {
         assert!(matches!(
-            settlement(&Ok(Disposition::Handled), 1),
+            settlement(&Ok(Disposition::Handled), 1, 0),
             AckKind::Ack
         ));
         // Lock contention: redelivered with a growing delay, never acked.
         assert!(matches!(
-            settlement(&Ok(Disposition::Busy), 1),
+            settlement(&Ok(Disposition::Busy), 1, 0),
             AckKind::Nak(Some(delay)) if delay == BUSY_REDELIVER_DELAY
         ));
         assert!(matches!(
-            settlement(&Ok(Disposition::Busy), 2),
+            settlement(&Ok(Disposition::Busy), 2, 0),
             AckKind::Nak(Some(delay)) if delay == BUSY_REDELIVER_DELAY * 2
         ));
         assert!(matches!(
-            settlement(&Ok(Disposition::Rejected), 1),
+            settlement(&Ok(Disposition::Rejected), 1, 0),
             AckKind::Term
         ));
     }
@@ -500,10 +582,42 @@ mod tests {
     fn handler_errors_are_nakd_quickly_then_termed_on_the_last_delivery() {
         let err = || Err(anyhow::anyhow!("publish failed"));
         assert!(matches!(
-            settlement(&err(), 1),
+            settlement(&err(), 1, 1),
             AckKind::Nak(Some(d)) if d == ERROR_REDELIVER_DELAY
         ));
-        assert!(matches!(settlement(&err(), MAX_DELIVER), AckKind::Term));
+        assert!(matches!(
+            settlement(&err(), MAX_DELIVER, MAX_DELIVER),
+            AckKind::Term
+        ));
+    }
+
+    #[test]
+    fn busy_deliveries_do_not_spend_the_handler_error_budget() {
+        let err = || Err(anyhow::anyhow!("publish failed"));
+        // 30 busy Naks later this is delivery 31 but only the first error.
+        assert!(matches!(
+            settlement(&err(), 31, 1),
+            AckKind::Nak(Some(d)) if d == ERROR_REDELIVER_DELAY
+        ));
+        // Consumer backstop still terminates regardless of the error count.
+        assert!(matches!(
+            settlement(&err(), CONSUMER_MAX_DELIVER, 1),
+            AckKind::Term
+        ));
+    }
+
+    #[test]
+    fn error_attempts_count_per_sequence_and_clear() {
+        let attempts = ErrorAttempts::default();
+        assert_eq!(attempts.record(7), 1);
+        assert_eq!(attempts.record(7), 2);
+        assert_eq!(attempts.record(8), 1);
+        attempts.clear(7);
+        assert_eq!(attempts.record(7), 1);
+        for sequence in 100..(100 + ERROR_ATTEMPTS_CAP as u64 + 5) {
+            attempts.record(sequence);
+        }
+        assert!(attempts.counts.lock().unwrap().len() <= ERROR_ATTEMPTS_CAP);
     }
 
     #[test]

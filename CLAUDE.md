@@ -827,7 +827,9 @@ the rejection (it also drops, with a `warn!` naming the correlation id, any resp
 the awaiting flow stays parked until its watchdog fires (forever with no deadline). On JetStream a busy session is
 redelivered while the message is younger than `busy_budget(step_timeout)` (handle timeout + 60 s, at most 31 min),
 measured from the message's publish time; every Nak counts against the server's `max_deliver`, so the consumer's is
-now the backstop `CONSUMER_MAX_DELIVER` (100) and `MAX_DELIVER` (6) is the application cap for handler ERRORS only.
+now the backstop `CONSUMER_MAX_DELIVER` (100) and `MAX_DELIVER` (6) is the application cap for handler ERRORS only. Handler errors are
+counted per stream sequence in-process (`jetstream::ErrorAttempts`), not from the delivery count, so busy Naks do not spend
+that budget; if `info()` fails the delivery is settled as the last one.
 
 ### What a component is told about its caller
 
@@ -896,6 +898,10 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
 - **Persistence after side effects is never a reason to re-run them.** `resume.clear` / `save_with_run` after a
   flow ran go through `persist_after_effects` (retries the write only) and fail as
   `RunnerError::PostEffectPersistence`, which `retry_with_jitter` does not retry.
+- **A failed effectful node is terminal too.** `drive_flow` sets its effects flag when a `performs_external_effect` node
+  succeeds AND when one fails (except `flow.call`, whose nested `drive_flow` classifies itself), so a transient failure
+  after a partial effect is never whole-turn retried. A pre-effect transient failure of such a node is not retried either
+  (conservative); `terminal_after_effects` keeps the full `{err:#}` chain in the reason.
 - **`redirect_count` (`flow.goto`) is per turn**, reset on resume. `drive_flow` also caps one turn at
   `MAX_STEPS_PER_TURN` (10,000) nodes.
 - **`RunnerHost` installs `DiscardSessionHost`** as the engine-level `SessionHost`; the store-backed host was

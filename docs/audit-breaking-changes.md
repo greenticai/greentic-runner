@@ -737,6 +737,45 @@ Follow-ups to the round-12 audit. Each entry is a behaviour change; none bumps a
   - an unsafe or unbuildable unit secret scope falls back to the team/tenant scope, which can serve a broader
     credential; the first skip per process logs a `warn!`.
 
+## Round 14
+
+- **A failed effectful node now makes a transient failure terminal.** `drive_flow` marked "effects performed" only after
+  an effectful node (`dw.agent`, `mcp`, `media.create`, `sorla.call`, `a2a`, ...; `performs_external_effect`) had
+  SUCCEEDED, so one that failed transiently after a partial effect (a tool call that ran, a request that was
+  published) was retried as a whole turn and the effect doubled. The flag is now also set when such a node fails
+  (`may_have_partial_effect_on_failure`). Conservative on purpose: a transient failure BEFORE the node did anything
+  (for example a broker connect error) is no longer retried either; non-retryable errors (validation, config) were
+  never retried, so they are unaffected. `flow.call` is exempt on failure because its nested `drive_flow` already
+  classifies its own failure. Accepted over-conservatism: a successful `flow.call` into a pure sub-flow, or a
+  read-only `dw.agent`, still counts as effectful, because the host cannot cheaply tell. **Affected:** a flow whose
+  first effectful node fails transiently now fails the turn instead of retrying it.
+- **`FlowTerminal.reason` keeps the root cause.** `terminal_after_effects` rebuilt the error from `err.to_string()`
+  (outermost context only); it now uses `{err:#}`, so the reason reads `outer: cause: root cause`.
+- **JetStream handler-error budget no longer counts busy Naks (`aw-event-bridge`).** `settlement` held `delivered >=
+  MAX_DELIVER` against handler errors, but a busy Nak is also a delivery, so a request that waited out a long turn
+  had no retries left for its first handler error. Handler errors are now counted separately
+  (`jetstream::ErrorAttempts`, keyed by stream sequence, process-local) and `MAX_DELIVER` (6) is held against that
+  count; `CONSUMER_MAX_DELIVER` still terminates. A redelivery landing on another replica restarts the error count
+  (extra retries, never more than the backstop). `settlement` takes a third argument, `error_attempts`.
+  `telco-x-event-bridge` has no JetStream consumer, so it has no analogue.
+- **JetStream `info()` failure.** Without delivery metadata neither backstop could count, so a Nak could redeliver
+  forever. The delivery is now settled as the last one (a busy session is answered `session_busy`, a handler error is
+  terminated and answered) with a `warn`. Backlog age: the busy budget is still measured from the PUBLISH time, so
+  time in the stream backlog counts; the caller's own wait started at publish, so answering sooner is correct.
+- **Tenant ids (round 13 rule) unchanged, rationale recorded.** One invalid tenant fails startup for all tenants on
+  purpose (fail fast beats serving a subset silently); the errors already name the tenant (`invalid host config for
+  tenant ...`, `invalid tenant configuration for ...`, and `validate_tenant_segment` quotes the id).
+  **Migration note:** renaming a tenant re-keys everything derived from the id: greentic-state FQNs, session and
+  parked-flow keys (`env:tenant:...`), the WASI per-tenant directory (`<host dir>/tenants/<tenant>`, not migrated)
+  and the secrets paths. Parked flows under the old name are not resumed. `IngressEnvelope::tenant_ctx()` keeps only
+  the `TenantId` rule: its tenants come from the already-validated host configs, and rejecting there would turn a
+  startup check into a per-request failure.
+- **Log volume.** The oversize tool-result `warn` (`cap_tool_result_for`) is emitted at most once a minute per process
+  (others at `debug`) and its tool name is stripped of control and bidi characters; the guest-memory-cap denial
+  (`wasm_limits`) is a `warn` once per process instead of once per invocation (later ones at `debug`).
+- Comment fixes only: `routing.rs::is_truthy_value` no longer claims to match every boolean env parser;
+  `CONSUMER_MAX_DELIVER` documents the 31 minute budget (about 40 deliveries).
+
 ## Changes missing from earlier rounds
 
 Found by review; each was already in the tree and absent from this document.

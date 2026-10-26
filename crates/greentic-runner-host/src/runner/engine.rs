@@ -460,6 +460,12 @@ impl NodeKind {
     ///   so the host cannot tell a pure formatter from an HTTP writer. Treating
     ///   them all as effectful would turn the whole-turn retry into a no-op for
     ///   almost every flow. Known limitation, documented in CLAUDE.md.
+    ///
+    /// Over-conservative cases, accepted: a `flow.call` to a pure sub-flow and a
+    /// read-only `dw.agent` count as effectful on SUCCESS, because the host
+    /// cannot cheaply tell (the nested run's own flag is not surfaced, and an
+    /// agent's tools are chosen by the model at run time). The cost is that a
+    /// later transient failure in that turn is not re-run.
     fn performs_external_effect(&self) -> bool {
         matches!(
             self,
@@ -476,6 +482,13 @@ impl NodeKind {
                 | NodeKind::A2a { .. }
                 | NodeKind::MediaCreate
         )
+    }
+
+    /// Whether a FAILED run of this node may already have changed something
+    /// outside the turn. Same set as [`Self::performs_external_effect`] except
+    /// `flow.call`, whose nested `drive_flow` classifies its own failure.
+    fn may_have_partial_effect_on_failure(&self) -> bool {
+        !matches!(self, NodeKind::FlowCall) && self.performs_external_effect()
     }
 }
 
@@ -494,7 +507,8 @@ fn terminal_after_effects(err: anyhow::Error, effects_performed: bool) -> anyhow
         error = %format!("{err:#}"),
         "flow failed after an earlier node performed an external effect; the turn is not re-run"
     );
-    terminal_flow_error(err.to_string())
+    // `{:#}` keeps the whole cause chain (the root cause is usually the useful part).
+    terminal_flow_error(format!("{err:#}"))
 }
 
 #[derive(Clone, Debug)]
@@ -1460,6 +1474,17 @@ impl FlowEngine {
                     // failures, then convert to a metadata-only Ok envelope at
                     // the top level once retries are exhausted (session flows).
                     // The envelope keeps what the earlier nodes produced.
+                    //
+                    // An effectful node that fails may already have done part
+                    // of its work (a published request, a tool call that ran
+                    // before the next one failed), so a TRANSIENT failure here
+                    // must not re-run the turn either. `FlowCall` is exempt: the
+                    // nested `drive_flow` tracks its own effects and has already
+                    // made the failure terminal when it had any. Errors that are
+                    // not retryable anyway (validation, config) are unaffected.
+                    if node.kind.may_have_partial_effect_on_failure() {
+                        *effects_performed = true;
+                    }
                     return Err(FlowFailure {
                         error: err,
                         node_outputs: state.outputs_map(),
@@ -10130,6 +10155,28 @@ mod tests {
         assert!(is_terminal_flow_error(&after));
         assert!(!should_retry(&after));
         assert_eq!(after.to_string(), "internal timeout: unavailable");
+        // The root cause survives the rebuild.
+        let chained = anyhow::Error::new(TransientFlowError("connection reset".into()))
+            .context("sorla.call failed");
+        let rebuilt = terminal_after_effects(chained, true);
+        assert!(is_terminal_flow_error(&rebuilt));
+        assert!(
+            rebuilt.to_string().contains("sorla.call failed"),
+            "{rebuilt}"
+        );
+        assert!(
+            rebuilt.to_string().contains("connection reset"),
+            "{rebuilt}"
+        );
+    }
+
+    #[test]
+    fn failed_effect_nodes_may_have_partial_effects_except_flow_call() {
+        assert!(NodeKind::MediaCreate.may_have_partial_effect_on_failure());
+        assert!(NodeKind::SorlaCall { target: "t".into() }.may_have_partial_effect_on_failure());
+        assert!(!NodeKind::FlowCall.may_have_partial_effect_on_failure());
+        assert!(!NodeKind::BuiltinStateGet.may_have_partial_effect_on_failure());
+        assert!(!NodeKind::Wait.may_have_partial_effect_on_failure());
     }
 
     fn chain_flow(flow_id: &str, nodes: &[(&str, &str, Value)]) -> HostFlow {
