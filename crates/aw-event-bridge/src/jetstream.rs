@@ -38,8 +38,40 @@ pub fn agentic_consumer_config() -> consumer::pull::Config {
         ack_policy: consumer::AckPolicy::Explicit,
         max_deliver: CONSUMER_MAX_DELIVER,
         ack_wait: ACK_WAIT,
+        // Server-side ceiling on unacked deliveries, equal to the in-process cap
+        // ([`crate::MAX_INFLIGHT`]). The pull loop never holds more permits than
+        // this, so the server stops handing this consumer more work while every
+        // slot is busy. The default (1000) is looser than the cap.
+        max_ack_pending: MAX_ACK_PENDING,
         ..Default::default()
     }
+}
+
+/// `max_ack_pending` of the durable: the in-flight cap, as the `i64` the wire uses.
+pub const MAX_ACK_PENDING: i64 = crate::MAX_INFLIGHT as i64;
+
+/// Most messages requested in one pull (and so held in the client buffer).
+const PULL_BATCH: usize = 16;
+
+/// How long one pull waits for messages before it is re-issued.
+const PULL_EXPIRES: Duration = Duration::from_secs(30);
+
+/// Wait for one in-flight slot, then take up to `max - 1` more that are free
+/// right now. Each slot is one message the caller is about to pull, so a message
+/// is only requested from the stream when a slot exists to run it.
+async fn acquire_batch(
+    permits: &Arc<tokio::sync::Semaphore>,
+    max: usize,
+) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, tokio::sync::AcquireError> {
+    let mut held = Vec::with_capacity(max.max(1));
+    held.push(permits.clone().acquire_owned().await?);
+    while held.len() < max {
+        match permits.clone().try_acquire_owned() {
+            Ok(permit) => held.push(permit),
+            Err(_) => break,
+        }
+    }
+    Ok(held)
 }
 
 /// Ensure the `greentic-agentic` stream and `agentic-workers` durable pull
@@ -74,6 +106,7 @@ pub async fn ensure_consumer(
     // a turn and would redeliver (and double-run) it. Converge it in place.
     if ack_wait_is_stale(consumer.cached_info().config.ack_wait)
         || consumer.cached_info().config.max_deliver != CONSUMER_MAX_DELIVER
+        || consumer.cached_info().config.max_ack_pending != MAX_ACK_PENDING
     {
         tracing::warn!(
             existing = ?consumer.cached_info().config.ack_wait,
@@ -390,9 +423,24 @@ pub async fn run_bridge_jetstream(
     invoker: Arc<dyn AgentDispatchInvoker>,
 ) -> Result<()> {
     let consumer = ensure_consumer(&client).await?;
+    let permits = Arc::new(tokio::sync::Semaphore::new(crate::MAX_INFLIGHT));
     let mut attempt: u32 = 0;
     loop {
-        match consumer.messages().await {
+        // Take slots BEFORE asking the stream for messages: a message that is
+        // not requested stays in the stream (visible to other replicas, and not
+        // ticking against this consumer's ack_wait), whereas a message already
+        // pulled would sit unacked, with no progress acks, until a slot frees.
+        let mut slots = match acquire_batch(&permits, PULL_BATCH).await {
+            Ok(slots) => slots,
+            Err(error) => anyhow::bail!("in-flight semaphore closed: {error}"),
+        };
+        let pulled = consumer
+            .fetch()
+            .max_messages(slots.len())
+            .expires(PULL_EXPIRES)
+            .messages()
+            .await;
+        match pulled {
             Ok(mut messages) => {
                 while let Some(item) = messages.next().await {
                     let js_msg = match item {
@@ -405,16 +453,28 @@ pub async fn run_bridge_jetstream(
                         }
                     };
                     attempt = 0;
+                    let Some(permit) = slots.pop() else {
+                        // Cannot happen (the pull is capped at `slots.len()`);
+                        // never run without a slot, let redelivery retry it.
+                        tracing::warn!("jetstream delivered more than requested; leaving unacked");
+                        continue;
+                    };
                     let client = client.clone();
                     let invoker = invoker.clone();
-                    tokio::spawn(handle_one(client, invoker, js_msg));
+                    tokio::spawn(async move {
+                        let _slot = permit;
+                        handle_one(client, invoker, js_msg).await;
+                    });
                 }
-                tracing::warn!("jetstream message stream ended; re-opening");
             }
-            Err(error) => tracing::warn!(%error, "open jetstream messages stream failed"),
+            Err(error) => {
+                tracing::warn!(%error, "open jetstream pull failed");
+                drop(slots);
+                tokio::time::sleep(backoff_delay(attempt)).await;
+                attempt = attempt.saturating_add(1);
+            }
         }
-        tokio::time::sleep(backoff_delay(attempt)).await;
-        attempt = attempt.saturating_add(1);
+        // Unused slots (short or empty batch) are returned as `slots` drops.
     }
 }
 
@@ -594,6 +654,34 @@ mod tests {
             "ack_policy must be Explicit, got {:?}",
             cfg.ack_policy
         );
+    }
+
+    #[test]
+    fn consumer_caps_unacked_deliveries_at_the_inflight_cap() {
+        let cfg = agentic_consumer_config();
+        assert_eq!(cfg.max_ack_pending, crate::MAX_INFLIGHT as i64);
+        assert!(
+            cfg.max_ack_pending < 1000,
+            "tighter than the server default"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_batch_takes_what_is_free_and_waits_when_none_is() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(3));
+        let first = acquire_batch(&permits, 16).await.expect("open semaphore");
+        assert_eq!(first.len(), 3, "never more than the cap");
+        assert_eq!(permits.available_permits(), 0);
+
+        // Nothing free: the next acquire must wait, not pull past the cap.
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(50), acquire_batch(&permits, 16)).await;
+        assert!(waiting.is_err(), "blocked while every slot is held");
+
+        drop(first);
+        let again = acquire_batch(&permits, 2).await.expect("open semaphore");
+        assert_eq!(again.len(), 2, "batch is capped at the requested size");
+        assert_eq!(permits.available_permits(), 1);
     }
 
     #[test]

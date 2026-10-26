@@ -124,7 +124,7 @@ async fn dispatch_to_resumer_outcome(
             tracing::error!(
                 %error,
                 correlation_id = %crate::log_safe::log_safe(&input.correlation_id),
-                "failed to resume session on dispatch response"
+                "failed to resume session on dispatch response; the response is spent and its deadline watchdog was retired at admission, so a wait that is still parked now has no timeout (known limitation, see CLAUDE.md)"
             );
             None
         }

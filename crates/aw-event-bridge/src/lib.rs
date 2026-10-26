@@ -536,7 +536,10 @@ pub const QUEUE_GROUP: &str = "agentic-workers";
 /// caller at once to retry, which lands on a random replica again. Real
 /// backpressure is a pull consumer (the durable JetStream path), where a
 /// replica asks for work itself and unread work stays in the stream for the
-/// other replicas.
+/// other replicas. The JetStream path ([`jetstream::run_bridge_jetstream`])
+/// does exactly that: it takes a slot from a [`MAX_INFLIGHT`] semaphore before
+/// each pull and the durable sets `max_ack_pending` to the same number, so it
+/// never refuses with `overloaded`; it simply stops pulling.
 pub const MAX_INFLIGHT: usize = 256;
 
 /// Error code published when the in-flight cap refused a request.

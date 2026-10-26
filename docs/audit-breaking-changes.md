@@ -961,3 +961,26 @@ marked `#[non_exhaustive]`.**
   them before execution (comments, quotes and a trailing `;` are handled) and the read-only pool also sets
   `PRAGMA query_only = ON`. The SQL gateway is fail-closed/unused in the shipped hosts, so this is defence in depth.
   `PRAGMA`/`EXPLAIN` queries are no longer accepted on SQLite.
+
+## Round 18b
+
+- **JetStream agentic consumer is backpressured (`aw-event-bridge`).** `run_bridge_jetstream` no longer
+  spawns a handler for every message it reads. It takes a slot from a `MAX_INFLIGHT` (256) semaphore BEFORE
+  each pull (`fetch().max_messages(<slots>)`, batches of at most 16), so unread work stays in the stream for
+  other replicas and nothing sits unacked without progress acks while waiting for a slot. The durable's
+  `max_ack_pending` is now `MAX_INFLIGHT` (was the server default, 1000); `ensure_consumer` converges an
+  existing durable whose value differs. Behaviour change: a saturated replica pulls less instead of running
+  more; the core-NATS path still answers `overloaded`.
+- **Known limitation (`RuntimeSessionResumer::resume_checked`).** A response is admitted, its deadline
+  watchdog retired, and only then does `handle` run. If `handle` fails with an infrastructure error (resume-store
+  read/save, `PostEffectPersistence`) the response is spent and the watchdog is gone, so a wait that is still
+  parked has no timeout and the user gets no reply until they message again. Not fixed: the original deadline
+  is not recorded, and a synthetic `timeout` would resume the park, repeating effects when the failure was
+  post-effect, and would need the approval nonce/`decision_token`. The failure is logged at `error` with that
+  consequence spelled out.
+- **Pack-carried extensions are staged one at a time and bounded.** `stage_from_packs` reads, stages and
+  releases each `extensions/*.gtxpack` in turn (resident memory: one archive) and refuses, with a visible
+  `StagingFailure`, entries beyond 64 per pass or beyond 512 MiB of archive bytes in total.
+- **Store pull body is capped while streaming (`mcp_store_pull`).** `download_artifact` reads the body chunk by
+  chunk and fails with `Integrity` once `MAX_ARTIFACT_BYTES` is passed, instead of buffering a chunked body
+  with no `Content-Length` first.

@@ -482,9 +482,9 @@ fn parse_trusted_signer(entry: &str) -> Option<VerifyingKey> {
 
 /// GET the `.gtxpack` bytes, sending the optional `gts_` bearer token.
 ///
-/// Rejects the response before buffering when `Content-Length` exceeds
-/// [`MAX_ARTIFACT_BYTES`], and also after buffering in case the header was absent
-/// or lied. This limits exposure to a hostile/misconfigured store.
+/// Rejects the response before reading when `Content-Length` exceeds
+/// [`MAX_ARTIFACT_BYTES`], and also while streaming (see [`collect_capped`]) in
+/// case the header was absent or lied. This limits exposure to a hostile/misconfigured store.
 async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
     // Bounded: an unbounded client let a stalled store hold a pull (and, now
     // that pulls are serialised per ref, every waiter behind it) forever.
@@ -518,17 +518,38 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
             "artifact at {url} claims Content-Length {content_length} which exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
         )));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| StorePullError::Network(format!("read body from {url}: {e}")))?;
-    if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
-        return Err(StorePullError::Integrity(format!(
-            "artifact at {url} is {} bytes which exceeds the {MAX_ARTIFACT_BYTES}-byte cap",
-            bytes.len()
-        )));
+    collect_capped(response.bytes_stream(), MAX_ARTIFACT_BYTES, url).await
+}
+
+/// Collect a body chunk by chunk, failing as soon as the running total passes
+/// `cap`. `response.bytes()` would buffer the whole body first, so a store that
+/// omits `Content-Length` (chunked) could grow memory without bound before any
+/// size check ran.
+async fn collect_capped<S, B, E>(
+    mut stream: S,
+    cap: u64,
+    url: &str,
+) -> Result<Vec<u8>, StorePullError>
+where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt as _;
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| StorePullError::Network(format!("read body from {url}: {e}")))?;
+        let chunk = chunk.as_ref();
+        if (body.len() as u64).saturating_add(chunk.len() as u64) > cap {
+            return Err(StorePullError::Integrity(format!(
+                "artifact at {url} exceeds the {cap}-byte cap while streaming"
+            )));
+        }
+        body.extend_from_slice(chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(body)
 }
 
 /// Hex-lowercase SHA256 of `bytes`. Matches the store's `hex::encode` output.
