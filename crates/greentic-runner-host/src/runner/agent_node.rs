@@ -1318,6 +1318,9 @@ mod aw {
         // legitimate third-party key.
         "AWS_ACCESS_KEY_ID",
         "AZURE_CLIENT_SECRET",
+        "AZURE_CREDENTIALS",
+        "AZURE_ACCESS_TOKEN",
+        "AZURE_DEVOPS_EXT_PAT",
         "AZURE_USERNAME",
         "AZURE_PASSWORD",
         "GOOGLE_APPLICATION_CREDENTIALS",
@@ -1335,7 +1338,7 @@ mod aw {
     /// too, but only the families that carry that identity: `AWS_SECRET_*`,
     /// `AWS_SESSION_*`, `AWS_CONTAINER_*`, `AWS_WEB_IDENTITY_*`, `AWS_SHARED_*`,
     /// `AZURE_FEDERATED_*`, `AZURE_CLIENT_CERTIFICATE_*`, `AZURE_STORAGE_*`,
-    /// `GOOGLE_CLOUD_*`, `GCP_*`, plus the exact names above, and the
+    /// `GOOGLE_CLOUD_*`, `GOOGLE_OAUTH_*`, `GCP_*`, `CLOUDSDK_*`, `ARM_*`, `AWS_BEARER_*`, `AWS_SECURITY_*`, `AWS_ACCESS_KEY*`, `AZURE_*_CONNECTION_STRING`, plus the exact names above, and the
     /// `DATABASE_*`, `NATS_*`, `POSTGRES_*`, `MYSQL_*`, `KUBERNETES_*`
     /// connection settings. Third-party API keys that merely share a vendor
     /// prefix stay usable as tool secrets: `GOOGLE_API_KEY` (Gemini),
@@ -1352,6 +1355,16 @@ mod aw {
         "AWS_CONTAINER_",
         "AWS_WEB_IDENTITY_",
         "AWS_SHARED_",
+        // Bedrock bearer key, legacy `AWS_SECURITY_TOKEN`, legacy
+        // `AWS_ACCESS_KEY` (+ `_ID`).
+        "AWS_BEARER_",
+        "AWS_SECURITY_",
+        "AWS_ACCESS_KEY",
+        // Terraform/azurerm service principal (`ARM_CLIENT_SECRET`, ...).
+        "ARM_",
+        // gcloud CLI auth (`CLOUDSDK_AUTH_ACCESS_TOKEN`, ...).
+        "CLOUDSDK_",
+        "GOOGLE_OAUTH_",
         "AZURE_FEDERATED_",
         "AZURE_CLIENT_CERTIFICATE_",
         "AZURE_STORAGE_",
@@ -1365,7 +1378,9 @@ mod aw {
     ];
 
     pub(crate) fn env_secret_name_is_denied(name: &str) -> bool {
-        ENV_SECRET_DENY_EXACT.contains(&name)
+        // `AZURE_<SERVICE>_CONNECTION_STRING` embeds an account key.
+        (name.starts_with("AZURE_") && name.ends_with("_CONNECTION_STRING"))
+            || ENV_SECRET_DENY_EXACT.contains(&name)
             || ENV_SECRET_DENY_PREFIXES
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
@@ -3405,6 +3420,16 @@ mod aw {
                 "secret://database/url",
                 "secret://nats/url",
                 "secret://kubeconfig",
+                "secret://aws/bearer/token/bedrock",
+                "secret://aws/security_token",
+                "secret://aws/access_key",
+                "secret://azure/credentials",
+                "secret://azure/cosmos/connection_string",
+                "secret://azure/devops/ext_pat",
+                "secret://arm/client_secret",
+                "secret://arm/subscription_id",
+                "secret://google/oauth/access_token",
+                "secret://cloudsdk/auth/access_token",
             ] {
                 let name = env_var_name_for_secret(denied);
                 assert!(
@@ -3420,6 +3445,11 @@ mod aw {
                 "secret://github/token",
                 "secret://gh/token",
                 "secret://aws/region",
+                "secret://aws/profile",
+                "secret://azure/tenant_id",
+                "secret://azure/client_id",
+                "secret://anthropic/api_key",
+                "secret://alarm/key",
             ] {
                 let name = env_var_name_for_secret(ok);
                 assert!(!env_secret_name_is_denied(&name), "{ok} -> {name}");
