@@ -83,15 +83,17 @@ pub async fn build(engine: Engine, dsn: &str, read_only: bool) -> Result<Connect
             .map(ConnectionPool::Mysql)
             .map_err(|e| format!("mysql connect: {e}")),
         Engine::Sqlite => {
-            let mut opts = dsn
+            // `query_only` is set on EVERY pool, not just read-only ones: the
+            // gateway only ever reads, and the statement-shape check in
+            // `execute::run` looks at the first keyword, so
+            // `WITH t AS (SELECT 1) DELETE FROM x` would otherwise write
+            // through a `read_only: false` pool. It also refuses writes to
+            // databases ATTACHed later.
+            let opts = dsn
                 .parse::<sqlx::sqlite::SqliteConnectOptions>()
                 .map_err(|e| format!("sqlite dsn: {e}"))?
-                .read_only(read_only);
-            if read_only {
-                // Also refuses writes to databases ATTACHed later; the
-                // statement shape is checked in `execute::run`.
-                opts = opts.pragma("query_only", "ON");
-            }
+                .read_only(read_only)
+                .pragma("query_only", "ON");
             sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(5)
                 .acquire_timeout(ACQUIRE_TIMEOUT)
