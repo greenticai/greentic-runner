@@ -452,7 +452,7 @@ mod tests {
         let err = dispatcher
             .dispatch(request)
             .await
-            .expect_err("an oversized publish is refused");
+            .expect_err("a publish to an invalid subject is refused");
         assert!(crate::runner::engine::is_pre_effect_error(&err), "{err:#}");
         assert!(
             !watchdog_pending("corr-refused-publish"),

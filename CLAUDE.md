@@ -907,7 +907,9 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
   `terminal_after_effects` rebuilds the error as a `TerminalFlowError` whose `Display` is only the OUTERMOST message
   (it reaches `metadata.error_message`, user facing) but whose `source()` keeps the original causes, so `{err:#}` /
   `anyhow_chain_text` (operator log, redacted run error, `FlowTerminal.reason`) still see the root cause; never put
-  `err:#` into a user-facing string. The full chain is also logged at `warn`. A deterministic pre-effect error whose
+  `err:#` into a user-facing string. Note `FlowTerminal.reason` (and the non-terminal `AdapterCall.reason`) carries the
+  full chain and is returned to ingress callers via `Err`: it is operator-side text, not the user envelope (which uses
+  `to_string()`), so do not forward it verbatim to an end user. The full chain is also logged at `warn`. A deterministic pre-effect error whose
   message echoes input (`tenant_ctx_for_audit`) is a `terminal_flow_error` so `should_retry`'s text heuristic cannot
   retry it; other deterministic errors containing "internal"/"unavailable"/"timeout" can still be retried (known).
 - **`redirect_count` (`flow.goto`) is per turn**, reset on resume. `drive_flow` also caps one turn at

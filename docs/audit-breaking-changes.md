@@ -893,7 +893,7 @@ marked `#[non_exhaustive]`.**
   node output (`terminated_by: "error"`), so it never reaches this path as an `Err`. `mcp`, `media.create` and
   `sorla` HTTP report failure as values, not errors. An earlier completed effect still makes any later failure of the
   turn terminal, marked or not.
-- **`FlowTerminal.reason` is the outermost message again** (reverts the round 14 `{err:#}` change). That string reaches
+- **`FlowTerminal.reason` carried the outermost message in round 15 and carries the full chain again since round 16** (reverts the round 14 `{err:#}` change). That string reaches
   the user-facing failure envelope (`metadata.error_message`), and a cause chain can carry a URL or host. The full chain
   is logged at `warn` in `terminal_after_effects`. (Round 16: the chain is also kept as `source()`, see
   [Round 16](#round-16); the user-facing text is unchanged.)
