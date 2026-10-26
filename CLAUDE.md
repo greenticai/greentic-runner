@@ -956,6 +956,12 @@ Two retry layers re-run a failed turn from its start: the engine's own loop (`ex
 - **Deterministic jump failures are terminal**: `unknown_flow` (flow not registered), `unknown_node`, "no start node"
   and a malformed `greentic_control` block (`parse_component_control`). A `load_flow` I/O failure stays retryable.
 
+**Known limitation: a failed resume after admission leaves the wait without a timeout.** `RuntimeSessionResumer::resume_checked` retires the deadline watchdog at admission, before `handle` runs. If `handle` then fails with an infrastructure error (resume-store read/save, `PostEffectPersistence`) the response is spent and no watchdog remains, so a still-parked wait has no timeout and the user hears nothing until they message again (`dispatch_to_resumer_outcome` logs it at `error`). Not re-armed on purpose: the original deadline is not recorded, a synthetic `timeout` would resume the park and repeat effects after a post-effect failure, and an approval would also need its nonce/`decision_token`. A fix needs the deadline persisted with the park.
+
+**Backpressure (aw-event-bridge JetStream path).** `run_bridge_jetstream` takes a `MAX_INFLIGHT` semaphore slot before each pull (`fetch().max_messages(<slots>)`), so unread messages stay in the stream; the durable's `max_ack_pending` equals `MAX_INFLIGHT` and `ensure_consumer` converges a stale one. Pulling a message without a slot would let it sit unacked, with no progress acks, past `ack_wait` and run twice.
+
+**Bounded intake of pack-carried extensions and store artifacts.** `pack_extensions::stage_from_packs` stages one archive at a time (read, stage, release) and caps a pass at 64 entries / 512 MiB total (`stage_bounded`; over-cap entries become `StagingFailure`s). `mcp_store_pull::download_artifact` streams the body through `collect_capped` against `MAX_ARTIFACT_BYTES`; never use `response.bytes()` there.
+
 ### Pack Hot-Reload
 
 Full list of user-visible and breaking changes from the audit branch: `docs/audit-breaking-changes.md`.

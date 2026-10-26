@@ -660,7 +660,10 @@ mod tests {
     fn consumer_caps_unacked_deliveries_at_the_inflight_cap() {
         let cfg = agentic_consumer_config();
         assert_eq!(cfg.max_ack_pending, crate::MAX_INFLIGHT as i64);
-        assert!(cfg.max_ack_pending < 1000, "tighter than the server default");
+        assert!(
+            cfg.max_ack_pending < 1000,
+            "tighter than the server default"
+        );
     }
 
     #[tokio::test]
@@ -671,11 +674,8 @@ mod tests {
         assert_eq!(permits.available_permits(), 0);
 
         // Nothing free: the next acquire must wait, not pull past the cap.
-        let waiting = tokio::time::timeout(
-            Duration::from_millis(50),
-            acquire_batch(&permits, 16),
-        )
-        .await;
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(50), acquire_batch(&permits, 16)).await;
         assert!(waiting.is_err(), "blocked while every slot is held");
 
         drop(first);
