@@ -94,8 +94,45 @@ pub fn redact_locator(locator: &str) -> String {
     }
 }
 
+/// Drop reqwest's `" for url (<url>)"` Display suffix from one error message.
+/// The URL may be a presigned S3 / Azure SAS locator, so its query must never
+/// reach an error chain.
+pub(crate) fn strip_url_suffix(message: &str) -> String {
+    match message.find(" for url (") {
+        Some(start) => {
+            let tail = &message[start + " for url (".len()..];
+            match tail.find(')') {
+                Some(end) => format!("{}{}", &message[..start], &tail[end + 1..]),
+                None => message[..start].to_string(),
+            }
+        }
+        None => message.to_string(),
+    }
+}
+
+/// The reason an I/O error gives, with every `" for url (...)"` suffix removed.
+///
+/// A body read that fails mid-stream surfaces as an `io::Error` WRAPPING a
+/// `reqwest::Error`; going through `?` would keep the whole chain, and the
+/// wrapped error's Display carries the full request URL. The chain is flattened
+/// here to text instead.
+pub(crate) fn body_read_reason(error: &std::io::Error) -> String {
+    let mut parts: Vec<String> = vec![strip_url_suffix(&error.to_string())];
+    let mut source = std::error::Error::source(error);
+    while let Some(err) = source {
+        let text = strip_url_suffix(&err.to_string());
+        // `io::Error::other(e)` repeats `e` as both Display and source.
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        source = err.source();
+    }
+    parts.join(": ")
+}
+
 /// Copy `reader` into `writer`, failing as soon as more than `cap` bytes
-/// arrive. Returns the number of bytes copied.
+/// arrive. Returns the number of bytes copied. A read/write error is reported
+/// by reason only (see [`body_read_reason`]), never with the request URL.
 pub(crate) fn copy_capped<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
@@ -103,11 +140,15 @@ pub(crate) fn copy_capped<R: std::io::Read, W: std::io::Write>(
     what: &str,
 ) -> Result<u64> {
     use std::io::Read as _;
+    let copy_failed = |error: std::io::Error| {
+        anyhow::anyhow!("failed to copy {what}: {}", body_read_reason(&error))
+    };
     let Some(cap) = cap else {
-        return Ok(std::io::copy(reader, writer)?);
+        return std::io::copy(reader, writer).map_err(copy_failed);
     };
     // Read one byte past the cap so "exactly cap" passes and "cap + 1" fails.
-    let copied = std::io::copy(&mut reader.by_ref().take(cap.saturating_add(1)), writer)?;
+    let copied = std::io::copy(&mut reader.by_ref().take(cap.saturating_add(1)), writer)
+        .map_err(copy_failed)?;
     if copied > cap {
         bail!("{what} exceeds the {cap} byte download limit");
     }
@@ -200,7 +241,7 @@ impl ParsedReference {
 
 #[cfg(test)]
 mod download_cap_tests {
-    use super::{copy_capped, env_cap_bytes, redact_locator};
+    use super::{body_read_reason, copy_capped, env_cap_bytes, redact_locator};
 
     #[test]
     fn copy_stops_past_the_cap_and_allows_exactly_the_cap() {
@@ -213,6 +254,49 @@ mod download_cap_tests {
         let err = copy_capped(&mut data.as_slice(), &mut out, Some(9), "x").expect_err("over");
         assert!(err.to_string().contains("download limit"));
         assert!(out.len() <= 10, "must not keep reading past cap + 1");
+    }
+
+    /// What a failed streaming body read looks like: reqwest's Display ends in
+    /// `" for url (<full url>)"`.
+    #[derive(Debug)]
+    struct UrlBearingError;
+
+    impl std::fmt::Display for UrlBearingError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "error decoding response body for url (https://b.s3.amazonaws.com/a.gtpack?X-Amz-Signature=SECRET123)"
+            )
+        }
+    }
+
+    impl std::error::Error for UrlBearingError {}
+
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(UrlBearingError))
+        }
+    }
+
+    #[test]
+    fn a_failed_body_read_does_not_carry_the_request_url() {
+        for cap in [None, Some(1024)] {
+            let mut out = Vec::new();
+            let err =
+                copy_capped(&mut FailingReader, &mut out, cap, "pack").expect_err("read must fail");
+            let chain = format!("{err:#}");
+            assert!(!chain.contains("SECRET123"), "{chain}");
+            assert!(!chain.contains("amazonaws"), "{chain}");
+            assert!(chain.contains("error decoding response body"), "{chain}");
+        }
+    }
+
+    #[test]
+    fn body_read_reason_flattens_without_repeating_the_wrapped_error() {
+        let err = std::io::Error::other(UrlBearingError);
+        assert_eq!(body_read_reason(&err), "error decoding response body");
     }
 
     #[test]

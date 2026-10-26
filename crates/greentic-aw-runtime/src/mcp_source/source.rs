@@ -395,7 +395,7 @@ impl McpToolSource {
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| format!("request failed: {}", e.without_url()))?;
 
         let status = resp.status();
         if status.as_u16() != 200 {

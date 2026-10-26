@@ -503,7 +503,7 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
     let response = request
         .send()
         .await
-        .map_err(|e| StorePullError::Network(format!("GET {url}: {e}")))?;
+        .map_err(|e| StorePullError::Network(format!("GET {url}: {}", e.without_url())))?;
     let status = response.status();
     if !status.is_success() {
         return Err(StorePullError::Network(format!(

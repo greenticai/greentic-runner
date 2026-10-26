@@ -86,7 +86,12 @@ impl HttpGraphProvider {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|e| ConfigError::Internal(format!("graph registry request failed: {e}")))?;
+            .map_err(|e| {
+                ConfigError::Internal(format!(
+                    "graph registry request failed: {}",
+                    e.without_url()
+                ))
+            })?;
 
         match resp.status().as_u16() {
             200 => {
