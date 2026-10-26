@@ -322,7 +322,7 @@ impl BillingMeter for HttpBillingMeter {
                     "worker metering rejected; continuing"
                 ),
                 Err(e) => tracing::warn!(
-                    error = %e,
+                    error = %e.without_url(),
                     "worker metering unreachable; continuing"
                 ),
             }

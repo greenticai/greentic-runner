@@ -61,14 +61,16 @@ impl ConfigProvider for HttpConfigProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ConfigError::Internal(format!("agent registry request failed: {e}"))
+                    ConfigError::Internal(format!(
+                        "agent registry request failed: {}",
+                        e.without_url()
+                    ))
                 })?;
 
             match resp.status().as_u16() {
-                200 => resp
-                    .json::<AgentConfig>()
-                    .await
-                    .map_err(|e| ConfigError::Misconfigured(format!("agent config decode: {e}"))),
+                200 => resp.json::<AgentConfig>().await.map_err(|e| {
+                    ConfigError::Misconfigured(format!("agent config decode: {}", e.without_url()))
+                }),
                 404 => Err(ConfigError::AgentNotFound(agent_id.to_string())),
                 // Auth failures are operator-actionable misconfig, not a
                 // transient fault — surface them (Misconfigured is NOT swallowed
@@ -158,6 +160,30 @@ mod tests {
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Misconfigured(_))));
+    }
+
+    #[tokio::test]
+    async fn decode_and_transport_errors_do_not_carry_the_request_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not json"))
+            .mount(&server)
+            .await;
+        let tenant = TenantContext::new("t", "e");
+        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let decode = provider.agent_config(&tenant, "bot").await.unwrap_err();
+        let text = decode.to_string();
+        assert!(text.contains("agent config decode"), "{text}");
+        assert!(!text.contains("/api/v1/designer/agents"), "{text}");
+        assert!(!text.contains(&server.uri()), "{text}");
+
+        // Nothing listens on port 1: the send itself fails.
+        let provider = HttpConfigProvider::new("http://127.0.0.1:1/secret-path", "gtc_live_x");
+        let send = provider.agent_config(&tenant, "bot").await.unwrap_err();
+        let text = send.to_string();
+        assert!(text.contains("agent registry request failed"), "{text}");
+        assert!(!text.contains("secret-path"), "{text}");
+        assert!(!text.contains("/api/v1/designer/agents"), "{text}");
     }
 
     #[tokio::test]

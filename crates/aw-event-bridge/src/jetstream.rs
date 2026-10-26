@@ -72,12 +72,20 @@ pub const EMPTY_BATCH_FLOOR: Duration = Duration::from_millis(50);
 pub enum PullFault {
     /// `409`: the consumer reached `max_ack_pending`. Short fixed retry.
     MaxAckPending,
-    /// A message saying the durable consumer itself is gone (deleted, not
-    /// found): the loop re-runs [`ensure_consumer`] to re-create it.
+    /// The server said, on an in-flight pull, that the durable consumer was
+    /// deleted (`Consumer Deleted`): the loop re-runs [`ensure_consumer`] at once.
     ConsumerGone,
+    /// `503` / "no responders": nothing answers the pull. That is what a
+    /// durable deleted while the loop was idle (or blocked in `acquire_batch` /
+    /// leader election) looks like, because no in-flight pull is left to be
+    /// answered `Consumer Deleted`; it is also what a JetStream outage looks
+    /// like. Counted by [`ConsecutiveFaults`]; a run of them re-creates the
+    /// consumer.
+    Unavailable,
     /// Anything else (including every OTHER `409`: `Exceeded MaxWaiting`,
     /// `Exceeded MaxRequestBatch`/`Expires`/`MaxBytes`, `Consumer is push
-    /// based`): warn and escalate with [`backoff_delay`].
+    /// based`): warn and escalate with [`backoff_delay`]. Also counted by
+    /// [`ConsecutiveFaults`].
     Other,
 }
 
@@ -85,6 +93,13 @@ pub enum PullFault {
 /// `Batch` stream formats it as `"error while processing messages from the
 /// stream: 409, Some(\"Exceeded MaxAckPending\")"` (a boxed `io::Error`), so
 /// the status code and the server's description are all there is to match.
+///
+/// Only `Consumer Deleted` (a pull that was in flight when the durable went
+/// away) is a certain "consumer gone". There is deliberately no "consumer not
+/// found" branch: async-nats' `Batch` ends silently on a `404` (No Messages), so
+/// that text never reaches here. A durable deleted while no pull was in flight
+/// answers the next pull with `503` / no responders instead, handled through
+/// [`ConsecutiveFaults`].
 #[must_use]
 pub fn classify_pull_error(message: &str) -> PullFault {
     let lowered = message.to_ascii_lowercase();
@@ -95,10 +110,49 @@ pub fn classify_pull_error(message: &str) -> PullFault {
         || lowered.contains("max ack pending")
     {
         PullFault::MaxAckPending
-    } else if lowered.contains("consumer deleted") || lowered.contains("consumer not found") {
+    } else if lowered.contains("consumer deleted") {
         PullFault::ConsumerGone
+    } else if lowered.contains("no responders")
+        || lowered.contains("no_responders")
+        || lowered.contains("503")
+    {
+        PullFault::Unavailable
     } else {
         PullFault::Other
+    }
+}
+
+/// Consecutive pull failures (`Other` / `Unavailable` pull errors or a failed
+/// `.messages()` open) after which the loop re-runs [`ensure_consumer`].
+pub const RECREATE_AFTER_FAULTS: u32 = 3;
+
+/// Counts pull failures in a row so a durable deleted while idle is noticed.
+///
+/// Nothing proves the consumer is healthy except a pull that delivered a
+/// message, ended cleanly (`404`/`408`) or was answered `409 MaxAckPending`;
+/// each of those calls [`ConsecutiveFaults::clear`]. The count is NOT cleared
+/// when a re-creation is attempted, only when it succeeds, so a failing
+/// `ensure_consumer` is retried (with backoff) on every further fault.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ConsecutiveFaults {
+    count: u32,
+}
+
+impl ConsecutiveFaults {
+    /// Record one more failed pull; true once the consumer should be re-created.
+    pub fn record(&mut self) -> bool {
+        self.count = self.count.saturating_add(1);
+        self.count >= RECREATE_AFTER_FAULTS
+    }
+
+    /// The consumer answered (or was just re-created): start counting again.
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+
+    #[cfg(test)]
+    fn count(self) -> u32 {
+        self.count
     }
 }
 
@@ -164,10 +218,25 @@ pub async fn ensure_consumer(
     {
         Ok(consumer) => consumer,
         Err(create_err) => {
-            // The server refused because the existing durable's config differs.
-            tracing::warn!(error = %create_err, "agentic-workers consumer config differs; updating");
+            // `get_or_create_consumer` failed: a differing config on the existing
+            // durable is the usual cause, but a transient error looks the same.
+            // Read the durable as it is and converge from THAT, so a larger
+            // `max_ack_pending` (or an unlimited one) is never lowered; if it
+            // cannot be read either, report the original failure.
+            tracing::warn!(
+                error = %create_err,
+                "agentic-workers get_or_create_consumer failed; reading the existing consumer to converge it"
+            );
+            let existing = stream
+                .consumer_info(DURABLE_CONSUMER)
+                .await
+                .map_err(|info_err| {
+                    anyhow::anyhow!(
+                        "get_or_create agentic-workers consumer: {create_err}; reading it back failed: {info_err}"
+                    )
+                })?;
             return stream
-                .update_consumer(agentic_consumer_config())
+                .update_consumer(converged_consumer_config(existing.config.max_ack_pending))
                 .await
                 .context("update agentic-workers consumer");
         }
@@ -205,12 +274,16 @@ pub fn max_ack_pending_needs_raise(existing: i64) -> bool {
     existing > 0 && existing < MAX_ACK_PENDING
 }
 
-/// The config to converge an existing durable to: ours, but never lowering a
-/// finite `max_ack_pending` an operator or a newer build already set higher.
+/// The config to converge an existing durable to: ours, but `max_ack_pending`
+/// is never lowered. A finite value above ours is kept, and an unlimited one
+/// (`<= 0`; the server reports `-1`) stays unlimited, sent as `-1`: `0` on the
+/// wire would mean "server default" and silently turn unlimited into a limit.
 #[must_use]
 pub fn converged_consumer_config(existing_max_ack_pending: i64) -> consumer::pull::Config {
     let mut config = agentic_consumer_config();
-    if existing_max_ack_pending > MAX_ACK_PENDING {
+    if existing_max_ack_pending <= 0 {
+        config.max_ack_pending = -1;
+    } else if existing_max_ack_pending > MAX_ACK_PENDING {
         config.max_ack_pending = existing_max_ack_pending;
     }
     config
@@ -513,6 +586,25 @@ pub fn settlement(result: &Result<Disposition>, delivered: i64, error_attempts: 
 /// own `tokio::spawn` so one slow agent does not stall the pull loop, with
 /// `in_progress` acks sent while it runs. A stream error is logged and the
 /// message stream re-opened with backoff rather than ending the consumer.
+///
+/// **Consumer re-creation.** The durable is re-created ([`ensure_consumer`])
+/// when a pull is answered `Consumer Deleted`, or after
+/// [`RECREATE_AFTER_FAULTS`] pull failures in a row (`503` / no responders /
+/// any other error, or a failed `.messages()` open): a durable deleted while
+/// the loop was idle never produces `Consumer Deleted`, only `503`.
+///
+/// **What a re-creation does to messages in flight.** Their `ack` / progress /
+/// `term` were addressed to the OLD consumer's delivery, which no longer
+/// exists, so the server ignores them and the message is redelivered by the
+/// new consumer (a work-queue stream still holds it). The redelivery is
+/// absorbed by the dispatch ledger (`greentic_aw_runtime::dispatch_ledger`,
+/// keyed `{tenant}:{env}:{dispatch_id}`, the same `Greentic-Dispatch-Id` on the
+/// redelivered message) when the invoker was built `with_ledger` (the default
+/// `NoopDispatchLedger` does not deduplicate), and a turn still running is
+/// held off by the session lock (busy -> Nak). The new consumer's delivery
+/// count restarts at 1, so [`CONSUMER_MAX_DELIVER`] is a fresh budget for such a
+/// message; the busy age budget is measured from the publish time and does not
+/// reset, and the process-local [`ErrorAttempts`] keep their count.
 pub async fn run_bridge_jetstream(
     client: async_nats::Client,
     invoker: Arc<dyn AgentDispatchInvoker>,
@@ -520,6 +612,7 @@ pub async fn run_bridge_jetstream(
     let mut consumer = ensure_consumer(&client).await?;
     let permits = Arc::new(tokio::sync::Semaphore::new(crate::MAX_INFLIGHT));
     let mut attempt: u32 = 0;
+    let mut faults = ConsecutiveFaults::default();
     loop {
         // Take slots BEFORE asking the stream for messages: a message that is
         // not requested stays in the stream (visible to other replicas, and not
@@ -553,27 +646,36 @@ pub async fn run_bridge_jetstream(
                                         "consumer at max_ack_pending; retrying shortly"
                                     );
                                     attempt = 0;
+                                    faults.clear();
                                     tokio::time::sleep(MAX_ACK_PENDING_RETRY).await;
                                 }
                                 PullFault::ConsumerGone => {
                                     tracing::warn!(%error, "durable consumer is gone; re-creating");
-                                    match ensure_consumer(&client).await {
-                                        Ok(fresh) => {
-                                            consumer = fresh;
-                                            attempt = 0;
-                                        }
-                                        Err(create_error) => {
-                                            tracing::warn!(error = %create_error, "re-creating durable consumer failed");
-                                            attempt = attempt.saturating_add(1);
-                                        }
-                                    }
-                                    tokio::time::sleep(backoff_delay(attempt)).await;
+                                    recreate_consumer(
+                                        &client,
+                                        &mut consumer,
+                                        &mut attempt,
+                                        &mut faults,
+                                    )
+                                    .await;
                                     // The current pull belongs to the dead
                                     // consumer: abandon it and open a new one.
                                     break;
                                 }
-                                PullFault::Other => {
+                                PullFault::Unavailable | PullFault::Other => {
                                     tracing::warn!(%error, "jetstream message error; continuing");
+                                    if faults.record() {
+                                        // A durable deleted while idle shows up
+                                        // only as repeated 503 / no responders.
+                                        recreate_consumer(
+                                            &client,
+                                            &mut consumer,
+                                            &mut attempt,
+                                            &mut faults,
+                                        )
+                                        .await;
+                                        break;
+                                    }
                                     tokio::time::sleep(backoff_delay(attempt)).await;
                                     attempt = attempt.saturating_add(1);
                                 }
@@ -583,6 +685,7 @@ pub async fn run_bridge_jetstream(
                     };
                     received += 1;
                     attempt = 0;
+                    faults.clear();
                     let Some(permit) = slots.pop() else {
                         // Cannot happen (the pull is capped at `slots.len()`);
                         // never run without a slot, let redelivery retry it.
@@ -597,6 +700,8 @@ pub async fn run_bridge_jetstream(
                     });
                 }
                 if !paused {
+                    // A pull that ended cleanly was answered by the consumer.
+                    faults.clear();
                     let delay = empty_batch_delay(received, jitter_entropy());
                     if !delay.is_zero() {
                         drop(slots);
@@ -607,12 +712,39 @@ pub async fn run_bridge_jetstream(
             Err(error) => {
                 tracing::warn!(%error, "open jetstream pull failed");
                 drop(slots);
-                tokio::time::sleep(backoff_delay(attempt)).await;
-                attempt = attempt.saturating_add(1);
+                if faults.record() {
+                    recreate_consumer(&client, &mut consumer, &mut attempt, &mut faults).await;
+                } else {
+                    tokio::time::sleep(backoff_delay(attempt)).await;
+                    attempt = attempt.saturating_add(1);
+                }
             }
         }
         // Unused slots (short or empty batch) are returned as `slots` drops.
     }
+}
+
+/// Re-run [`ensure_consumer`] and swap in the fresh handle. On success the
+/// fault count and backoff reset; on failure both are kept so the next fault
+/// retries, after a backoff.
+async fn recreate_consumer(
+    client: &async_nats::Client,
+    consumer: &mut consumer::Consumer<consumer::pull::Config>,
+    attempt: &mut u32,
+    faults: &mut ConsecutiveFaults,
+) {
+    match ensure_consumer(client).await {
+        Ok(fresh) => {
+            *consumer = fresh;
+            *attempt = 0;
+            faults.clear();
+        }
+        Err(create_error) => {
+            tracing::warn!(error = %create_error, "re-creating durable consumer failed");
+            *attempt = attempt.saturating_add(1);
+        }
+    }
+    tokio::time::sleep(backoff_delay(*attempt)).await;
 }
 
 async fn handle_one(
@@ -822,9 +954,7 @@ mod tests {
     #[test]
     fn other_pull_errors_keep_the_escalating_backoff() {
         for wire in [
-            "error while processing messages from the stream: 503, Some(\"JetStream unavailable\")",
             "error while processing messages from the stream: 400, Some(\"Bad Request\")",
-            "no responders",
             "error while processing messages from the stream: 409, None",
             "error while processing messages from the stream: 409, Some(\"Exceeded MaxWaiting\")",
             "error while processing messages from the stream: 409, Some(\"Exceeded MaxRequestBatch of 10\")",
@@ -838,12 +968,34 @@ mod tests {
 
     #[test]
     fn a_deleted_consumer_is_not_max_ack_pending_and_triggers_recreate() {
+        let wire =
+            "error while processing messages from the stream: 409, Some(\"Consumer Deleted\")";
+        assert_eq!(classify_pull_error(wire), PullFault::ConsumerGone, "{wire}");
+    }
+
+    #[test]
+    fn a_503_or_no_responders_is_unavailable_not_gone() {
         for wire in [
-            "error while processing messages from the stream: 409, Some(\"Consumer Deleted\")",
-            "error while processing messages from the stream: 404, Some(\"consumer not found\")",
+            "error while processing messages from the stream: 503 No Responders, None",
+            "error while processing messages from the stream: 503, Some(\"JetStream unavailable\")",
+            "no responders",
         ] {
-            assert_eq!(classify_pull_error(wire), PullFault::ConsumerGone, "{wire}");
+            assert_eq!(classify_pull_error(wire), PullFault::Unavailable, "{wire}");
         }
+    }
+
+    #[test]
+    fn consecutive_faults_trigger_recreation_and_reset_on_proof_of_life() {
+        let mut faults = ConsecutiveFaults::default();
+        for _ in 0..RECREATE_AFTER_FAULTS - 1 {
+            assert!(!faults.record());
+        }
+        assert!(faults.record(), "the Nth fault in a row re-creates");
+        // A failed re-creation keeps the count: the next fault retries at once.
+        assert!(faults.record());
+        faults.clear();
+        assert_eq!(faults.count(), 0);
+        assert!(!faults.record(), "a successful pull restarts the count");
     }
 
     #[test]
@@ -859,6 +1011,23 @@ mod tests {
         assert_eq!(
             converged_consumer_config(MAX_ACK_PENDING / 2).max_ack_pending,
             MAX_ACK_PENDING
+        );
+    }
+
+    #[test]
+    fn converging_keeps_an_unlimited_max_ack_pending_unlimited() {
+        for existing in [-1, 0, i64::MIN] {
+            assert_eq!(
+                converged_consumer_config(existing).max_ack_pending,
+                -1,
+                "{existing}"
+            );
+        }
+        // The other fields are still ours, so a stale ack_wait converges.
+        assert_eq!(converged_consumer_config(-1).ack_wait, ACK_WAIT);
+        assert_eq!(
+            converged_consumer_config(-1).max_deliver,
+            CONSUMER_MAX_DELIVER
         );
     }
 
