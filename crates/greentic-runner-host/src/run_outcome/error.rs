@@ -48,30 +48,46 @@ const CAUSED_BY: &str = "\ncaused by: ";
 /// What every redacted span is replaced with.
 const REDACTED: &str = "[redacted]";
 
-/// Keys whose value is a credential when they appear as `key=value`,
-/// `key: value` or `"key": "value"`. Matched case-insensitively as a whole
-/// key (so `token` matches `access_token`'s suffix only through its own entry).
-const SENSITIVE_KEYS: &[&str] = &[
-    "access_token",
-    "refresh_token",
-    "id_token",
+/// Substrings that mark a `key=value`, `key: value` or `"key": "value"` key as
+/// a credential. Mirrors `trace::agent_audit::is_sensitive_key` (substring
+/// semantics, not an exact-name list), so `x-amz-security-token`, `bot_token`
+/// and `x-goog-api-key` are caught. Checked per `-`/`_` separated segment of
+/// the key; see [`is_sensitive_key`].
+const SENSITIVE_SUBSTRINGS: &[&str] = &[
     "token",
-    "api_key",
-    "apikey",
-    "api-key",
-    "x-api-key",
-    "client_secret",
     "secret",
     "password",
     "passwd",
-    "pwd",
-    "private_key",
-    "session",
-    "cookie",
-    "set-cookie",
+    "authorization",
     "signature",
-    "sig",
+    "credential",
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "secretkey",
 ];
+
+/// Segments that are sensitive only as a COMPLETE segment: too short or too
+/// common to match as a substring (`sig` would hit `design`/`signal`, `key`
+/// would hit `keyboard`). Covers a bare `key=`, `x-goog-api-key` and
+/// `Ocp-Apim-Subscription-Key`.
+const SENSITIVE_SEGMENTS: &[&str] = &[
+    "key", "sig", "pwd", "auth", "session", "cookie", "bearer", "jwt",
+];
+
+/// True when `key` (an identifier of `[A-Za-z0-9_-]`) names a credential.
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    // Only the LAST segment names what the value is: `bot_token`,
+    // `x-amz-security-token`, `x-goog-api-key` are credentials, while
+    // `secret_missing` / `token_type` are status words that merely mention one,
+    // and `max_tokens` is a counter.
+    let Some(last) = key.rsplit(['-', '_']).next() else {
+        return false;
+    };
+    SENSITIVE_SEGMENTS.contains(&last)
+        || (last != "tokens" && SENSITIVE_SUBSTRINGS.iter().any(|n| last.contains(n)))
+}
 
 /// The `error` object of a v2 run-outcome event. Serialised `snake_case`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -359,7 +375,7 @@ fn redact_sensitive_pairs(text: &str) -> String {
             .find(|&j| !is_key_byte(bytes[j]))
             .unwrap_or(bytes.len());
         let key = &text[i..key_end];
-        if !SENSITIVE_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+        if !is_sensitive_key(key) {
             i = key_end;
             continue;
         }

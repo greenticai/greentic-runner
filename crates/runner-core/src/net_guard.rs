@@ -35,7 +35,14 @@ pub enum IpClass {
 
 fn classify_v4(ip: Ipv4Addr) -> IpClass {
     let o = ip.octets();
-    if ip == Ipv4Addr::new(169, 254, 169, 254) || ip == Ipv4Addr::new(100, 100, 100, 200) {
+    if ip == Ipv4Addr::new(169, 254, 169, 254)
+        // Alibaba Cloud
+        || ip == Ipv4Addr::new(100, 100, 100, 200)
+        // Azure WireServer / platform endpoint (not link-local, so it needs its own entry)
+        || ip == Ipv4Addr::new(168, 63, 129, 16)
+        // Oracle Cloud (OCI) instance metadata
+        || ip == Ipv4Addr::new(192, 0, 0, 192)
+    {
         IpClass::Metadata
     } else if o[0] == 169 && o[1] == 254 {
         IpClass::LinkLocal

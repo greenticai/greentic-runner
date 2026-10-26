@@ -884,8 +884,10 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
   (`agent_node::env_secret_lookup`), but host configuration resolves as not found
   (`env_secret_name_is_denied`): the exact names `ADMIN_TOKEN`, `OPERATOR_TOKEN`, `PACK_PUBLIC_KEY`,
   `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`,
-  `TELEGRAM_BOT_TOKEN`, `REDIS_URL`, `OTLP_ENDPOINT`, `OTLP_HEADERS`, and any name with the prefix `GREENTIC_`,
-  `TENANT_JWT_`, `SECRETS_` or `PACK_`. Extend `ENV_SECRET_DENY_EXACT` / `ENV_SECRET_DENY_PREFIXES` when a new
+  `TELEGRAM_BOT_TOKEN`, `REDIS_URL`, `OTLP_ENDPOINT`, `OTLP_HEADERS`, `PGPASSWORD`, `KUBECONFIG`, `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`,
+  `CARGO_REGISTRY_TOKEN`, `SSH_AUTH_SOCK`, and any name with the prefix `GREENTIC_`,
+  `TENANT_JWT_`, `SECRETS_`, `PACK_`, or (ambient cloud/infra credentials, round 18) `AWS_`, `AZURE_`, `GOOGLE_`,
+  `GCP_`, `DATABASE_`, `NATS_`, `POSTGRES_`, `MYSQL_`, `KUBERNETES_`. Extend `ENV_SECRET_DENY_EXACT` / `ENV_SECRET_DENY_PREFIXES` when a new
   host-level env secret is introduced. `OPENAI_API_KEY` is deliberately NOT denied.
 - **Tool-extension HTTP client** (`build_tool_http_client`): `redirect::Policy::none()` plus the `http_guard`
   address policy on DNS (a reqwest-0.12 resolver, since the ext-runtime pins 0.12 and `GuardedResolver` targets 0.13).
@@ -916,6 +918,20 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
   `MAX_STEPS_PER_TURN` (10,000) nodes.
 - **`RunnerHost` installs `DiscardSessionHost`** as the engine-level `SessionHost`; the store-backed host was
   write-only and leaked a row per turn. Parked snapshots live in `FlowResumeStore`, not there.
+
+### Credentials in URLs and errors (round 18)
+
+Rules that fail silently if changed. (1) A `reqwest::Error`'s `Display` appends ` for url (<full url>)`; never format one
+into a log line, error context or guest-facing message without `without_url()` (it consumes the error, so compute
+`is_blocked_error` first). The host `http-client` logs only `log_safe::log_safe_origin` (scheme+host+port; the PATH can
+hold a token, so a path-preserving helper is not enough there; `log_safe_url` was removed). A body-read `io::Error` wraps a reqwest error: use
+`http_guard::body_read_reason`. (2) A pack locator may be a presigned S3 / Azure SAS URL: put it in an error or log only
+through `runner_core::packs::resolver::redact_locator`, and reload failures through `watcher::redact_chain`
+(`HealthState::last_error`, hence `/admin/packs/status`, is redacted too). (3) `run_outcome::error::redact` decides
+whether a `key=value` key is a credential by its LAST `-`/`_` segment (`is_sensitive_key`), not an exact list; add a new
+credential word to `SENSITIVE_SUBSTRINGS` / `SENSITIVE_SEGMENTS`. (4) The SQLite SQL gateway accepts a single
+`SELECT`/`WITH`/`VALUES` statement (`execute::check_sqlite_read_only_sql`): `read_only(true)` alone does not stop
+`VACUUM INTO`, `ATTACH` or stacked statements. See `docs/audit-breaking-changes.md` (Round 18).
 
 ### Per-session turn lock
 
@@ -1142,7 +1158,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_WASM_MAX_MEMORY_MB` | Cap on any one guest linear memory AND on the total linear memory across all memories in one store (`wasm_limits::GuestLimiter`; multi-memory is enabled). Default `1024`; `0` disables both. At most 16 memories per store. Table/instance counts are always capped at generous fixed values. A grow past the cap is denied (`memory.grow` returns `-1`, no trap) with one `warn!` per store. |
 | `GREENTIC_OAUTH_BROKER_SHARED_SECRET` | Shared secret for the OAuth broker; overrides the YAML `oauth.shared_secret`. A blank value is treated as unset. Never logged. |
 | `GREENTIC_SHUTDOWN_GRACE_SECS` | Seconds in-flight HTTP requests get to drain after SIGTERM/ctrl-c before being cancelled (axum graceful shutdown). Default `30`; `0` aborts at once. `host.stop()` runs on every exit path. |
-| `GREENTIC_HTTP_ALLOW_METADATA` | Truthy disables the default outbound block on link-local (`169.254/16`, `fe80::/10`) and cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`). |
+| `GREENTIC_HTTP_ALLOW_METADATA` | Truthy disables the default outbound block on link-local (`169.254/16`, `fe80::/10`) and cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`, Azure WireServer `168.63.129.16`, Oracle `192.0.0.192`). |
 | `GREENTIC_HTTP_DENY_PRIVATE` | Opt-in (default OFF): also block loopback, `0.0.0.0/8`, RFC1918, CGNAT and ULA destinations. |
 | `GREENTIC_HTTP_MAX_RESPONSE_MB` | Cap on an outbound response body (host `http-client` and `wasi:http`). Default `64`; `0` disables. |
 | `GREENTIC_WASI_HTTP_ENFORCE_POLICY` | Opt-in (default OFF): make `wasi:http` honour a tenant's `http_enabled = false` (that flag is true only when the tenant has a `messaging` binding, so default enforcement would break other tenants' wasi-http components). |

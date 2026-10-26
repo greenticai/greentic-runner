@@ -443,10 +443,9 @@ impl Transport {
             if let Some((name, value)) = auth {
                 post = post.header(name, value);
             }
-            let response = post
-                .send()
-                .await
-                .map_err(|err| format!("calling a2a agent {agent_id} failed: {err}"))?;
+            let response = post.send().await.map_err(|err| {
+                format!("calling a2a agent {agent_id} failed: {}", err.without_url())
+            })?;
             if oauth && !retried && response.status() == reqwest::StatusCode::UNAUTHORIZED {
                 self.credentials.invalidate(route).await;
                 retried = true;

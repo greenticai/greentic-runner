@@ -294,7 +294,7 @@ impl CardCache {
             .get(url)
             .send()
             .await
-            .map_err(|err| A2aError::Transport(err.to_string()))?;
+            .map_err(|err| A2aError::Transport(err.without_url().to_string()))?;
         if !response.status().is_success() {
             return Err(A2aError::Transport(format!(
                 "unexpected status {}",
@@ -304,7 +304,7 @@ impl CardCache {
         let body = response
             .text()
             .await
-            .map_err(|err| A2aError::Transport(err.to_string()))?;
+            .map_err(|err| A2aError::Transport(err.without_url().to_string()))?;
         let card: AgentCard =
             serde_json::from_str(&body).map_err(|source| A2aError::Malformed {
                 url: url.to_string(),

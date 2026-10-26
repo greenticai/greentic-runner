@@ -269,7 +269,7 @@ pub async fn start_pack_watcher_with_policy(
             )
             .await
             {
-                tracing::error!(error = %err, "pack reload failed");
+                tracing::error!(error = %redact_chain(&err), "pack reload failed");
                 health_clone.record_reload_error(&err);
             }
         }
@@ -284,6 +284,13 @@ pub async fn start_pack_watcher_with_policy(
 /// to build. Its old digest is no longer resolved, so nothing else would bump
 /// the archive mtime and the next successful store could prune it from under
 /// the live runtime.
+/// An error chain for a log line, the reload failure list or `/admin/packs/status`
+/// `last_error`. A pack locator may be a presigned S3 / Azure SAS URL, so URL
+/// userinfo and queries (and credential pairs) are redacted.
+pub(crate) fn redact_chain(err: &anyhow::Error) -> String {
+    crate::run_outcome::error::redact(&format!("{err:#}"))
+}
+
 fn keep_archives_alive(manager: &PackManager, runtime: &TenantRuntime) {
     for pack in runtime.all_packs() {
         if let Some(path) = pack.archive_path() {
@@ -336,8 +343,8 @@ async fn reload_once(
         let record = match record {
             Ok(record) => record,
             Err(err) => {
-                tracing::error!(tenant = %tenant, error = %format!("{err:#}"), "pack resolve failed; keeping previous runtime");
-                failures.push(format!("{tenant}: {err:#}"));
+                tracing::error!(tenant = %tenant, error = %redact_chain(&err), "pack resolve failed; keeping previous runtime");
+                failures.push(format!("{tenant}: {}", redact_chain(&err)));
                 if let Some(prev) = previous {
                     next.insert(RuntimeKey::legacy(tenant.clone()), prev);
                     if let Some(digests) = applied.lock().get(&tenant).cloned() {
@@ -472,8 +479,8 @@ async fn reload_once(
                 new_applied.insert(tenant.clone(), digests);
             }
             Err(err) => {
-                tracing::error!(tenant = %tenant, error = %format!("{err:#}"), "tenant reload failed; keeping previous runtime");
-                failures.push(format!("{tenant}: {err:#}"));
+                tracing::error!(tenant = %tenant, error = %redact_chain(&err), "tenant reload failed; keeping previous runtime");
+                failures.push(format!("{tenant}: {}", redact_chain(&err)));
                 failed_digests
                     .lock()
                     .record_failure(&tenant, &digests, Instant::now());
@@ -499,8 +506,8 @@ async fn reload_once(
             Ok(timers) => runtime.register_timers(timers),
             Err(err) => {
                 let tenant = runtime.config().tenant.clone();
-                tracing::error!(tenant = %tenant, error = %format!("{err:#}"), "failed to start timers after reload");
-                failures.push(format!("{tenant}: timers: {err:#}"));
+                tracing::error!(tenant = %tenant, error = %redact_chain(&err), "failed to start timers after reload");
+                failures.push(format!("{tenant}: timers: {}", redact_chain(&err)));
             }
         }
     }

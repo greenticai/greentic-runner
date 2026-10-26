@@ -124,3 +124,34 @@ fn chain_text_joins_every_source() {
     let io = std::io::Error::other("disk");
     assert_eq!(chain_text(&io), "disk");
 }
+
+#[test]
+fn compound_credential_keys_are_redacted() {
+    for (input, secret) in [
+        ("x-amz-security-token: FwoGZXIvYXdz", "FwoGZXIvYXdz"),
+        ("bot_token=123:ABCdef", "123:ABCdef"),
+        ("x-goog-api-key: AIzaSyXYZ", "AIzaSyXYZ"),
+        ("Ocp-Apim-Subscription-Key: 0123abcd", "0123abcd"),
+        ("retry with key=hunter2 now", "hunter2"),
+        ("X-Amz-Signature=deadbeef", "deadbeef"),
+        (r#"{"client_credential": "zzz9"}"#, "zzz9"),
+    ] {
+        let out = redact(input);
+        assert!(!out.contains(secret), "{input} -> {out}");
+        assert!(out.contains("[redacted]"), "{input} -> {out}");
+    }
+}
+
+#[test]
+fn ordinary_keys_survive_the_substring_match() {
+    for input in [
+        "design: rejected by the planner",
+        "max_tokens: 100",
+        "keyboard=us layout=en",
+        "signal: terminated",
+        "author: bob",
+        "status: 502",
+    ] {
+        assert_eq!(redact(input), input, "over-redacted: {input}");
+    }
+}

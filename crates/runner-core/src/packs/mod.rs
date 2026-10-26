@@ -390,10 +390,9 @@ impl PackManager {
             return self.open_resolved(entry, locator, cached.path, cached.digest);
         }
 
-        let response = self
-            .registry
-            .fetch(&locator)
-            .with_context(|| format!("resolver failed for {}", locator))?;
+        let response = self.registry.fetch(&locator).with_context(|| {
+            format!("resolver failed for {}", resolver::redact_locator(&locator))
+        })?;
 
         let fetched_digest = compute_digest(response.path())?;
         if entry

@@ -1307,6 +1307,14 @@ mod aw {
         "REDIS_URL",
         "OTLP_ENDPOINT",
         "OTLP_HEADERS",
+        // Ambient credentials of common tooling the runner process may inherit.
+        "PGPASSWORD",
+        "KUBECONFIG",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "NPM_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+        "SSH_AUTH_SOCK",
     ];
     /// `SECRETS_BROKER_*` (`secret://secrets/broker/token` -> the host's own
     /// secrets-broker bearer), `SECRETS_*` (backend selector and cache knobs),
@@ -1316,7 +1324,26 @@ mod aw {
     /// LLM fallback, but `secret://openai/api_key` is the documented way for an
     /// extension tool to get its own OpenAI key from the env, and flipping this
     /// to an allow-list would break that same fallback for every other tool.
-    const ENV_SECRET_DENY_PREFIXES: &[&str] = &["GREENTIC_", "TENANT_JWT_", "SECRETS_", "PACK_"];
+    ///
+    /// Ambient cloud/infra credentials of the runner's own identity are denied
+    /// too (`AWS_*`, `AZURE_*`, `GOOGLE_*`, `GCP_*`, `DATABASE_*`, `NATS_*`,
+    /// `POSTGRES_*`, `MYSQL_*`, `KUBERNETES_*`): a pack must not read the
+    /// host's cloud keys or connection strings through `secret://aws/...`.
+    const ENV_SECRET_DENY_PREFIXES: &[&str] = &[
+        "GREENTIC_",
+        "TENANT_JWT_",
+        "SECRETS_",
+        "PACK_",
+        "AWS_",
+        "AZURE_",
+        "GOOGLE_",
+        "GCP_",
+        "DATABASE_",
+        "NATS_",
+        "POSTGRES_",
+        "MYSQL_",
+        "KUBERNETES_",
+    ];
 
     pub(crate) fn env_secret_name_is_denied(name: &str) -> bool {
         ENV_SECRET_DENY_EXACT.contains(&name)
@@ -3345,6 +3372,15 @@ mod aw {
                 "secret://pack/public/key",
                 "secret://redis/url",
                 "secret://otlp/headers",
+                "secret://aws/secret_access_key",
+                "secret://aws/session_token",
+                "secret://azure/client_secret",
+                "secret://google/application_credentials",
+                "secret://gcp/project",
+                "secret://database/url",
+                "secret://nats/url",
+                "secret://github/token",
+                "secret://kubeconfig",
             ] {
                 let name = env_var_name_for_secret(denied);
                 assert!(
