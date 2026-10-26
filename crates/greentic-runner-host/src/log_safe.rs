@@ -54,16 +54,35 @@ pub(crate) fn log_safe_max(raw: &str, max_chars: usize) -> Cow<'_, str> {
     )
 }
 
-/// A URL for a log line: userinfo and query are redacted by the shared
-/// credential redactor, then the result is made log-safe.
-pub(crate) fn log_safe_url(raw: &str) -> String {
-    let redacted = crate::run_outcome::error::redact(raw);
-    log_safe(&redacted).into_owned()
+/// A URL reduced to `scheme://host[:port]` for a host-level log line. Path,
+/// query, fragment and userinfo are all dropped: the path itself can carry a
+/// credential (`api.telegram.org/bot<TOKEN>/sendMessage`, Slack webhook paths),
+/// which a path-preserving redaction would keep.
+pub(crate) fn log_safe_origin(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return "<non-url>".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    log_safe_max(&format!("{scheme}://{host}"), 128).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_drops_path_query_and_userinfo() {
+        assert_eq!(
+            log_safe_origin("https://api.telegram.org/bot123:SECRET/sendMessage?x=1"),
+            "https://api.telegram.org"
+        );
+        assert_eq!(
+            log_safe_origin("http://u:p@localhost:8080/hook#f"),
+            "http://localhost:8080"
+        );
+        assert_eq!(log_safe_origin("not a url"), "<non-url>");
+    }
 
     #[test]
     fn clean_input_is_borrowed() {
@@ -131,14 +150,5 @@ mod tests {
     fn truncation_stays_on_char_boundary_with_unsafe_chars() {
         assert_eq!(log_safe_max("日\u{202E}本語日", 3), "日 本");
         assert_eq!(log_safe_max("é\u{2028}éé", 2), "é ");
-    }
-
-    #[test]
-    fn url_userinfo_and_query_are_stripped() {
-        let out = log_safe_url("https://user:pw@example.com/p?token=abc\nfake");
-        assert!(!out.contains("pw"));
-        assert!(!out.contains("abc"));
-        assert!(!out.contains('\n'));
-        assert!(out.contains("example.com/p"));
     }
 }

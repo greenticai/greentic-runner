@@ -957,20 +957,24 @@ impl HostState {
                 builder = builder.timeout(timeout);
             }
             if opts.allow_insecure == Some(true) {
-                warn!(url = %crate::log_safe::log_safe_url(&req.url), "allow-insecure not supported; using default TLS validation");
+                warn!(origin = %crate::log_safe::log_safe_origin(&req.url), "allow-insecure not supported; using default TLS validation");
             }
             if let Some(follow_redirects) = opts.follow_redirects
                 && !follow_redirects
             {
-                warn!(url = %crate::log_safe::log_safe_url(&req.url), "follow-redirects=false not supported; using default client behaviour");
+                warn!(origin = %crate::log_safe::log_safe_origin(&req.url), "follow-redirects=false not supported; using default client behaviour");
             }
         }
 
         let response = match builder.send() {
             Ok(resp) => resp,
             Err(err) => {
-                warn!(url = %crate::log_safe::log_safe_url(&req.url), error = %err, "http client request failed");
-                if crate::http_guard::is_blocked_error(&err) {
+                // reqwest's Display appends ` for url (<full url>)`; the URL can
+                // carry a token (bot<TOKEN> path, webhook path, query).
+                let blocked = crate::http_guard::is_blocked_error(&err);
+                let err = err.without_url();
+                warn!(origin = %crate::log_safe::log_safe_origin(&req.url), error = %err, "http client request failed");
+                if blocked {
                     return Err(HttpClientError {
                         code: "denied".into(),
                         message: crate::http_guard::BLOCKED_MARKER.to_string(),
@@ -1000,10 +1004,13 @@ impl HostState {
         ) {
             Ok(bytes) => Some(bytes),
             Err(err) => {
-                warn!(url = %crate::log_safe::log_safe_url(&req.url), error = %err, "http response body read failed");
+                warn!(origin = %crate::log_safe::log_safe_origin(&req.url), error = %crate::http_guard::body_read_reason(&err), "http response body read failed");
                 return Err(HttpClientError {
                     code: "unavailable".into(),
-                    message: format!("failed to read response body: {err}"),
+                    message: format!(
+                        "failed to read response body: {}",
+                        crate::http_guard::body_read_reason(&err)
+                    ),
                 });
             }
         };

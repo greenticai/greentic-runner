@@ -925,3 +925,39 @@ marked `#[non_exhaustive]`.**
   `RemoteDispatchHandler`, `NatsDispatcher` publish failure, invalid audit ids) are pinned. A missing
   `RemoteDispatchHandler` is a deterministic, pre-effect configuration error: not retried, and it does not set the
   effects flag.
+
+## Round 18
+
+- **Host `http-client` no longer logs or returns the request URL (F1).** reqwest 0.13's `Display` appends
+  ` for url (<full url>)`, which carried query strings, userinfo and path tokens (`api.telegram.org/bot<TOKEN>/...`,
+  Slack webhook paths) into the `warn!` lines and the guest-facing `unavailable` message. Errors now go through
+  `without_url()`, and the log field is `origin` (scheme + host + port only, `log_safe::log_safe_origin`) instead of `url`
+  (the removed `log_safe_url` kept the path). The response-body read error is scrubbed the same way (`http_guard::body_read_reason`,
+  the `io::Error` wraps a reqwest error). Also scrubbed: the secrets-broker transport errors, the A2A agent call/card
+  fetch errors and the pack index fetch. **Affected:** log queries on the `url` field of `http client request failed`;
+  a guest that parsed the URL out of the `unavailable` message.
+- **Azure WireServer `168.63.129.16` and Oracle IMDS `192.0.0.192` are `Metadata` (F3).** Blocked by default like
+  `169.254.169.254`; `GREENTIC_HTTP_ALLOW_METADATA=1` still lifts the block. **Affected:** a pack that deliberately
+  called either address.
+- **Run-outcome redaction matches credential key names by suffix segment (F4).** `redact_sensitive_pairs` no longer
+  needs an exact name: the LAST `-`/`_` segment of `key=`/`key:`/`"key":` is checked (substring for `token`, `secret`,
+  `password`, `passwd`, `authorization`, `signature`, `credential`, `apikey`, `accesskey`, ...; whole segment for `key`,
+  `sig`, `pwd`, `auth`, `session`, `cookie`, `bearer`, `jwt`). `x-amz-security-token`, `bot_token`, `x-goog-api-key`,
+  `Ocp-Apim-Subscription-Key` and a bare `key=` are now redacted; `secret_missing`, `max_tokens`, `design`, `signal`,
+  `keyboard` are not. Not covered: the `dst.` prefix of `agent_audit` (a `.` is not a key byte here).
+- **Tool-secret env deny-list grows (F7).** `secret://aws/...`, `azure`, `google`, `gcp`, `database`, `nats`, `postgres`,
+  `mysql`, `kubernetes` (prefixes `AWS_`, `AZURE_`, `GOOGLE_`, `GCP_`, `DATABASE_`, `NATS_`, `POSTGRES_`, `MYSQL_`,
+  `KUBERNETES_`) and the exact names `PGPASSWORD`, `KUBECONFIG`, `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`,
+  `CARGO_REGISTRY_TOKEN`, `SSH_AUTH_SOCK` now resolve as not found. **Affected:** an extension tool that read its key from
+  such an env var; seal it as a real secret instead.
+- **Pack locators are redacted in errors, logs and `/admin/packs/status` (F8).** A locator may be a presigned S3 / Azure
+  SAS URL. `runner_core::packs::resolver::redact_locator` (userinfo -> `[redacted]`, query/fragment -> `?[redacted]`)
+  is used for the HTTP resolver, the resolver wrapper and the index fetch contexts; the reqwest error uses
+  `without_url()`. The watcher's failure list, its logs, `HealthState::last_error` (so `last_error` in
+  `/admin/packs/status`) and the `POST /admin/packs/reload` error body go through `watcher::redact_chain`
+  (`run_outcome::error::redact`). **Affected:** the query part of a locator no longer appears in those messages.
+- **SQLite SQL gateway accepts one `SELECT`/`WITH`/`VALUES` statement (F2).** `read_only(true)` did not stop
+  `VACUUM INTO` (writes a new file), `ATTACH` or stacked statements. `execute::check_sqlite_read_only_sql` now refuses
+  them before execution (comments, quotes and a trailing `;` are handled) and the read-only pool also sets
+  `PRAGMA query_only = ON`. The SQL gateway is fail-closed/unused in the shipped hosts, so this is defence in depth.
+  `PRAGMA`/`EXPLAIN` queries are no longer accepted on SQLite.

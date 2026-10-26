@@ -38,9 +38,21 @@ impl Index {
                 let mut response = client
                     .get(url.clone())
                     .send()
-                    .with_context(|| format!("failed to fetch index {}", url))?
+                    .map_err(reqwest::Error::without_url)
+                    .with_context(|| {
+                        format!(
+                            "failed to fetch index {}",
+                            super::resolver::redact_locator(url.as_str())
+                        )
+                    })?
                     .error_for_status()
-                    .with_context(|| format!("index download failed {}", url))?;
+                    .map_err(reqwest::Error::without_url)
+                    .with_context(|| {
+                        format!(
+                            "index download failed {}",
+                            super::resolver::redact_locator(url.as_str())
+                        )
+                    })?;
                 let cap =
                     env_cap_bytes("GREENTIC_PACK_INDEX_MAX_MB", DEFAULT_MAX_INDEX_DOWNLOAD_MB);
                 if let (Some(cap), Some(len)) = (cap, response.content_length())

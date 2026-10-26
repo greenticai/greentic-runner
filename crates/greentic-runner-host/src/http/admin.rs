@@ -64,10 +64,11 @@ pub async fn reload(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
                 )
             }
             Err(err) => {
-                tracing::warn!(error = %err, "reload trigger failed");
+                let shown = crate::run_outcome::error::redact(&err.to_string());
+                tracing::warn!(error = %shown, "reload trigger failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": err.to_string() })),
+                    Json(json!({ "error": shown })),
                 )
             }
         }

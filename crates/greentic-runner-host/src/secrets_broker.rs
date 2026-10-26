@@ -130,7 +130,7 @@ impl SecretsManager for BrokerSecretsManager {
             .authorize(self.client.get(&url))
             .send()
             .await
-            .map_err(|e| SecretError::Backend(Cow::Owned(e.to_string())))?;
+            .map_err(|e| SecretError::Backend(Cow::Owned(e.without_url().to_string())))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(SecretError::NotFound(path.to_string()));
         }
@@ -148,7 +148,7 @@ impl SecretsManager for BrokerSecretsManager {
         let body: SecretResponse = resp
             .json()
             .await
-            .map_err(|e| SecretError::Backend(Cow::Owned(e.to_string())))?;
+            .map_err(|e| SecretError::Backend(Cow::Owned(e.without_url().to_string())))?;
         match body.encoding.as_str() {
             "base64" => base64::engine::general_purpose::STANDARD
                 .decode(body.value.as_bytes())
@@ -171,7 +171,7 @@ impl SecretsManager for BrokerSecretsManager {
             }))
             .send()
             .await
-            .map_err(|e| SecretError::Backend(Cow::Owned(e.to_string())))?;
+            .map_err(|e| SecretError::Backend(Cow::Owned(e.without_url().to_string())))?;
         if !resp.status().is_success() {
             return Err(SecretError::Backend(Cow::Owned(format!(
                 "broker put {}",
@@ -187,7 +187,7 @@ impl SecretsManager for BrokerSecretsManager {
             .authorize(self.client.delete(&url))
             .send()
             .await
-            .map_err(|e| SecretError::Backend(Cow::Owned(e.to_string())))?;
+            .map_err(|e| SecretError::Backend(Cow::Owned(e.without_url().to_string())))?;
         if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
             return Err(SecretError::Backend(Cow::Owned(format!(
                 "broker delete {}",

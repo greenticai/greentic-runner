@@ -5,7 +5,8 @@
 //!
 //! * **Always on**: link-local (`169.254.0.0/16`, `fe80::/10`) and the cloud
 //!   metadata addresses (`169.254.169.254`, `fd00:ec2::254`,
-//!   `100.100.100.200`) are refused. `GREENTIC_HTTP_ALLOW_METADATA=1` disables
+//!   `100.100.100.200`, Azure WireServer `168.63.129.16`, Oracle
+//!   `192.0.0.192`) are refused. `GREENTIC_HTTP_ALLOW_METADATA=1` disables
 //!   this block.
 //! * Loopback, RFC1918, ULA and CGNAT stay allowed (in-cluster calls are
 //!   legitimate). `GREENTIC_HTTP_DENY_PRIVATE=1` also refuses loopback,
@@ -251,9 +252,71 @@ pub(crate) fn read_capped_body(
     Ok(buf)
 }
 
+/// Why a response body could not be read, for a log line or a guest-facing
+/// error. `read_capped_body` returns an `io::Error` that may wrap a
+/// `reqwest::Error`, whose `Display` appends ` for url (...)` with the full
+/// request URL (query, userinfo, tokens in the path); that suffix is dropped.
+pub(crate) fn body_read_reason(err: &std::io::Error) -> String {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = err.get_ref().map(|e| e as _);
+    while let Some(inner) = source {
+        if let Some(req) = inner.downcast_ref::<reqwest::Error>() {
+            return format!("{} ({})", err.kind(), req.to_string_without_url());
+        }
+        source = inner.source();
+    }
+    err.to_string()
+}
+
+trait WithoutUrlDisplay {
+    fn to_string_without_url(&self) -> String;
+}
+
+impl WithoutUrlDisplay for reqwest::Error {
+    fn to_string_without_url(&self) -> String {
+        // `reqwest::Error::without_url` consumes the error and we only hold a
+        // reference behind the `io::Error`, so cut reqwest's ` for url (...)`
+        // Display suffix instead.
+        let full = self.to_string();
+        match full.find(" for url (") {
+            Some(idx) => full[..idx].to_string(),
+            None => full,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_read_reason_drops_the_request_url() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                // Promise 100 bytes, send 3, hang up: the body read fails.
+                let _ = conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nabc",
+                );
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let resp = client
+            .get(format!("http://{addr}/bot123:TOKENINPATH/x?sig=SECRETQ"))
+            .send()
+            .expect("headers arrive");
+        let err = read_capped_body(resp, Some(1000)).expect_err("truncated body");
+        let reason = body_read_reason(&err);
+        assert!(!reason.contains("TOKENINPATH"), "{reason}");
+        assert!(!reason.contains("SECRETQ"), "{reason}");
+        assert!(!reason.contains("for url"), "{reason}");
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("ip literal")
@@ -283,6 +346,11 @@ mod tests {
             ("169.254.1.1", LinkLocal),
             ("169.254.169.254", Metadata),
             ("100.100.100.200", Metadata),
+            ("168.63.129.16", Metadata),
+            ("192.0.0.192", Metadata),
+            ("168.63.129.17", Public),
+            ("192.0.0.193", Public),
+            ("::ffff:168.63.129.16", Metadata),
             ("fe80::1", LinkLocal),
             ("febf::1", LinkLocal),
             ("fec0::1", Public),
@@ -311,6 +379,8 @@ mod tests {
             "fe80::1",
             "fd00:ec2::254",
             "100.100.100.200",
+            "168.63.129.16",
+            "192.0.0.192",
             "::ffff:169.254.169.254",
         ] {
             assert!(g.check_ip(ip(blocked)).is_err(), "{blocked}");

@@ -6,7 +6,7 @@ use tempfile::NamedTempFile;
 
 use super::{
     DEFAULT_DOWNLOAD_TIMEOUT_SECS, DEFAULT_MAX_PACK_DOWNLOAD_MB, FetchResponse, PackResolver,
-    copy_capped, env_cap_bytes,
+    copy_capped, env_cap_bytes, redact_locator,
 };
 
 pub struct HttpResolver {
@@ -53,13 +53,18 @@ impl PackResolver for HttpResolver {
     }
 
     fn fetch(&self, locator: &str) -> Result<FetchResponse> {
+        // The locator may be a presigned S3 / Azure SAS URL: neither it nor
+        // reqwest's own " for url (...)" Display suffix may reach an error chain.
+        let shown = redact_locator(locator);
         let mut response = self
             .client
             .get(locator)
             .send()
-            .with_context(|| format!("failed to download {}", locator))?
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("failed to download {shown}"))?
             .error_for_status()
-            .with_context(|| format!("download failed {}", locator))?;
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("download failed {shown}"))?;
 
         let cap = env_cap_bytes(
             "GREENTIC_PACK_MAX_DOWNLOAD_MB",
@@ -68,13 +73,13 @@ impl PackResolver for HttpResolver {
         if let (Some(cap), Some(len)) = (cap, response.content_length())
             && len > cap
         {
-            bail!("{locator} is {len} bytes, over the {cap} byte download limit");
+            bail!("{shown} is {len} bytes, over the {cap} byte download limit");
         }
 
         let mut temp = NamedTempFile::new().context("failed to allocate temp file for download")?;
         {
             let mut writer = temp.as_file_mut();
-            copy_capped(&mut response, &mut writer, cap, locator)
+            copy_capped(&mut response, &mut writer, cap, &shown)
                 .context("failed to stream HTTP content")?;
         }
         Ok(FetchResponse::from_temp(temp.into_temp_path()))
@@ -120,5 +125,21 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("failed to download"));
+    }
+
+    #[test]
+    fn failed_download_error_chain_carries_no_query_or_userinfo() {
+        let resolver = HttpResolver::new("http", None).expect("resolver");
+        // Port 1 refuses the connection, so the send itself fails.
+        let err =
+            match resolver.fetch("http://user:pw@127.0.0.1:1/a.gtpack?X-Amz-Signature=SECRETSIG") {
+                Ok(_) => panic!("unreachable host must fail"),
+                Err(err) => err,
+            };
+        let chain = format!("{err:#}");
+        assert!(chain.contains("failed to download"), "{chain}");
+        assert!(!chain.contains("SECRETSIG"), "{chain}");
+        assert!(!chain.contains("user:pw"), "{chain}");
+        assert!(!chain.contains("pw@"), "{chain}");
     }
 }

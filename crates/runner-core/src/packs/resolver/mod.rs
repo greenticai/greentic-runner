@@ -70,6 +70,30 @@ pub(crate) fn env_cap_bytes(var: &str, default_mb: u64) -> Option<u64> {
     (mb != 0).then(|| mb.saturating_mul(1024 * 1024))
 }
 
+/// A pack locator that is safe to put in an error chain, log line or admin
+/// response. A locator may be a presigned S3 URL or an Azure SAS URL, whose
+/// credential rides in the userinfo or the query/fragment: both are replaced,
+/// the scheme, host and path are kept so the failure is still diagnosable.
+pub fn redact_locator(locator: &str) -> String {
+    let Some(sep) = locator.find("://") else {
+        return locator.to_string();
+    };
+    let (scheme, rest) = locator.split_at(sep + 3);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let host = match authority.rfind('@') {
+        Some(at) => format!("[redacted]@{}", &authority[at + 1..]),
+        None => authority.to_string(),
+    };
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let (path, query) = tail.split_at(path_end);
+    if query.is_empty() {
+        format!("{scheme}{host}{path}")
+    } else {
+        format!("{scheme}{host}{path}?[redacted]")
+    }
+}
+
 /// Copy `reader` into `writer`, failing as soon as more than `cap` bytes
 /// arrive. Returns the number of bytes copied.
 pub(crate) fn copy_capped<R: std::io::Read, W: std::io::Write>(
@@ -176,7 +200,7 @@ impl ParsedReference {
 
 #[cfg(test)]
 mod download_cap_tests {
-    use super::{copy_capped, env_cap_bytes};
+    use super::{copy_capped, env_cap_bytes, redact_locator};
 
     #[test]
     fn copy_stops_past_the_cap_and_allows_exactly_the_cap() {
@@ -189,6 +213,26 @@ mod download_cap_tests {
         let err = copy_capped(&mut data.as_slice(), &mut out, Some(9), "x").expect_err("over");
         assert!(err.to_string().contains("download limit"));
         assert!(out.len() <= 10, "must not keep reading past cap + 1");
+    }
+
+    #[test]
+    fn locator_redaction_drops_userinfo_query_and_fragment() {
+        let out = redact_locator(
+            "https://user:pw@bucket.s3.amazonaws.com/packs/a.gtpack?X-Amz-Signature=abc&X-Amz-Credential=k#frag",
+        );
+        assert_eq!(
+            out,
+            "https://[redacted]@bucket.s3.amazonaws.com/packs/a.gtpack?[redacted]"
+        );
+        assert_eq!(
+            redact_locator("https://acct.blob.core.windows.net/c/a.gtpack?sv=1&sig=zz"),
+            "https://acct.blob.core.windows.net/c/a.gtpack?[redacted]"
+        );
+        assert_eq!(
+            redact_locator("fs://./packs/a.gtpack"),
+            "fs://./packs/a.gtpack"
+        );
+        assert_eq!(redact_locator("no-scheme"), "no-scheme");
     }
 
     #[test]

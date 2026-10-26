@@ -80,6 +80,10 @@ pub async fn run(
     let cap = u64::from(max_rows);
     match (engine, pool) {
         (Engine::Sqlite, ConnectionPool::Sqlite(p)) => {
+            // `read_only(true)` + `query_only` stop writes to the database file,
+            // but not `VACUUM INTO 'new-file'`, `ATTACH`, nor a second
+            // statement smuggled after the first, so refuse them up front.
+            check_sqlite_read_only_sql(sql)?;
             let (rows, truncated) = collect_capped(sqlx::query(sql).fetch(p), cap)
                 .await
                 .map_err(map_err)?;
@@ -125,6 +129,91 @@ async fn mysql_read_only_fetch(
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Accept only ONE statement that starts with `SELECT`, `WITH` or `VALUES`.
+///
+/// SQLite has no read-only transaction mode like Postgres/MySQL, and sqlx
+/// exposes no authorizer. `SqliteConnectOptions::read_only` opens the file
+/// read-only, yet `VACUUM INTO '<path>'` still writes a NEW file, `ATTACH`
+/// can open (and create) another database, and sqlx runs every statement of a
+/// multi-statement string. Comments, quoted strings/identifiers and a trailing
+/// `;` are skipped correctly, so `SELECT ';'` and `SELECT 1;` stay valid.
+pub(crate) fn check_sqlite_read_only_sql(sql: &str) -> Result<(), String> {
+    const ALLOWED_START: [&str; 3] = ["select", "with", "values"];
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut first_word: Option<String> = None;
+    let mut statement_ended = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            quote @ (b'\'' | b'"' | b'`' | b'[') => {
+                if statement_ended {
+                    return Err("only a single SQL statement is allowed".to_string());
+                }
+                if first_word.is_none() {
+                    return Err("only SELECT queries are allowed".to_string());
+                }
+                let close = if quote == b'[' { b']' } else { quote };
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == close {
+                        // A doubled quote is an escaped quote inside the literal.
+                        if close != b']' && bytes.get(i + 1) == Some(&close) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b';' => {
+                statement_ended = true;
+                i += 1;
+            }
+            c if c.is_ascii_whitespace() => i += 1,
+            _ => {
+                if statement_ended {
+                    return Err("only a single SQL statement is allowed".to_string());
+                }
+                if first_word.is_none() {
+                    let start = i;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                    {
+                        i += 1;
+                    }
+                    if i == start {
+                        return Err("only SELECT queries are allowed".to_string());
+                    }
+                    let word = sql[start..i].to_ascii_lowercase();
+                    if !ALLOWED_START.contains(&word.as_str()) {
+                        return Err("only SELECT queries are allowed".to_string());
+                    }
+                    first_word = Some(word);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if first_word.is_none() {
+        return Err("empty SQL statement".to_string());
+    }
+    Ok(())
+}
 
 fn map_err(error: sqlx::Error) -> String {
     format!("query error: {error}")
@@ -693,6 +782,78 @@ mod tests {
         assert_eq!(result.rows.len(), 0);
         assert!(!result.truncated);
         assert_eq!(result.row_count, 0);
+    }
+
+    #[test]
+    fn sqlite_guard_accepts_single_select_shapes() {
+        for sql in [
+            "SELECT 1",
+            "  select 1;",
+            "SELECT ';' AS semi",
+            "SELECT 'it''s; fine'",
+            "-- lead\nSELECT 1 /* ; */ ;  -- trail",
+            "WITH t AS (SELECT 1 AS a) SELECT a FROM t",
+            "VALUES (1),(2)",
+            r#"SELECT "a;b" FROM t"#,
+        ] {
+            assert!(check_sqlite_read_only_sql(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn sqlite_guard_refuses_writes_attach_vacuum_and_stacked_statements() {
+        for sql in [
+            "VACUUM INTO '/tmp/copy.db'",
+            "ATTACH DATABASE '/tmp/x.db' AS x",
+            "PRAGMA writable_schema = 1",
+            "INSERT INTO t VALUES (1)",
+            "DELETE FROM t",
+            "/* hide */ DROP TABLE t",
+            "SELECT 1; VACUUM INTO '/tmp/copy.db'",
+            "SELECT 1; SELECT 2",
+            "SELECT 1;;ATTACH 'x' AS y",
+            "SELECT 1; -- c\n DROP TABLE t",
+            "'SELECT'",
+            "",
+            "   -- only a comment",
+        ] {
+            assert!(check_sqlite_read_only_sql(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_refuses_vacuum_into_on_a_read_only_pool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("src.db");
+        {
+            let rw = sqlx::sqlite::SqlitePool::connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("rw pool");
+            sqlx::query("CREATE TABLE t (id INTEGER)")
+                .execute(&rw)
+                .await
+                .expect("create");
+            rw.close().await;
+        }
+        let dsn = format!("sqlite://{}", db.display());
+        let pool = crate::sql::pool::build(Engine::Sqlite, &dsn, true)
+            .await
+            .expect("read-only pool");
+        let target = dir.path().join("copy.db");
+        let sql = format!("VACUUM INTO '{}'", target.display());
+        let err = run(Engine::Sqlite, &pool, &sql, 10)
+            .await
+            .expect_err("must be refused");
+        assert!(err.contains("only SELECT"), "{err}");
+        assert!(!target.exists(), "VACUUM INTO must not create a file");
+        let ok = run(Engine::Sqlite, &pool, "SELECT count(*) AS n FROM t", 10)
+            .await
+            .expect("select still works");
+        assert_eq!(ok.row_count, 1);
     }
 
     #[tokio::test]

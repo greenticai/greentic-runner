@@ -53,7 +53,9 @@ impl HealthState {
 
     pub fn record_reload_error(&self, err: &Error) {
         let mut meta = self.meta.lock();
-        meta.last_error = Some(err.to_string());
+        // `/admin/packs/status` serves this; the chain may name a presigned
+        // pack locator, so redact URL userinfo/queries and credential pairs.
+        meta.last_error = Some(crate::watcher::redact_chain(err));
     }
 
     pub fn snapshot(&self) -> HealthSnapshot {
@@ -157,6 +159,21 @@ mod tests {
         assert_eq!(json["telemetry_ready"], true);
         assert_eq!(json["secrets_ready"], true);
         assert_eq!(json["active_packs"], 0);
+    }
+
+    #[tokio::test]
+    async fn last_error_redacts_presigned_locator() {
+        let state = state();
+        state.health.record_reload_error(&anyhow::anyhow!(
+            "t: failed to download https://b.s3.amazonaws.com/a.gtpack?X-Amz-Signature=SECRETSIG"
+        ));
+        let last = state
+            .health
+            .snapshot()
+            .last_error
+            .expect("last_error recorded");
+        assert!(!last.contains("SECRETSIG"), "{last}");
+        assert!(last.contains("b.s3.amazonaws.com/a.gtpack"), "{last}");
     }
 
     #[tokio::test]

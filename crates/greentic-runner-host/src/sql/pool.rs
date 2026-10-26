@@ -83,10 +83,15 @@ pub async fn build(engine: Engine, dsn: &str, read_only: bool) -> Result<Connect
             .map(ConnectionPool::Mysql)
             .map_err(|e| format!("mysql connect: {e}")),
         Engine::Sqlite => {
-            let opts = dsn
+            let mut opts = dsn
                 .parse::<sqlx::sqlite::SqliteConnectOptions>()
                 .map_err(|e| format!("sqlite dsn: {e}"))?
                 .read_only(read_only);
+            if read_only {
+                // Also refuses writes to databases ATTACHed later; the
+                // statement shape is checked in `execute::run`.
+                opts = opts.pragma("query_only", "ON");
+            }
             sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(5)
                 .acquire_timeout(ACQUIRE_TIMEOUT)
