@@ -187,7 +187,8 @@ pub fn validate_scope_id(kind: &str, value: &str) -> Result<(), Rejection> {
 
 /// The `(tenant, env)` pair to stamp on a response, from the request's own
 /// scope headers (`env` defaults to `default` like [`parse_request`]). `None`
-/// when an id is absent or fails [`validate_scope_id`]. The host's listener
+/// when the tenant is absent or an id fails [`is_echoable_scope_id`] (looser
+/// than [`validate_scope_id`]: it allows `..`). The host's listener
 /// drops a response with no tenant/env headers.
 #[must_use]
 pub fn response_scope(tenant: Option<&str>, env: Option<&str>) -> Option<(String, String)> {

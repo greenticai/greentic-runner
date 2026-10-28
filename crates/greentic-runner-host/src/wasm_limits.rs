@@ -16,8 +16,9 @@
 //! A grow past a cap is DENIED, not trapped: `memory.grow` / `table.grow`
 //! return `-1` to the guest, which decides what to do (a Rust guest typically
 //! aborts on the failed allocation, and THAT surfaces as an ordinary invocation
-//! error). Wasmtime logs nothing for a denied grow, so the host warns once per
-//! store ([`GuestLimiter`]).
+//! error). Wasmtime logs nothing for a denied grow, so the host logs it
+//! ([`GuestLimiter`]): `warn` for the first denial of the whole PROCESS, `debug`
+//! for every later one (each store logs at most once).
 //!
 //! An unparseable value falls back to the default (a malformed knob must not
 //! silently remove a safety limit, nor break every invocation).

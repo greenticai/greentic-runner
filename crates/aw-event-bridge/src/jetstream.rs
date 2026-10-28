@@ -660,7 +660,7 @@ pub async fn run_bridge_jetstream(
                                         &mut consumer,
                                         &mut attempt,
                                         &mut faults,
-                                        false,
+                                        RecreateCause::ConsumerGone,
                                     )
                                     .await;
                                     // The current pull belongs to the dead
@@ -677,7 +677,7 @@ pub async fn run_bridge_jetstream(
                                             &mut consumer,
                                             &mut attempt,
                                             &mut faults,
-                                            true,
+                                            RecreateCause::FaultRun,
                                         )
                                         .await;
                                         break;
@@ -720,8 +720,14 @@ pub async fn run_bridge_jetstream(
                 tracing::warn!(%error, "open jetstream pull failed");
                 drop(slots);
                 if faults.record() {
-                    recreate_consumer(&client, &mut consumer, &mut attempt, &mut faults, true)
-                        .await;
+                    recreate_consumer(
+                        &client,
+                        &mut consumer,
+                        &mut attempt,
+                        &mut faults,
+                        RecreateCause::FaultRun,
+                    )
+                    .await;
                 } else {
                     tokio::time::sleep(backoff_delay(attempt)).await;
                     attempt = attempt.saturating_add(1);
@@ -744,6 +750,27 @@ pub async fn run_bridge_jetstream(
 #[must_use]
 fn recreate_backoff(attempt: u32) -> (Duration, u32) {
     (backoff_delay(attempt), attempt.saturating_add(1))
+}
+
+/// Why the pull loop is re-creating the durable consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecreateCause {
+    /// The server answered `Consumer Deleted` on an in-flight pull.
+    ConsumerGone,
+    /// A run of pull failures ([`ConsecutiveFaults`]), including a failed
+    /// `.messages()` open or repeated `503` / no responders.
+    FaultRun,
+}
+
+impl RecreateCause {
+    /// Whether a successful re-creation may pull again almost at once (see
+    /// [`recreate_delay`]). Only a run of faults gets the shortcut; a
+    /// `ConsumerGone` does not, so a durable something keeps deleting climbs
+    /// to the backoff cap.
+    #[must_use]
+    fn fast_on_success(self) -> bool {
+        matches!(self, Self::FaultRun)
+    }
 }
 
 /// The pause after a re-creation attempt. After a SUCCESSFUL re-creation that
@@ -770,7 +797,7 @@ async fn recreate_consumer(
     consumer: &mut consumer::Consumer<consumer::pull::Config>,
     attempt: &mut u32,
     faults: &mut ConsecutiveFaults,
-    fast_on_success: bool,
+    cause: RecreateCause,
 ) {
     let (escalated, next) = recreate_backoff(*attempt);
     *attempt = next;
@@ -785,7 +812,7 @@ async fn recreate_consumer(
             false
         }
     };
-    tokio::time::sleep(recreate_delay(created, fast_on_success, escalated)).await;
+    tokio::time::sleep(recreate_delay(created, cause.fast_on_success(), escalated)).await;
 }
 
 async fn handle_one(
@@ -1037,6 +1064,27 @@ mod tests {
         faults.clear();
         assert_eq!(faults.count(), 0);
         assert!(!faults.record(), "a successful pull restarts the count");
+    }
+
+    #[test]
+    fn only_a_fault_run_recreation_may_take_the_short_pause() {
+        let escalated = Duration::from_secs(8);
+        assert!(RecreateCause::FaultRun.fast_on_success());
+        assert!(!RecreateCause::ConsumerGone.fast_on_success());
+        // End to end through the pure delay: a successful ConsumerGone
+        // re-creation still takes the escalated delay.
+        assert_eq!(
+            recreate_delay(
+                true,
+                RecreateCause::ConsumerGone.fast_on_success(),
+                escalated
+            ),
+            escalated
+        );
+        assert_eq!(
+            recreate_delay(true, RecreateCause::FaultRun.fast_on_success(), escalated),
+            backoff_delay(0)
+        );
     }
 
     #[test]
