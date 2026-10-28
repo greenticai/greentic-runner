@@ -245,8 +245,9 @@ pub fn validate_scope_id(kind: &str, value: &str) -> Result<(), Rejection> {
 
 /// The `(tenant, env)` pair to stamp on a response, from the request's own
 /// scope headers. `env` defaults to `default` exactly as [`parse_request`]
-/// does. `None` when either id fails [`validate_scope_id`] (or tenant is
-/// absent): an unvalidated id is never echoed into a header.
+/// does. `None` when either id fails [`is_echoable_scope_id`] (or tenant is
+/// absent): an id outside that charset is never echoed into a header. That
+/// check is looser than [`validate_scope_id`] (it allows `..`).
 ///
 /// The host's listener drops a response with no tenant/env headers, so every
 /// error response whose scope is valid must carry them.

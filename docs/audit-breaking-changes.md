@@ -728,7 +728,7 @@ Follow-ups to the round-12 audit. Each entry is a behaviour change; none bumps a
     when the dispatch carried no deadline;
   - a denied `memory.grow` / `table.grow` (past `GREENTIC_WASM_MAX_MEMORY_MB` or the fixed table caps) is NOT a trap:
     the guest sees `-1`, and a Rust guest usually aborts on the failed allocation, which does surface as an
-    invocation error. The host now logs one `warn!` per store (the earlier wording above said "trap");
+    invocation error. The host now logs one `warn!` per store (the earlier wording above said "trap"; superseded: it is a `warn!` once per PROCESS and later denials are `debug`, see "Log volume" below);
   - if the tool-extension HTTP client cannot be built (the loopback blackhole listener cannot bind, builder failure)
     it is cached as unavailable for the life of the process, so every tool HTTP call fails; each site now logs an
     `error!` with the reason;
@@ -828,6 +828,7 @@ was checked against the tree (`git diff 16b0cbfd HEAD`).
 | Item | Change | Break |
 |---|---|---|
 | `aw_event_bridge::InvokeOutcome` | gains the required field `error: Option<DispatchError>` | struct literals and exhaustive destructuring |
+| `telco_x_event_bridge::InvokeOutcome` | gains the required field `error: Option<DispatchError>` (same change as `aw_event_bridge::InvokeOutcome`; `EchoInvoker` sets `None`) | struct literals and exhaustive destructuring, including every `TelcoXDispatchInvoker` impl that builds one |
 | `greentic_runner_host::runtime::block_on` | now `F: Future<Output = R> + Send, R: Send` (it degrades to a runtime-less executor instead of panicking) | callers passing non-`Send` futures |
 | `engine::runtime::IngressEnvelope::tenant_ctx()` | returns `GResult<TenantCtx>` (was `TenantCtx`) | every caller |
 | `cache::ArtifactMetadata` | gains the public field `artifact_sha256: Option<String>` (+ `with_artifact_sha256`) | struct literals |
@@ -840,7 +841,8 @@ was checked against the tree (`git diff 16b0cbfd HEAD`).
 | `engine::error::RunnerError` | new variants `PostEffectPersistence { reason }`, `FlowTerminal { reason }` (+ `is_terminal()`) | exhaustive `match` |
 | `runner::playbook_turn::PlaybookTurnHost` | gains the field `billing_meter: Option<Arc<dyn BillingMeter>>` | struct literals |
 | `runner_core::PackCache::lookup` | new since the baseline; returns `Result<Option<CachedPack { path, digest }>>` (`CachedPack` is re-exported), and `ResolvedPack.digest` is always the canonical lowercase digest | callers of `lookup`, code comparing the raw pinned spelling |
-| `RunnerConfig` | additive `from_config_with_port`; `from_config` now errors on a malformed `PORT` | behaviour only | behaviour only |
+| `RunnerConfig` | additive `from_config_with_port`; `from_config` now errors on a malformed `PORT` | behaviour only |
+| `telco_x_event_bridge` bridge hardening | `handle_message` keeps its signature and now delegates to the new `handle_message_outcome` (returns `Disposition`); `build_response` keeps its signature; new `LockContention`, `is_lock_contention`, `validate_scope_id`, `response_scope`, `is_echoable_scope_id`, `parse_request`, `publish_error_for_message`, `QUEUE_GROUP`, `MAX_INFLIGHT`, `HANDLE_TIMEOUT`, `OVERLOADED_CODE`, `SESSION_BUSY_CODE` | additive |
 | Round 13 additions | `PackManager::with_refresh_interval`, `PackManager::touch_cached_archive`, `PackRuntime::archive_path`, `aw_event_bridge::{is_echoable_scope_id, jetstream::{busy_budget, CONSUMER_MAX_DELIVER, BUSY_BUDGET_MARGIN}}`, `state::cap_tool_result_for` | additive, except `jetstream::busy_policy` which now takes `(delivered, age, budget)` |
 
 No new `#[non_exhaustive]` was added: marking the enums above `#[non_exhaustive]` would stop the NEXT variant from being
@@ -968,7 +970,7 @@ marked `#[non_exhaustive]`.**
   spawns a handler for every message it reads. It takes a slot from a `MAX_INFLIGHT` (256) semaphore BEFORE
   each pull (`fetch().max_messages(<slots>)`, batches of at most 16), so unread work stays in the stream for
   other replicas and nothing sits unacked without progress acks while waiting for a slot. The durable's
-  `max_ack_pending` is now `MAX_INFLIGHT` (was the server default, 1000); `ensure_consumer` converges an
+  `max_ack_pending` is now `MAX_INFLIGHT` (was the server default, 1000; superseded in Round 19: it is `2 * MAX_INFLIGHT`); `ensure_consumer` converges an
   existing durable whose value differs. Behaviour change: a saturated replica pulls less instead of running
   more; the core-NATS path still answers `overloaded`.
 - **Known limitation (`RuntimeSessionResumer::resume_checked`).** A response is admitted, its deadline
@@ -1040,7 +1042,7 @@ marked `#[non_exhaustive]`.**
   wording here said it "never lowers"; that was wrong for an unlimited value and for the `get_or_create` error path,
   both fixed in Round 21.) An older build still lowers it to 256 on its own start.
   The warning names `max_ack_pending`.
-- **Pack download error scrubbing balances parentheses (F5a).** `strip_url_suffix` removes a `" for url (...)"` suffix
+- **Pack download error scrubbing balances parentheses (F5a; superseded in Round 21 F7, which removed parenthesis counting).** `strip_url_suffix` removes a `" for url (...)"` suffix
   whose URL contains balanced `( )`. A lone literal `)` in the URL still ends the suffix early.
 - **Directory packs: `read_pack_file` is capped at 64 MiB per file (F5b).** Introduced by commit `c573decf` (Round 19
   work), not by a Round 20 commit. `PackRuntime::read_pack_file` for a
@@ -1100,7 +1102,7 @@ marked `#[non_exhaustive]`.**
   `scheme://[redacted]` is shown, no host. **Affected:** such URLs no longer show a host in error text.
 - **Dispatch-ledger wording (F3).** The serve default is not always no-op: `agent_node::serve_agentic` installs
   `RedisDispatchLedger` when `GREENTIC_AW_REDIS_URL` is set with the `redis` backend; `serve()` and
-  `RuntimeAgentDispatchInvoker::new` default to `NoopDispatchLedger`. Round 20 F3 and Round 21 F5 are marked superseded.
+  `RuntimeAgentDispatchInvoker::new` default to `NoopDispatchLedger`. The affected wording is Round 21 F4 (marked superseded there); Round 20 F3 and Round 21 F5 are URL-redaction entries and are not part of this correction.
 - **Test determinism (F4).** `HttpConfigProvider::with_client` lets every wiremock test build a `.no_proxy()`
   client (`direct()`), so `HTTP(S)_PROXY` / `ALL_PROXY` in the environment cannot change a result.
 - **Tool-secret env deny-list (F5).** Adds exact `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (proxy URLs embed
@@ -1117,3 +1119,23 @@ marked `#[non_exhaustive]`.**
 - **Additive public API not listed above:** `runner_core::net_guard` (shared SSRF classification),
   `runner_core::{PackPolicy, join_public_keys}` re-exports, `greentic_aw_runtime::{url_redact, scoped_secrets}`
   modules. They add surface only and do not change the semver recommendation.
+  The only compile-time break in this round's crates is the `telco_x_event_bridge::InvokeOutcome.error` field listed in
+  "Rust API changes"; upgrade checklist: add `error: None` (or the failure) to every `InvokeOutcome { .. }` literal in
+  `TelcoXDispatchInvoker` impls.
+
+## Round 26 (docs/API)
+
+- **Telco-X bridge `InvokeOutcome` break recorded.** `telco_x_event_bridge::InvokeOutcome` gained the required field
+  `error: Option<DispatchError>` (same as `aw_event_bridge::InvokeOutcome`); it and the other new `telco-x-event-bridge`
+  public items are now in "Rust API changes". CONFIRMED against `git diff 16b0cbfd..HEAD`; the other crates' public
+  changes in that diff were already listed or are purely additive.
+- **Log-volume wording corrected.** The guest-memory-cap denial is a `warn!` once per PROCESS (later denials `debug`,
+  each store at most once), not "one `warn!` per store"; the oversize tool-result log (`cap_tool_result_for`) is a
+  `warn!` at most once a minute per process, `debug` otherwise. CLAUDE.md, the `wasm_limits.rs` module comment are
+  corrected, and the earlier "one `warn!` per store" entry is marked superseded.
+- **Earlier entries marked superseded:** Round 20 F5a (parenthesis balancing, removed in Round 21 F7), Round 18b
+  (`max_ack_pending` `MAX_INFLIGHT`, now `2 * MAX_INFLIGHT` since Round 19). The Round 22 F3 "dispatch-ledger wording"
+  note now names the right entry (Round 21 F4).
+- **Comment/test only:** `response_scope` docs (both bridges) name `is_echoable_scope_id`, not `validate_scope_id`; the
+  re-creation pause is chosen by the pure `RecreateCause::fast_on_success` (tested); the MCP parallel-probe test bound
+  is derived from the serial floor with a larger margin. No behaviour change.

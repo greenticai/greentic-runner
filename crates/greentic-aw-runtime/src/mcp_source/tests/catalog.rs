@@ -613,8 +613,14 @@ async fn servers_are_probed_concurrently_and_ingested_in_order() {
             "srv{i} must be in the catalog"
         );
     }
+    // Each `tools/list` takes at least 1s, so a serial probe loop can never
+    // finish before SERVERS seconds, while overlapping probes take about 1s.
+    // Assert only "clearly under the serial floor" (half a second of margin
+    // below it, 4.5s above the parallel case) so a loaded CI host does not
+    // flake the test; a regression to serial probing still fails it.
+    let serial_floor = std::time::Duration::from_secs(SERVERS as u64);
     assert!(
-        elapsed < std::time::Duration::from_millis(4500),
-        "probes must overlap (sequential would be {SERVERS}s+), took {elapsed:?}"
+        elapsed < serial_floor - std::time::Duration::from_millis(500),
+        "probes must overlap (sequential would be {serial_floor:?}+), took {elapsed:?}"
     );
 }

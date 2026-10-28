@@ -322,7 +322,7 @@ fail-closed on a task panic); never call `run_chain` directly from async code. (
 through `background::BackgroundGate` (cap + timeout), not a bare `tokio::spawn`. (5) The core-NATS bridges cap
 in-flight requests (`MAX_INFLIGHT`) and bound each handler. (6) A tool result over `MAX_TOOL_RESULT_BYTES`
 (32 KiB serialised) is replaced in the history by `{truncated, original_bytes, preview}`; the model never sees the
-rest, so `state::cap_tool_result_for` logs a `warn!` with the tool name and size. See
+rest, so `state::cap_tool_result_for` logs the cut with the tool name and size: a `warn!` at most once a minute per process (`OVERSIZE_WARN`), `debug` otherwise. See
 `docs/audit-breaking-changes.md`.
 
 ### Knowledge retrieval backends
@@ -853,7 +853,7 @@ Known gap, not closed here: `tenant_ctx_from_v1` lets a component override `team
 
 ### Guest sandbox, limits and outbound guard
 
-Each tenant's packs get `/state`, `/cache`, `/logs` backed by `<host dir>/tenants/<tenant>` (`RunnerWasiPolicy::for_tenant`; tenant ids must be `[A-Za-z0-9._-]{1,128}`, not `.`/`..`), and `env_allow` is only that tenant's `env_passthrough`. The pack-artifact cache (`<cache>/packs`) is never visible to guests. Data under the old host-wide dirs is not migrated. Execution limits live in `wasm_limits.rs` (a grow past the memory/table cap is DENIED, not trapped: the guest sees `-1` from `memory.grow`/`table.grow` and a Rust guest usually aborts on the failed allocation; `GuestLimiter` logs one `warn!` per store); the outbound SSRF/size guard in `http_guard.rs` (host `http-client`: checked in the client's DNS resolver, so it covers the connect address and redirects; `wasi:http`: the name is resolved and validated just before the upstream connector re-resolves it, so a DNS-rebinding race remains — egress-filter at the network layer if that matters).
+Each tenant's packs get `/state`, `/cache`, `/logs` backed by `<host dir>/tenants/<tenant>` (`RunnerWasiPolicy::for_tenant`; tenant ids must be `[A-Za-z0-9._-]{1,128}`, not `.`/`..`), and `env_allow` is only that tenant's `env_passthrough`. The pack-artifact cache (`<cache>/packs`) is never visible to guests. Data under the old host-wide dirs is not migrated. Execution limits live in `wasm_limits.rs` (a grow past the memory/table cap is DENIED, not trapped: the guest sees `-1` from `memory.grow`/`table.grow` and a Rust guest usually aborts on the failed allocation; `GuestLimiter` logs a `warn!` for the first denial per PROCESS, later denials at `debug`, each store at most once); the outbound SSRF/size guard in `http_guard.rs` (host `http-client`: checked in the client's DNS resolver, so it covers the connect address and redirects; `wasi:http`: the name is resolved and validated just before the upstream connector re-resolves it, so a DNS-rebinding race remains — egress-filter at the network layer if that matters).
 
 ### Desktop session snapshots (legacy adoption)
 
@@ -1187,11 +1187,10 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `SECRETS_BROKER_TOKEN` | Bearer token sent to the broker (may be empty for an unauthenticated broker) |
 | `SECRETS_CACHE_TTL_SECS` | TTL of the in-process secrets read cache (`CachingSecretsManager`); default `300` |
 | `SECRETS_CACHE_MAX_ENTRIES` | LRU capacity of that cache; default `512`, `0`/invalid falls back to the default |
-| `GREENTIC_OAUTH_BROKER_SHARED_SECRET` | Shared secret sent as `Authorization: Bearer` on OAuth broker token requests (including the email-send path). Overrides `oauth.shared_secret` from the host config; never logged |
+| `GREENTIC_OAUTH_BROKER_SHARED_SECRET` | Shared secret sent as `Authorization: Bearer` on OAuth broker token requests (including the email-send path). Overrides `oauth.shared_secret` from the host config; a blank value is treated as unset. Never logged |
 | `GREENTIC_PRESENT_PROVIDER_AS_USER` | Opt-in (default OFF): restore the legacy presentation in which a component invoked by a flow with no verified caller is told the PROVIDER id as its `user` / `user_id`. See "What a component is told about its caller" above. Truthy = `1`/`true`/`yes`/`on`. |
 | `GREENTIC_WASM_MAX_EXEC_SECS` | Per-invocation wall-clock deadline for a guest component (epoch interruption, 1s granularity). Default `300`; `0` disables. A trap surfaces as an ordinary invocation error. |
-| `GREENTIC_WASM_MAX_MEMORY_MB` | Cap on any one guest linear memory AND on the total linear memory across all memories in one store (`wasm_limits::GuestLimiter`; multi-memory is enabled). Default `1024`; `0` disables both. At most 16 memories per store. Table/instance counts are always capped at generous fixed values. A grow past the cap is denied (`memory.grow` returns `-1`, no trap) with one `warn!` per store. |
-| `GREENTIC_OAUTH_BROKER_SHARED_SECRET` | Shared secret for the OAuth broker; overrides the YAML `oauth.shared_secret`. A blank value is treated as unset. Never logged. |
+| `GREENTIC_WASM_MAX_MEMORY_MB` | Cap on any one guest linear memory AND on the total linear memory across all memories in one store (`wasm_limits::GuestLimiter`; multi-memory is enabled). Default `1024`; `0` disables both. At most 16 memories per store. Table/instance counts are always capped at generous fixed values. A grow past the cap is denied (`memory.grow` returns `-1`, no trap); the first denial per process is a `warn!`, later ones `debug`. |
 | `GREENTIC_SHUTDOWN_GRACE_SECS` | Seconds in-flight HTTP requests get to drain after SIGTERM/ctrl-c before being cancelled (axum graceful shutdown). Default `30`; `0` aborts at once. `host.stop()` runs on every exit path. |
 | `GREENTIC_HTTP_ALLOW_METADATA` | Truthy disables the default outbound block on link-local (`169.254/16`, `fe80::/10`) and cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`, Azure WireServer `168.63.129.16`, Oracle `192.0.0.192`). |
 | `GREENTIC_HTTP_DENY_PRIVATE` | Opt-in (default OFF): also block loopback, `0.0.0.0/8`, RFC1918, CGNAT and ULA destinations. |
