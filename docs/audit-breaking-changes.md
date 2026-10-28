@@ -1117,3 +1117,18 @@ marked `#[non_exhaustive]`.**
 - **Additive public API not listed above:** `runner_core::net_guard` (shared SSRF classification),
   `runner_core::{PackPolicy, join_public_keys}` re-exports, `greentic_aw_runtime::{url_redact, scoped_secrets}`
   modules. They add surface only and do not change the semver recommendation.
+
+## Round 26
+
+- **A resumed run that fails after one of its own effects no longer keeps its park.** Before: the resume ended in
+  `Err`, the snapshot stayed at the old wait (`fetch` does not consume it) and the next message resumed the same wait and
+  repeated the effect. Now the top-level turn path (`FlowEngine::resume_surfacing_failures`) answers with the same
+  metadata-only failure envelope a fresh run gets (`metadata.error_kind = "flow_execution_failed"`) and clears the park
+  through `persist_after_effects`. Callers that saw `Err` from `handle` for this case now get an `Ok` reply; failures
+  before any effect (deterministic or transient) are still `Err` and keep the park. Plain `FlowEngine::resume` is
+  unchanged. Additive public API: `FlowEngine::resume_surfacing_failures`, `runner::engine::is_after_effects_failure`.
+- **Resolve failure now keeps the previous runtime's archives alive** (`watcher::reload_once`), like the rebuild-failed and
+  backoff branches, so a long index/resolve outage cannot let the cache prune an archive a live runtime re-opens lazily.
+- **Deadline watchdog registration is race-free** for a near-zero deadline (no stale finished entry in `WATCHDOGS`).
+- **Legacy state-key migration is write-if-absent** where the store supports it; a racing `set_json` is no longer
+  overwritten by the stale legacy value. Stores without the primitive keep the previous behaviour.

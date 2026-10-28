@@ -1000,6 +1000,24 @@ Two retry layers re-run a failed turn from its start: the engine's own loop (`ex
   If you add a node kind with an external effect, add it to `performs_external_effect`.
 - **Deterministic jump failures are terminal**: `unknown_flow` (flow not registered), `unknown_node`, "no start node"
   and a malformed `greentic_control` block (`parse_component_control`). A `load_flow` I/O failure stays retryable.
+- **A RESUMED run that fails after its own effect clears the park (round 26).** `fetch` does not consume a snapshot, so
+  a resume that ended in `Err` used to leave the wait in place and the next message repeated the effect.
+  `terminal_after_effects` now stamps `TerminalFlowError.after_effects` (also on an already-terminal error, e.g. a
+  step budget hit after an effect); `is_after_effects_failure` reads it. The top-level turn path resumes through
+  `FlowEngine::resume_surfacing_failures`, which turns such a failure into the same metadata-only `Ok` envelope a
+  fresh run gets (`surfaced_failure_execution`), so `call_traced` takes its ordinary `Completed` branch:
+  `persist_after_effects(resume.clear)`, `PostEffectPersistence` semantics unchanged, turn lock still held. Every
+  OTHER resume failure stays an `Err` and KEEPS the park: a deterministic pre-effect one (`unknown_node`, step
+  budget before any effect) and a transient pre-effect one, so the user can retry; a deterministic one therefore
+  keeps failing on each message until the pack is fixed (known, unchanged). Plain `FlowEngine::resume` (nested flow
+  tools, `pack.rs`) is unchanged and still returns `Err`: a flow tool's caller must SEE the failure.
+
+**Watchdog registration and state migration (round 26).** `remote_dispatch::arm_watchdog` holds the `WATCHDOGS` lock across
+spawn + insert, so a near-zero deadline cannot deregister before its entry exists (it used to leave a finished
+`JoinHandle`, which `cancel_watchdog` then reported as "cancelled"). `StateStoreHost::get_json` migrates a pre-escaping
+legacy key with `set_json_if_absent` (a concurrent `set_json` on the current key wins and is what the caller sees);
+a store whose `set_json_if_absent` errors (its default) keeps the old unconditional write, so the stale-overwrite
+window remains only there and is normally closed by the turn lock anyway.
 
 **Known limitation: a failed resume after admission leaves the wait without a timeout.** `RuntimeSessionResumer::resume_checked` retires the deadline watchdog at admission, before `handle` runs. If `handle` then fails with an infrastructure error (resume-store read/save, `PostEffectPersistence`) the response is spent and no watchdog remains, so a still-parked wait has no timeout and the user hears nothing until they message again (`dispatch_to_resumer_outcome` logs it at `error`). Not re-armed on purpose: the original deadline is not recorded, a synthetic `timeout` would resume the park and repeat effects after a post-effect failure, and an approval would also need its nonce/`decision_token`. A fix needs the deadline persisted with the park.
 
@@ -1016,7 +1034,8 @@ Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 
 Three things that fail silently if changed: (1) the superseded runtime's cron timers are stopped with a per-runtime `CancellationToken` that `adapt_timer::drive_schedule` observes ONLY while sleeping — never `JoinHandle::abort`, which would cancel a tick mid-`handle()` after its effects but before the snapshot save; (2) the digest used for signatures and the watcher's applied-digest comparison is the one COMPUTED from the cached file (`CachedPack.digest`, canonical lowercase), never the index's spelling of the pin; (3) `PackCache::store` prunes idle sibling digest dirs, but a loaded `PackRuntime` keeps its archive PATH and re-opens it lazily, so pruning is gated on mtime (cache hits refresh it), keeps the newest 2, and must never delete anything recently used. The idle gate is `max(1h, 2 x PACK_REFRESH_INTERVAL)`
 (`runner_core::packs::prune_min_idle`, applied through `PackManager::with_refresh_interval` by the watcher); `touch`
 opens the archive READ-ONLY (a 0444 cached archive used to fail the write open, so its mtime never refreshed); and a
-runtime kept because its republish failed to build has its archives touched (`watcher::keep_archives_alive`).
+runtime kept because its republish failed to build, because the tenant's pack resolve failed, or because it is in
+backoff has its archives touched (`watcher::keep_archives_alive`; the resolve-failure branch was missing it until round 26).
 `ActivePacks::insert_pack` / `insert_revision` / `remove_revision` cancel the cron timers of the runtime they replace or
 remove (not when the same `Arc` is re-inserted), so an embedder still holding it does not double-fire a tick.
 
