@@ -10,6 +10,7 @@ pub mod env;
 pub mod net_guard;
 pub mod packs;
 pub mod path_safety;
+pub mod url_split;
 
 pub use env::{IndexLocation, PackConfig, PackSource, join_public_keys};
 pub use packs::{

@@ -59,12 +59,14 @@ pub(crate) fn log_safe_max(raw: &str, max_chars: usize) -> Cow<'_, str> {
 /// credential (`api.telegram.org/bot<TOKEN>/sendMessage`, Slack webhook paths),
 /// which a path-preserving redaction would keep.
 pub(crate) fn log_safe_origin(raw: &str) -> String {
-    let Some((scheme, rest)) = raw.split_once("://") else {
+    let Some(parts) = runner_core::url_split::split_url(raw) else {
         return "<non-url>".to_string();
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or_default();
-    log_safe_max(&format!("{scheme}://{host}"), 128).into_owned()
+    if parts.ambiguous {
+        // An `@` after the authority: the host cannot be told from credential text.
+        return log_safe_max(&format!("{}[redacted]", parts.scheme_prefix), 128).into_owned();
+    }
+    log_safe_max(&format!("{}{}", parts.scheme_prefix, parts.host), 128).into_owned()
 }
 
 #[cfg(test)]
@@ -82,6 +84,24 @@ mod tests {
             "http://localhost:8080"
         );
         assert_eq!(log_safe_origin("not a url"), "<non-url>");
+    }
+
+    #[test]
+    fn origin_is_fail_closed_on_delimiters_in_userinfo() {
+        for input in [
+            "https://deploy:pa/ss@host/p.gtpack",
+            "https://deploy:pa?ss@host/p",
+            "https://deploy:pa#ss@host/p",
+        ] {
+            assert_eq!(log_safe_origin(input), "https://[redacted]", "{input}");
+        }
+    }
+
+    #[test]
+    fn origin_requires_a_valid_scheme() {
+        for input in ["x/bot123:TOKEN?r=http://a", "1ab://h", "://h", "a b://h"] {
+            assert_eq!(log_safe_origin(input), "<non-url>", "{input}");
+        }
     }
 
     #[test]
