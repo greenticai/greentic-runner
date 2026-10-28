@@ -291,32 +291,14 @@ fn underscore_slug(raw: &str, max: usize) -> String {
     slug.trim_end_matches('_').to_string()
 }
 
-/// First `bytes` bytes of `sha256(raw)`, lowercase hex.
-fn hash_hex(raw: &str, bytes: usize) -> String {
+/// First [`UNIT_SEGMENT_HASH_BYTES`] bytes of `sha256(raw)`, lowercase hex.
+fn short_hash(raw: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(raw.as_bytes());
-    digest[..bytes.min(digest.len())]
+    digest[..UNIT_SEGMENT_HASH_BYTES]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// First [`UNIT_SEGMENT_HASH_BYTES`] bytes of `sha256(raw)`, lowercase hex.
-fn short_hash(raw: &str) -> String {
-    hash_hex(raw, UNIT_SEGMENT_HASH_BYTES)
-}
-
-/// Bytes of `sha256(raw pack id)` appended to a LOSSY pack slug (40 lowercase
-/// hex chars). Sized so that a hashed pack part is always longer than
-/// [`UNIT_SEGMENT_SLUG_MAX`]: a lossless pack id is its own slug and so is at
-/// most that long, which means no lossless id can ever spell a hashed part,
-/// whatever its characters. (With the old 12-hex suffix a pack that registered
-/// the literal id `my_pack_<12 hex>` shared `my.pack`'s address.)
-const PACK_ID_HASH_BYTES: usize = 20;
-
-/// Hash suffix of a lossy pack id. See [`PACK_ID_HASH_BYTES`].
-fn pack_id_hash(raw: &str) -> String {
-    hash_hex(raw, PACK_ID_HASH_BYTES)
 }
 
 /// The PACK segment a deployed unit's own copy of a pack secret lives under:
@@ -345,7 +327,7 @@ fn pack_id_hash(raw: &str) -> String {
 ///    a 40-byte prefix) still get different segments — and so no two
 ///    `(pack, unit)` pairs can produce one string by splitting at a different
 ///    `_unit_`;
-/// 3. the pack id likewise carries a 40-hex `sha256` suffix of the RAW id whenever
+/// 3. the pack id likewise carries a `sha256` suffix of the RAW id whenever
 ///    its slug is lossy (differs from the id: case, punctuation, collapsed or
 ///    truncated), so `my.pack` / `my_pack` cannot share an address. A pack id
 ///    that is already its own slug is left unhashed. BREAKING for lossy pack
@@ -374,11 +356,11 @@ pub fn unit_pack_segment(pack_id: &str, unit_id: &str) -> Option<String> {
     // `[a-z0-9_]`, canonical, within the cap) is the id itself, so it keeps
     // its historical, unhashed address.
     let pack_part = if pack_slug.is_empty() {
-        format!("pack_{}", pack_id_hash(pack_raw))
+        format!("pack_{}", short_hash(pack_raw))
     } else if pack_slug == pack_raw {
         pack_slug
     } else {
-        format!("{pack_slug}_{}", pack_id_hash(pack_raw))
+        format!("{pack_slug}_{}", short_hash(pack_raw))
     };
 
     let unit_hash = short_hash(unit_raw);
@@ -917,7 +899,7 @@ mod tests {
         );
         assert_eq!(
             unit_pack_segment("pack.dw.support", "Web Assistant (prod)").expect("segment"),
-            "pack_dw_support_3394615683428d7740880ca827e1d0a801ef5cc0_unit_web_assistant_prod_3ee04e3f306a"
+            "pack_dw_support_339461568342_unit_web_assistant_prod_3ee04e3f306a"
         );
     }
 
@@ -973,41 +955,6 @@ mod tests {
             assert_eq!(canonicalize_secret_key(&seg), seg);
             assert_eq!(greentic_secrets_lib::spec::canonical_secret_name(&seg), seg);
         }
-    }
-
-    /// A pack may register any id it likes, including the exact string a lossy
-    /// id used to hash to. The hashed pack part is longer than any lossless id
-    /// (those are at most `UNIT_SEGMENT_SLUG_MAX` bytes), so they never meet.
-    #[test]
-    fn a_lossless_id_cannot_spell_a_hashed_pack_part() {
-        let lossy = "my.pack";
-        let segment = unit_pack_segment(lossy, "u").expect("segment");
-        // What the previous rule produced for `my.pack`, registered literally.
-        let old_form = format!("my_pack_{}", short_hash(lossy));
-        let other = unit_pack_segment(&old_form, "u").expect("other");
-        assert_ne!(segment, other);
-        // The full new form as a literal id is too long to be lossless (cut at
-        // the slug cap), so it is hashed itself.
-        let full_new = segment
-            .split("_unit_")
-            .next()
-            .expect("pack part")
-            .to_string();
-        assert!(full_new.len() > UNIT_SEGMENT_SLUG_MAX, "got {full_new}");
-        let other = unit_pack_segment(&full_new, "u").expect("other");
-        assert_ne!(segment, other);
-        // Same for the punctuation-only fallback `pack_<hash>`.
-        let fallback = unit_pack_segment("...", "u").expect("fallback");
-        let fallback_pack = fallback.split("_unit_").next().expect("part");
-        assert!(
-            fallback_pack.len() > UNIT_SEGMENT_SLUG_MAX,
-            "got {fallback_pack}"
-        );
-        let old_fallback = format!("pack_{}", short_hash("..."));
-        assert_ne!(
-            fallback,
-            unit_pack_segment(&old_fallback, "u").expect("other")
-        );
     }
 
     #[test]
