@@ -151,7 +151,34 @@ impl StateHost for StateStoreHost {
                 let Some(value) = store.get_json(&tenant, STATE_PREFIX, &legacy_key, None)? else {
                     return Ok(None);
                 };
-                store.set_json(&tenant, STATE_PREFIX, &state_key, None, &value, ttl_secs)?;
+                // Write-if-absent: a `set_json` that landed on the current key
+                // between the read above and this write is NEWER than the legacy
+                // value, and a plain `set_json` here would overwrite it with the
+                // stale one. A backend without the primitive (its default is an
+                // error) keeps the old unconditional write.
+                let value = match store.set_json_if_absent(
+                    &tenant,
+                    STATE_PREFIX,
+                    &state_key,
+                    &value,
+                    ttl_secs,
+                ) {
+                    Ok(true) => value,
+                    Ok(false) => store
+                        .get_json(&tenant, STATE_PREFIX, &state_key, None)?
+                        .unwrap_or(value),
+                    Err(_) => {
+                        store.set_json(
+                            &tenant,
+                            STATE_PREFIX,
+                            &state_key,
+                            None,
+                            &value,
+                            ttl_secs,
+                        )?;
+                        value
+                    }
+                };
                 store.del(&tenant, STATE_PREFIX, &legacy_key)?;
                 Ok(Some(value))
             })
@@ -532,6 +559,151 @@ mod tests {
         assert_eq!(
             store
                 .get_json(&tenant, STATE_PREFIX, &derive_state_key(&key), None)
+                .expect("current"),
+            Some(value)
+        );
+    }
+
+    /// An in-memory store that, right after the LEGACY key is read, lets a
+    /// concurrent `set_json` land on the current key (the migrate-on-read race).
+    struct RacingStore {
+        inner: InMemoryStateStore,
+        legacy: StoreStateKey,
+        current: StoreStateKey,
+        newer: Value,
+        supports_if_absent: bool,
+    }
+
+    impl StateStore for RacingStore {
+        fn get_json(
+            &self,
+            tenant: &TenantCtx,
+            prefix: &str,
+            key: &StoreStateKey,
+            path: Option<&greentic_state::StatePath>,
+        ) -> greentic_types::GResult<Option<Value>> {
+            let found = self.inner.get_json(tenant, prefix, key, path)?;
+            if *key == self.legacy && found.is_some() {
+                self.inner
+                    .set_json(tenant, prefix, &self.current, None, &self.newer, None)?;
+            }
+            Ok(found)
+        }
+
+        fn set_json(
+            &self,
+            tenant: &TenantCtx,
+            prefix: &str,
+            key: &StoreStateKey,
+            path: Option<&greentic_state::StatePath>,
+            value: &Value,
+            ttl_secs: Option<u32>,
+        ) -> greentic_types::GResult<()> {
+            self.inner
+                .set_json(tenant, prefix, key, path, value, ttl_secs)
+        }
+
+        fn del(
+            &self,
+            tenant: &TenantCtx,
+            prefix: &str,
+            key: &StoreStateKey,
+        ) -> greentic_types::GResult<bool> {
+            self.inner.del(tenant, prefix, key)
+        }
+
+        fn del_prefix(&self, tenant: &TenantCtx, prefix: &str) -> greentic_types::GResult<u64> {
+            self.inner.del_prefix(tenant, prefix)
+        }
+
+        fn set_json_if_absent(
+            &self,
+            tenant: &TenantCtx,
+            prefix: &str,
+            key: &StoreStateKey,
+            value: &Value,
+            ttl_secs: Option<u32>,
+        ) -> greentic_types::GResult<bool> {
+            if self.supports_if_absent {
+                self.inner
+                    .set_json_if_absent(tenant, prefix, key, value, ttl_secs)
+            } else {
+                Err(greentic_types::GreenticError::new(
+                    greentic_types::ErrorCode::InvalidInput,
+                    "unsupported",
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_does_not_overwrite_a_write_that_raced_it() {
+        let mut key = sample_key();
+        key.flow_id = "flow/main%x".into();
+        let tenant = tenant_ctx_from_key(&key).expect("tenant");
+        let legacy = legacy_state_key(&key).expect("differs from current key");
+        let current = derive_state_key(&key);
+        let stale = serde_json::json!({"n": "stale"});
+        let newer = serde_json::json!({"n": "newer"});
+        let store = Arc::new(RacingStore {
+            inner: InMemoryStateStore::new(),
+            legacy: legacy.clone(),
+            current: current.clone(),
+            newer: newer.clone(),
+            supports_if_absent: true,
+        });
+        store
+            .inner
+            .set_json(&tenant, STATE_PREFIX, &legacy, None, &stale, None)
+            .expect("seed");
+        let host = StateStoreHost::new(store.clone());
+
+        // The racing write wins: the caller sees it, and so does the store.
+        assert_eq!(host.get_json(&key).await.expect("get"), Some(newer.clone()));
+        assert_eq!(
+            store
+                .inner
+                .get_json(&tenant, STATE_PREFIX, &current, None)
+                .expect("current"),
+            Some(newer)
+        );
+        assert!(
+            store
+                .inner
+                .get_json(&tenant, STATE_PREFIX, &legacy, None)
+                .expect("legacy")
+                .is_none(),
+            "the legacy key is still removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_falls_back_to_a_plain_write_without_if_absent_support() {
+        let mut key = sample_key();
+        key.flow_id = "flow/main%x".into();
+        let tenant = tenant_ctx_from_key(&key).expect("tenant");
+        let legacy = legacy_state_key(&key).expect("differs from current key");
+        let current = derive_state_key(&key);
+        let value = serde_json::json!({"n": 2});
+        let store = Arc::new(RacingStore {
+            inner: InMemoryStateStore::new(),
+            legacy: legacy.clone(),
+            current: current.clone(),
+            newer: value.clone(),
+            supports_if_absent: false,
+        });
+        // No racing write here: seed only the legacy key, with the race value
+        // equal to it, so the fallback path is what is observed.
+        store
+            .inner
+            .set_json(&tenant, STATE_PREFIX, &legacy, None, &value, None)
+            .expect("seed");
+        let host = StateStoreHost::new(store.clone());
+        assert_eq!(host.get_json(&key).await.expect("get"), Some(value.clone()));
+        assert_eq!(
+            store
+                .inner
+                .get_json(&tenant, STATE_PREFIX, &current, None)
                 .expect("current"),
             Some(value)
         );
