@@ -1323,7 +1323,9 @@ impl PackFlowAdapter {
                     flow_id: resume_flow_id.as_str(),
                     ..ctx
                 };
-                self.engine.resume(resume_ctx, snapshot, payload).await
+                self.engine
+                    .resume_surfacing_failures(resume_ctx, snapshot, payload)
+                    .await
             } else if let Some(entry) = envelope.entry_node.as_deref() {
                 self.engine.execute_from(ctx, payload, entry).await
             } else {

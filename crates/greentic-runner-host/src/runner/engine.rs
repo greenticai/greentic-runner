@@ -508,14 +508,17 @@ impl NodeKind {
 /// `source()`, so `{err:#}` and `anyhow_chain_text` (operator log, redacted run
 /// error) still see the root cause.
 fn terminal_after_effects(err: anyhow::Error, effects_performed: bool) -> anyhow::Error {
-    if !effects_performed || is_terminal_flow_error(&err) {
+    if !effects_performed || is_after_effects_failure(&err) {
         return err;
     }
     tracing::warn!(
         error = %format!("{err:#}"),
         "flow failed after an earlier node performed an external effect; the turn is not re-run"
     );
-    terminal_flow_error_from(err)
+    // An error that is ALREADY terminal (a step budget, an unknown node) is
+    // rebuilt too: it still has to carry the "effects ran" marker, which a
+    // resume reads to decide whether the park may be cleared.
+    terminal_flow_error_from_after_effects(err)
 }
 
 #[derive(Clone, Debug)]
@@ -666,6 +669,30 @@ fn user_facing_flow_failure_text(entry: &Value) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| crate::runner::i18n::select_locale(None));
     user_facing_flow_failure_text_for(&locale)
+}
+
+/// The metadata-only envelope a session flow's terminal failure is rendered as
+/// (see `USER_FACING_FLOW_FAILURE_KEY`), shared by a fresh run and by a resumed
+/// run that failed after an effect so both answer the user identically.
+fn surfaced_failure_execution(
+    input: &Value,
+    flow_id: &str,
+    err: &anyhow::Error,
+    node_outputs: JsonMap<String, Value>,
+) -> FlowExecution {
+    FlowExecution::completed(
+        json!({
+            "text": user_facing_flow_failure_text(input),
+            // Generic, user-safe, and REQUIRED for the failure to reach
+            // anyone. See `USER_FACING_FLOW_FAILURE_KEY`.
+            "metadata": {
+                "error_kind": "flow_execution_failed",
+                "error_message": err.to_string(),
+                "flow_id": flow_id,
+            }
+        }),
+        node_outputs,
+    )
 }
 
 impl FlowEngine {
@@ -1214,18 +1241,10 @@ impl FlowEngine {
                             // raw engine text to the chat.
                             if surface_failures && ctx.session_id.is_some() {
                                 *surfaced_ref = true;
-                                return Ok(FlowExecution::completed(
-                                    json!({
-                                        "text": user_facing_flow_failure_text(&original_input),
-                                        // Generic, user-safe, and REQUIRED for the
-                                        // failure to reach anyone. See
-                                        // `USER_FACING_FLOW_FAILURE_KEY`.
-                                        "metadata": {
-                                            "error_kind": "flow_execution_failed",
-                                            "error_message": err.to_string(),
-                                            "flow_id": ctx.flow_id,
-                                        }
-                                    }),
+                                return Ok(surfaced_failure_execution(
+                                    &original_input,
+                                    ctx.flow_id,
+                                    &err,
                                     node_outputs,
                                 ));
                             }
@@ -1267,6 +1286,33 @@ impl FlowEngine {
         snapshot: FlowSnapshot,
         input: Value,
     ) -> Result<FlowExecution> {
+        self.resume_with_options(ctx, snapshot, input, false).await
+    }
+
+    /// [`Self::resume`] for the top-level turn path. A resumed run whose failure
+    /// FOLLOWED an external effect of that same run (`is_after_effects_failure`)
+    /// is rendered as the same metadata-only envelope a fresh run gets, as an
+    /// `Ok` completed execution, so the caller clears the park exactly as it
+    /// does for any completed turn; returning `Err` would leave the snapshot in
+    /// place and the next message would resume it and repeat the effect. Every
+    /// other failure (deterministic pre-effect, transient pre-effect) is still
+    /// an `Err` and the park is kept, so a transient one can be retried.
+    pub async fn resume_surfacing_failures(
+        &self,
+        ctx: FlowContext<'_>,
+        snapshot: FlowSnapshot,
+        input: Value,
+    ) -> Result<FlowExecution> {
+        self.resume_with_options(ctx, snapshot, input, true).await
+    }
+
+    async fn resume_with_options(
+        &self,
+        ctx: FlowContext<'_>,
+        snapshot: FlowSnapshot,
+        input: Value,
+        surface_after_effects: bool,
+    ) -> Result<FlowExecution> {
         if snapshot.pack_id != ctx.pack_id {
             return Err(terminal_flow_error(format!(
                 "snapshot pack {} does not match requested {}",
@@ -1298,16 +1344,38 @@ impl FlowEngine {
         // to refresh `entry` ourselves; `ensure_entry` is a no-op once
         // entry is non-null.
         state.replace_input(input.clone());
+        let surfaced_input = surface_after_effects.then(|| input.clone());
         // Park the submitted fields for the node that was awaiting them. Only a
         // snapshot flagged `awaiting_submit` names the waiting node in
         // `next_node`; `session.wait` names its SUCCESSOR, which has not run.
         state.pending_card_answers = pending_card_answers;
         state.entry = input;
         let span = self.flow_execute_span(&ctx);
-        self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
+        let result = self
+            .drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
             .instrument(span)
-            .await
-            .map_err(|failure| failure.error)
+            .await;
+        match result {
+            Ok(execution) => Ok(execution),
+            Err(failure) => match surfaced_input {
+                Some(input)
+                    if ctx.session_id.is_some() && is_after_effects_failure(&failure.error) =>
+                {
+                    tracing::warn!(
+                        error = %format!("{:#}", failure.error),
+                        flow_id = ctx.flow_id,
+                        "resumed flow failed after an effect; surfacing the failure and clearing the park"
+                    );
+                    Ok(surfaced_failure_execution(
+                        &input,
+                        ctx.flow_id,
+                        &failure.error,
+                        failure.node_outputs,
+                    ))
+                }
+                _ => Err(failure.error),
+            },
+        }
     }
 
     async fn execute_once(
@@ -10215,7 +10283,31 @@ mod tests {
         assert_send_sync(&TerminalFlowError {
             message: String::new(),
             original: None,
+            after_effects: false,
         });
+    }
+
+    #[test]
+    fn only_a_failure_that_followed_an_effect_carries_the_after_effects_marker() {
+        // Deterministic pre-effect terminal: terminal, but not "after effects".
+        let deterministic = terminal_flow_error("flow x has no node `y`");
+        assert!(is_terminal_flow_error(&deterministic));
+        assert!(!is_after_effects_failure(&deterministic));
+        // No effect yet: untouched.
+        let untouched = terminal_after_effects(deterministic, false);
+        assert!(!is_after_effects_failure(&untouched));
+        // Transient failure after an effect: marked, message preserved.
+        let marked = terminal_after_effects(anyhow!("internal timeout"), true);
+        assert!(is_after_effects_failure(&marked));
+        assert_eq!(marked.to_string(), "internal timeout");
+        // An already-terminal error after an effect picks the marker up too.
+        let upgraded = terminal_after_effects(terminal_flow_error("step limit"), true);
+        assert!(is_after_effects_failure(&upgraded));
+        assert_eq!(upgraded.to_string(), "step limit");
+        // The marker survives added context and a pre_effect wrapper.
+        assert!(is_after_effects_failure(&upgraded.context("outer")));
+        assert!(is_after_effects_failure(&pre_effect(marked)));
+        assert!(!is_after_effects_failure(&anyhow!("plain")));
     }
 
     #[test]
@@ -16518,7 +16610,7 @@ fn error_causes(err: &anyhow::Error) -> Vec<&(dyn std::error::Error + 'static)> 
 /// [`RunnerError::FlowTerminal`](crate::engine::error::RunnerError::FlowTerminal).
 /// The `Display` text is the bare message, so existing message assertions hold.
 ///
-/// It may carry the error it replaced ([`terminal_flow_error_from`]). `Display`
+/// It may carry the error it replaced ([`terminal_flow_error_from_after_effects`]). `Display`
 /// stays the OUTERMOST message only, because `to_string()` is what reaches the
 /// user-facing failure envelope and a cause chain can name a host or URL;
 /// `source()` exposes the original causes so `{err:#}` and
@@ -16528,6 +16620,11 @@ fn error_causes(err: &anyhow::Error) -> Vec<&(dyn std::error::Error + 'static)> 
 pub struct TerminalFlowError {
     message: String,
     original: Option<anyhow::Error>,
+    /// An earlier node of the SAME run had already performed an external
+    /// effect when this failure happened (see [`terminal_after_effects`]).
+    /// A deterministic pre-effect failure (unknown node) is terminal too but
+    /// leaves this `false`: nothing ran that a re-delivery would repeat.
+    after_effects: bool,
 }
 
 impl std::fmt::Display for TerminalFlowError {
@@ -16552,16 +16649,31 @@ pub(crate) fn terminal_flow_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(TerminalFlowError {
         message: message.into(),
         original: None,
+        after_effects: false,
     })
 }
 
 /// Make `err` terminal while keeping its cause chain reachable through
-/// `source()` (see [`TerminalFlowError`]); `Display` is `err`'s outermost
-/// message, unchanged.
-pub(crate) fn terminal_flow_error_from(err: anyhow::Error) -> anyhow::Error {
+/// `source()` (see [`TerminalFlowError`]; `Display` is `err`'s outermost message,
+/// unchanged), recording that an earlier node of the run had performed an
+/// external effect.
+fn terminal_flow_error_from_after_effects(err: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(TerminalFlowError {
         message: err.to_string(),
         original: Some(err),
+        after_effects: true,
+    })
+}
+
+/// Whether the failure is terminal AND followed an external effect of the same
+/// run. A resumed run that fails this way has already spent the effect, so the
+/// park it was resumed from must not outlive the turn (the next message would
+/// resume the same wait and repeat the effect).
+pub fn is_after_effects_failure(err: &anyhow::Error) -> bool {
+    error_causes(err).into_iter().any(|cause| {
+        cause
+            .downcast_ref::<TerminalFlowError>()
+            .is_some_and(|terminal| terminal.after_effects)
     })
 }
 

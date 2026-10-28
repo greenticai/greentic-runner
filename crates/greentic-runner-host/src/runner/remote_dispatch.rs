@@ -33,6 +33,7 @@ fn next_watchdog_generation() -> u64 {
 
 /// Register `handle` as the watchdog for `correlation_id` under `generation`,
 /// aborting any previous one registered under the same id.
+#[cfg(test)]
 fn register_watchdog(correlation_id: String, generation: u64, handle: tokio::task::JoinHandle<()>) {
     if let Some((_, previous)) = WATCHDOGS
         .lock()
@@ -63,12 +64,19 @@ where
 {
     let generation = next_watchdog_generation();
     let key = correlation_id.clone();
+    // The map lock is held across spawn + insert (no await in between), so a
+    // task with a tiny deadline cannot reach `deregister_watchdog` before its
+    // own entry exists: it blocks on this lock instead of finding nothing to
+    // remove and leaving a finished handle behind.
+    let mut watchdogs = WATCHDOGS.lock();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(deadline_ms)).await;
         deregister_watchdog(&key, generation);
         on_timeout.await;
     });
-    register_watchdog(correlation_id, generation, handle);
+    if let Some((_, previous)) = watchdogs.insert(correlation_id, (generation, handle)) {
+        previous.abort();
+    }
     generation
 }
 
@@ -471,6 +479,20 @@ mod tests {
         assert!(watchdog_pending("corr-gen"), "stale generation is a no-op");
         deregister_watchdog_for_test("corr-gen", newer);
         assert!(!watchdog_pending("corr-gen"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_watchdog_that_expires_at_once_leaves_no_entry_behind() {
+        for i in 0..200 {
+            arm_watchdog(format!("corr-instant-{i}"), 0, async {});
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for i in 0..200 {
+            assert!(
+                !watchdog_pending(&format!("corr-instant-{i}")),
+                "a finished watchdog must deregister itself (iteration {i})"
+            );
+        }
     }
 
     #[tokio::test]
