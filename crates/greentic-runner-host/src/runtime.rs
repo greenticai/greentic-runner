@@ -1803,7 +1803,11 @@ impl TenantRuntime {
         // spawns would drop their JoinHandles, which detaches (not aborts) them.
         // Guarded like the pack's blocking client: this client carries the
         // email/OAuth broker traffic, so it must not reach link-local or
-        // cloud-metadata addresses (SSRF), including via redirects.
+        // cloud-metadata addresses (SSRF), including via redirects. The DNS half
+        // of the guard does NOT apply behind an `HTTP(S)_PROXY` (the proxy
+        // resolves the name; an IP literal is never resolved): this client keeps
+        // the environment proxy on purpose, because it talks to operator-set
+        // broker/OAuth/mail URLs that some deployments reach only via a proxy.
         let http_guard = crate::http_guard::HttpGuard::from_env();
         let http_client = Client::builder()
             .dns_resolver(Arc::new(crate::http_guard::GuardedResolver {
