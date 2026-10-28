@@ -6278,6 +6278,8 @@ fn locate_pack_assets(
 const MAX_ASSET_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 /// Total cap for all extracted pack assets (decompressed).
 const MAX_ASSETS_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap on the number of entries (files and directories) under `assets/` in one pack.
+const MAX_ASSET_ENTRIES: usize = 20_000;
 /// Cap for archive entries read fully into memory (manifests, schemas, ...).
 const MAX_ARCHIVE_ENTRY_READ_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -6328,6 +6330,16 @@ fn confined_asset_path(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
 }
 
 fn extract_assets_from_archive(path: &Path) -> Result<Option<(TempDir, PathBuf)>> {
+    extract_assets_with_entry_cap(path, MAX_ASSET_ENTRIES)
+}
+
+/// [`extract_assets_from_archive`] refusing a pack with more than `max_entries`
+/// entries under `assets/` (files and directories alike). The byte caps alone do
+/// not bound inode use: a million empty files cost no bytes.
+fn extract_assets_with_entry_cap(
+    path: &Path,
+    max_entries: usize,
+) -> Result<Option<(TempDir, PathBuf)>> {
     let file =
         File::open(path).with_context(|| format!("failed to open pack {}", path.display()))?;
     let mut archive =
@@ -6335,11 +6347,19 @@ fn extract_assets_from_archive(path: &Path) -> Result<Option<(TempDir, PathBuf)>
     let temp = TempDir::new().context("failed to create temporary assets directory")?;
     let mut found = false;
     let mut total_bytes = 0u64;
+    let mut asset_entries = 0usize;
     for idx in 0..archive.len() {
         let mut entry = archive.by_index(idx)?;
         let raw_name = entry.name().to_string();
         if !raw_name.starts_with("assets/") {
             continue;
+        }
+        asset_entries += 1;
+        if asset_entries > max_entries {
+            bail!(
+                "pack {} has too many asset entries (limit {max_entries})",
+                path.display()
+            );
         }
         // `enclosed_name` rejects absolute paths and `..` escapes (zip-slip).
         let Some(safe_name) = entry.enclosed_name() else {
@@ -7596,6 +7616,26 @@ mod audit_hardening_tests {
             extract_assets_from_archive(&archive).expect_err("zip-slip entry must be rejected");
         assert!(err.to_string().contains("unsafe asset path"));
         assert!(!dir.path().join("evil.txt").exists());
+    }
+
+    #[test]
+    fn extract_assets_caps_the_entry_count() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("many.gtpack");
+        let names: Vec<String> = (0..6).map(|i| format!("assets/f{i}.txt")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b""[..])).collect();
+        write_zip(&archive, &entries);
+        let err = extract_assets_with_entry_cap(&archive, 5)
+            .expect_err("more entries than the cap must be refused");
+        assert!(err.to_string().contains("too many asset entries"), "{err}");
+        assert!(extract_assets_with_entry_cap(&archive, 6).is_ok());
+        // Entries outside `assets/` do not count.
+        let other = dir.path().join("other.gtpack");
+        let mut entries: Vec<(&str, &[u8])> = vec![("assets/a.txt", &b"x"[..])];
+        let outside: Vec<String> = (0..10).map(|i| format!("flows/f{i}.ygtc")).collect();
+        entries.extend(outside.iter().map(|n| (n.as_str(), &b""[..])));
+        write_zip(&other, &entries);
+        assert!(extract_assets_with_entry_cap(&other, 1).is_ok());
     }
 
     #[test]

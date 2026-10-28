@@ -153,6 +153,9 @@ pub(crate) struct StagedExtension {
     /// refused by the loader moments later with a far better message than
     /// anything this module could invent.
     pub(crate) extension_id: Option<String>,
+    /// Decompressed size of the staged tree, as recorded when it was unpacked.
+    /// Counted against the per-pass unpacked-bytes budget (`stage_bounded`).
+    pub(crate) unpacked_bytes: u64,
 }
 
 /// One `.gtxpack` this host could not present to the loader at all.
@@ -229,13 +232,20 @@ const MAX_EXT_ENTRIES: usize = 4096;
 /// count, each declared size and the running total are capped, and the real
 /// decompressed bytes are streamed to disk through a `take` because a declared
 /// size can lie.
-fn unpack_archive(bytes: &[u8], dest: &Path) -> Result<()> {
+#[cfg(test)]
+fn unpack_archive(bytes: &[u8], dest: &Path) -> Result<u64> {
+    unpack_archive_within(bytes, dest, MAX_EXT_TOTAL_BYTES)
+}
+
+/// [`unpack_archive`] with the total cap lowered to `max_total_bytes` (never
+/// raised above [`MAX_EXT_TOTAL_BYTES`]). Returns the decompressed bytes written.
+fn unpack_archive_within(bytes: &[u8], dest: &Path, max_total_bytes: u64) -> Result<u64> {
     unpack_archive_with_limits(
         bytes,
         dest,
         ExtractLimits {
             max_entry_bytes: MAX_EXT_ENTRY_BYTES,
-            max_total_bytes: MAX_EXT_TOTAL_BYTES,
+            max_total_bytes: max_total_bytes.min(MAX_EXT_TOTAL_BYTES),
             max_entries: MAX_EXT_ENTRIES,
         },
     )
@@ -248,7 +258,7 @@ struct ExtractLimits {
     max_entries: usize,
 }
 
-fn unpack_archive_with_limits(bytes: &[u8], dest: &Path, limits: ExtractLimits) -> Result<()> {
+fn unpack_archive_with_limits(bytes: &[u8], dest: &Path, limits: ExtractLimits) -> Result<u64> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes)).context("read the extension archive")?;
     if archive.len() > limits.max_entries {
@@ -300,7 +310,7 @@ fn unpack_archive_with_limits(bytes: &[u8], dest: &Path, limits: ExtractLimits) 
             );
         }
     }
-    Ok(())
+    Ok(total_bytes)
 }
 
 /// Read `describe.json`'s `metadata.id` out of a staged directory.
@@ -323,14 +333,26 @@ fn staged_extension_id(dir: &Path) -> Option<String> {
 ///
 /// Digest-keyed so two tenants carrying the same extension unpack it once, and
 /// so a re-run within one process is idempotent.
-fn stage_one(entry_name: &str, bytes: &[u8]) -> Result<StagedExtension> {
+fn stage_one(entry_name: &str, bytes: &[u8], unpack_budget: u64) -> Result<StagedExtension> {
     let root = staging_root().context("no staging directory is available")?;
-    stage_one_in(root, entry_name, bytes)
+    stage_one_budgeted(root, entry_name, bytes, unpack_budget)
 }
 
 /// [`stage_one`] against an explicit root, so tests can inspect the layout
 /// without sharing the process-wide staging root.
+#[cfg(test)]
 fn stage_one_in(root: &Path, entry_name: &str, bytes: &[u8]) -> Result<StagedExtension> {
+    stage_one_budgeted(root, entry_name, bytes, MAX_EXT_TOTAL_BYTES)
+}
+
+/// [`stage_one_in`] refusing to unpack more than `unpack_budget` bytes. An
+/// already-staged slot is reused only if its recorded size fits the budget too.
+fn stage_one_budgeted(
+    root: &Path,
+    entry_name: &str,
+    bytes: &[u8],
+    unpack_budget: u64,
+) -> Result<StagedExtension> {
     // Serialise staging process-wide. Two callers staging the same bytes share
     // one slot; without this, the second sees no marker mid-unpack and clears
     // the slot under the first (`Directory not empty`), or the sweep races an
@@ -357,8 +379,25 @@ fn stage_one_in(root: &Path, entry_name: &str, bytes: &[u8]) -> Result<StagedExt
         }
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create staging dir {}", dir.display()))?;
-        unpack_archive(bytes, &dir)?;
-        std::fs::write(&marker, b"").with_context(|| format!("mark {} staged", dir.display()))?;
+        let unpacked = match unpack_archive_within(bytes, &dir, unpack_budget) {
+            Ok(unpacked) => unpacked,
+            Err(error) => {
+                // Do not leave a refused (possibly huge) partial tree on disk
+                // until the sweep's grace expires.
+                if let Err(clean) = std::fs::remove_dir_all(&slot) {
+                    tracing::debug!(error = %clean, "cannot remove refused staging slot");
+                }
+                return Err(error);
+            }
+        };
+        std::fs::write(&marker, unpacked.to_string())
+            .with_context(|| format!("mark {} staged", dir.display()))?;
+    }
+    let unpacked_bytes = recorded_unpacked_bytes(&slot, &dir);
+    if unpacked_bytes > unpack_budget {
+        bail!(
+            "extension archive unpacks to {unpacked_bytes} bytes, over the {unpack_budget} bytes left for this pass"
+        );
     }
 
     let extension_id = staged_extension_id(&dir);
@@ -368,7 +407,31 @@ fn stage_one_in(root: &Path, entry_name: &str, bytes: &[u8]) -> Result<StagedExt
         entry_name: entry_name.to_string(),
         dir,
         extension_id,
+        unpacked_bytes,
     })
+}
+
+/// Decompressed size of a staged slot: the number its marker records, else (a
+/// marker from a build that wrote none) the sum of the files under `dir`.
+fn recorded_unpacked_bytes(slot: &Path, dir: &Path) -> u64 {
+    std::fs::read_to_string(slot.join(COMPLETE_MARKER))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| dir_size(dir))
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    read_dir
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => dir_size(&entry.path()),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// File in a slot naming the extension id staged there, so a later digest of
@@ -401,12 +464,16 @@ fn record_slot_use(slot: &Path, extension_id: Option<&str>) {
 }
 
 /// Remove staging slots nothing has used for `grace`: incomplete slots (a crash
-/// mid-unpack) and slots holding an older digest of the same extension as
-/// `keep`. `keep` itself is never removed. Slots of other extensions are left
-/// alone, so tenants carrying different extensions never evict each other.
-/// Best effort: a failure is logged, never propagated.
+/// mid-unpack) and complete slots of ANY extension id (an older digest of the
+/// same extension, a different id, or one with no readable id). `keep` itself
+/// is never removed, and every stage re-touches its slot, so a slot some pack
+/// still carries never ages out while that pack is staged again; it is the age
+/// test that keeps tenants' different extensions from evicting each other.
+/// Known limit: a runtime that registered a slot and is not rebuilt for longer
+/// than `grace` while another extension stages loses its slot, the same
+/// exposure superseded digests always had. Best effort: a failure is logged,
+/// never propagated.
 fn sweep_stale_slots(root: &Path, keep: &Path, grace: std::time::Duration) {
-    let keep_id = std::fs::read_to_string(keep.join(SLOT_ID_FILE)).ok();
     let Ok(read_dir) = std::fs::read_dir(root) else {
         return;
     };
@@ -417,14 +484,7 @@ fn sweep_stale_slots(root: &Path, keep: &Path, grace: std::time::Duration) {
             continue;
         }
         let last_used = match std::fs::metadata(path.join(COMPLETE_MARKER)) {
-            Ok(meta) => {
-                let same_extension = keep_id.is_some()
-                    && std::fs::read_to_string(path.join(SLOT_ID_FILE)).ok() == keep_id;
-                if !same_extension {
-                    continue;
-                }
-                meta.modified().ok()
-            }
+            Ok(meta) => meta.modified().ok(),
             // No marker: an unpack that died partway.
             Err(_) => std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
         };
@@ -463,6 +523,7 @@ pub(crate) fn stage_from_packs(packs: &[Arc<PackRuntime>]) -> PackExtensions {
         |name, pack, limit| pack.read_pack_file_capped(name, limit),
         MAX_PACK_EXT_ENTRIES,
         MAX_PACK_EXT_TOTAL_BYTES,
+        MAX_PACK_EXT_UNPACKED_BYTES,
     )
 }
 
@@ -472,6 +533,10 @@ const MAX_PACK_EXT_ENTRIES: usize = 64;
 /// also bounded by what the unpacker accepts). Reading is one entry at a time,
 /// so this bounds work and disk, while resident memory stays at one archive.
 const MAX_PACK_EXT_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Most DECOMPRESSED bytes unpacked to disk from the loaded packs in one pass.
+/// The compressed cap above does not bound this: each archive may unpack to
+/// [`MAX_EXT_TOTAL_BYTES`], so 64 of them were 16 GiB.
+const MAX_PACK_EXT_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Stage candidates one at a time: read, stage, release the bytes, then read
 /// the next. The previous shape collected every archive into a `Vec` first, so
@@ -483,15 +548,19 @@ const MAX_PACK_EXT_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// return more than that: an entry over budget is refused WHILE it is read (at
 /// most budget + 1 bytes resident), not after it was read whole. The total is
 /// checked again on what came back, so a reader that ignores the limit still
-/// cannot overspend. This is the one staging path: the tests drive it too.
+/// cannot overspend. Each archive may unpack only into what is left of
+/// `max_unpacked_bytes` (decompressed, across the pass); a refused unpack is a
+/// failure and its partial tree is removed. This is the one staging path: the tests drive it too.
 fn stage_bounded<T>(
     candidates: Vec<(String, T)>,
     read: impl Fn(&str, &T, u64) -> Option<Vec<u8>>,
     max_entries: usize,
     max_total_bytes: u64,
+    max_unpacked_bytes: u64,
 ) -> PackExtensions {
     let mut out = PackExtensions::default();
     let mut total: u64 = 0;
+    let mut unpacked_total: u64 = 0;
     for (index, (entry_name, source)) in candidates.into_iter().enumerate() {
         if index >= max_entries {
             out.failures.push(StagingFailure {
@@ -521,8 +590,12 @@ fn stage_bounded<T>(
             continue;
         }
         total += len;
-        match stage_one(&entry_name, &bytes) {
-            Ok(staged) => out.staged.push(staged),
+        let unpack_budget = max_unpacked_bytes.saturating_sub(unpacked_total);
+        match stage_one(&entry_name, &bytes, unpack_budget) {
+            Ok(staged) => {
+                unpacked_total = unpacked_total.saturating_add(staged.unpacked_bytes);
+                out.staged.push(staged);
+            }
             Err(error) => out.failures.push(StagingFailure {
                 entry_name,
                 reason: format!("{error:#}"),
@@ -679,6 +752,7 @@ mod tests {
             entries.into_iter().collect(),
             |_, bytes, limit| (bytes.len() as u64 <= limit).then(|| bytes.clone()),
             usize::MAX,
+            u64::MAX,
             u64::MAX,
         )
     }
@@ -875,6 +949,7 @@ mod tests {
             },
             3,
             u64::MAX,
+            u64::MAX,
         );
         assert_eq!(out.staged.len(), 3);
         assert_eq!(out.failures.len(), 2, "over-cap entries are reported");
@@ -888,7 +963,13 @@ mod tests {
         let candidates: Vec<(String, ())> = (0..3)
             .map(|n| (format!("extensions/b{n}.gtxpack"), ()))
             .collect();
-        let out = stage_bounded(candidates, |_, (), _| Some(archive.clone()), 10, one * 2);
+        let out = stage_bounded(
+            candidates,
+            |_, (), _| Some(archive.clone()),
+            10,
+            one * 2,
+            u64::MAX,
+        );
         assert_eq!(out.staged.len(), 2);
         assert_eq!(out.failures.len(), 1);
         assert!(out.failures[0].reason.contains("in total"));
@@ -912,6 +993,7 @@ mod tests {
             },
             10,
             one * 2 + 1,
+            u64::MAX,
         );
         assert_eq!(*seen.borrow(), vec![one * 2 + 1, one + 1, 1]);
         assert_eq!(out.staged.len(), 2);
@@ -943,6 +1025,7 @@ mod tests {
             vec![("extensions/gone.gtxpack".to_string(), ())],
             |_, (), _| None,
             10,
+            u64::MAX,
             u64::MAX,
         );
         assert!(out.staged.is_empty());
@@ -1009,6 +1092,7 @@ mod tests {
             entry_name: "extensions/acme.tool.gtxpack".to_string(),
             dir: PathBuf::from("/nonexistent"),
             extension_id: Some("acme.tool".to_string()),
+            unpacked_bytes: 0,
         };
         let on_disk: std::collections::HashSet<String> =
             ["acme.tool".to_string()].into_iter().collect();
@@ -1254,9 +1338,123 @@ mod tests {
         assert!(!old_slot.exists(), "an aged superseded slot is removed");
         assert!(new_slot.exists(), "the current slot is kept");
         assert!(
-            other_slot.exists(),
-            "another extension's slot is never evicted"
+            !other_slot.exists(),
+            "an aged slot of another extension id is reclaimed too"
         );
+    }
+
+    #[test]
+    fn a_recently_used_slot_of_another_extension_is_never_evicted() {
+        let root = tempfile::tempdir().expect("staging root");
+        let other = stage_one_in(
+            root.path(),
+            "extensions/b.gtxpack",
+            &extension_archive("other.tool"),
+        )
+        .expect("other");
+        let other_slot = other.dir.parent().expect("slot").to_path_buf();
+        let anonymous = stage_one_in(
+            root.path(),
+            "extensions/c.gtxpack",
+            &zip_bytes(&[("extension.wasm", b"no describe".as_slice())]),
+        )
+        .expect("anonymous");
+        let anonymous_slot = anonymous.dir.parent().expect("slot").to_path_buf();
+        let current = stage_one_in(
+            root.path(),
+            "extensions/a.gtxpack",
+            &extension_archive("acme.tool"),
+        )
+        .expect("current");
+        let current_slot = current.dir.parent().expect("slot").to_path_buf();
+
+        sweep_stale_slots(root.path(), &current_slot, SUPERSEDED_GRACE);
+        assert!(other_slot.exists() && anonymous_slot.exists());
+
+        // Aged: the id-less slot goes as well as the other id's; a re-stage
+        // (a runtime still using it) refreshes the age first.
+        for slot in [&other_slot, &anonymous_slot] {
+            age_slot(slot, SUPERSEDED_GRACE + std::time::Duration::from_secs(60));
+        }
+        record_slot_use(&other_slot, other.extension_id.as_deref());
+        sweep_stale_slots(root.path(), &current_slot, SUPERSEDED_GRACE);
+        assert!(other_slot.exists(), "a re-touched slot survives");
+        assert!(
+            !anonymous_slot.exists(),
+            "an aged id-less slot is reclaimed"
+        );
+        assert!(current_slot.exists());
+    }
+
+    #[test]
+    fn the_unpacked_byte_budget_bounds_a_pass_and_cleans_up() {
+        let big = zip_bytes(&[
+            ("describe.json", describe_bytes("acme.big").as_slice()),
+            ("blob.bin", vec![7u8; 4000].as_slice()),
+        ]);
+        let small = extension_archive("acme.small");
+        let candidates = vec![
+            ("extensions/big.gtxpack".to_string(), big.clone()),
+            ("extensions/small.gtxpack".to_string(), small.clone()),
+        ];
+        // Budget fits the small archive but not the big one, whatever their
+        // (tiny) compressed size.
+        let out = stage_bounded(
+            candidates,
+            |_, bytes, _| Some(bytes.clone()),
+            10,
+            u64::MAX,
+            1000,
+        );
+        assert_eq!(out.staged.len(), 1, "{:?}", out.failures);
+        assert_eq!(out.staged[0].entry_name, "extensions/small.gtxpack");
+        assert_eq!(out.failures.len(), 1);
+        assert_eq!(out.failures[0].entry_name, "extensions/big.gtxpack");
+        assert!(
+            out.failures[0].reason.contains("total size limit"),
+            "{:?}",
+            out.failures
+        );
+    }
+
+    #[test]
+    fn the_unpacked_budget_is_spent_across_entries() {
+        let a = extension_archive("acme.a");
+        let b = extension_archive("acme.b");
+        let one = out_unpacked(&a);
+        let out = stage_bounded(
+            vec![
+                ("extensions/a.gtxpack".to_string(), a),
+                ("extensions/b.gtxpack".to_string(), b),
+            ],
+            |_, bytes, _| Some(bytes.clone()),
+            10,
+            u64::MAX,
+            one + one / 2,
+        );
+        assert_eq!(out.staged.len(), 1, "{:?}", out.failures);
+        assert_eq!(out.failures.len(), 1);
+    }
+
+    fn out_unpacked(archive: &[u8]) -> u64 {
+        let dir = tempfile::tempdir().expect("dest");
+        unpack_archive(archive, dir.path()).expect("unpack")
+    }
+
+    #[test]
+    fn a_staged_slot_records_its_unpacked_size_and_is_charged_again_on_reuse() {
+        let root = tempfile::tempdir().expect("staging root");
+        let archive = extension_archive("acme.tool");
+        let expected = out_unpacked(&archive);
+        let first = stage_one_in(root.path(), "extensions/a.gtxpack", &archive).expect("first");
+        assert_eq!(first.unpacked_bytes, expected);
+        // Reusing the slot reports the same size...
+        let again = stage_one_in(root.path(), "extensions/a.gtxpack", &archive).expect("again");
+        assert_eq!(again.unpacked_bytes, expected);
+        // ...and a budget below it refuses even though nothing is unpacked.
+        let err = stage_one_budgeted(root.path(), "extensions/a.gtxpack", &archive, expected - 1)
+            .expect_err("over budget");
+        assert!(err.to_string().contains("over the"), "{err}");
     }
 
     #[test]
