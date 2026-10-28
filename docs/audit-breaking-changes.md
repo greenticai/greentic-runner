@@ -1123,7 +1123,7 @@ marked `#[non_exhaustive]`.**
   "Rust API changes"; upgrade checklist: add `error: None` (or the failure) to every `InvokeOutcome { .. }` literal in
   `TelcoXDispatchInvoker` impls.
 
-## Round 26 (docs/API)
+## Round 26c: docs and API
 
 - **Telco-X bridge `InvokeOutcome` break recorded.** `telco_x_event_bridge::InvokeOutcome` gained the required field
   `error: Option<DispatchError>` (same as `aw_event_bridge::InvokeOutcome`); it and the other new `telco-x-event-bridge`
@@ -1141,7 +1141,7 @@ marked `#[non_exhaustive]`.**
   is derived from the serial floor with a larger margin. No behaviour change.
 
 
-## Round 26
+## Round 26a: resume, watcher, state
 
 - **A resumed run that fails after one of its own effects no longer keeps its park.** Before: the resume ended in
   `Err`, the snapshot stayed at the old wait (`fetch` does not consume it) and the next message resumed the same wait and
@@ -1149,7 +1149,8 @@ marked `#[non_exhaustive]`.**
   metadata-only failure envelope a fresh run gets (`metadata.error_kind = "flow_execution_failed"`) and clears the park
   through `persist_after_effects`. Callers that saw `Err` from `handle` for this case now get an `Ok` reply; failures
   before any effect (deterministic or transient) are still `Err` and keep the park. Plain `FlowEngine::resume` is
-  unchanged. Additive public API: `FlowEngine::resume_surfacing_failures`, `runner::engine::is_after_effects_failure`.
+  unchanged (used by nested flow tools in `pack.rs`; the desktop runner moved to `resume_surfacing_failures` in
+  Round 27). Additive public API: `FlowEngine::resume_surfacing_failures`, `runner::engine::is_after_effects_failure`.
 - **Resolve failure now keeps the previous runtime's archives alive** (`watcher::reload_once`), like the rebuild-failed and
   backoff branches, so a long index/resolve outage cannot let the cache prune an archive a live runtime re-opens lazily.
 - **Deadline watchdog registration is race-free** for a near-zero deadline (no stale finished entry in `WATCHDOGS`).
@@ -1157,7 +1158,7 @@ marked `#[non_exhaustive]`.**
   overwritten by the stale legacy value. Stores without the primitive keep the previous behaviour.
 
 
-## Round 26
+## Round 26b: redaction, staging, proxy
 
 - **Run-outcome URL redaction is fail-closed on delimiters in userinfo (L1, `run_outcome/error.rs`).** CONFIRMED:
   `https://svc:Ab,cd@host/x)` ended the URL at the raw `,`, so `redact_one_url` saw `https://svc:Ab` (no `@`) and
@@ -1173,14 +1174,13 @@ marked `#[non_exhaustive]`.**
   (ALPHA then alnum/`+`/`-`/`.`): `log_safe_origin("x/bot123:TOKEN?r=http://a")` is `<non-url>` (it used to return a
   "scheme" holding the token), and `redact_locator` returns `<invalid-locator>` for a string that contains `://` but
   has no valid scheme. **Affected:** an ambiguous locator logs as `scheme://[redacted]` with no host.
-- **Pack-extension staging bounds decompressed bytes and reclaims all idle slots (L3).** CONFIRMED. A pass was bounded
+- **Pack-extension staging bounds decompressed bytes (L3).** (The "reclaims all idle slots" half of this entry is
+  SUPERSEDED by Round 27 M1: the sweep is back to superseded digests of the same id only.) CONFIRMED. A pass was bounded
   only by compressed bytes (512 MiB) while each of 64 archives could unpack 256 MiB (16 GiB). `stage_bounded` now takes
   a per-pass unpacked budget (`MAX_PACK_EXT_UNPACKED_BYTES`, 1 GiB); each archive unpacks into what is left, a refused
   unpack removes its partial slot at once, and a reused slot is charged its recorded size (the marker now holds the
-  unpacked byte count). `sweep_stale_slots` also removes COMPLETE slots of any extension id (different id, or no
-  readable id) after the same 1 h idle grace; every stage still re-touches its slot. Known limit: a runtime that
-  registered a slot and is not rebuilt for over an hour while another extension stages loses its files, the exposure
-  superseded digests already had. `extract_assets_from_archive` also caps entries under `assets/`
+  unpacked byte count). ~~`sweep_stale_slots` also removes COMPLETE slots of any extension id~~ (reverted in Round 27
+  M1). `extract_assets_from_archive` also caps entries under `assets/`
   (`MAX_ASSET_ENTRIES`, 20,000).
 - **A2A and knowledge-index clients ignore `HTTP(S)_PROXY` (L4).** CONFIRMED: the guard lives in the DNS resolver, which
   a proxy bypasses. Both clients (pack-controlled URLs) now call `.no_proxy()`. **Affected (behaviour change):** a
@@ -1195,3 +1195,43 @@ marked `#[non_exhaustive]`.**
   is the colliding one) and would not close the class: the non-unit `scoped_secret_path_for_pack` already normalises pack
   ids and collides the same way. The attacker must control a pack in the victim's tenant, which is already inside the
   pack trust boundary. Revisit together with a pack-id uniqueness check at load time.
+
+
+## Round 27
+
+- **M1: the staging sweep no longer deletes complete slots of other extension ids (regression from Round 26b L3).**
+  CONFIRMED. `build_ext_runtime` runs once per `TenantRuntime`, so tenant A's runtime, which is not rebuilt, still
+  points into its slot; tenant B's build swept it away after 1 h idle, taking A's extension files with it.
+  `sweep_stale_slots` is back to the Round 24 behaviour: it removes (a) slots with no completion marker that are older
+  than the grace (a crashed unpack) and (b) complete slots whose `.ext-id` equals the id being staged (superseded
+  digests), never any other id. The per-pass unpacked-bytes budget (`MAX_PACK_EXT_UNPACKED_BYTES`), the size marker,
+  the cleanup of a refused partial slot and the `assets/` entry cap stay. **Known limitation:** slots of different ids
+  that are not a supersede are never swept while the process lives; disk growth is bounded by distinct extensions x
+  digests. The claim "sweeps idle complete slots of any id" in Round 26b and in CLAUDE.md "Round 26 notes" is
+  superseded by this entry.
+- **M2: a desktop resume that fails after an effect now deletes the session snapshot.** CONFIRMED.
+  `greentic-runner-desktop` resumed through plain `FlowEngine::resume`; such a failure ended in `Err`, only the
+  `Completed` branch removed `<id>.snapshot.json`, so the next activity resumed the same wait and repeated the effect
+  (the bug Round 26a fixed in `engine/runtime.rs`). It now uses `FlowEngine::resume_surfacing_failures`. A failure
+  before any effect is still an error and keeps the snapshot. Plain `resume` remains only in the nested flow-tool path
+  (`pack.rs`).
+
+### Accepted trade-offs and known behaviours (Round 26 follow-ups)
+
+- **Self-parking effectful nodes that fail transiently end the segment.** A resumed run whose own node is effectful and
+  self-parking (e.g. a conversational `dw.agent`, `LoopHere`) and fails transiently (`StateUnavailable`, an LLM error)
+  now follows the non-resume path: a failed effectful node sets `effects_performed`, so the failure is post-effect, the
+  park is cleared and the segment ends (the next message starts at the entrypoint) instead of retrying the same node.
+  Reason: the node may already have made partial tool calls, and this is consistent with a fresh run. An alternative
+  (marking `pre_effect` for failures before the first tool call) is not implemented.
+- **Intentional over-redaction (fail-closed; reduces diagnostics only).** `run_outcome/error.rs::url_end` swallows a
+  whole word such as `https://api.example.com,owner=a@b.com` or compact JSON
+  `{"url":"https://h.com","user":"bob@corp.com"}`; an invalid scheme or a numeric prefix turns the token into
+  `[redacted]`; `redact_locator` / `log_safe_origin` show `scheme://[redacted]` for a legitimate locator with an `@` in
+  the path (`oci://ghcr.io/org/pack@sha256:...`, `https://h/@scope/pkg`) because an `@` after the authority is treated
+  as ambiguous.
+- **Observability change.** `RuntimeSessionResumer::resume_checked` discards the output of a resume; a post-effect
+  failure that used to be logged at `error!` through `dispatch_to_resumer_outcome` is now a `warn!` plus a recorded
+  run outcome (it is an answered failure, not an infrastructure error).
+- **Known test flake (minor).** The 3 s stub in the proxy child-process test starts before the child is spawned, so a
+  slow spawn can eat into it. Not tightened.

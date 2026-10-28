@@ -615,7 +615,15 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             // downstream read (`{{node.<card>.answers.<field>}}`). Jumping to an
             // entry node instead skips the card, so the answers never exist and
             // every downstream binding resolves empty.
-            engine.resume(ctx, snapshot, opts.input.clone()).await
+            //
+            // A resume that fails AFTER one of its own effects is answered as a
+            // completed failure envelope (`resume_surfacing_failures`), so the
+            // `Completed` arm below deletes the snapshot; with plain `resume` the
+            // `Err` kept it and the next activity repeated the effect. A failure
+            // before any effect stays an `Err` and keeps the park.
+            engine
+                .resume_surfacing_failures(ctx, snapshot, opts.input.clone())
+                .await
         } else if let Some(entry_node) = opts.entry_node.as_deref() {
             // No parked run to continue, so this is the caller's first hop into
             // the flow: start at the node it named.

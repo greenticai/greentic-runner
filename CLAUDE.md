@@ -907,7 +907,7 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
 
 - Any code that shows a URL without its credentials uses `runner_core::url_split::split_url` (authority ends at the first `/?#`; an `@` after it is ambiguous, show `scheme://[redacted]` only; scheme must be valid). `redact_locator`, `log_safe_origin` and the run-outcome redactor do; `url_redact::redact_http_url` keeps its own copy (aw-runtime copy of the same rule).
 - The A2A and `knowledge_index` clients are `.no_proxy()`: the SSRF guard is in the DNS resolver, which a proxy bypasses. The `runtime.rs` broker/OAuth/mail client deliberately keeps the env proxy.
-- `unit_pack_segment` keeps the 12-hex suffix; a lossless id spelling a lossy id's hashed segment is a documented residual (needs a pack in the same tenant). Pack-extension staging also has a per-pass unpacked-bytes budget (1 GiB) and sweeps idle complete slots of any id. See `docs/audit-breaking-changes.md` (Round 26).
+- `unit_pack_segment` keeps the 12-hex suffix; a lossless id spelling a lossy id's hashed segment is a documented residual (needs a pack in the same tenant). Pack-extension staging also has a per-pass unpacked-bytes budget (1 GiB). ~~Sweeps idle complete slots of any id~~: SUPERSEDED by Round 27 M1 — `sweep_stale_slots` removes only old marker-less slots and superseded digests of the SAME extension id, because another tenant's runtime still points into its slot (slots of different ids are not swept while the process lives; known limitation). See `docs/audit-breaking-changes.md` (Round 26a/26b/26c and Round 27, which also records the accepted trade-offs: self-parking effectful node failures end the segment, intentional over-redaction, resumer `warn!` instead of `error!`).
 
 ### Engine and tool-secret rules (round 11)
 
@@ -1006,7 +1006,7 @@ Two retry layers re-run a failed turn from its start: the engine's own loop (`ex
   If you add a node kind with an external effect, add it to `performs_external_effect`.
 - **Deterministic jump failures are terminal**: `unknown_flow` (flow not registered), `unknown_node`, "no start node"
   and a malformed `greentic_control` block (`parse_component_control`). A `load_flow` I/O failure stays retryable.
-- **A RESUMED run that fails after its own effect clears the park (round 26).** `fetch` does not consume a snapshot, so
+- **A RESUMED run that fails after its own effect clears the park (round 26a).** `fetch` does not consume a snapshot, so
   a resume that ended in `Err` used to leave the wait in place and the next message repeated the effect.
   `terminal_after_effects` now stamps `TerminalFlowError.after_effects` (also on an already-terminal error, e.g. a
   step budget hit after an effect); `is_after_effects_failure` reads it. The top-level turn path resumes through
@@ -1015,10 +1015,16 @@ Two retry layers re-run a failed turn from its start: the engine's own loop (`ex
   `persist_after_effects(resume.clear)`, `PostEffectPersistence` semantics unchanged, turn lock still held. Every
   OTHER resume failure stays an `Err` and KEEPS the park: a deterministic pre-effect one (`unknown_node`, step
   budget before any effect) and a transient pre-effect one, so the user can retry; a deterministic one therefore
-  keeps failing on each message until the pack is fixed (known, unchanged). Plain `FlowEngine::resume` (nested flow
-  tools, `pack.rs`) is unchanged and still returns `Err`: a flow tool's caller must SEE the failure.
+  keeps failing on each message until the pack is fixed (known, unchanged). Plain `FlowEngine::resume` (only the nested
+  flow-tool path in `pack.rs`; the desktop runner uses `resume_surfacing_failures` too since Round 27 M2, deleting its
+  snapshot on a post-effect failure) is unchanged and still returns `Err`: a flow tool's caller must SEE the failure.
+  **Accepted trade-off:** a self-parking effectful node (conversational `dw.agent`, `LoopHere`) that itself fails
+  transiently on resume is a post-effect failure like any other: the park is cleared and the segment ends instead of
+  retrying the node (it may have made partial tool calls). Marking pre-first-tool-call failures `pre_effect` is not done.
+  Consequently a post-effect resume failure reaches `RuntimeSessionResumer::resume_checked` (which discards the output)
+  as a `warn!` plus a recorded run outcome, no longer an `error!`.
 
-**Watchdog registration and state migration (round 26).** `remote_dispatch::arm_watchdog` holds the `WATCHDOGS` lock across
+**Watchdog registration and state migration (round 26a).** `remote_dispatch::arm_watchdog` holds the `WATCHDOGS` lock across
 spawn + insert, so a near-zero deadline cannot deregister before its entry exists (it used to leave a finished
 `JoinHandle`, which `cancel_watchdog` then reported as "cancelled"). `StateStoreHost::get_json` migrates a pre-escaping
 legacy key with `set_json_if_absent` (a concurrent `set_json` on the current key wins and is what the caller sees);
@@ -1041,7 +1047,7 @@ Three things that fail silently if changed: (1) the superseded runtime's cron ti
 (`runner_core::packs::prune_min_idle`, applied through `PackManager::with_refresh_interval` by the watcher); `touch`
 opens the archive READ-ONLY (a 0444 cached archive used to fail the write open, so its mtime never refreshed); and a
 runtime kept because its republish failed to build, because the tenant's pack resolve failed, or because it is in
-backoff has its archives touched (`watcher::keep_archives_alive`; the resolve-failure branch was missing it until round 26).
+backoff has its archives touched (`watcher::keep_archives_alive`; the resolve-failure branch was missing it until round 26a).
 `ActivePacks::insert_pack` / `insert_revision` / `remove_revision` cancel the cron timers of the runtime they replace or
 remove (not when the same `Arc` is re-inserted), so an embedder still holding it does not double-fire a tick.
 

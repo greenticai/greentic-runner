@@ -464,16 +464,16 @@ fn record_slot_use(slot: &Path, extension_id: Option<&str>) {
 }
 
 /// Remove staging slots nothing has used for `grace`: incomplete slots (a crash
-/// mid-unpack) and complete slots of ANY extension id (an older digest of the
-/// same extension, a different id, or one with no readable id). `keep` itself
-/// is never removed, and every stage re-touches its slot, so a slot some pack
-/// still carries never ages out while that pack is staged again; it is the age
-/// test that keeps tenants' different extensions from evicting each other.
-/// Known limit: a runtime that registered a slot and is not rebuilt for longer
-/// than `grace` while another extension stages loses its slot, the same
-/// exposure superseded digests always had. Best effort: a failure is logged,
-/// never propagated.
+/// mid-unpack) and slots holding an older digest of the same extension as
+/// `keep`. `keep` itself is never removed. Slots of other extensions are left
+/// alone, so tenants carrying different extensions never evict each other: a
+/// `TenantRuntime` that registered a slot is not rebuilt when another tenant's
+/// build runs, and still points into its files. Known limitation: slots of
+/// different ids that are not a supersede are never swept while the process
+/// lives; disk growth is bounded by distinct extensions x digests.
+/// Best effort: a failure is logged, never propagated.
 fn sweep_stale_slots(root: &Path, keep: &Path, grace: std::time::Duration) {
+    let keep_id = std::fs::read_to_string(keep.join(SLOT_ID_FILE)).ok();
     let Ok(read_dir) = std::fs::read_dir(root) else {
         return;
     };
@@ -484,7 +484,14 @@ fn sweep_stale_slots(root: &Path, keep: &Path, grace: std::time::Duration) {
             continue;
         }
         let last_used = match std::fs::metadata(path.join(COMPLETE_MARKER)) {
-            Ok(meta) => meta.modified().ok(),
+            Ok(meta) => {
+                let same_extension = keep_id.is_some()
+                    && std::fs::read_to_string(path.join(SLOT_ID_FILE)).ok() == keep_id;
+                if !same_extension {
+                    continue;
+                }
+                meta.modified().ok()
+            }
             // No marker: an unpack that died partway.
             Err(_) => std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
         };
@@ -1338,13 +1345,13 @@ mod tests {
         assert!(!old_slot.exists(), "an aged superseded slot is removed");
         assert!(new_slot.exists(), "the current slot is kept");
         assert!(
-            !other_slot.exists(),
-            "an aged slot of another extension id is reclaimed too"
+            other_slot.exists(),
+            "another extension's slot is never evicted"
         );
     }
 
     #[test]
-    fn a_recently_used_slot_of_another_extension_is_never_evicted() {
+    fn a_complete_slot_of_another_extension_idle_past_the_grace_is_not_swept() {
         let root = tempfile::tempdir().expect("staging root");
         let other = stage_one_in(
             root.path(),
@@ -1368,20 +1375,13 @@ mod tests {
         .expect("current");
         let current_slot = current.dir.parent().expect("slot").to_path_buf();
 
-        sweep_stale_slots(root.path(), &current_slot, SUPERSEDED_GRACE);
-        assert!(other_slot.exists() && anonymous_slot.exists());
-
-        // Aged: the id-less slot goes as well as the other id's; a re-stage
-        // (a runtime still using it) refreshes the age first.
         for slot in [&other_slot, &anonymous_slot] {
             age_slot(slot, SUPERSEDED_GRACE + std::time::Duration::from_secs(60));
         }
-        record_slot_use(&other_slot, other.extension_id.as_deref());
         sweep_stale_slots(root.path(), &current_slot, SUPERSEDED_GRACE);
-        assert!(other_slot.exists(), "a re-touched slot survives");
         assert!(
-            !anonymous_slot.exists(),
-            "an aged id-less slot is reclaimed"
+            other_slot.exists() && anonymous_slot.exists(),
+            "a runtime that is not rebuilt still points into these complete slots"
         );
         assert!(current_slot.exists());
     }
