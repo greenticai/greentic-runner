@@ -346,6 +346,10 @@ async fn reload_once(
                 tracing::error!(tenant = %tenant, error = %redact_chain(&err), "pack resolve failed; keeping previous runtime");
                 failures.push(format!("{tenant}: {}", redact_chain(&err)));
                 if let Some(prev) = previous {
+                    // Like the other keep-previous branches: the kept runtime
+                    // re-opens its archive lazily, so a long resolve outage must
+                    // not let the cache prune its (idle-looking) directory.
+                    keep_archives_alive(manager, &prev);
                     next.insert(RuntimeKey::legacy(tenant.clone()), prev);
                     if let Some(digests) = applied.lock().get(&tenant).cloned() {
                         new_applied.insert(tenant.clone(), digests);
