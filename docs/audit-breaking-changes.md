@@ -1188,10 +1188,10 @@ marked `#[non_exhaustive]`.**
   the environment must allow direct egress to those hosts. Decided NOT to change the broker/OAuth/email client in
   `runtime.rs` (operator-set URLs, not pack-controlled; `.no_proxy()` there would break proxy-only egress for mail and
   OAuth); its comment claimed connect coverage and now says the DNS guard does not apply behind a proxy.
-- **Per-unit pack secret address: hashed pack parts cannot be spelled by a lossless id (L5, BREAKING for lossy pack
-  ids).** CONFIRMED: `my.pack` became `my_pack_<12hex>`, and a pack registering that literal id (already its own slug)
-  got the same address. The hash suffix of a lossy pack id is now 40 hex (20 bytes of `sha256`), which makes a hashed
-  pack part always longer than 40 bytes, and a lossless id (its own slug, cut at 40) never is. Lossless ids keep their
-  address. **Affected:** unit-scoped secrets of lossy pack ids (`pack.dw.support`, `supplier-sor-0.1.0`) must be
-  re-staged AGAIN under the new segment, with no read fallback (it is the colliding address). Supersedes the 12-hex
-  wording of the earlier "Per-unit pack secret address" entry. The unit-id hash is unchanged.
+- **Per-unit pack secret address: accepted residual (L5, NOT changed).** CONFIRMED but deliberately not fixed: `my.pack`
+  becomes `my_pack_<12hex>`, and a pack in the same tenant and unit that registers that literal id (already its own slug)
+  gets the same address. Widening the hash would be BREAKING (every unit-scoped secret of a lossy pack id such as
+  `pack.dw.support` or `supplier-sor-0.1.0` would have to be re-staged, with no read fallback because the old address
+  is the colliding one) and would not close the class: the non-unit `scoped_secret_path_for_pack` already normalises pack
+  ids and collides the same way. The attacker must control a pack in the victim's tenant, which is already inside the
+  pack trust boundary. Revisit together with a pack-id uniqueness check at load time.

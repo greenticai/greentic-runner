@@ -907,7 +907,7 @@ The resolver adapters are per-crate because host uses reqwest 0.13 and aw-runtim
 
 - Any code that shows a URL without its credentials uses `runner_core::url_split::split_url` (authority ends at the first `/?#`; an `@` after it is ambiguous, show `scheme://[redacted]` only; scheme must be valid). `redact_locator`, `log_safe_origin` and the run-outcome redactor do; `url_redact::redact_http_url` keeps its own copy (aw-runtime copy of the same rule).
 - The A2A and `knowledge_index` clients are `.no_proxy()`: the SSRF guard is in the DNS resolver, which a proxy bypasses. The `runtime.rs` broker/OAuth/mail client deliberately keeps the env proxy.
-- `unit_pack_segment`: a lossy pack id carries a 40-hex hash so its pack part is longer than any lossless id (<= 40 bytes). Pack-extension staging also has a per-pass unpacked-bytes budget (1 GiB) and sweeps idle complete slots of any id. See `docs/audit-breaking-changes.md` (Round 26).
+- `unit_pack_segment` keeps the 12-hex suffix; a lossless id spelling a lossy id's hashed segment is a documented residual (needs a pack in the same tenant). Pack-extension staging also has a per-pass unpacked-bytes budget (1 GiB) and sweeps idle complete slots of any id. See `docs/audit-breaking-changes.md` (Round 26).
 
 ### Engine and tool-secret rules (round 11)
 
