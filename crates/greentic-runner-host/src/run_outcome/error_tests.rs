@@ -38,6 +38,34 @@ fn url_queries_and_userinfo_are_removed_but_host_and_path_kept() {
 }
 
 #[test]
+fn url_userinfo_with_raw_delimiters_does_not_leak() {
+    for (text, secret) in [
+        ("GET https://svc:Ab,cd@host/x) failed", "cd"),
+        ("GET https://svc:Ab;cd@host/x failed", "cd"),
+        ("GET https://svc:Ab)cd@host/x failed", "cd"),
+        ("GET https://svc:Ab]cd@host/x failed", "cd"),
+        ("GET https://svc:Ab'cd@host/x failed", "cd"),
+        ("GET https://svc:Ab/cd@host/x failed", "cd"),
+        ("GET https://svc:Ab?cd@host/x failed", "cd"),
+        ("GET https://svc:Ab#cd@host/x failed", "cd"),
+    ] {
+        let out = redact(text);
+        assert!(!out.contains(secret), "{text} -> {out}");
+        assert!(!out.contains("Ab"), "{text} -> {out}");
+        assert!(out.ends_with(" failed"), "{text} -> {out}");
+    }
+    // The ordinary shape still keeps host and path.
+    let out = redact("GET https://svc:Ab,cd@host/x) failed");
+    assert!(out.contains("https://[redacted]@host/x)"), "{out}");
+    // Prose punctuation after a plain URL is not swallowed.
+    assert_eq!(
+        redact("see https://host/x, then"),
+        "see https://host/x, then"
+    );
+    assert_eq!(redact("(https://host)"), "(https://host)");
+}
+
+#[test]
 fn credential_pairs_are_removed() {
     for text in [
         r#"body {"access_token": "tok-123", "ok": false}"#,

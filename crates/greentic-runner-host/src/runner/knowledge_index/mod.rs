@@ -87,6 +87,10 @@ fn build_client(timeout: Duration) -> Result<reqwest::Client, String> {
     // link-local / metadata destinations, on connect and on every redirect hop.
     let guard = crate::http_guard::HttpGuard::from_env();
     reqwest::Client::builder()
+        // The guard lives in this client's DNS resolver, which a proxy
+        // bypasses (the proxy resolves the name, and an IP literal is never
+        // resolved at all). Never honour `HTTP(S)_PROXY` / `ALL_PROXY` here.
+        .no_proxy()
         .timeout(timeout)
         .dns_resolver(std::sync::Arc::new(crate::http_guard::GuardedResolver {
             guard,

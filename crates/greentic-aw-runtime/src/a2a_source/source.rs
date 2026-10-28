@@ -154,12 +154,7 @@ impl A2aToolSource {
     fn build(routes: Vec<A2aRoute>, credentials: CredentialScope) -> Result<Self, reqwest::Error> {
         // A route's URL comes from the pack: refuse link-local / metadata
         // destinations (see `outbound_guard`). Redirects stay off outright.
-        let guard = crate::outbound_guard::HttpGuard::from_env();
-        let client = reqwest::Client::builder()
-            .dns_resolver(Arc::new(crate::outbound_guard::GuardedResolver { guard }))
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(CALL_TIMEOUT)
-            .build()?;
+        let client = build_http_client(crate::outbound_guard::HttpGuard::from_env())?;
         let mut agents = HashMap::with_capacity(routes.len());
         for route in routes {
             agents.entry(route.agent_id.clone()).or_insert(route);
@@ -717,6 +712,97 @@ fn check_target_literal(agent_id: &str, target: &url::Url) -> Result<(), String>
     crate::outbound_guard::HttpGuard::from_env()
         .check_url_literal(target)
         .map_err(|reason| format!("a2a agent {agent_id} interface URL refused: {reason}"))
+}
+
+/// The A2A HTTP client. `no_proxy()` is load-bearing: the guard sits in the DNS
+/// resolver, which an `HTTP(S)_PROXY` / `ALL_PROXY` in the environment would
+/// bypass (the proxy resolves the name, and an IP literal is never resolved).
+fn build_http_client(
+    guard: crate::outbound_guard::HttpGuard,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(Arc::new(crate::outbound_guard::GuardedResolver { guard }))
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(CALL_TIMEOUT)
+        .build()
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+
+    const CHILD_FLAG: &str = "GREENTIC_TEST_PROXY_CHILD";
+
+    /// Serve one canned 200 on `listener` in a thread; report whether it was hit.
+    fn spawn_stub(listener: TcpListener) -> std::thread::JoinHandle<bool> {
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).ok();
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    );
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        })
+    }
+
+    /// In the child (the env proxy points at `proxy`), the client must reach
+    /// `target` directly and never touch the proxy.
+    #[test]
+    fn a2a_client_ignores_the_environment_proxy() {
+        if std::env::var_os(CHILD_FLAG).is_none() {
+            let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+            let target_url = format!("http://{}/", target.local_addr().unwrap());
+            let proxy_hit = spawn_stub(proxy);
+            let target_hit = spawn_stub(target);
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "a2a_source::source::proxy_tests::a2a_client_ignores_the_environment_proxy",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_FLAG, &target_url)
+                .env("HTTP_PROXY", &proxy_url)
+                .env("http_proxy", &proxy_url)
+                .env("ALL_PROXY", &proxy_url)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child failed");
+            assert!(
+                target_hit.join().unwrap(),
+                "target must be reached directly"
+            );
+            assert!(!proxy_hit.join().unwrap(), "the env proxy must not be used");
+            return;
+        }
+        let url = std::env::var(CHILD_FLAG).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client =
+            super::build_http_client(crate::outbound_guard::HttpGuard::from_env()).unwrap();
+        let body =
+            rt.block_on(async { client.get(&url).send().await.unwrap().text().await.unwrap() });
+        assert_eq!(body, "ok");
+    }
 }
 
 #[cfg(test)]

@@ -698,3 +698,75 @@ async fn tenant_and_team_must_be_header_safe_slugs() {
     // A blank team still means "no team".
     assert_eq!(parse_error(&with("team", "  ")), None);
 }
+
+/// The guard lives in the client's DNS resolver, which an `HTTP(S)_PROXY` in the
+/// environment would bypass. Re-runs itself as a child with a proxy in its
+/// environment (editing the env in-process is `unsafe`) and checks the request
+/// reaches the target directly, never the proxy.
+#[test]
+fn knowledge_client_ignores_the_environment_proxy() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    const CHILD_FLAG: &str = "GREENTIC_TEST_PROXY_CHILD";
+
+    fn spawn_stub(listener: TcpListener) -> std::thread::JoinHandle<bool> {
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).ok();
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    );
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        })
+    }
+
+    if let Some(url) = std::env::var_os(CHILD_FLAG) {
+        let url = url.to_string_lossy().into_owned();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = super::build_client(std::time::Duration::from_secs(2)).unwrap();
+        let body =
+            rt.block_on(async { client.get(&url).send().await.unwrap().text().await.unwrap() });
+        assert_eq!(body, "ok");
+        return;
+    }
+
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let target_url = format!("http://{}/", target.local_addr().unwrap());
+    let proxy_hit = spawn_stub(proxy);
+    let target_hit = spawn_stub(target);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runner::knowledge_index::tests::knowledge_client_ignores_the_environment_proxy",
+            "--test-threads=1",
+        ])
+        .env(CHILD_FLAG, &target_url)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .status()
+        .unwrap();
+    assert!(status.success(), "child failed");
+    assert!(
+        target_hit.join().unwrap(),
+        "target must be reached directly"
+    );
+    assert!(!proxy_hit.join().unwrap(), "the env proxy must not be used");
+}

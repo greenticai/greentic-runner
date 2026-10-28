@@ -75,22 +75,30 @@ pub(crate) fn env_cap_bytes(var: &str, default_mb: u64) -> Option<u64> {
 /// credential rides in the userinfo or the query/fragment: both are replaced,
 /// the scheme, host and path are kept so the failure is still diagnosable.
 pub fn redact_locator(locator: &str) -> String {
-    let Some(sep) = locator.find("://") else {
+    if !locator.contains("://") {
         return locator.to_string();
+    }
+    // A string that merely contains `://` without a valid leading scheme
+    // (`x/bot1:TOKEN?r=http://a`) is not a locator we can reason about.
+    let Some(parts) = crate::url_split::split_url(locator) else {
+        return "<invalid-locator>".to_string();
     };
-    let (scheme, rest) = locator.split_at(sep + 3);
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    let host = match authority.rfind('@') {
-        Some(at) => format!("[redacted]@{}", &authority[at + 1..]),
-        None => authority.to_string(),
+    if parts.ambiguous {
+        // An `@` after the authority: a password with a raw `/?#`. No host shown.
+        return format!("{}[redacted]", parts.scheme_prefix);
+    }
+    let host = if parts.had_userinfo {
+        format!("[redacted]@{}", parts.host)
+    } else {
+        parts.host.to_string()
     };
+    let tail = parts.remainder;
     let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
     let (path, query) = tail.split_at(path_end);
     if query.is_empty() {
-        format!("{scheme}{host}{path}")
+        format!("{}{host}{path}", parts.scheme_prefix)
     } else {
-        format!("{scheme}{host}{path}?[redacted]")
+        format!("{}{host}{path}?[redacted]", parts.scheme_prefix)
     }
 }
 
@@ -371,6 +379,23 @@ mod download_cap_tests {
             "fs://./packs/a.gtpack"
         );
         assert_eq!(redact_locator("no-scheme"), "no-scheme");
+    }
+
+    #[test]
+    fn redact_locator_is_fail_closed_on_delimiters_in_userinfo() {
+        for input in [
+            "https://deploy:pa/ss@host/p.gtpack",
+            "https://deploy:pa?ss@host/p.gtpack",
+            "https://deploy:pa#ss@host/p.gtpack",
+        ] {
+            assert_eq!(redact_locator(input), "https://[redacted]", "{input}");
+        }
+        assert_eq!(
+            redact_locator("https://u:p@host/a.gtpack"),
+            "https://[redacted]@host/a.gtpack"
+        );
+        let out = redact_locator("x/bot123:TOKEN?r=http://a");
+        assert!(!out.contains("TOKEN"), "{out}");
     }
 
     #[test]

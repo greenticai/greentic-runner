@@ -288,7 +288,7 @@ fn redact_urls(text: &str) -> String {
             .last()
             .map(|(i, _)| i)
             .unwrap_or(sep);
-        let end = token_end(text, sep + 3);
+        let end = url_end(text, sep + 3);
         out.push_str(&text[pos..scheme_start]);
         out.push_str(&redact_one_url(&text[scheme_start..end]));
         pos = end;
@@ -297,17 +297,47 @@ fn redact_urls(text: &str) -> String {
     out
 }
 
+/// End of the URL whose authority starts at `from`.
+///
+/// [`token_end`] stops at `, ; ) ] }` and quotes, all of which are legal raw
+/// bytes in a password. When the authority (up to the first `/?#`, bounded by
+/// whitespace) holds an `@` beyond that point, the delimiter sat inside the
+/// userinfo, so the URL runs on to the end of the authority; otherwise the
+/// tail after the delimiter would leak. Fail-closed, like `redact_http_url`.
+fn url_end(text: &str, from: usize) -> usize {
+    let end = token_end(text, from);
+    let region_end = text[from..]
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| from + i)
+        .unwrap_or(text.len());
+    let authority_end = text[from..region_end]
+        .find(['/', '?', '#'])
+        .map(|i| from + i)
+        .unwrap_or(region_end);
+    if authority_end > end && text[from..authority_end].contains('@') {
+        // Carry on to the end of the whitespace-delimited word: the path and
+        // query after the authority are still redacted by `redact_one_url`.
+        return region_end;
+    }
+    end
+}
+
 fn redact_one_url(url: &str) -> String {
-    let Some(sep) = url.find("://") else {
-        return url.to_string();
+    let Some(parts) = runner_core::url_split::split_url(url) else {
+        return REDACTED.to_string();
     };
-    let (scheme, rest) = url.split_at(sep + 3);
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    let host = match authority.rfind('@') {
-        Some(at) => format!("{REDACTED}@{}", &authority[at + 1..]),
-        None => authority.to_string(),
+    if parts.ambiguous {
+        // An `@` after the authority: the host cannot be told from a password
+        // that contained a raw `/?#`. Show the scheme only.
+        return format!("{}{REDACTED}", parts.scheme_prefix);
+    }
+    let host = if parts.had_userinfo {
+        format!("{REDACTED}@{}", parts.host)
+    } else {
+        parts.host.to_string()
     };
+    let tail = parts.remainder;
     let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
     let (path, query) = tail.split_at(path_end);
     let query = if query.is_empty() {
@@ -315,7 +345,7 @@ fn redact_one_url(url: &str) -> String {
     } else {
         format!("?{REDACTED}")
     };
-    format!("{scheme}{host}{path}{query}")
+    format!("{}{host}{path}{query}", parts.scheme_prefix)
 }
 
 /// `Authorization: <anything to end of line>`.
