@@ -1117,3 +1117,42 @@ marked `#[non_exhaustive]`.**
 - **Additive public API not listed above:** `runner_core::net_guard` (shared SSRF classification),
   `runner_core::{PackPolicy, join_public_keys}` re-exports, `greentic_aw_runtime::{url_redact, scoped_secrets}`
   modules. They add surface only and do not change the semver recommendation.
+
+## Round 26
+
+- **Run-outcome URL redaction is fail-closed on delimiters in userinfo (L1, `run_outcome/error.rs`).** CONFIRMED:
+  `https://svc:Ab,cd@host/x)` ended the URL at the raw `,`, so `redact_one_url` saw `https://svc:Ab` (no `@`) and
+  `cd@host/x)` reached `redacted_excerpt`. `url_end` now runs a URL on to the end of its whitespace-delimited word when
+  the authority (up to the first `/?#`) holds an `@` beyond the `, ; ) ] } ' "` cut, and `redact_one_url` uses the
+  shared `runner_core::url_split::split_url`: an `@` after the authority makes the URL ambiguous and only
+  `scheme://[redacted]` is shown. **Affected:** a URL whose path or query contains an `@` (an e-mail in a query) now
+  shows no host in a stored excerpt.
+- **`redact_locator` and `log_safe_origin` use the same rule (L2).** CONFIRMED: `https://deploy:pa/ss@host/p.gtpack`
+  came out whole from `redact_locator` and `https://deploy:pa` from `log_safe_origin`. Both now go through
+  `runner_core::url_split` (the same authority rule as `url_redact::redact_http_url`; `runner-core` cannot depend on
+  `greentic-aw-runtime`, so the helper lives here and `redact_http_url` keeps its own copy). The scheme is validated
+  (ALPHA then alnum/`+`/`-`/`.`): `log_safe_origin("x/bot123:TOKEN?r=http://a")` is `<non-url>` (it used to return a
+  "scheme" holding the token), and `redact_locator` returns `<invalid-locator>` for a string that contains `://` but
+  has no valid scheme. **Affected:** an ambiguous locator logs as `scheme://[redacted]` with no host.
+- **Pack-extension staging bounds decompressed bytes and reclaims all idle slots (L3).** CONFIRMED. A pass was bounded
+  only by compressed bytes (512 MiB) while each of 64 archives could unpack 256 MiB (16 GiB). `stage_bounded` now takes
+  a per-pass unpacked budget (`MAX_PACK_EXT_UNPACKED_BYTES`, 1 GiB); each archive unpacks into what is left, a refused
+  unpack removes its partial slot at once, and a reused slot is charged its recorded size (the marker now holds the
+  unpacked byte count). `sweep_stale_slots` also removes COMPLETE slots of any extension id (different id, or no
+  readable id) after the same 1 h idle grace; every stage still re-touches its slot. Known limit: a runtime that
+  registered a slot and is not rebuilt for over an hour while another extension stages loses its files, the exposure
+  superseded digests already had. `extract_assets_from_archive` also caps entries under `assets/`
+  (`MAX_ASSET_ENTRIES`, 20,000).
+- **A2A and knowledge-index clients ignore `HTTP(S)_PROXY` (L4).** CONFIRMED: the guard lives in the DNS resolver, which
+  a proxy bypasses. Both clients (pack-controlled URLs) now call `.no_proxy()`. **Affected (behaviour change):** a
+  deployment that reached an A2A agent or a Chronicle index/embeddings host only through an egress proxy configured in
+  the environment must allow direct egress to those hosts. Decided NOT to change the broker/OAuth/email client in
+  `runtime.rs` (operator-set URLs, not pack-controlled; `.no_proxy()` there would break proxy-only egress for mail and
+  OAuth); its comment claimed connect coverage and now says the DNS guard does not apply behind a proxy.
+- **Per-unit pack secret address: hashed pack parts cannot be spelled by a lossless id (L5, BREAKING for lossy pack
+  ids).** CONFIRMED: `my.pack` became `my_pack_<12hex>`, and a pack registering that literal id (already its own slug)
+  got the same address. The hash suffix of a lossy pack id is now 40 hex (20 bytes of `sha256`), which makes a hashed
+  pack part always longer than 40 bytes, and a lossless id (its own slug, cut at 40) never is. Lossless ids keep their
+  address. **Affected:** unit-scoped secrets of lossy pack ids (`pack.dw.support`, `supplier-sor-0.1.0`) must be
+  re-staged AGAIN under the new segment, with no read fallback (it is the colliding address). Supersedes the 12-hex
+  wording of the earlier "Per-unit pack secret address" entry. The unit-id hash is unchanged.
