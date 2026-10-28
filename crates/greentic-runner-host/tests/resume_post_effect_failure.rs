@@ -1,5 +1,5 @@
 //! A RESUMED run that fails after one of its own nodes performed an external
-//! effect must not leave its park behind (audit round 26, L1).
+//! effect must not leave its park behind (audit round 26a, L1).
 //!
 //! `FlowResumeStore::fetch` does not consume a snapshot, so a resume that ends
 //! in `Err` keeps the wait it resumed from; the next message would resume the
