@@ -1097,6 +1097,17 @@ impl FlowEngine {
                         node_outputs,
                     }) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
+                            // The reason otherwise survives only in the reply's
+                            // `metadata.error_message`, which no channel shows, so a
+                            // failing node (a deep worker whose LLM key is rejected, say)
+                            // left the log silent while the user saw a generic apology.
+                            tracing::error!(
+                                tenant = ctx.tenant,
+                                flow_id = ctx.flow_id,
+                                attempt,
+                                error = %format!("{err:#}"),
+                                "flow execution failed terminally"
+                            );
                             // User-facing session flows surface the terminal
                             // error as a metadata-only Ok envelope so the
                             // messaging provider renders it instead of leaking

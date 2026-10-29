@@ -322,6 +322,14 @@ mod dw {
                     idempotency_key,
                 )
                 .await
+                .inspect_err(|err| {
+                    tracing::warn!(
+                        target,
+                        operation,
+                        error = %format!("{err:#}"),
+                        "in-process operala dispatch failed"
+                    );
+                })
                 .with_context(|| format!("in-process operala dispatch to '{target}' failed"))?;
             // Mirror the NATS `operala.call` response shape closely enough for
             // flow templates to read `{{node.reply}}`/`{{node.output}}`
