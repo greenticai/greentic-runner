@@ -979,6 +979,11 @@ mod aw {
 
     impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+            if let Some(name) = greentic_aw_runtime::infra_connection::kind_from_guest_uri(uri) {
+                return Err(greentic_ext_runtime::SecretsError::Backend(format!(
+                    "infra resource '{name}' is not available on the out-of-process serve path (it resolves one credential for every tenant); deploy the worker as a unit"
+                )));
+            }
             let name = env_var_name_for_secret(uri);
             std::env::var(&name)
                 .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
@@ -5094,6 +5099,27 @@ mod aw {
                 assert!(!uri.contains("_unit_"), "{uri}");
                 assert!(uri.starts_with("secrets://default/"), "{uri}");
                 assert!(uri.contains("/_/infra/vector_store_qdrant"), "{uri}");
+            }
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn the_serve_path_refuses_an_infra_uri_even_when_the_env_var_is_set() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            // SAFETY: `serial` keeps env mutation single-threaded within this suite.
+            unsafe {
+                std::env::set_var("INFRA_VECTOR_STORE_QDRANT", "http://localhost:6333");
+            }
+            let got = super::EnvSecretsBackend.get("secret://infra/vector_store_qdrant");
+            unsafe {
+                std::env::remove_var("INFRA_VECTOR_STORE_QDRANT");
+            }
+            match got {
+                Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
+                    assert!(msg.contains("serve path"), "{msg}");
+                }
+                other => panic!("expected Backend error, got {other:?}"),
             }
         }
 
