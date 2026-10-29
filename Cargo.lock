@@ -359,7 +359,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aw-event-bridge"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2407,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-a2a"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-aw-runtime"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3214,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3260,7 +3260,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3287,7 +3287,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3377,7 +3377,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-tests"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6423,7 +6423,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7503,7 +7503,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "telco-x-event-bridge"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-nats",

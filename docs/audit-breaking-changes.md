@@ -850,7 +850,7 @@ a break, but it is itself a break for exhaustive matchers, so it is a release de
 
 ### Semver recommendation
 
-The workspace is `1.2.1` at the baseline. Several of the changes above are breaking for downstream Rust code (new
+The workspace was `1.2.1` at the baseline. Several of the changes above are breaking for downstream Rust code (new
 variants on public enums, a required struct field, a changed return type and a tightened bound), which is
 semver-major in the strict reading. Recommendation: release as **at least `1.3.0`** if the ecosystem treats these
 crates as application-internal (all known consumers are in-tree siblings pinned together), or **`2.0.0`** if strict
@@ -860,9 +860,12 @@ and `runner-core`, plus the greentic-* lane ranges) and the per-crate path depen
 (`crates/greentic-runner/Cargo.toml`, `crates/greentic-runner-desktop/Cargo.toml`, `crates/tests/Cargo.toml`,
 `crates/greentic-runner-host/Cargo.toml`, `crates/greentic-aw-runtime/Cargo.toml`): every one currently says
 `>=1.2.0-0, <1.3.0-0`, so a `1.3.0` workspace version would not satisfy its own siblings until they are widened, and
-`2.0.0` needs the same. The external `greentic-*` lane ranges are a separate, cross-repo decision. **Whether and when
-to release is the maintainer's decision; no version was bumped, no release workflow was touched, and nothing was
-marked `#[non_exhaustive]`.**
+`2.0.0` needs the same. The external `greentic-*` lane ranges are a separate, cross-repo decision. **Decision (maintainer): released as `1.2.2`.** The version stays inside the 1.2 lane on purpose: every neighbour
+(greentic-start, deployer, designer) and the in-tree path dependencies range these crates `>=1.2.0-0, <1.3.0-0`, so a
+patch bump is picked up without touching any constraint, whereas `1.3.0` or `2.0.0` would not satisfy them until they were
+widened. The cost is stated rather than hidden: this release carries the breaking Rust API changes listed above under a
+patch number, so an embedder that builds struct literals of `InvokeOutcome` or matches the public error enums exhaustively
+must adapt on upgrade (see the Rust API table). Nothing was marked `#[non_exhaustive]`.
 
 ## Tests and CI
 
