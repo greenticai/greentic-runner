@@ -40,6 +40,8 @@ pub mod flow_adapter;
 pub mod flow_invoker;
 pub mod graph_node;
 pub mod i18n;
+#[cfg(feature = "agentic-worker")]
+pub(crate) mod infra_secret;
 pub mod invocation;
 #[cfg(feature = "agentic-worker")]
 pub mod knowledge_corpus;
