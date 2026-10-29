@@ -7,7 +7,7 @@ name: Nightly Semver Advisory
 
 on:
   schedule:
-    # 06:05 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
+    # 03:53 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
     - cron: "53 3 * * *"
   workflow_dispatch:
     inputs:

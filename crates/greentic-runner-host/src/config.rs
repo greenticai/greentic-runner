@@ -236,19 +236,12 @@ impl HostConfig {
 
         let secrets_policy = SecretsPolicy::from_bindings(&bindings);
         let http_enabled = bindings.flow_type_bindings.contains_key("messaging");
-        let webhook_policy = bindings
-            .flow_type_bindings
-            .get("webhook")
-            .and_then(|binding| {
-                serde_yaml::from_value::<WebhookBindingConfig>(binding.config.clone())
-                    .map(WebhookPolicy::from)
-                    .map_err(|err| {
-                        tracing::warn!(error = %err, "failed to parse webhook binding config");
-                        err
-                    })
-                    .ok()
-            })
-            .unwrap_or_default();
+        let webhook_policy = webhook_policy_from_bindings(&bindings)?;
+
+        // Reject unusable tenant ids up front instead of silently running as
+        // the `local` tenant later.
+        tenant_ctx_for(&bindings.tenant, greentic_env().as_deref())
+            .with_context(|| format!("invalid tenant in bindings file {path:?}"))?;
 
         Ok(Self {
             tenant: bindings.tenant.clone(),
@@ -339,22 +332,100 @@ impl HostConfig {
         {
             cfg.team = Some(team.clone());
         }
-        // Prefer env var; fall back to yaml field. Never log the value.
+        // Prefer env var; fall back to yaml field. Never log the value. A
+        // blank env value is "not set" (like every other blank env knob), so an
+        // empty `GREENTIC_OAUTH_BROKER_SHARED_SECRET=` cannot override a
+        // configured secret with nothing. The value itself is kept verbatim.
+        let usable = |raw: &str| !raw.trim().is_empty();
         cfg.shared_secret = env_secret
+            .filter(|raw| usable(raw))
             .map(str::to_owned)
-            .or_else(|| oauth.shared_secret.clone());
+            .or_else(|| oauth.shared_secret.clone().filter(|raw| usable(raw)));
         Some(cfg)
     }
 
     /// Derive a tenant context for the current configuration. This is used when
     /// evaluating scoped requirements (e.g. secrets).
+    ///
+    /// Fails when the tenant id or `GREENTIC_ENV` is not a valid identifier;
+    /// it never substitutes the `local` tenant/env.
+    pub fn try_tenant_ctx(&self) -> Result<greentic_types::TenantCtx> {
+        tenant_ctx_for(&self.tenant, greentic_env().as_deref())
+    }
+
+    /// Infallible variant kept for callers that cannot propagate errors.
+    ///
+    /// Configs are validated with [`Self::try_tenant_ctx`] when loaded
+    /// (`load_from_path`, `run`), so the fallback below is unreachable for
+    /// validated configs; it logs loudly if it is ever taken.
     pub fn tenant_ctx(&self) -> greentic_types::TenantCtx {
-        let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
-        let env_id = greentic_types::EnvId::from_str(&env)
-            .unwrap_or_else(|_| greentic_types::EnvId::new("local").expect("local env id"));
-        let tenant_id = greentic_types::TenantId::from_str(&self.tenant)
-            .unwrap_or_else(|_| greentic_types::TenantId::new("local").expect("tenant id"));
-        greentic_types::TenantCtx::new(env_id, tenant_id)
+        match self.try_tenant_ctx() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                tracing::error!(
+                    tenant = %self.tenant,
+                    error = %err,
+                    "invalid tenant/env identifier; falling back to local context"
+                );
+                local_fallback_ctx()
+            }
+        }
+    }
+}
+
+/// Last-resort context for the infallible [`HostConfig::tenant_ctx`] shim.
+///
+/// `local` is a compile-time literal that satisfies the identifier grammar, so
+/// the `expect`s below cannot fire; validated configs never reach this path.
+#[allow(clippy::expect_used)]
+fn local_fallback_ctx() -> greentic_types::TenantCtx {
+    greentic_types::TenantCtx::new(
+        greentic_types::EnvId::new("local").expect("`local` is a valid env id"),
+        greentic_types::TenantId::new("local").expect("`local` is a valid tenant id"),
+    )
+}
+
+/// A raw `GREENTIC_ENV` / `DEFAULT_TENANT` style value: trimmed, and `None` when
+/// absent OR blank. A blank value is "not configured", exactly like an unset one.
+pub(crate) fn non_blank(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// The deployment env from `GREENTIC_ENV`, `None` when unset or blank. Every
+/// reader goes through this so an empty value cannot behave differently per
+/// call site (previously: `""` in one place, an error in another).
+pub(crate) fn greentic_env() -> Option<String> {
+    non_blank(std::env::var("GREENTIC_ENV").ok().as_deref())
+}
+
+/// [`greentic_env`] with the documented `local` default.
+pub(crate) fn greentic_env_or_local() -> String {
+    greentic_env().unwrap_or_else(|| "local".to_string())
+}
+
+fn tenant_ctx_for(tenant: &str, env: Option<&str>) -> Result<greentic_types::TenantCtx> {
+    // An empty `GREENTIC_ENV` is "not configured", like an unset one.
+    let env = env
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("local");
+    let env_id = greentic_types::EnvId::from_str(env)
+        .map_err(|err| anyhow::anyhow!("invalid GREENTIC_ENV `{env}`: {err}"))?;
+    let tenant_id = greentic_types::TenantId::from_str(tenant)
+        .map_err(|err| anyhow::anyhow!("invalid tenant id `{tenant}`: {err}"))?;
+    // The strictest downstream rule (secrets path), enforced once here.
+    crate::secrets_broker::validate_tenant_segment(tenant)?;
+    Ok(greentic_types::TenantCtx::new(env_id, tenant_id))
+}
+
+fn webhook_policy_from_bindings(bindings: &BindingsFile) -> Result<WebhookPolicy> {
+    match bindings.flow_type_bindings.get("webhook") {
+        Some(binding) => serde_yaml::from_value::<WebhookBindingConfig>(binding.config.clone())
+            .map(WebhookPolicy::from)
+            .context("failed to parse webhook binding config"),
+        None => Ok(WebhookPolicy::default()),
     }
 }
 
@@ -589,6 +660,16 @@ fn default_retry_base_delay_ms() -> u64 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_greentic_env_is_treated_as_unset() {
+        for blank in [None, Some(""), Some("  ")] {
+            let ctx = tenant_ctx_for("tenant-a", blank).expect("blank env means local");
+            assert_eq!(ctx.env.as_str(), "local");
+        }
+        assert!(tenant_ctx_for("tenant-a", Some("bad env!")).is_err());
+    }
+
     use crate::gtbind::{PackBinding, TenantBindings};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -837,6 +918,85 @@ fast2flow:
     }
 
     #[test]
+    fn a_blank_env_shared_secret_does_not_override_the_yaml_one() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some("yaml-secret".into()),
+        }));
+        for blank in ["", "   "] {
+            let broker = cfg
+                .oauth_broker_config_with_env(Some(blank))
+                .expect("missing broker config");
+            assert_eq!(
+                broker.shared_secret.as_deref(),
+                Some("yaml-secret"),
+                "{blank:?}"
+            );
+        }
+        // Blank everywhere means no secret, not an empty one.
+        let none = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some(String::new()),
+        }));
+        let broker = none
+            .oauth_broker_config_with_env(Some(""))
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret, None);
+    }
+
+    #[test]
+    fn invalid_webhook_binding_config_is_an_error_not_allow_all() {
+        let bindings: BindingsFile = serde_yaml::from_str(
+            "tenant: demo\nflow_type_bindings:\n  webhook:\n    adapter: webhook\n    config:\n      deny_paths: not-a-list\n",
+        )
+        .expect("bindings parse");
+        let err = webhook_policy_from_bindings(&bindings).expect_err("must fail");
+        assert!(format!("{err:#}").contains("webhook binding config"));
+    }
+
+    #[test]
+    fn valid_webhook_binding_config_keeps_deny_paths() {
+        let bindings: BindingsFile = serde_yaml::from_str(
+            "tenant: demo\nflow_type_bindings:\n  webhook:\n    adapter: webhook\n    config:\n      deny_paths: [/admin]\n",
+        )
+        .expect("bindings parse");
+        let policy = webhook_policy_from_bindings(&bindings).expect("policy");
+        assert!(!policy.is_allowed("/admin/x"));
+        assert!(policy.is_allowed("/hook"));
+    }
+
+    #[test]
+    fn tenant_ids_a_secret_read_would_refuse_are_rejected_at_load() {
+        for bad in [".hidden", "a..b", "..", ".", &"a".repeat(129)] {
+            let err = tenant_ctx_for(bad, None).expect_err(bad);
+            assert!(
+                err.to_string().contains("invalid tenant id"),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in ["demo", "acme-1.eu", "T_1", "a.b"] {
+            assert!(tenant_ctx_for(good, None).is_ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn tenant_ctx_for_rejects_invalid_ids_instead_of_falling_back() {
+        assert!(tenant_ctx_for("bad tenant!", None).is_err());
+        assert!(tenant_ctx_for("demo", Some("bad env!")).is_err());
+        let ctx = tenant_ctx_for("demo", None).expect("valid");
+        assert_eq!(ctx.tenant.as_str(), "demo");
+        assert_eq!(ctx.env.as_str(), "local");
+    }
+
+    #[test]
     fn gtbind_configs_enable_outbound_http() {
         let cfg = HostConfig::from_gtbind(TenantBindings {
             tenant: "demo".into(),
@@ -853,5 +1013,18 @@ fast2flow:
             cfg.http_enabled,
             "gtbind-backed tenants should allow outbound component HTTP"
         );
+    }
+}
+
+#[cfg(test)]
+mod non_blank_tests {
+    use super::*;
+
+    #[test]
+    fn blank_and_whitespace_are_unset() {
+        assert_eq!(non_blank(None), None);
+        assert_eq!(non_blank(Some("")), None);
+        assert_eq!(non_blank(Some("  \t")), None);
+        assert_eq!(non_blank(Some(" prod ")), Some("prod".to_string()));
     }
 }

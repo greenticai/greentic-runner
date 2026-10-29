@@ -201,51 +201,57 @@ pub(crate) async fn discover(
     client: &reqwest::Client,
     route: &SorlaRouteDoc,
 ) -> (Vec<SorxOperation>, HashMap<(String, String), String>) {
+    match discover_checked(client, route).await {
+        Ok(found) => found,
+        Err(reason) => {
+            // Status/transport reason only: never a body or the token.
+            tracing::warn!(
+                url = %route.url,
+                reason = %reason,
+                "sorla: capability discovery failed; starting with an empty tool set"
+            );
+            (Vec::new(), HashMap::new())
+        }
+    }
+}
+
+/// Like [`discover`], but says WHY discovery found nothing, so a caller that
+/// is about to report "no capability" can report the real cause instead
+/// (`sorla_unauthorized`, `sorla_unreachable`, ...). The reason never carries
+/// a response body or the credential.
+pub(crate) async fn discover_checked(
+    client: &reqwest::Client,
+    route: &SorlaRouteDoc,
+) -> Result<(Vec<SorxOperation>, HashMap<(String, String), String>), String> {
     let url = format!("{}/admin/v1/capabilities", route.url.trim_end_matches('/'));
     let mut req = client.get(&url);
     if let Some(token) = &route.token {
         req = req.bearer_auth(token);
     }
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
-                if status.as_u16() == 401 {
-                    tracing::warn!(
-                        url = %route.url,
-                        status = status.as_u16(),
-                        "sorla_unauthorized: the SoR rejected this caller's credential during discovery; starting with an empty tool set"
-                    );
-                } else {
-                    tracing::warn!(
-                        url = %route.url,
-                        status = status.as_u16(),
-                        "sorla: SoRX capabilities endpoint returned a non-success status; starting with an empty tool set"
-                    );
-                }
-                return (Vec::new(), HashMap::new());
-            }
-            match resp.json::<Value>().await {
-                Ok(body) => parse_capabilities(&body),
-                Err(err) => {
-                    tracing::warn!(
-                        url = %route.url,
-                        error = %err,
-                        "sorla: failed to parse SoRX capabilities response; starting with an empty tool set"
-                    );
-                    (Vec::new(), HashMap::new())
-                }
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                url = %route.url,
-                error = %err,
-                "sorla: failed to reach SoRX capabilities endpoint; starting with an empty tool set"
-            );
-            (Vec::new(), HashMap::new())
-        }
+    let resp = req.send().await.map_err(|err| {
+        format!(
+            "sorla_unreachable: could not reach the SoR ({})",
+            err.without_url()
+        )
+    })?;
+    let status = resp.status();
+    if status.as_u16() == 401 {
+        return Err(
+            "sorla_unauthorized: the SoR rejected this caller's credential during discovery"
+                .to_string(),
+        );
     }
+    if !status.is_success() {
+        return Err(format!(
+            "sorla_discovery_failed: the SoR capabilities endpoint returned HTTP {}",
+            status.as_u16()
+        ));
+    }
+    let body = resp
+        .json::<Value>()
+        .await
+        .map_err(|_| "sorla_discovery_failed: unparsable capabilities response".to_string())?;
+    Ok(parse_capabilities(&body))
 }
 
 /// Invoke one SoR capability: `POST {route.url}/admin/v1/capabilities/invoke`,
@@ -285,12 +291,12 @@ pub(crate) async fn invoke_sor(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("sorx invoke request failed: {e}"))?;
+        .map_err(|e| format!("sorx invoke request failed: {}", e.without_url()))?;
     let status = resp.status();
     let text = resp
         .text()
         .await
-        .map_err(|e| format!("sorx invoke response read failed: {e}"))?;
+        .map_err(|e| format!("sorx invoke response read failed: {}", e.without_url()))?;
     let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
     match status.as_u16() {

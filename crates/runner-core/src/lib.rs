@@ -7,11 +7,14 @@
 //! wrap these helpers with the canonical runtime.
 
 pub mod env;
+pub mod net_guard;
 pub mod packs;
 pub mod path_safety;
+pub mod url_split;
 
-pub use env::{IndexLocation, PackConfig, PackSource};
+pub use env::{IndexLocation, PackConfig, PackSource, join_public_keys};
 pub use packs::{
-    Index, PackDigest, PackManager, PackRef, PackVersion, ResolvedPack, ResolvedSet, TenantPacks,
+    Index, PackDigest, PackManager, PackPolicy, PackRef, PackVersion, ResolvedPack, ResolvedSet,
+    TenantPacks,
 };
 pub use path_safety::normalize_under_root;

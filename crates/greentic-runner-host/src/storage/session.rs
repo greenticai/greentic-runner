@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+#[cfg(any(feature = "session-redis", test))]
+use greentic_session::SessionResult;
 use greentic_session::inmemory::InMemorySessionStore;
-use greentic_session::{SessionData, SessionKey as StoreSessionKey, SessionResult, SessionStore};
+use greentic_session::{SessionData, SessionKey as StoreSessionKey, SessionStore};
 use greentic_types::{
     EnvId, FlowId, GreenticError, PackId, SessionCursor as TypesSessionCursor, TenantCtx, TenantId,
     UserId,
@@ -21,6 +23,7 @@ use crate::engine::host::{
 };
 use crate::storage::config::SessionBackend;
 use crate::storage::offload::{Offloaded, StoreKind};
+#[cfg(any(feature = "session-redis", test))]
 use greentic_session::ReplyScope;
 
 pub type DynSessionStore = Arc<dyn SessionStore>;
@@ -30,21 +33,111 @@ pub type DynSessionStore = Arc<dyn SessionStore>;
 /// The store is held behind [`Offloaded`], so every call reaches it through
 /// `spawn_blocking` — `SessionStore` is a synchronous trait and its Redis
 /// implementation blocks on a socket.
+///
+/// # Known limitation (deferred)
+///
+/// `greentic_session`'s `find_by_user` only sees sessions registered as
+/// *waits*, so against the in-memory and Redis stores a plain `put` is not found
+/// again by `get`. Registering sessions as waits fixes that, but it changes what
+/// the flow engine observes (the parked-flow and resumer end-to-end suites
+/// regress), so it needs an engine-side decision first. `touch` therefore also
+/// cannot enforce a store-level TTL yet.
+///
+/// # Concurrency
+///
+/// Read-modify-write operations (`put`, `update_cas`, `touch`, `delete`) on one
+/// session are serialised by a per-session in-process lock (dropped from the
+/// map again as soon as nobody holds or waits on it, so the map stays bounded
+/// by the number of in-flight operations), so two concurrent
+/// `update_cas` calls with the same expected revision cannot both succeed
+/// within one process. The `SessionStore` trait offers no atomic
+/// compare-and-swap, so across processes sharing a Redis store this is still
+/// last-writer-wins; closing that needs a CAS primitive in `greentic-session`.
+///
+/// Each locked operation runs to completion on its own task (see
+/// [`SessionStoreHost::run_detached`]): the lock guard lives inside that task,
+/// so a caller timeout or cancellation can neither abandon the operation
+/// half-way nor release the lock while its `spawn_blocking` write is still
+/// running (which would let a later `update_cas` read stale state and lose an
+/// update).
+#[derive(Clone)]
 pub struct SessionStoreHost {
     store: Offloaded<dyn SessionStore>,
+    locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionStoreHost {
     pub fn new(store: DynSessionStore) -> Self {
         Self {
             store: Offloaded::new(store, StoreKind::Session),
+            locks: Arc::new(dashmap::DashMap::new()),
         }
     }
 
+    /// Run one locked read-modify-write as a non-cancellable unit: spawn it and
+    /// await the handle. Dropping the returned future leaves the task running.
+    async fn run_detached<T, F, Fut>(&self, op: F) -> GResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(SessionStoreHost) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = GResult<T>> + Send + 'static,
+    {
+        let this = self.clone();
+        match tokio::spawn(op(this)).await {
+            Ok(result) => result,
+            Err(err) => Err(RunnerError::Session {
+                reason: format!("session operation panicked or was cancelled: {err}"),
+            }),
+        }
+    }
+
+    /// Take the in-process lock guarding one session (keyed by its derived user
+    /// id, which covers tenant, pack, flow and hint). The map entry is removed
+    /// when the returned guard drops and no other task holds or awaits it.
+    async fn lock_session(&self, key: &SessionKey) -> GResult<SessionLockGuard<'_>> {
+        let id = user_id_from_key(key)?.as_str().to_string();
+        let mutex = {
+            let entry = self
+                .locks
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+            Arc::clone(entry.value())
+        };
+        // Build the guard BEFORE awaiting: if this future is cancelled while
+        // waiting (after the holder released, so the holder's own sweep saw the
+        // waiter's Arc and kept the entry), dropping the still-empty guard
+        // sweeps the entry instead of leaking it until the next op on this id.
+        let mut guard = SessionLockGuard {
+            locks: &self.locks,
+            id,
+            guard: None,
+        };
+        guard.guard = Some(mutex.lock_owned().await);
+        Ok(guard)
+    }
+
     async fn lookup_entry(&self, key: &SessionKey) -> GResult<Option<StoreEntry>> {
-        let base_ctx = tenant_ctx_from_key(key)?;
         let user = user_id_from_key(key)?;
-        let ctx = base_ctx.clone().with_user(Some(user.clone()));
+        if let Some(entry) = self.lookup_entry_for(key, user.clone()).await? {
+            return Ok(Some(entry));
+        }
+        // Sessions written before the slot was derived from tenant/pack/flow
+        // live under a hint-only slot; without this fallback an upgrade would
+        // orphan every parked flow. The snapshot's own key is still verified.
+        let legacy = legacy_user_id_from_key(key)?;
+        if legacy == user {
+            return Ok(None);
+        }
+        self.lookup_entry_for(key, legacy).await
+    }
+
+    async fn lookup_entry_for(
+        &self,
+        key: &SessionKey,
+        user: UserId,
+    ) -> GResult<Option<StoreEntry>> {
+        let base_ctx = tenant_ctx_from_key(key)?;
+        let ctx = base_ctx.with_user(Some(user.clone()));
         let result = {
             let ctx = ctx.clone();
             let user = user.clone();
@@ -76,6 +169,22 @@ impl SessionStoreHost {
         }
     }
 
+    /// Remove the legacy hint-only slot of `key`, if one still exists.
+    async fn remove_legacy(&self, key: &SessionKey) -> GResult<()> {
+        let new_user = user_id_from_key(key)?;
+        let legacy = legacy_user_id_from_key(key)?;
+        if legacy == new_user {
+            return Ok(());
+        }
+        if let Some(entry) = self.lookup_entry_for(key, legacy).await? {
+            self.store
+                .call(move |store| store.remove_session(&entry.key))
+                .await
+                .map_err(map_store_error)?;
+        }
+        Ok(())
+    }
+
     async fn upsert(
         &self,
         snapshot: &SessionSnapshot,
@@ -98,6 +207,25 @@ impl SessionStoreHost {
             })
             .await
             .map_err(map_store_error)
+    }
+}
+
+/// Holds one session's in-process lock and removes the map entry on drop when
+/// no other task holds or awaits it (`strong_count == 1` means only the map
+/// still owns the mutex; the check runs under the shard lock, so a concurrent
+/// `lock_session` either sees the entry or inserts a fresh one).
+struct SessionLockGuard<'a> {
+    locks: &'a dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    id: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for SessionLockGuard<'_> {
+    fn drop(&mut self) {
+        // Release the mutex (and its Arc) before checking the count.
+        drop(self.guard.take());
+        self.locks
+            .remove_if(&self.id, |_, mutex| Arc::strong_count(mutex) == 1);
     }
 }
 
@@ -196,18 +324,48 @@ impl SessionHost for SessionStoreHost {
     }
 
     async fn put(&self, snapshot: SessionSnapshot) -> GResult<()> {
+        self.run_detached(move |this| async move { this.put_locked(snapshot).await })
+            .await
+    }
+
+    async fn update_cas(&self, snapshot: SessionSnapshot, expected_revision: u64) -> GResult<bool> {
+        self.run_detached(move |this| async move {
+            this.update_cas_locked(snapshot, expected_revision).await
+        })
+        .await
+    }
+
+    async fn delete(&self, key: &SessionKey) -> GResult<()> {
+        let key = key.clone();
+        self.run_detached(move |this| async move { this.delete_locked(&key).await })
+            .await
+    }
+
+    async fn touch(&self, key: &SessionKey, ttl: Duration) -> GResult<()> {
+        let key = key.clone();
+        self.run_detached(move |this| async move { this.touch_locked(&key, ttl).await })
+            .await
+    }
+}
+
+impl SessionStoreHost {
+    async fn put_locked(&self, snapshot: SessionSnapshot) -> GResult<()> {
+        let _guard = self.lock_session(&snapshot.key).await?;
         let base_ctx = tenant_ctx_from_key(&snapshot.key)?;
         let user = user_id_from_key(&snapshot.key)?;
         let ctx = base_ctx.with_user(Some(user.clone()));
         self.upsert(&snapshot, ctx, &user).await?;
+        // Migrate: the new slot now owns the session, drop the legacy one.
+        self.remove_legacy(&snapshot.key).await?;
         Ok(())
     }
 
-    async fn update_cas(
+    async fn update_cas_locked(
         &self,
         mut snapshot: SessionSnapshot,
         expected_revision: u64,
     ) -> GResult<bool> {
+        let _guard = self.lock_session(&snapshot.key).await?;
         let Some(entry) = self.lookup_entry(&snapshot.key).await? else {
             return Ok(false);
         };
@@ -219,17 +377,20 @@ impl SessionHost for SessionStoreHost {
         Ok(true)
     }
 
-    async fn delete(&self, key: &SessionKey) -> GResult<()> {
-        if let Some(entry) = self.lookup_entry(key).await? {
+    async fn delete_locked(&self, key: &SessionKey) -> GResult<()> {
+        let _guard = self.lock_session(key).await?;
+        if let Some(entry) = self.lookup_entry_for(key, user_id_from_key(key)?).await? {
             self.store
                 .call(move |store| store.remove_session(&entry.key))
                 .await
                 .map_err(map_store_error)?;
         }
+        self.remove_legacy(key).await?;
         Ok(())
     }
 
-    async fn touch(&self, key: &SessionKey, ttl: Duration) -> GResult<()> {
+    async fn touch_locked(&self, key: &SessionKey, ttl: Duration) -> GResult<()> {
+        let _guard = self.lock_session(key).await?;
         if let Some(mut entry) = self.lookup_entry(key).await? {
             entry.snapshot.ttl = ttl;
             self.upsert(&entry.snapshot, entry.ctx, &entry.user).await?;
@@ -287,6 +448,14 @@ fn tenant_ctx_from_key(key: &SessionKey) -> GResult<TenantCtx> {
 }
 
 fn user_id_from_key(key: &SessionKey) -> GResult<UserId> {
+    let digest = Sha256::digest(session_identity(key).as_bytes());
+    let slug = format!("sess{}", hex::encode(&digest[..8]));
+    UserId::from_str(&slug).map_err(map_store_error)
+}
+
+/// Slot id used before the slot was derived from tenant/pack/flow: the hint
+/// alone (or `tenant::pack::flow` when there is none).
+fn legacy_user_id_from_key(key: &SessionKey) -> GResult<UserId> {
     let hint = key
         .session_hint
         .clone()
@@ -294,6 +463,25 @@ fn user_id_from_key(key: &SessionKey) -> GResult<UserId> {
     let digest = Sha256::digest(hint.as_bytes());
     let slug = format!("sess{}", hex::encode(&digest[..8]));
     UserId::from_str(&slug).map_err(map_store_error)
+}
+
+/// Identity string of one session: tenant, pack, flow AND hint. The hint alone
+/// is not enough: two packs or flows (or tenants) sharing a conversation hint
+/// must not share a store slot. Length-prefixed so segment boundaries cannot
+/// alias (`a::b` + `c` vs `a` + `b::c`).
+fn session_identity(key: &SessionKey) -> String {
+    let hint = key.session_hint.as_deref().unwrap_or("");
+    format!(
+        "{}:{}|{}:{}|{}:{}|{}:{}",
+        key.tenant_key.len(),
+        key.tenant_key,
+        key.pack_id.len(),
+        key.pack_id,
+        key.flow_id.len(),
+        key.flow_id,
+        hint.len(),
+        hint,
+    )
 }
 
 fn map_store_error(err: GreenticError) -> RunnerError {
@@ -330,17 +518,20 @@ fn map_store_error(err: GreenticError) -> RunnerError {
 /// it empties). Completing a flow clears everything via `clear_wait`; the
 /// residue is only for conversations abandoned mid-wait. Expiring that set is an
 /// upstream change in `greentic-session`.
+#[cfg(any(feature = "session-redis", test))]
 struct DefaultWaitTtl {
     inner: DynSessionStore,
     ttl: Duration,
 }
 
+#[cfg(any(feature = "session-redis", test))]
 impl DefaultWaitTtl {
     fn new(inner: DynSessionStore, ttl: Duration) -> Self {
         Self { inner, ttl }
     }
 }
 
+#[cfg(any(feature = "session-redis", test))]
 impl SessionStore for DefaultWaitTtl {
     fn create_session(&self, ctx: &TenantCtx, data: SessionData) -> SessionResult<StoreSessionKey> {
         self.inner.create_session(ctx, data)
@@ -686,6 +877,11 @@ mod host_tests {
     #[derive(Default)]
     struct PerUserStore {
         slots: std::sync::Mutex<Vec<(UserId, StoreSessionKey, SessionData)>>,
+        /// Monotonic slot ids: deriving the id from `slots.len()` reused the id
+        /// of a live slot after a removal, so a later remove took both.
+        next_slot: std::sync::atomic::AtomicUsize,
+        /// Test knob: how long `update_session` blocks before writing.
+        update_delay_ms: std::sync::atomic::AtomicU64,
     }
 
     impl PerUserStore {
@@ -708,7 +904,10 @@ mod host_tests {
                 .clone()
                 .unwrap_or_else(|| unreachable!("encode_snapshot always sets a user"));
             let mut slots = self.slots();
-            let key = StoreSessionKey::new(format!("slot-{}", slots.len()));
+            let id = self
+                .next_slot
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let key = StoreSessionKey::new(format!("slot-{id}"));
             slots.push((user, key.clone(), data));
             Ok(key)
         }
@@ -722,6 +921,12 @@ mod host_tests {
         }
 
         fn update_session(&self, key: &StoreSessionKey, data: SessionData) -> SessionResult<()> {
+            let delay = self
+                .update_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
             if let Some(slot) = self.slots().iter_mut().find(|(_, k, _)| k == key) {
                 slot.2 = data;
             }
@@ -805,6 +1010,103 @@ mod host_tests {
     }
 
     #[tokio::test]
+    async fn concurrent_update_cas_has_a_single_winner() -> Result<()> {
+        let host = host();
+        let key = key_for("cas");
+        host.put(SessionSnapshot::new(key.clone(), "sid".into()))
+            .await?;
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let host = Arc::clone(&host);
+            let key = key.clone();
+            tasks.push(tokio::spawn(async move {
+                host.update_cas(SessionSnapshot::new(key, "sid".into()), 0)
+                    .await
+            }));
+        }
+        let mut wins = 0;
+        for task in tasks {
+            if task.await.map_err(|e| anyhow!("{e}"))?? {
+                wins += 1;
+            }
+        }
+        assert_eq!(wins, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn user_ids_differ_across_pack_flow_and_tenant_for_one_hint() -> Result<()> {
+        let base = key_for("shared-hint");
+        let mut other_pack = base.clone();
+        other_pack.pack_id = "pack.other".into();
+        let mut other_flow = base.clone();
+        other_flow.flow_id = "flow.other".into();
+        let mut other_tenant = base.clone();
+        other_tenant.tenant_key = "local::other".into();
+        let ids = [
+            user_id_from_key(&base)?,
+            user_id_from_key(&other_pack)?,
+            user_id_from_key(&other_flow)?,
+            user_id_from_key(&other_tenant)?,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        Ok(())
+    }
+
+    /// A waiter cancelled after the holder released (but before it ran) must
+    /// not leave the lock-map entry behind.
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_leak_its_lock_entry() -> Result<()> {
+        let host = SessionStoreHost::new(Arc::new(PerUserStore::default()));
+        let key = key_for("cancel");
+        let holder = host.lock_session(&key).await?;
+        assert_eq!(host.locks.len(), 1);
+
+        let mut waiter = Box::pin(host.lock_session(&key));
+        tokio::select! {
+            biased;
+            _ = &mut waiter => anyhow::bail!("lock is held, waiter must pend"),
+            () = async move { drop(holder) } => {}
+        }
+        // The holder's sweep saw the waiter's Arc and kept the entry.
+        assert_eq!(host.locks.len(), 1);
+        drop(waiter);
+        assert_eq!(host.locks.len(), 0, "cancelled waiter leaked its entry");
+        Ok(())
+    }
+
+    /// A caller that gives up (timeout / client disconnect) mid-`update_cas`
+    /// must not release the session lock while the write is still running: the
+    /// next `update_cas` with the same expected revision has to see the bump
+    /// and lose, not read stale state and clobber it.
+    #[tokio::test]
+    async fn cancelled_update_cas_keeps_the_lock_until_its_write_lands() -> Result<()> {
+        let store = Arc::new(PerUserStore::default());
+        let host = Arc::new(SessionStoreHost::new(store.clone()));
+        let key = key_for("cancel-cas");
+        host.put(SessionSnapshot::new(key.clone(), "sid".into()))
+            .await?;
+        store
+            .update_delay_ms
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+
+        let first = host.update_cas(SessionSnapshot::new(key.clone(), "sid".into()), 0);
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), first).await;
+        assert!(timed_out.is_err(), "first update must still be in flight");
+
+        let second = host
+            .update_cas(SessionSnapshot::new(key.clone(), "sid".into()), 0)
+            .await?;
+        assert!(!second, "second writer must observe the first one's bump");
+        assert_eq!(host.get(&key).await?.map(|s| s.revision), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn get_of_an_unknown_session_is_none() -> Result<()> {
         assert_eq!(host().get(&key_for("nobody")).await?, None);
         Ok(())
@@ -873,6 +1175,89 @@ mod host_tests {
         assert_eq!(
             host.get(&b).await?.map(|s| s.session_id),
             Some("sid-b".into())
+        );
+        Ok(())
+    }
+
+    /// Write `snapshot` the way a pre-upgrade runner did: under the hint-only slot.
+    fn seed_legacy(store: &PerUserStore, snapshot: &SessionSnapshot) -> Result<()> {
+        let legacy = legacy_user_id_from_key(&snapshot.key)?;
+        let ctx = tenant_ctx_from_key(&snapshot.key)?.with_user(Some(legacy.clone()));
+        let data = encode_snapshot(snapshot, ctx.clone(), &legacy)?;
+        store.create_session(&ctx, data)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_session_in_the_legacy_hint_only_slot_is_still_found() -> Result<()> {
+        let store = Arc::new(PerUserStore::default());
+        let host = SessionStoreHost::new(store.clone());
+        let key = key_for("legacy");
+        seed_legacy(&store, &SessionSnapshot::new(key.clone(), "sid-old".into()))?;
+
+        assert_eq!(
+            host.get(&key).await?.map(|s| s.session_id),
+            Some("sid-old".into())
+        );
+        // A CAS against the legacy revision succeeds and keeps one slot.
+        let mut next = SessionSnapshot::new(key.clone(), "sid-new".into());
+        next.revision = 1;
+        assert!(host.update_cas(next, 0).await?);
+        assert_eq!(store.slots().len(), 1);
+        assert_eq!(
+            host.get(&key).await?.map(|s| s.session_id),
+            Some("sid-new".into())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn put_migrates_a_legacy_slot_and_delete_clears_it() -> Result<()> {
+        let store = Arc::new(PerUserStore::default());
+        let host = SessionStoreHost::new(store.clone());
+        let key = key_for("migrate");
+        seed_legacy(&store, &SessionSnapshot::new(key.clone(), "sid-old".into()))?;
+
+        host.put(SessionSnapshot::new(key.clone(), "sid-put".into()))
+            .await?;
+        assert_eq!(store.slots().len(), 1, "legacy slot must be migrated");
+        assert_eq!(
+            host.get(&key).await?.map(|s| s.session_id),
+            Some("sid-put".into())
+        );
+
+        let other = key_for("delete");
+        seed_legacy(&store, &SessionSnapshot::new(other.clone(), "sid-x".into()))?;
+        host.delete(&other).await?;
+        assert!(host.get(&other).await?.is_none());
+        assert_eq!(store.slots().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_legacy_slot_of_another_pack_is_not_adopted() -> Result<()> {
+        let store = Arc::new(PerUserStore::default());
+        let host = SessionStoreHost::new(store.clone());
+        let mut foreign = key_for("shared");
+        foreign.pack_id = "pack.other".into();
+        seed_legacy(&store, &SessionSnapshot::new(foreign, "sid-foreign".into()))?;
+        assert!(host.get(&key_for("shared")).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_lock_map_does_not_outlive_its_operations() -> Result<()> {
+        let host = SessionStoreHost::new(Arc::new(PerUserStore::default()));
+        for i in 0..20 {
+            let key = key_for(&format!("s{i}"));
+            host.put(SessionSnapshot::new(key.clone(), format!("sid-{i}")))
+                .await?;
+            host.touch(&key, Duration::from_secs(1)).await?;
+        }
+        assert!(
+            host.locks.is_empty(),
+            "{} stale lock entries",
+            host.locks.len()
         );
         Ok(())
     }

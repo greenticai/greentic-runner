@@ -6,7 +6,7 @@
 //! `greentic-runner` CLI. Downstream crates embed it either through
 //! [`RunnerConfig`] + [`run`] (HTTP host) or [`HostBuilder`] (direct API access).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +36,9 @@ pub mod fault;
 pub mod greentic_x_provider;
 pub mod gtbind;
 pub mod http;
+mod http_guard;
 pub mod identify_hint;
+mod log_safe;
 pub mod metrics;
 pub mod operator_metrics;
 pub mod operator_registry;
@@ -62,10 +64,32 @@ pub mod trace;
 pub mod validate;
 pub mod verify;
 pub mod wasi;
+mod wasm_limits;
+
+/// The wasmtime engine and cache [`cache::EngineProfile`] the runtime itself
+/// uses for compiled-component caching. CLI cache tools (`warmup`, `doctor`,
+/// `prune`) must use this so they act on the same cache directory as the
+/// runtime instead of a profile of a default-configured engine.
+///
+/// # Errors
+/// Returns an error if the engine cannot be built.
+pub fn runtime_cache_engine_and_profile() -> anyhow::Result<(wasmtime::Engine, cache::EngineProfile)>
+{
+    let engine = wasm_limits::build_engine()?;
+    let profile = cache::EngineProfile::from_engine(
+        &engine,
+        cache::CpuPolicy::Native,
+        wasm_limits::ENGINE_FINGERPRINT.to_string(),
+    );
+    Ok((engine, profile))
+}
 pub mod watcher;
 
 mod activity;
 mod host;
+// `http_guard::GuardedHooks` supersedes `HttpTimeoutHooks` (same ceiling, plus the
+// address guard and body cap); the timeout helpers it reuses stay here.
+#[allow(dead_code)]
 mod http_timeout_hooks;
 pub mod oauth;
 
@@ -195,6 +219,17 @@ pub struct RunnerConfig {
 impl RunnerConfig {
     /// Build a [`RunnerConfig`] from a resolved greentic-config and the provided binding files.
     pub fn from_config(resolved_config: ResolvedConfig, bindings: Vec<PathBuf>) -> Result<Self> {
+        Self::from_config_with_port(resolved_config, bindings, None)
+    }
+
+    /// Like [`RunnerConfig::from_config`], with an explicit port (the `--port`
+    /// flag). When `port` is `Some`, the `PORT` environment variable is not
+    /// read at all, so a malformed `PORT` cannot fail a run that overrides it.
+    pub fn from_config_with_port(
+        resolved_config: ResolvedConfig,
+        bindings: Vec<PathBuf>,
+        port: Option<u16>,
+    ) -> Result<Self> {
         if bindings.is_empty() {
             anyhow::bail!("at least one gtbind file is required");
         }
@@ -209,10 +244,7 @@ impl RunnerConfig {
         )?;
         maybe_write_gtbind_index(&tenant_bindings, &resolved_config.config.paths, &mut pack)?;
         let refresh = parse_refresh_interval(std::env::var("PACK_REFRESH_INTERVAL").ok())?;
-        let port = std::env::var("PORT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(8080);
+        let port = resolve_port(port, || std::env::var("PORT").ok())?;
         let default_tenant = resolved_config
             .config
             .dev
@@ -220,23 +252,34 @@ impl RunnerConfig {
             .map(|dev| dev.default_tenant.clone())
             .unwrap_or_else(|| crate::routing::DEFAULT_TENANT.into());
         let routing = RoutingConfig::from_env_with_default(default_tenant);
+        routing.startup_check()?;
         let paths = &resolved_config.config.paths;
         ensure_paths_exist(paths)?;
-        let mut wasi_policy = default_wasi_policy(paths);
-        let mut env_allow = HashSet::new();
-        for binding in tenant_bindings.values() {
-            env_allow.extend(binding.env_passthrough.iter().cloned());
-        }
-        for key in env_allow {
-            wasi_policy = wasi_policy.allow_env(key);
-        }
+        // The env allowlist is intentionally NOT the union of every tenant's
+        // `env_passthrough`: `PackRuntime::load` adds only the owning tenant's
+        // keys via `RunnerWasiPolicy::for_tenant`.
+        let wasi_policy = default_wasi_policy(paths);
 
-        let admin = AdminAuth::new(resolved_config.config.services.as_ref().and_then(|s| {
+        let config_admin_token = resolved_config.config.services.as_ref().and_then(|s| {
             s.events
                 .as_ref()
                 .and_then(|svc| svc.headers.as_ref())
                 .and_then(|headers| headers.get("x-admin-token").cloned())
-        }));
+        });
+        let (admin_token, admin_source) =
+            resolve_admin_token(std::env::var("ADMIN_TOKEN").ok(), config_admin_token);
+        match admin_source {
+            AdminTokenSource::Env => {
+                tracing::info!("admin API auth: bearer token (ADMIN_TOKEN)")
+            }
+            AdminTokenSource::Config => {
+                tracing::info!("admin API auth: bearer token (services.events.headers)")
+            }
+            AdminTokenSource::None => tracing::warn!(
+                "admin API auth: no ADMIN_TOKEN configured; admin routes are loopback-only"
+            ),
+        }
+        let admin = AdminAuth::new(admin_token);
         let secrets_backend = SecretsBackend::from_config(&resolved_config.config.secrets)?;
         Ok(Self {
             tenant_bindings,
@@ -281,6 +324,19 @@ fn maybe_write_gtbind_index(
     }
     if !uses_locators {
         return Ok(());
+    }
+
+    // Known limitation: a gtbind pack binding carries no signature (and no
+    // digest for a semver `pack_ref`), so the generated index entries cannot
+    // either. With a trust key configured the loader requires a signature per
+    // entry, and strict mode a pinned digest for remote packs, so these packs
+    // are refused. Verification is deliberately not relaxed; say why up front.
+    if pack.public_key.is_some() {
+        tracing::warn!(
+            "gtbind pack_locator packs carry no signature; with a pack trust key configured \
+             the loader will refuse them. Use a signed pack index instead of pack_locator, \
+             or leave the trust key unset for development"
+        );
     }
 
     let mut entries = serde_json::Map::new();
@@ -346,6 +402,84 @@ fn maybe_write_gtbind_index(
     Ok(())
 }
 
+/// Parse the `PORT` value; an unset variable yields the default, an invalid
+/// one is an error instead of a silent fallback.
+/// An explicit port wins and the environment is never consulted.
+fn resolve_port(explicit: Option<u16>, env: impl FnOnce() -> Option<String>) -> Result<u16> {
+    match explicit {
+        Some(port) => Ok(port),
+        None => parse_port(env()),
+    }
+}
+
+/// Unset, empty and whitespace-only `PORT` all mean the default (8080).
+fn parse_port(value: Option<String>) -> Result<u16> {
+    match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(8080),
+        Some(raw) => raw
+            .parse::<u16>()
+            .map_err(|err| anyhow!("invalid PORT `{raw}`: {err}")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminTokenSource {
+    Env,
+    Config,
+    None,
+}
+
+/// `ADMIN_TOKEN` wins over the `x-admin-token` header from config.
+fn resolve_admin_token(
+    env_token: Option<String>,
+    config_token: Option<String>,
+) -> (Option<String>, AdminTokenSource) {
+    if let Some(token) = http::auth::normalize_token(env_token) {
+        return (Some(token), AdminTokenSource::Env);
+    }
+    if let Some(token) = http::auth::normalize_token(config_token) {
+        return (Some(token), AdminTokenSource::Config);
+    }
+    (None, AdminTokenSource::None)
+}
+
+/// Resolve when the process receives ctrl-c or (on unix) SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to install SIGTERM handler; using ctrl-c only");
+                let _ = signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
+}
+
+/// Whether strict pack verification is requested via config or environment.
+fn pack_policy_from(resolved: &ResolvedConfig) -> runner_core::PackPolicy {
+    let require_signatures = resolved
+        .config
+        .packs
+        .as_ref()
+        .and_then(|packs| packs.trust.as_ref())
+        .map(|trust| trust.require_signatures)
+        .unwrap_or(false);
+    let policy = runner_core::PackPolicy::from_env();
+    let strict = policy.verify_strict || require_signatures;
+    policy.strict(strict)
+}
+
 fn parse_refresh_interval(value: Option<String>) -> Result<Duration> {
     let raw = value.unwrap_or_else(|| "30s".into());
     humantime::parse_duration(&raw).map_err(|err| anyhow!("invalid PACK_REFRESH_INTERVAL: {err}"))
@@ -392,13 +526,15 @@ fn pack_config_from(
                 runner_core::env::IndexLocation::from_value(url)?
             }
             PackSourceConfig::OciRegistry { reference } => {
-                runner_core::env::IndexLocation::from_value(reference)?
+                anyhow::bail!(
+                    "OCI registry pack sources are not supported (reference `{reference}`); \
+                     use a local or HTTP(S) index"
+                )
             }
         };
-        let public_key = cfg
-            .trust
-            .as_ref()
-            .and_then(|trust| trust.public_keys.first().cloned());
+        let public_key = runner_core::join_public_keys(
+            cfg.trust.as_ref().map(|trust| trust.public_keys.as_slice()),
+        );
         return Ok(PackConfig {
             source: runner_core::env::PackSource::Fs,
             index_location,
@@ -536,7 +672,7 @@ fn maybe_spawn_inproc_agentic_serve() {
     let agent_count = agents.len();
     tracing::info!(
         agent_count,
-        nats_url = %nats_url,
+        nats_url = %greentic_aw_runtime::url_redact::redact_url(&nats_url),
         "starting in-process agentic serve (GREENTIC_AGENTIC_SERVE_INPROC)"
     );
     tokio::spawn(async move {
@@ -558,14 +694,23 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         telemetry,
         secrets_backend,
         wasi_policy,
-        resolved_config: _resolved_config,
+        resolved_config,
         trace,
         validation,
     } = cfg;
+    // `from_config` already ran this, but an embedder may have hand-built the
+    // `RunnerConfig`; a routing config that must not run fails here as well.
+    routing.startup_check()?;
+    let pack_policy = pack_policy_from(&resolved_config);
 
     let mut builder = HostBuilder::new();
     for bindings in tenant_bindings.into_values() {
         let mut host_config = HostConfig::from_gtbind(bindings);
+        // Fail fast on tenant ids / GREENTIC_ENV that are not valid identifiers
+        // rather than silently running scoped lookups as `local`.
+        host_config.try_tenant_ctx().with_context(|| {
+            format!("invalid tenant configuration for `{}`", host_config.tenant)
+        })?;
         host_config.trace = trace.clone();
         host_config.validation = validation.clone();
         builder = builder.with_config(host_config);
@@ -600,8 +745,13 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
     #[cfg(feature = "agentic-worker")]
     maybe_spawn_inproc_agentic_serve();
 
-    let (watcher, reload_handle) =
-        watcher::start_pack_watcher(Arc::clone(&host), pack.clone(), refresh_interval).await?;
+    let (watcher, reload_handle) = watcher::start_pack_watcher_with_policy(
+        Arc::clone(&host),
+        pack.clone(),
+        pack_policy,
+        refresh_interval,
+    )
+    .await?;
 
     let routing = TenantRouting::new(routing.clone());
     let server = HostServer::new(
@@ -614,18 +764,81 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         Arc::clone(&host),
     )?;
 
-    tokio::select! {
-        result = server.serve() => {
-            result?;
-        }
-        _ = signal::ctrl_c() => {
-            tracing::info!("received shutdown signal");
-        }
-    }
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn(server.serve_with_shutdown(async move {
+        let _ = stop_rx.await;
+    }));
+    let serve_result = drive_until_shutdown(
+        serve_task,
+        stop_tx,
+        shutdown_signal,
+        shutdown_grace_from_raw(std::env::var(SHUTDOWN_GRACE_ENV).ok().as_deref()),
+    )
+    .await;
 
+    // Runs on EVERY exit path, including a failed `serve`, so timers, NATS
+    // listeners and the watcher are always stopped.
     drop(watcher);
-    host.stop().await?;
+    let stop_result = host.stop().await;
+    serve_result?;
+    stop_result?;
     Ok(())
+}
+
+/// Env var: seconds in-flight requests get to drain after a shutdown signal.
+const SHUTDOWN_GRACE_ENV: &str = "GREENTIC_SHUTDOWN_GRACE_SECS";
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
+
+/// Parse the drain deadline: unset/invalid -> 30s; `0` -> no drain (abort at once).
+fn shutdown_grace_from_raw(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Wait for the serve task to end on its own or for a shutdown signal. On the
+/// first signal, trigger graceful shutdown and give the task `grace` to drain
+/// before it is aborted; a SECOND signal during the drain aborts at once (the
+/// usual "press ctrl-c again to force"). `signals` is called once per wait, so
+/// each call must yield a fresh future. Returns the serve outcome (a panic
+/// becomes an error). The caller still runs `host.stop()` after an abort.
+async fn drive_until_shutdown<F, S>(
+    mut serve_task: tokio::task::JoinHandle<Result<()>>,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    mut signals: F,
+    grace: Duration,
+) -> Result<()>
+where
+    F: FnMut() -> S,
+    S: std::future::Future<Output = ()>,
+{
+    let joined = tokio::select! {
+        joined = &mut serve_task => joined,
+        _ = signals() => {
+            tracing::info!(grace_secs = grace.as_secs(), "received shutdown signal; draining");
+            let _ = stop_tx.send(());
+            tokio::select! {
+                drained = tokio::time::timeout(grace, &mut serve_task) => match drained {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        tracing::warn!("drain deadline exceeded; aborting in-flight requests");
+                        serve_task.abort();
+                        return Ok(());
+                    }
+                },
+                _ = signals() => {
+                    tracing::warn!("second shutdown signal; aborting in-flight requests");
+                    serve_task.abort();
+                    return Ok(());
+                }
+            }
+        }
+    };
+    match joined {
+        Ok(result) => result,
+        Err(err) => Err(anyhow!("host server task failed: {err}")),
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +855,40 @@ mod tests {
             cache_dir: temp.path().join("cache"),
             logs_dir: temp.path().join("logs"),
         }
+    }
+
+    #[test]
+    fn parse_port_defaults_and_rejects_invalid_values() {
+        assert_eq!(parse_port(None).expect("default"), 8080);
+        assert_eq!(parse_port(Some("9090".into())).expect("valid"), 9090);
+        assert_eq!(parse_port(Some(String::new())).expect("empty"), 8080);
+        assert_eq!(parse_port(Some("  ".into())).expect("blank"), 8080);
+        assert!(parse_port(Some("not-a-port".into())).is_err());
+        assert!(parse_port(Some("70000".into())).is_err());
+    }
+
+    #[test]
+    fn explicit_port_skips_the_port_env_entirely() {
+        let port = resolve_port(Some(9000), || Some("garbage".into())).expect("explicit wins");
+        assert_eq!(port, 9000);
+        assert!(resolve_port(None, || Some("garbage".into())).is_err());
+        assert_eq!(resolve_port(None, || None).expect("default"), 8080);
+    }
+
+    #[test]
+    fn admin_token_prefers_env_then_config() {
+        let (token, source) = resolve_admin_token(Some("env".into()), Some("cfg".into()));
+        assert_eq!(
+            (token.as_deref(), source),
+            (Some("env"), AdminTokenSource::Env)
+        );
+        let (token, source) = resolve_admin_token(Some(" \n".into()), Some(" cfg\n".into()));
+        assert_eq!(
+            (token.as_deref(), source),
+            (Some("cfg"), AdminTokenSource::Config)
+        );
+        let (token, source) = resolve_admin_token(None, None);
+        assert_eq!((token, source), (None, AdminTokenSource::None));
     }
 
     #[test]
@@ -802,5 +1049,101 @@ mod tests {
             telemetry_from_env(&enabled(), Some("this-has-no-equals-sign".into()), None)
                 .expect("malformed headers must not disable telemetry");
         assert!(malformed.export.headers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn grace_defaults_and_parses() {
+        assert_eq!(shutdown_grace_from_raw(None), Duration::from_secs(30));
+        assert_eq!(
+            shutdown_grace_from_raw(Some("junk")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(shutdown_grace_from_raw(Some(" 5 ")), Duration::from_secs(5));
+        assert_eq!(shutdown_grace_from_raw(Some("0")), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn signal_triggers_graceful_stop_and_waits_for_drain() {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = stop_rx.await;
+            tokio::time::sleep(Duration::from_millis(50)).await; // in-flight work
+            Ok(())
+        });
+        let out = drive_until_shutdown(
+            task,
+            stop_tx,
+            || std::future::ready(()),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(out.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stuck_drain_is_aborted_after_grace() {
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let out = drive_until_shutdown(
+            task,
+            stop_tx,
+            || std::future::ready(()),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(out.is_ok());
+    }
+
+    #[tokio::test]
+    async fn serve_error_is_returned_not_swallowed() {
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async { Err(anyhow!("bind failed")) });
+        let out = drive_until_shutdown(
+            task,
+            stop_tx,
+            std::future::pending::<()>,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(out.is_err_and(|e| e.to_string().contains("bind failed")));
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_during_the_drain_aborts_without_waiting_for_grace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async {
+            // Never drains.
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        // First wait resolves at once; the second resolves shortly after,
+        // while the drain is still pending.
+        let signals = move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        let started = std::time::Instant::now();
+        let out = drive_until_shutdown(task, stop_tx, signals, Duration::from_secs(30)).await;
+        assert!(out.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not wait out the 30s grace"
+        );
     }
 }

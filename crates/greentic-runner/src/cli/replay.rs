@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use serde_json::Value;
 
 use greentic_runner_host::RunnerWasiPolicy;
@@ -28,16 +28,16 @@ pub struct ReplayArgs {
     #[arg(long, value_name = "PATH")]
     pub pack: Option<PathBuf>,
 
-    /// Stop after reaching the failing step (default true)
-    #[arg(long, default_value_t = true)]
+    /// Stop after reaching the failing step (default true; `--until-failure=false` to disable)
+    #[arg(long, action = ArgAction::Set, default_value_t = true, value_name = "BOOL")]
     pub until_failure: bool,
 
     /// Run a specific 1-based step index
     #[arg(long, value_name = "N")]
     pub step: Option<usize>,
 
-    /// Compare hashes when available
-    #[arg(long, default_value_t = true)]
+    /// Compare hashes when available (default true; `--compare-hashes=false` to disable)
+    #[arg(long, action = ArgAction::Set, default_value_t = true, value_name = "BOOL")]
     pub compare_hashes: bool,
 }
 
@@ -46,8 +46,9 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
     let pack_path = resolve_pack_path(&trace, args.pack.as_deref())?;
     let pack = load_pack(&pack_path).await?;
 
-    let target_step = args.step.map(|value| value.saturating_sub(1));
+    let target_step = resolve_target_step(args.step, trace.steps.len())?;
     let last_index = trace.steps.len().saturating_sub(1);
+    let mut divergences = 0usize;
 
     for (idx, step) in trace.steps.iter().enumerate() {
         if let Some(target) = target_step
@@ -69,16 +70,23 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
             .await
             .with_context(|| format!("replay failed at step {}", idx + 1))?;
 
+        let Some(output) = output else {
+            println!("  host-managed step; not re-executed, output hash not compared");
+            if step.error.is_some() && args.until_failure {
+                println!("  stopping at failing step");
+                break;
+            }
+            continue;
+        };
+
         if args.compare_hashes {
             if let Some(expected) = step.output_hash.as_ref() {
-                let actual = hash_value(&output, expected);
-                if actual.value != expected.value {
-                    println!(
-                        "  divergence: expected output hash {}, got {}",
-                        expected.value, actual.value
-                    );
-                } else {
-                    println!("  output hash matches");
+                match compare_output_hash(&output, expected)? {
+                    HashCheck::Match => println!("  output hash matches"),
+                    HashCheck::Diverged { expected, actual } => {
+                        divergences += 1;
+                        println!("  divergence: expected output hash {expected}, got {actual}");
+                    }
                 }
             } else {
                 println!("  output hash missing; skipping compare");
@@ -95,7 +103,29 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
         }
     }
 
+    if divergences > 0 {
+        bail!("replay diverged from the recorded trace at {divergences} step(s)");
+    }
     Ok(())
+}
+
+/// Convert the 1-based `--step` value into a 0-based index, rejecting `0` and
+/// values beyond the end of the trace instead of silently doing nothing.
+fn resolve_target_step(step: Option<usize>, total: usize) -> Result<Option<usize>> {
+    match step {
+        None => Ok(None),
+        Some(0) => bail!("--step is 1-based; 0 is not a valid step"),
+        Some(n) if n > total => bail!("--step {n} is out of range: the trace has {total} step(s)"),
+        Some(n) => Ok(Some(n - 1)),
+    }
+}
+
+/// Steps the host executes itself (no component to re-run), so replay has no
+/// output to compare against the recorded hash.
+fn is_host_managed_step(component_id: &str) -> bool {
+    component_id.starts_with("emit.")
+        || component_id == "flow.call"
+        || component_id == "session.wait"
 }
 
 fn load_trace(path: &Path) -> Result<TraceEnvelope> {
@@ -174,18 +204,15 @@ async fn replay_step(
     trace: &TraceEnvelope,
     step: &greentic_runner_host::trace::TraceStep,
     invocation: &Value,
-) -> Result<Value> {
+) -> Result<Option<Value>> {
     let component_id = step.component_id.as_str();
     let payload = invocation.get("payload").cloned().unwrap_or(Value::Null);
 
-    if component_id == "provider.invoke" {
-        return replay_provider(pack, trace, step, &payload).await;
+    if is_host_managed_step(component_id) {
+        return Ok(None);
     }
-    if component_id.starts_with("emit.")
-        || component_id == "flow.call"
-        || component_id == "session.wait"
-    {
-        return Ok(Value::Null);
+    if component_id == "provider.invoke" {
+        return replay_provider(pack, trace, step, &payload).await.map(Some);
     }
 
     let (component_ref, operation, input, config) = if component_id == "component.exec" {
@@ -225,6 +252,7 @@ async fn replay_step(
     pack.invoke_component(&component_ref, ctx, &operation, config_json, input_json)
         .await
         .context("component invoke failed")
+        .map(Some)
 }
 
 async fn replay_provider(
@@ -268,14 +296,117 @@ fn component_exec_ctx(trace: &TraceEnvelope, node_id: &str) -> ComponentExecCtx 
     }
 }
 
-fn hash_value(value: &Value, expected: &TraceHash) -> TraceHash {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
+#[derive(Debug, PartialEq, Eq)]
+enum HashCheck {
+    Match,
+    Diverged { expected: String, actual: String },
+}
+
+/// Hash the replayed output with the algorithm the trace recorded and compare.
+fn compare_output_hash(value: &Value, expected: &TraceHash) -> Result<HashCheck> {
+    let actual = hash_value(value, expected)?;
+    if actual.value == expected.value {
+        Ok(HashCheck::Match)
+    } else {
+        Ok(HashCheck::Diverged {
+            expected: expected.value.clone(),
+            actual: actual.value,
+        })
+    }
+}
+
+fn hash_value(value: &Value, expected: &TraceHash) -> Result<TraceHash> {
+    let bytes = serde_json::to_vec(value).context("failed to serialize replay output")?;
     let digest = match expected.algorithm.as_str() {
         "blake3" => blake3::hash(&bytes).to_hex().to_string(),
-        _ => blake3::hash(&bytes).to_hex().to_string(),
+        other => bail!("unsupported trace hash algorithm `{other}`"),
     };
-    TraceHash {
+    Ok(TraceHash {
         algorithm: expected.algorithm.clone(),
         value: digest,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn recorded(value: &Value) -> TraceHash {
+        TraceHash {
+            algorithm: "blake3".to_string(),
+            value: blake3::hash(&serde_json::to_vec(value).expect("serialize"))
+                .to_hex()
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn matching_output_is_not_a_divergence() {
+        let out = json!({"a": 1});
+        assert_eq!(
+            compare_output_hash(&out, &recorded(&out)).expect("compare"),
+            HashCheck::Match
+        );
+    }
+
+    #[test]
+    fn changed_output_is_a_divergence() {
+        let expected = recorded(&json!({"a": 1}));
+        let check = compare_output_hash(&json!({"a": 2}), &expected).expect("compare");
+        assert!(matches!(check, HashCheck::Diverged { .. }));
+    }
+
+    #[test]
+    fn emit_flow_call_and_session_wait_are_not_re_executed() {
+        // Their recorded output hash covers the node payload, which replay
+        // cannot reproduce, so they must be skipped rather than hashed as null.
+        assert!(is_host_managed_step("emit.response"));
+        assert!(is_host_managed_step("flow.call"));
+        assert!(is_host_managed_step("session.wait"));
+        assert!(!is_host_managed_step("component.exec"));
+        assert!(!is_host_managed_step("provider.invoke"));
+        let recorded_emit = recorded(&json!({"text": "hi"}));
+        assert!(matches!(
+            compare_output_hash(&Value::Null, &recorded_emit).expect("compare"),
+            HashCheck::Diverged { .. }
+        ));
+    }
+
+    #[test]
+    fn step_selection_is_validated() {
+        assert_eq!(resolve_target_step(None, 3).expect("none"), None);
+        assert_eq!(resolve_target_step(Some(1), 3).expect("first"), Some(0));
+        assert_eq!(resolve_target_step(Some(3), 3).expect("last"), Some(2));
+        assert!(resolve_target_step(Some(0), 3).is_err());
+        assert!(resolve_target_step(Some(4), 3).is_err());
+        assert!(resolve_target_step(Some(1), 0).is_err());
+    }
+
+    #[test]
+    fn unknown_hash_algorithm_is_an_error() {
+        let mut expected = recorded(&json!(1));
+        expected.algorithm = "md5".to_string();
+        assert!(compare_output_hash(&json!(1), &expected).is_err());
+    }
+
+    #[test]
+    fn bool_flags_can_be_turned_off() {
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            args: ReplayArgs,
+        }
+        let on = W::try_parse_from(["x", "trace.json"]).expect("parse");
+        assert!(on.args.until_failure && on.args.compare_hashes);
+        let off = W::try_parse_from([
+            "x",
+            "trace.json",
+            "--until-failure=false",
+            "--compare-hashes",
+            "false",
+        ])
+        .expect("parse");
+        assert!(!off.args.until_failure && !off.args.compare_hashes);
     }
 }

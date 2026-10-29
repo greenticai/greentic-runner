@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::error::LlmError;
-use crate::llm::{LlmBackend, LlmRequest, LlmResponse, LlmToolSchema, OnDelta};
+use crate::llm::{LlmBackend, LlmRequest, LlmResponse, LlmToolSchema, MALFORMED_ARGS_KEY, OnDelta};
 use crate::state::{ChatMessage, ToolCallRecord};
 use crate::tool_wire_name::{ToolNameCodec, wire_tool_name};
 
@@ -20,6 +20,13 @@ use crate::tool_wire_name::{ToolNameCodec, wire_tool_name};
 /// so a server that opens the stream and then stalls would otherwise hang
 /// indefinitely. Overridable only in tests for fast, deterministic checks.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// TCP connect bound for every request.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on a blocking completion as a whole, and on the wait for a streaming
+/// response's head. NOT applied to a streaming body (see `STREAM_IDLE_TIMEOUT`).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Endpoint used when [`ENV_BASE_URL`] names none.
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -39,6 +46,7 @@ pub struct OpenAiLlmBackend {
     api_key: String,
     base_url: String,
     client: Client,
+    request_timeout: Duration,
 }
 
 impl OpenAiLlmBackend {
@@ -65,8 +73,13 @@ impl OpenAiLlmBackend {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
+            request_timeout: REQUEST_TIMEOUT,
+            // No whole-request `.timeout()`: it would also cut a long
+            // streaming body after deltas were already emitted (not
+            // retryable). The blocking path sets a per-request timeout, the
+            // streaming path bounds time-to-first-byte and each chunk gap.
             client: Client::builder()
-                .timeout(Duration::from_secs(45))
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         }
@@ -163,12 +176,17 @@ struct OaToolDef<'a> {
 #[derive(Deserialize)]
 struct OaResponse {
     choices: Vec<OaChoice>,
-    usage: OaUsage,
+    /// Some OpenAI-compatible endpoints omit `usage`: that must not fail an
+    /// otherwise good reply (tokens then count as 0).
+    #[serde(default)]
+    usage: Option<OaUsage>,
 }
 
 #[derive(Deserialize)]
 struct OaChoice {
     message: OaMessageIn,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -191,7 +209,9 @@ struct OaToolFnIn {
 
 #[derive(Deserialize)]
 struct OaUsage {
+    #[serde(default)]
     prompt_tokens: u32,
+    #[serde(default)]
     completion_tokens: u32,
 }
 
@@ -224,26 +244,35 @@ impl LlmBackend for OpenAiLlmBackend {
                 .post(&url)
                 .bearer_auth(&self.api_key)
                 .json(&body)
+                .timeout(self.request_timeout)
                 .send()
                 .await
-                .map_err(|e| LlmError::Transport(e.to_string()))?;
+                .map_err(|e| LlmError::Transport(e.without_url().to_string()))?;
             let status = resp.status();
             if status.is_server_error() {
                 return Err(LlmError::ServiceUnavailable);
             }
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(LlmError::BadRequest(format!("{status}: {text}")));
+                return Err(map_client_error(status, &text));
             }
             let oa: OaResponse = resp
                 .json()
                 .await
-                .map_err(|e| LlmError::Decode(e.to_string()))?;
+                .map_err(|e| LlmError::Decode(e.without_url().to_string()))?;
             let choice = oa
                 .choices
                 .into_iter()
                 .next()
                 .ok_or_else(|| LlmError::Decode("no choices".into()))?;
+            check_finish_reason(
+                choice.finish_reason.as_deref(),
+                choice
+                    .message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty()),
+            )?;
             let tool_calls = choice
                 .message
                 .tool_calls
@@ -256,8 +285,8 @@ impl LlmBackend for OpenAiLlmBackend {
             Ok(LlmResponse {
                 content: choice.message.content,
                 tool_calls,
-                tokens_in: oa.usage.prompt_tokens,
-                tokens_out: oa.usage.completion_tokens,
+                tokens_in: oa.usage.as_ref().map_or(0, |u| u.prompt_tokens),
+                tokens_out: oa.usage.as_ref().map_or(0, |u| u.completion_tokens),
             })
         })
     }
@@ -301,9 +330,13 @@ impl LlmBackend for OpenAiLlmBackend {
                 .post(&url)
                 .bearer_auth(&self.api_key)
                 .json(&body)
-                .send()
+                .send();
+            // Bound only the wait for the response head; the body is bounded
+            // per chunk below, never as a whole.
+            let resp = tokio::time::timeout(self.request_timeout, resp)
                 .await
-                .map_err(|e| LlmError::Transport(e.to_string()))?;
+                .map_err(|_| LlmError::Transport("response header timeout".into()))?
+                .map_err(|e| LlmError::Transport(e.without_url().to_string()))?;
             let status = resp.status();
             // A non-2xx response is an error body, not an SSE stream — read
             // it whole and map exactly like the blocking path.
@@ -312,7 +345,7 @@ impl LlmBackend for OpenAiLlmBackend {
             }
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(LlmError::BadRequest(format!("{status}: {text}")));
+                return Err(map_client_error(status, &text));
             }
 
             let mut acc = StreamAccumulator::new();
@@ -324,7 +357,7 @@ impl LlmBackend for OpenAiLlmBackend {
                 .await
                 .map_err(|_| LlmError::Transport("stream idle timeout".into()))?
             {
-                let bytes = chunk.map_err(|e| LlmError::Transport(e.to_string()))?;
+                let bytes = chunk.map_err(|e| LlmError::Transport(e.without_url().to_string()))?;
                 for line in line_buf.push_bytes(&bytes) {
                     if let Some(text) = acc.push_line(&line)? {
                         on_delta(&text);
@@ -338,6 +371,9 @@ impl LlmBackend for OpenAiLlmBackend {
             {
                 on_delta(&text);
             }
+            // A body that ends without `[DONE]` or a `finish_reason` was cut
+            // off (proxy reset, server crash): never treat it as a reply.
+            acc.check_complete()?;
             Ok(acc.finish(&codec))
         })
     }
@@ -405,6 +441,10 @@ struct StreamAccumulator {
     tool_calls: BTreeMap<u32, ToolCallFrag>,
     tokens_in: u32,
     tokens_out: u32,
+    /// Saw the `data: [DONE]` terminator.
+    done: bool,
+    /// Last non-null `finish_reason` any choice reported.
+    finish_reason: Option<String>,
 }
 
 #[derive(Default)]
@@ -421,7 +461,21 @@ impl StreamAccumulator {
             tool_calls: BTreeMap::new(),
             tokens_in: 0,
             tokens_out: 0,
+            done: false,
+            finish_reason: None,
         }
+    }
+
+    /// Whether the stream ended the way a provider ends a finished reply:
+    /// `[DONE]` or a `finish_reason`. Also rejects a reply cut at the token
+    /// limit while it was still emitting a tool call.
+    fn check_complete(&self) -> Result<(), LlmError> {
+        if !self.done && self.finish_reason.is_none() {
+            return Err(LlmError::Transport(
+                "stream ended before [DONE] or a finish_reason".into(),
+            ));
+        }
+        check_finish_reason(self.finish_reason.as_deref(), !self.tool_calls.is_empty())
     }
 
     /// Parse one streaming line. Returns `Ok(Some(text))` when the line
@@ -437,6 +491,7 @@ impl StreamAccumulator {
             None => return Ok(None), // comments / keep-alives
         };
         if payload == "[DONE]" {
+            self.done = true;
             return Ok(None);
         }
         let chunk: OaStreamChunk =
@@ -447,6 +502,9 @@ impl StreamAccumulator {
         }
         let mut emit: Option<String> = None;
         for choice in chunk.choices {
+            if let Some(reason) = choice.finish_reason {
+                self.finish_reason = Some(reason);
+            }
             let delta = choice.delta;
             if let Some(text) = delta.content
                 && !text.is_empty()
@@ -503,6 +561,8 @@ struct OaStreamChunk {
 #[derive(Deserialize)]
 struct OaStreamChoice {
     delta: OaStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -534,8 +594,10 @@ struct OaStreamToolFn {
 /// carries: the call id, the dotted `extension.tool` name, and the
 /// JSON-encoded `arguments` string. Shared by the blocking ([`complete`])
 /// and streaming ([`StreamAccumulator::finish`]) paths so both decode
-/// arguments and split the name identically. Malformed argument JSON
-/// degrades to an empty object rather than failing the whole turn.
+/// arguments and split the name identically. Malformed argument JSON does NOT
+/// degrade to `{}` (that would run the tool with no arguments): the raw text is
+/// parked under [`MALFORMED_ARGS_KEY`] and the loop answers the call with a
+/// tool error instead of dispatching it.
 ///
 /// [`complete`]: OpenAiLlmBackend::complete
 fn build_tool_call_record(
@@ -544,7 +606,7 @@ fn build_tool_call_record(
     name: &str,
     raw_args: &str,
 ) -> ToolCallRecord {
-    let args: serde_json::Value = serde_json::from_str(raw_args).unwrap_or(serde_json::json!({}));
+    let args = parse_tool_args(raw_args);
     let (extension_id, tool_name) = codec.decode(name);
     ToolCallRecord {
         call_id,
@@ -552,6 +614,53 @@ fn build_tool_call_record(
         tool_name,
         args,
     }
+}
+
+/// Longest slice of unparseable arguments echoed back to the model.
+const MALFORMED_ARGS_ECHO_BYTES: usize = 512;
+
+/// Parse a tool call's JSON-encoded `arguments`. A blank string is a call with
+/// no arguments (`{}`); text that is not valid JSON becomes
+/// `{ MALFORMED_ARGS_KEY: "<prefix of the raw text>" }`.
+fn parse_tool_args(raw_args: &str) -> serde_json::Value {
+    if raw_args.trim().is_empty() {
+        return serde_json::json!({});
+    }
+    match serde_json::from_str(raw_args) {
+        Ok(value) => value,
+        Err(_) => {
+            let mut cut = raw_args.len().min(MALFORMED_ARGS_ECHO_BYTES);
+            while !raw_args.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            serde_json::json!({ MALFORMED_ARGS_KEY: &raw_args[..cut] })
+        }
+    }
+}
+
+/// Map a non-2xx, non-5xx reply: 429 is a retryable rate limit, the rest are
+/// deterministic client errors.
+fn map_client_error(status: reqwest::StatusCode, body: &str) -> LlmError {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        LlmError::RateLimited(format!("{status}: {body}"))
+    } else {
+        LlmError::BadRequest(format!("{status}: {body}"))
+    }
+}
+
+/// Reject a reply the model cut off at its token limit while writing a tool
+/// call: the arguments are a truncated prefix and must not be executed. A
+/// text reply cut the same way is kept (it is still the model's answer).
+fn check_finish_reason(finish_reason: Option<&str>, has_tool_calls: bool) -> Result<(), LlmError> {
+    if finish_reason == Some("length") {
+        if has_tool_calls {
+            return Err(LlmError::Decode(
+                "response hit the token limit in the middle of a tool call".into(),
+            ));
+        }
+        tracing::warn!("llm reply truncated at the token limit (finish_reason=length)");
+    }
+    Ok(())
 }
 
 /// Encode an `(extension_id, tool_name)` pair into a single OpenAI function
@@ -829,6 +938,52 @@ mod tests {
     }
 
     #[test]
+    fn malformed_tool_arguments_are_flagged_not_silently_emptied() {
+        let args = parse_tool_args(r#"{"q": "unterminated"#);
+        assert!(args.get(MALFORMED_ARGS_KEY).is_some(), "{args}");
+        assert_eq!(parse_tool_args(""), serde_json::json!({}));
+        assert_eq!(parse_tool_args(r#"{"q":1}"#), serde_json::json!({"q":1}));
+    }
+
+    #[test]
+    fn a_stream_without_done_or_finish_reason_is_a_transport_error() {
+        let mut acc = StreamAccumulator::new();
+        acc.push_line(r#"data: {"choices":[{"delta":{"content":"par"}}]}"#)
+            .expect("parse");
+        assert!(matches!(acc.check_complete(), Err(LlmError::Transport(_))));
+        acc.push_line("data: [DONE]").expect("parse");
+        assert!(acc.check_complete().is_ok());
+    }
+
+    #[test]
+    fn a_finish_reason_alone_completes_the_stream() {
+        let mut acc = StreamAccumulator::new();
+        acc.push_line(r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#)
+            .expect("parse");
+        assert!(acc.check_complete().is_ok());
+    }
+
+    #[test]
+    fn length_cutoff_inside_a_tool_call_is_rejected() {
+        let mut acc = StreamAccumulator::new();
+        acc.push_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"kb_FN_lookup","arguments":"{"}}]},"finish_reason":"length"}]}"#,
+        )
+        .expect("parse");
+        assert!(matches!(acc.check_complete(), Err(LlmError::Decode(_))));
+        assert!(check_finish_reason(Some("length"), false).is_ok());
+    }
+
+    #[test]
+    fn http_429_is_a_retryable_rate_limit() {
+        let err = map_client_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        assert!(matches!(err, LlmError::RateLimited(_)));
+        assert!(err.is_retryable());
+        let err = map_client_error(reqwest::StatusCode::BAD_REQUEST, "no");
+        assert!(matches!(err, LlmError::BadRequest(_)));
+    }
+
+    #[test]
     fn assistant_with_empty_tool_calls_omits_field() {
         // Regression: a text-only assistant turn must NOT serialise
         // `tool_calls: []` (OpenAI 400, code `empty_array`).
@@ -902,5 +1057,115 @@ mod tests {
             !all.contains("secret-plan") && !all.contains("artifact://"),
             "{all}"
         );
+    }
+
+    fn plain_req() -> LlmRequest {
+        LlmRequest {
+            system_prompt: "sys".into(),
+            history: vec![ChatMessage::User {
+                content: "hi".into(),
+                attachments: Vec::new(),
+            }],
+            tools: vec![],
+            provider: crate::config::LlmProviderRef {
+                provider: "openai".into(),
+                model: "m".into(),
+                credential_ref: None,
+            },
+            turn_attachments: Default::default(),
+            attachment_text_guard: None,
+        }
+    }
+
+    /// One-shot HTTP server: reads the request, then runs `respond` on the
+    /// socket. Returns its base URL.
+    async fn serve_once<F, Fut>(respond: F) -> String
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            // The request is small and sent in one go; one read drains it.
+            let _ = sock.read(&mut buf).await;
+            respond(sock).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_usage_is_accepted() {
+        use tokio::io::AsyncWriteExt;
+        let body = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let url = serve_once(move |mut sock| async move {
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        })
+        .await;
+        let backend = OpenAiLlmBackend::with_base_url("k", url);
+        let out = backend.complete(plain_req()).await.unwrap();
+        assert_eq!(out.content.as_deref(), Some("ok"));
+        assert_eq!((out.tokens_in, out.tokens_out), (0, 0));
+    }
+
+    /// The stream outlives the per-request timeout; only idle gaps are bounded,
+    /// so the full reply arrives (a whole-request timeout would cut it).
+    #[tokio::test]
+    async fn a_long_stream_is_not_cut_by_the_request_timeout() {
+        use tokio::io::AsyncWriteExt;
+        let url = serve_once(|mut sock| async move {
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            for word in ["a", "b", "c", "d", "e", "f"] {
+                let line = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{word}\"}}}}]}}\n\n"
+                );
+                sock.write_all(line.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            sock.write_all(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        let mut backend = OpenAiLlmBackend::with_base_url("k", url);
+        backend.request_timeout = Duration::from_millis(250);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+        let out = backend
+            .complete_streaming(
+                plain_req(),
+                Box::new(move |chunk: &str| sink.lock().unwrap().push_str(chunk)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content.as_deref(), Some("abcdef"));
+        assert_eq!(seen.lock().unwrap().as_str(), "abcdef");
+        assert_eq!(out.tokens_out, 2);
+    }
+
+    #[tokio::test]
+    async fn the_blocking_path_still_times_out() {
+        let url = serve_once(|sock| async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(sock);
+        })
+        .await;
+        let mut backend = OpenAiLlmBackend::with_base_url("k", url);
+        backend.request_timeout = Duration::from_millis(150);
+        let err = backend.complete(plain_req()).await.unwrap_err();
+        assert!(matches!(err, LlmError::Transport(_)), "{err:?}");
     }
 }

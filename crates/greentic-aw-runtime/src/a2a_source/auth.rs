@@ -13,6 +13,7 @@ use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
 use super::types::A2aRoute;
 use crate::oauth::{AuthMode, ClientCredentials, TokenProvider, parse_auth_mode, route_token_key};
+use crate::scoped_secrets::is_safe_segment;
 use secrecy::ExposeSecret;
 
 /// The secrets category A2A credentials are sealed under (contract §5/§6).
@@ -262,13 +263,6 @@ fn ensure_safe_segment(agent_id: &str, field: &str, value: &str) -> Result<(), S
         "a2a agent {agent_id}: {field} '{value}' is not a safe secret-path segment; \
          refusing to look up its credential"
     ))
-}
-
-fn is_safe_segment(value: &str) -> bool {
-    let charset_ok = value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    !value.is_empty() && charset_ok && !value.starts_with('.') && !value.contains("..")
 }
 
 /// Refuse to carry a credential to any host other than the one the admin

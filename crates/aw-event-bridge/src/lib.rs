@@ -21,12 +21,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_nats::HeaderMap;
 use async_trait::async_trait;
-use greentic_types::{DispatchError, RuntimeDispatchRequest, RuntimeDispatchResponse};
+use greentic_types::{RuntimeDispatchRequest, RuntimeDispatchResponse};
 use serde_json::Value;
 
 // Re-export the shared subject helpers so serve-mode callers can name the
 // agentic subjects without an extra greentic-types dependency.
-pub use greentic_types::{request_topic, response_topic};
+pub use greentic_types::{DispatchError, request_topic, response_topic};
 
 /// Runtime name for the agentic worker; selects the request/response subjects
 /// `greentic.agentic.request.v1` / `greentic.agentic.response.v1`.
@@ -40,6 +40,42 @@ pub struct InvokeOutcome {
     pub output: Value,
     /// Optional runtime-emitted events (empty for the agentic worker today).
     pub events: Vec<Value>,
+    /// Why `ok` is false, when the step ended without a usable reply
+    /// (timeout, iteration cap, token budget). `output` still carries the
+    /// partial `{reply, trail, terminated_by}` so a consumer can use it.
+    pub error: Option<DispatchError>,
+}
+
+/// Header carrying the per-dispatch id: random, minted ONCE per publish by the
+/// runner, so JetStream redelivery of the same message carries the same value
+/// while a later turn of the same conversation carries a different one.
+///
+/// It is deliberately NOT folded into the correlation id / idempotency key: the
+/// bridges reuse those as the downstream session id, so a nonce there would give
+/// every turn a fresh agent memory.
+pub const DISPATCH_ID_HEADER: &str = "Greentic-Dispatch-Id";
+
+/// Longest dispatch id accepted.
+const MAX_DISPATCH_ID_LEN: usize = 64;
+
+/// A dispatch id is used as a key segment: `[A-Za-z0-9_-]{1,64}` or it is
+/// treated as absent.
+#[must_use]
+pub fn valid_dispatch_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_DISPATCH_ID_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The identifiers of one dispatch handed to an invoker.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DispatchIdentity<'a> {
+    /// Correlation/idempotency hint (session hint; same for every turn).
+    pub idempotency_key: Option<&'a str>,
+    /// Unique per publish, stable across redelivery of that message.
+    pub dispatch_id: Option<&'a str>,
 }
 
 /// Seam over the actual agentic-worker invocation. The production impl wraps
@@ -69,6 +105,258 @@ pub trait AgentDispatchInvoker: Send + Sync {
         input: Value,
         idempotency_key: Option<&str>,
     ) -> Result<InvokeOutcome>;
+
+    /// [`Self::invoke`] with the per-dispatch identity the publisher stamped.
+    ///
+    /// The default ignores the dispatch id and calls [`Self::invoke`], so an
+    /// invoker that does not deduplicate redeliveries needs no change.
+    async fn invoke_identified(
+        &self,
+        tenant: &str,
+        env: &str,
+        target: &str,
+        operation: &str,
+        input: Value,
+        ident: DispatchIdentity<'_>,
+    ) -> Result<InvokeOutcome> {
+        self.invoke(tenant, env, target, operation, input, ident.idempotency_key)
+            .await
+    }
+
+    /// The wall-clock limit one step on `target` is configured with, when the
+    /// invoker knows it. A durable consumer sizes its per-message time bound
+    /// from this so an agent with a long `limits.timeout` is not cut off by a
+    /// fixed constant. `None` (the default) means "use the consumer's default".
+    async fn step_timeout(
+        &self,
+        _tenant: &str,
+        _env: &str,
+        _target: &str,
+    ) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+/// Longest tenant / env id the bridge accepts from a request header.
+const MAX_SCOPE_ID_LEN: usize = 128;
+
+/// Substring of `AgentError::LockTimeout`'s `Display` ("session lock could not
+/// be acquired within wait window"); see [`is_lock_contention`].
+const LOCK_CONTENTION_MARKER: &str = "session lock could not be acquired";
+
+/// Substring of `AgentError::StateUnavailable`'s `Display` (the state backend
+/// did not answer; nothing ran or was saved). Retryable like a busy session,
+/// so it takes the same redeliver / `session_busy` path instead of
+/// `invoke_failed`.
+const STATE_UNAVAILABLE_MARKER: &str = "agent state temporarily unavailable";
+
+/// Error an invoker can return when the target session is busy (another turn
+/// holds its lock). A busy session is never acked silently: depending on the
+/// [`BusyPolicy`] the message is redelivered later or answered with a
+/// `session_busy` error response, so the parked caller is never left waiting.
+#[derive(Debug)]
+pub struct LockContention(pub String);
+
+impl std::fmt::Display for LockContention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{LOCK_CONTENTION_MARKER}: {}", self.0)
+    }
+}
+
+impl std::error::Error for LockContention {}
+
+/// Whether an invoker error means "session lock busy" (typed [`LockContention`],
+/// or an error chain carrying the runtime's lock-timeout message).
+#[must_use]
+pub fn is_lock_contention(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LockContention>().is_some()
+        || error.chain().any(|cause| {
+            let text = cause.to_string();
+            text.contains(LOCK_CONTENTION_MARKER) || text.contains(STATE_UNAVAILABLE_MARKER)
+        })
+}
+
+/// What to do when the target session stays locked for the whole wait window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusyPolicy {
+    /// Publish nothing and return [`Disposition::Busy`] so a durable consumer
+    /// can Nak with a delay and have the request redelivered. Publishing a
+    /// failure here would resume the caller's flow while the first run is
+    /// still genuinely in progress.
+    Redeliver,
+    /// Publish a `session_busy` error response (core NATS has no redelivery,
+    /// and the last JetStream delivery has none left either).
+    Respond,
+}
+
+/// Error code published when the target session stayed locked.
+pub const SESSION_BUSY_CODE: &str = "session_busy";
+
+/// What became of one request message; drives the JetStream ack decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// A response was published (success or error); ack.
+    Handled,
+    /// Session lock busy under [`BusyPolicy::Redeliver`]: no response was
+    /// published; the durable consumer must Nak with a delay so the request is
+    /// redelivered (bounded by `max_deliver`). Never ack this.
+    Busy,
+    /// The request can never succeed (malformed / invalid ids); terminate it
+    /// (an error response was published when a correlation id existed).
+    Rejected,
+}
+
+/// Why a request was refused before reaching the invoker.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Rejection {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// A request that passed header and payload validation.
+#[derive(Debug)]
+pub struct ParsedRequest {
+    pub tenant: String,
+    pub env: String,
+    pub correlation: Option<String>,
+    pub idempotency: Option<String>,
+    /// `Greentic-Dispatch-Id`, when present and well formed.
+    pub dispatch_id: Option<String>,
+    pub request: RuntimeDispatchRequest,
+}
+
+/// Reject tenant / env ids that are empty, oversized, control-bearing, or could
+/// alter a key or URL path built from them (`:`, `/`, `\`, `..`).
+pub fn validate_scope_id(kind: &str, value: &str) -> Result<(), Rejection> {
+    let bad = value.is_empty()
+        || value.len() > MAX_SCOPE_ID_LEN
+        || value.contains("..")
+        || value
+            .chars()
+            .any(|c| c == ':' || c == '/' || c == '\\' || c.is_control() || c.is_whitespace());
+    if bad {
+        return Err(Rejection {
+            code: "invalid_request",
+            message: format!("invalid {kind} id"),
+        });
+    }
+    Ok(())
+}
+
+/// The `(tenant, env)` pair to stamp on a response, from the request's own
+/// scope headers. `env` defaults to `default` exactly as [`parse_request`]
+/// does. `None` when either id fails [`is_echoable_scope_id`] (or tenant is
+/// absent): an id outside that charset is never echoed into a header. That
+/// check is looser than [`validate_scope_id`] (it allows `..`).
+///
+/// The host's listener drops a response with no tenant/env headers, so every
+/// error response whose scope is valid must carry them.
+#[must_use]
+pub fn response_scope(tenant: Option<&str>, env: Option<&str>) -> Option<(String, String)> {
+    let tenant = tenant?;
+    // A blank env header is "absent", exactly as in `parse_request`.
+    let env = env
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("default");
+    if is_echoable_scope_id(tenant) && is_echoable_scope_id(env) {
+        Some((tenant.to_string(), env.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Whether a tenant / env id may be ECHOED into a response header.
+///
+/// This is the runner's own id charset (`[A-Za-z0-9._-]`, which includes `..`
+/// inside a name such as `a..b`), capped at [`MAX_SCOPE_ID_LEN`]. It is
+/// deliberately looser than [`validate_scope_id`], which also rejects `..`
+/// because THAT check guards ids used to build keys and paths. Echoing only
+/// stamps a header: if the response were not stamped for an id the runner
+/// accepted, its tenant-scoped listener would drop the rejection and the
+/// awaiting flow would wait out its watchdog (forever with no deadline).
+#[must_use]
+pub fn is_echoable_scope_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SCOPE_ID_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Validate headers and decode the payload (pure; no I/O).
+pub fn parse_request(
+    get_header: impl Fn(&str) -> Option<String>,
+    payload: &[u8],
+) -> Result<ParsedRequest, Rejection> {
+    let correlation = get_header("Greentic-Correlation-Id");
+    // The runner sets the idempotency key equal to the correlation id; prefer the
+    // explicit header but fall back to the correlation id so the invoker always
+    // has a stable session hint.
+    let idempotency = get_header("Greentic-Idempotency-Key").or_else(|| correlation.clone());
+    let dispatch_id = get_header(DISPATCH_ID_HEADER).filter(|id| valid_dispatch_id(id));
+    let tenant = get_header("Greentic-Tenant").unwrap_or_default();
+    // A blank `Greentic-Env` is treated as absent (the runner's own decoder
+    // does the same), not as an invalid id.
+    let env = get_header("Greentic-Env")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    validate_scope_id("tenant", &tenant)?;
+    validate_scope_id("env", &env)?;
+    let request: RuntimeDispatchRequest =
+        serde_json::from_slice(payload).map_err(|error| Rejection {
+            code: "invalid_request",
+            message: format!("malformed dispatch request: {error}"),
+        })?;
+    Ok(ParsedRequest {
+        tenant,
+        env,
+        correlation,
+        idempotency,
+        dispatch_id,
+        request,
+    })
+}
+
+fn error_response(code: &str, message: String) -> RuntimeDispatchResponse {
+    RuntimeDispatchResponse {
+        ok: false,
+        output: Value::Null,
+        events: vec![],
+        error: Some(DispatchError {
+            code: code.into(),
+            message,
+        }),
+    }
+}
+
+/// Map an invoker failure to its error response: a busy session is
+/// `session_busy` (the caller may retry), anything else `invoke_failed`.
+fn failure_response(error: &anyhow::Error) -> RuntimeDispatchResponse {
+    let code = if is_lock_contention(error) {
+        SESSION_BUSY_CODE
+    } else {
+        "invoke_failed"
+    };
+    error_response(code, error.to_string())
+}
+
+/// Invoke; `Err` carries the invoker error so the caller can classify it.
+async fn dispatch(
+    invoker: Arc<dyn AgentDispatchInvoker>,
+    tenant: &str,
+    env: &str,
+    ident: DispatchIdentity<'_>,
+    req: RuntimeDispatchRequest,
+) -> Result<RuntimeDispatchResponse, anyhow::Error> {
+    let outcome = invoker
+        .invoke_identified(tenant, env, &req.target, &req.operation, req.input, ident)
+        .await?;
+    Ok(RuntimeDispatchResponse {
+        ok: outcome.ok,
+        output: outcome.output,
+        events: outcome.events,
+        error: outcome.error,
+    })
 }
 
 /// Invoke and build the response (no NATS I/O). Errors map to an error response.
@@ -79,71 +367,31 @@ pub async fn build_response(
     idempotency_key: Option<&str>,
     req: RuntimeDispatchRequest,
 ) -> RuntimeDispatchResponse {
-    match invoker
-        .invoke(
-            tenant,
-            env,
-            &req.target,
-            &req.operation,
-            req.input,
-            idempotency_key,
-        )
-        .await
-    {
-        Ok(outcome) => RuntimeDispatchResponse {
-            ok: outcome.ok,
-            output: outcome.output,
-            events: outcome.events,
-            error: None,
-        },
-        Err(error) => RuntimeDispatchResponse {
-            ok: false,
-            output: Value::Null,
-            events: vec![],
-            error: Some(DispatchError {
-                code: "invoke_failed".into(),
-                message: error.to_string(),
-            }),
-        },
+    let ident = DispatchIdentity {
+        idempotency_key,
+        dispatch_id: None,
+    };
+    match dispatch(invoker, tenant, env, ident, req).await {
+        Ok(resp) => resp,
+        Err(error) => failure_response(&error),
     }
 }
 
-/// Handle one request message end-to-end: decode, invoke, publish response.
-///
-/// The correlation id is echoed VERBATIM (the runner's `agentic.call` node
-/// encodes `::pack=…::flow=…::thread=…::reply=…` resume markers there and parses
-/// them back on response, so the bridge must not alter it).
-pub async fn handle_message(
+async fn publish_response(
     client: &async_nats::Client,
-    invoker: Arc<dyn AgentDispatchInvoker>,
-    msg: async_nats::Message,
+    correlation: Option<&str>,
+    scope: Option<(&str, &str)>,
+    resp: &RuntimeDispatchResponse,
 ) -> Result<()> {
-    let headers = msg.headers.as_ref();
-    let get_header = |name: &str| -> Option<String> {
-        headers
-            .and_then(|header_map| header_map.get(name))
-            .map(|value| value.as_str().to_string())
-    };
-
-    let correlation = get_header("Greentic-Correlation-Id");
-    // The runner sets the idempotency key equal to the correlation id; prefer the
-    // explicit header but fall back to the correlation id so the invoker always
-    // has a stable session hint.
-    let idempotency = get_header("Greentic-Idempotency-Key").or_else(|| correlation.clone());
-    let tenant = get_header("Greentic-Tenant").unwrap_or_default();
-    let env = get_header("Greentic-Env").unwrap_or_else(|| "default".to_string());
-
-    let req: RuntimeDispatchRequest = serde_json::from_slice(&msg.payload)?;
-    let resp = build_response(invoker, &tenant, &env, idempotency.as_deref(), req).await;
-
     let mut out_headers = HeaderMap::new();
-    if let Some(correlation_value) = correlation.as_deref() {
+    if let Some(correlation_value) = correlation {
         out_headers.insert("Greentic-Correlation-Id", correlation_value);
     }
-    out_headers.insert("Greentic-Tenant", tenant.as_str());
-    out_headers.insert("Greentic-Env", env.as_str());
-
-    let response_bytes = serde_json::to_vec(&resp)?;
+    if let Some((tenant, env)) = scope {
+        out_headers.insert("Greentic-Tenant", tenant);
+        out_headers.insert("Greentic-Env", env);
+    }
+    let response_bytes = serde_json::to_vec(resp)?;
     client
         .publish_with_headers(
             response_topic(RUNTIME_NAME),
@@ -154,21 +402,230 @@ pub async fn handle_message(
     Ok(())
 }
 
-/// Subscribe to `greentic.agentic.request.v1` and serve forever (one spawned
-/// task per message).
+/// Handle one request message end-to-end: decode, invoke, publish response,
+/// and report the [`Disposition`] so a durable consumer can ack / terminate.
+///
+/// The correlation id is echoed VERBATIM (the runner's call node encodes
+/// `::pack=…::flow=…::thread=…::reply=…` resume markers there and parses
+/// them back on response, so the bridge must not alter it). A request refused
+/// at validation gets an error response whenever it carried a correlation id,
+/// so the awaiting flow fails fast instead of waiting out its deadline.
+pub async fn handle_message_outcome(
+    client: &async_nats::Client,
+    invoker: Arc<dyn AgentDispatchInvoker>,
+    msg: async_nats::Message,
+    busy: BusyPolicy,
+) -> Result<Disposition> {
+    let headers = msg.headers.as_ref();
+    let get_header = |name: &str| -> Option<String> {
+        headers
+            .and_then(|header_map| header_map.get(name))
+            .map(|value| value.as_str().to_string())
+    };
+
+    let parsed = match parse_request(get_header, &msg.payload) {
+        Ok(parsed) => parsed,
+        Err(rejection) => {
+            tracing::warn!(code = rejection.code, message = %rejection.message, "rejecting dispatch request");
+            if let Some(correlation) = get_header("Greentic-Correlation-Id") {
+                let resp = error_response(rejection.code, rejection.message);
+                let tenant = get_header("Greentic-Tenant");
+                let env = get_header("Greentic-Env");
+                let scope = response_scope(tenant.as_deref(), env.as_deref());
+                publish_response(
+                    client,
+                    Some(&correlation),
+                    scope.as_ref().map(|(t, e)| (t.as_str(), e.as_str())),
+                    &resp,
+                )
+                .await?;
+            }
+            return Ok(Disposition::Rejected);
+        }
+    };
+
+    let resp = match dispatch(
+        invoker,
+        &parsed.tenant,
+        &parsed.env,
+        DispatchIdentity {
+            idempotency_key: parsed.idempotency.as_deref(),
+            dispatch_id: parsed.dispatch_id.as_deref(),
+        },
+        parsed.request,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(error) if is_lock_contention(&error) && busy == BusyPolicy::Redeliver => {
+            tracing::warn!(%error, "session busy; requesting redelivery");
+            return Ok(Disposition::Busy);
+        }
+        Err(error) => failure_response(&error),
+    };
+    publish_response(
+        client,
+        parsed.correlation.as_deref(),
+        Some((&parsed.tenant, &parsed.env)),
+        &resp,
+    )
+    .await?;
+    Ok(Disposition::Handled)
+}
+
+/// Handle one request message end-to-end (see [`handle_message_outcome`]).
+pub async fn handle_message(
+    client: &async_nats::Client,
+    invoker: Arc<dyn AgentDispatchInvoker>,
+    msg: async_nats::Message,
+) -> Result<()> {
+    // Core NATS has no redelivery: answer a busy session instead of dropping it.
+    handle_message_outcome(client, invoker, msg, BusyPolicy::Respond)
+        .await
+        .map(|_| ())
+}
+
+/// Publish an error response for an already-received request message, echoing
+/// its correlation id and scope headers. Returns `Ok(false)` without
+/// publishing when the message carries no correlation id, since nobody is
+/// waiting for it then.
+pub async fn publish_error_for_message(
+    client: &async_nats::Client,
+    msg: &async_nats::Message,
+    code: &str,
+    message: String,
+) -> Result<bool> {
+    let header = |name: &str| -> Option<String> {
+        msg.headers
+            .as_ref()
+            .and_then(|header_map| header_map.get(name))
+            .map(|value| value.as_str().to_string())
+    };
+    let Some(correlation) = header("Greentic-Correlation-Id") else {
+        return Ok(false);
+    };
+    let tenant = header("Greentic-Tenant");
+    let env = header("Greentic-Env");
+    let scope = response_scope(tenant.as_deref(), env.as_deref());
+    publish_response(
+        client,
+        Some(&correlation),
+        scope.as_ref().map(|(t, e)| (t.as_str(), e.as_str())),
+        &error_response(code, message),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Queue group shared by all bridge replicas, so a request is delivered to ONE
+/// worker rather than fanned out to every replica.
+pub const QUEUE_GROUP: &str = "agentic-workers";
+
+/// Most core-NATS requests handled at once. Past this the bridge answers
+/// `overloaded` instead of spawning another task: with no cap a burst (or a
+/// slow downstream) grew tasks, and the sessions they hold, without bound.
+///
+/// Why this refuses instead of waiting for a slot before reading the next
+/// message: a core-NATS queue-group subscription has no server-side
+/// backpressure. The server picks the receiving replica at publish time
+/// without asking whether it has capacity, so a message the client has not yet
+/// read is already committed to THIS replica and sits in the client's
+/// subscription buffer; another replica cannot pick it up. Holding off
+/// `next()` would therefore only queue requests behind a full replica (until
+/// the buffer overflows and the client drops them as a slow consumer, with the
+/// caller waiting out its whole deadline), whereas `overloaded` tells the
+/// caller at once to retry, which lands on a random replica again. Real
+/// backpressure is a pull consumer (the durable JetStream path), where a
+/// replica asks for work itself and unread work stays in the stream for the
+/// other replicas. The JetStream path ([`jetstream::run_bridge_jetstream`])
+/// does exactly that: it takes a slot from a [`MAX_INFLIGHT`] semaphore before
+/// each pull, so it never refuses with `overloaded`; it simply stops pulling.
+/// The durable's `max_ack_pending` is `2 * MAX_INFLIGHT` and is CONSUMER-WIDE:
+/// one ceiling shared by every replica (fleet-wide, not per replica), with
+/// headroom for Nak'd messages that hold ack-pending without a permit. A pull
+/// answered `409` at that ceiling is retried after a short fixed delay.
+pub const MAX_INFLIGHT: usize = 256;
+
+/// Error code published when the in-flight cap refused a request.
+pub const OVERLOADED_CODE: &str = "overloaded";
+
+/// Take an in-flight slot, or `None` when [`MAX_INFLIGHT`] are taken.
+fn admit(permits: &Arc<tokio::sync::Semaphore>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    permits.clone().try_acquire_owned().ok()
+}
+
+/// Run `fut` for at most `limit`; `None` when it did not finish in time.
+async fn within<T>(
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::time::timeout(limit, fut).await.ok()
+}
+
+/// Handle one core-NATS request under the same time bound the JetStream path
+/// uses ([`jetstream::handle_timeout_for`]); on expiry the caller gets a
+/// `timeout` response instead of waiting out its own deadline.
+async fn handle_bounded(
+    client: &async_nats::Client,
+    invoker: Arc<dyn AgentDispatchInvoker>,
+    msg: async_nats::Message,
+) {
+    let bound = jetstream::handle_timeout_for(jetstream::step_timeout_of(&invoker, &msg).await);
+    let for_error = msg.clone();
+    match within(bound, handle_message(client, invoker, msg)).await {
+        Some(Ok(())) => {}
+        Some(Err(error)) => tracing::error!(%error, "event bridge failed to handle request"),
+        None => {
+            tracing::error!(timeout = ?bound, "agentic handler exceeded its time bound");
+            if let Err(error) = publish_error_for_message(
+                client,
+                &for_error,
+                "timeout",
+                format!("agent request handling exceeded {bound:?}"),
+            )
+            .await
+            {
+                tracing::warn!(%error, "could not publish timeout response");
+            }
+        }
+    }
+}
+
+/// Subscribe to the request subject as part of [`QUEUE_GROUP`] and serve
+/// forever (one spawned task per message, at most [`MAX_INFLIGHT`] at once,
+/// each bounded in time).
 pub async fn run_bridge(
     client: async_nats::Client,
     invoker: Arc<dyn AgentDispatchInvoker>,
 ) -> Result<()> {
     use futures_util::StreamExt;
-    let mut subscriber = client.subscribe(request_topic(RUNTIME_NAME)).await?;
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
+    let mut subscriber = client
+        .queue_subscribe(request_topic(RUNTIME_NAME), QUEUE_GROUP.to_string())
+        .await?;
     while let Some(msg) = subscriber.next().await {
+        let Some(permit) = admit(&permits) else {
+            tracing::warn!(
+                max = MAX_INFLIGHT,
+                "event bridge at its in-flight cap; refusing a request"
+            );
+            if let Err(error) = publish_error_for_message(
+                &client,
+                &msg,
+                OVERLOADED_CODE,
+                "the agent service is at capacity; retry shortly".to_string(),
+            )
+            .await
+            {
+                tracing::warn!(%error, "could not publish overload response");
+            }
+            continue;
+        };
         let client = client.clone();
         let invoker = invoker.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_message(&client, invoker, msg).await {
-                tracing::error!(%error, "aw event bridge failed to handle request");
-            }
+            let _slot = permit;
+            handle_bounded(&client, invoker, msg).await;
         });
     }
     Ok(())
@@ -209,6 +666,7 @@ mod tests {
                 ok: true,
                 output: json!({"reply": "pong", "trail": [], "terminated_by": "reply"}),
                 events: vec![],
+                error: None,
             })
         }
     }
@@ -293,5 +751,248 @@ mod tests {
         let error = resp.error.expect("error response must carry details");
         assert_eq!(error.code, "invoke_failed");
         assert_eq!(error.message, "boom");
+    }
+
+    fn header_fn<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn dispatch_id_header_is_parsed_and_validated() {
+        let payload = serde_json::to_vec(&sample_request()).unwrap();
+        let with = |id: &'static str| {
+            let headers = [("Greentic-Tenant", "acme"), (DISPATCH_ID_HEADER, id)];
+            parse_request(header_fn(&headers), &payload)
+                .unwrap()
+                .dispatch_id
+        };
+        assert_eq!(with("abc123").as_deref(), Some("abc123"));
+        assert_eq!(with("bad:id"), None, "unsafe ids are treated as absent");
+        assert_eq!(with(""), None);
+        let headers = [("Greentic-Tenant", "acme")];
+        assert_eq!(
+            parse_request(header_fn(&headers), &payload)
+                .unwrap()
+                .dispatch_id,
+            None
+        );
+    }
+
+    fn payload() -> Vec<u8> {
+        serde_json::to_vec(&sample_request()).unwrap()
+    }
+
+    #[test]
+    fn valid_headers_parse_and_default_env() {
+        let headers = [
+            ("Greentic-Tenant", "acme"),
+            ("Greentic-Correlation-Id", "c1"),
+        ];
+        let parsed = parse_request(header_fn(&headers), &payload()).unwrap();
+        assert_eq!(parsed.tenant, "acme");
+        assert_eq!(parsed.env, "default");
+        assert_eq!(parsed.idempotency.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn scope_ids_with_separators_or_empty_are_rejected() {
+        for bad in ["", "a:b", "a/b", "..", "a..b", "a b", "a\\b", "x\n"] {
+            assert!(validate_scope_id("tenant", bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_scope_id("tenant", &"a".repeat(MAX_SCOPE_ID_LEN + 1)).is_err());
+        assert!(validate_scope_id("tenant", "acme-1_prod.eu").is_ok());
+        let headers = [("Greentic-Tenant", "a:b")];
+        assert!(parse_request(header_fn(&headers), &payload()).is_err());
+        let missing_tenant: [(&str, &str); 0] = [];
+        assert!(parse_request(header_fn(&missing_tenant), &payload()).is_err());
+    }
+
+    #[test]
+    fn malformed_payload_is_rejected_with_invalid_request() {
+        let headers = [("Greentic-Tenant", "acme")];
+        let rejection = parse_request(header_fn(&headers), b"not json").unwrap_err();
+        assert_eq!(rejection.code, "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn lock_contention_answers_session_busy_instead_of_dropping() {
+        struct BusyInvoker;
+
+        #[async_trait]
+        impl AgentDispatchInvoker for BusyInvoker {
+            async fn invoke(
+                &self,
+                _tenant: &str,
+                _env: &str,
+                _target: &str,
+                _operation: &str,
+                _input: Value,
+                _idempotency_key: Option<&str>,
+            ) -> Result<InvokeOutcome> {
+                Err(anyhow::Error::new(LockContention("s".into())))
+            }
+        }
+
+        let resp = build_response(
+            Arc::new(BusyInvoker),
+            "acme",
+            "prod",
+            Some("c"),
+            sample_request(),
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error.map(|e| e.code).as_deref(),
+            Some(SESSION_BUSY_CODE)
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_failure_outcome_error_is_forwarded() {
+        struct FailedStep;
+
+        #[async_trait]
+        impl AgentDispatchInvoker for FailedStep {
+            async fn invoke(
+                &self,
+                _tenant: &str,
+                _env: &str,
+                _target: &str,
+                _operation: &str,
+                _input: Value,
+                _idempotency_key: Option<&str>,
+            ) -> Result<InvokeOutcome> {
+                Ok(InvokeOutcome {
+                    ok: false,
+                    output: json!({"reply": "partial", "trail": [], "terminated_by": "timeout"}),
+                    events: vec![],
+                    error: Some(DispatchError {
+                        code: "timeout".into(),
+                        message: "agent step ended: timeout".into(),
+                    }),
+                })
+            }
+        }
+
+        let resp =
+            build_response(Arc::new(FailedStep), "acme", "prod", None, sample_request()).await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.map(|e| e.code).as_deref(), Some("timeout"));
+        assert_eq!(resp.output["reply"], json!("partial"));
+    }
+
+    #[test]
+    fn lock_contention_is_detected_typed_and_by_message() {
+        assert!(is_lock_contention(&anyhow::Error::new(LockContention(
+            "s".into()
+        ))));
+        let wrapped = anyhow::anyhow!("session lock could not be acquired within wait window")
+            .context("agent step failed");
+        assert!(is_lock_contention(&wrapped));
+        assert!(!is_lock_contention(&anyhow::anyhow!("boom")));
+        let unavailable = anyhow::anyhow!("agent state temporarily unavailable: redis error: down")
+            .context("agentic step failed");
+        assert!(is_lock_contention(&unavailable));
+    }
+
+    #[test]
+    fn the_in_flight_cap_admits_up_to_the_limit_then_refuses() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let first = admit(&permits);
+        let second = admit(&permits);
+        assert!(first.is_some() && second.is_some());
+        assert!(admit(&permits).is_none(), "a third request is refused");
+        drop(first);
+        assert!(admit(&permits).is_some(), "a freed slot is reusable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_that_overruns_its_bound_is_cut_off() {
+        let slow = within(std::time::Duration::from_secs(5), async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            1
+        })
+        .await;
+        assert_eq!(slow, None);
+        let fast = within(std::time::Duration::from_secs(5), async { 2 }).await;
+        assert_eq!(fast, Some(2));
+    }
+
+    #[test]
+    fn state_load_failures_other_than_a_blip_are_not_retryable() {
+        let decode = anyhow::anyhow!("agent state load failed: decode error: bad");
+        assert!(!is_lock_contention(&decode));
+    }
+
+    #[test]
+    fn a_blank_env_header_is_absent_not_invalid() {
+        for blank in ["", "   "] {
+            let parsed = parse_request(
+                |name| match name {
+                    "Greentic-Tenant" => Some("acme".to_string()),
+                    "Greentic-Env" => Some(blank.to_string()),
+                    _ => None,
+                },
+                &payload(),
+            )
+            .expect("blank env falls back to default");
+            assert_eq!(parsed.env, "default");
+            assert_eq!(
+                response_scope(Some("acme"), Some(blank)),
+                Some(("acme".into(), "default".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_replies_echo_ids_the_runner_accepts_even_with_dots() {
+        // `a..b` is valid for the runner ([A-Za-z0-9._-]) but rejected here for
+        // key-building; its rejection must still be stamped so the runner's
+        // tenant-scoped listener does not drop it.
+        let rejection = parse_request(
+            |name| match name {
+                "Greentic-Tenant" => Some("a..b".to_string()),
+                _ => None,
+            },
+            &payload(),
+        );
+        assert!(rejection.is_err(), "key-building keeps rejecting `..`");
+        assert!(validate_scope_id("tenant", "a..b").is_err());
+        assert_eq!(
+            response_scope(Some("a..b"), Some("e..1")),
+            Some(("a..b".into(), "e..1".into()))
+        );
+        // Anything outside the runner charset is still never echoed.
+        assert_eq!(response_scope(Some("a b"), None), None);
+        assert_eq!(response_scope(Some("acme"), Some("x/y")), None);
+        assert_eq!(response_scope(Some(""), None), None);
+        assert!(!is_echoable_scope_id(&"a".repeat(MAX_SCOPE_ID_LEN + 1)));
+    }
+
+    #[test]
+    fn response_scope_is_kept_for_valid_ids_and_dropped_for_invalid_ones() {
+        assert_eq!(
+            response_scope(Some("acme"), Some("prod")),
+            Some(("acme".into(), "prod".into()))
+        );
+        // Missing env defaults like `parse_request`.
+        assert_eq!(
+            response_scope(Some("acme"), None),
+            Some(("acme".into(), "default".into()))
+        );
+        assert_eq!(response_scope(None, Some("prod")), None);
+        assert_eq!(response_scope(Some("a:b"), Some("prod")), None);
+        assert_eq!(response_scope(Some("acme"), Some("../x")), None);
+    }
+
+    #[test]
+    fn queue_group_is_stable() {
+        assert_eq!(QUEUE_GROUP, "agentic-workers");
     }
 }

@@ -48,30 +48,68 @@ const CAUSED_BY: &str = "\ncaused by: ";
 /// What every redacted span is replaced with.
 const REDACTED: &str = "[redacted]";
 
-/// Keys whose value is a credential when they appear as `key=value`,
-/// `key: value` or `"key": "value"`. Matched case-insensitively as a whole
-/// key (so `token` matches `access_token`'s suffix only through its own entry).
-const SENSITIVE_KEYS: &[&str] = &[
-    "access_token",
-    "refresh_token",
-    "id_token",
+/// Substrings that mark a `key=value`, `key: value` or `"key": "value"` key as
+/// a credential. Mirrors `trace::agent_audit::is_sensitive_key` (substring
+/// semantics, not an exact-name list), so `x-amz-security-token`, `bot_token`
+/// and `x-goog-api-key` are caught. Checked per `-`/`_` separated segment of
+/// the key; see [`is_sensitive_key`].
+const SENSITIVE_SUBSTRINGS: &[&str] = &[
     "token",
-    "api_key",
-    "apikey",
-    "api-key",
-    "x-api-key",
-    "client_secret",
     "secret",
     "password",
     "passwd",
-    "pwd",
-    "private_key",
-    "session",
-    "cookie",
-    "set-cookie",
+    "authorization",
     "signature",
-    "sig",
+    "credential",
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "secretkey",
+    "accountkey",
+    "signingkey",
+    "encryptionkey",
+    "sessionkey",
 ];
+
+/// Segments that are sensitive only as a COMPLETE segment: too short or too
+/// common to match as a substring (`sig` would hit `design`/`signal`, `key`
+/// would hit `keyboard`). Covers a bare `key=`, `x-goog-api-key` and
+/// `Ocp-Apim-Subscription-Key`.
+const SENSITIVE_SEGMENTS: &[&str] = &[
+    "key", "sig", "pwd", "auth", "session", "cookie", "bearer", "jwt",
+];
+
+/// True when `key` (an identifier of `[A-Za-z0-9_-]`) names a credential.
+fn is_sensitive_key(key: &str) -> bool {
+    if is_camel_case_key_suffix(key) {
+        return true;
+    }
+    let key = key.to_ascii_lowercase();
+    // Only the LAST segment names what the value is: `bot_token`,
+    // `x-amz-security-token`, `x-goog-api-key` are credentials, while
+    // `secret_missing` / `token_type` are status words that merely mention one,
+    // and `max_tokens` is a counter.
+    let Some(last) = key.rsplit(['-', '_']).next() else {
+        return false;
+    };
+    SENSITIVE_SEGMENTS.contains(&last)
+        || (last != "tokens" && SENSITIVE_SUBSTRINGS.iter().any(|n| last.contains(n)))
+}
+
+/// True for a camelCase identifier whose final word is `Key` (`storageKey`,
+/// `clientKey`, `StorageAccountKey`). A plain lowercase `ends_with("key")` would
+/// also hit `monkey` / `hotkey`; the capital `K` after a lowercase letter marks
+/// a word boundary instead. `session_id` / `sessionId` do not end in `Key`.
+fn is_camel_case_key_suffix(key: &str) -> bool {
+    let last = key.rsplit(['-', '_']).next().unwrap_or(key);
+    let Some(prefix) = last.strip_suffix("Key") else {
+        return false;
+    };
+    prefix
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
 
 /// The `error` object of a v2 run-outcome event. Serialised `snake_case`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -250,7 +288,7 @@ fn redact_urls(text: &str) -> String {
             .last()
             .map(|(i, _)| i)
             .unwrap_or(sep);
-        let end = token_end(text, sep + 3);
+        let end = url_end(text, sep + 3);
         out.push_str(&text[pos..scheme_start]);
         out.push_str(&redact_one_url(&text[scheme_start..end]));
         pos = end;
@@ -259,17 +297,47 @@ fn redact_urls(text: &str) -> String {
     out
 }
 
+/// End of the URL whose authority starts at `from`.
+///
+/// [`token_end`] stops at `, ; ) ] }` and quotes, all of which are legal raw
+/// bytes in a password. When the authority (up to the first `/?#`, bounded by
+/// whitespace) holds an `@` beyond that point, the delimiter sat inside the
+/// userinfo, so the URL runs on to the end of the authority; otherwise the
+/// tail after the delimiter would leak. Fail-closed, like `redact_http_url`.
+fn url_end(text: &str, from: usize) -> usize {
+    let end = token_end(text, from);
+    let region_end = text[from..]
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| from + i)
+        .unwrap_or(text.len());
+    let authority_end = text[from..region_end]
+        .find(['/', '?', '#'])
+        .map(|i| from + i)
+        .unwrap_or(region_end);
+    if authority_end > end && text[from..authority_end].contains('@') {
+        // Carry on to the end of the whitespace-delimited word: the path and
+        // query after the authority are still redacted by `redact_one_url`.
+        return region_end;
+    }
+    end
+}
+
 fn redact_one_url(url: &str) -> String {
-    let Some(sep) = url.find("://") else {
-        return url.to_string();
+    let Some(parts) = runner_core::url_split::split_url(url) else {
+        return REDACTED.to_string();
     };
-    let (scheme, rest) = url.split_at(sep + 3);
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    let host = match authority.rfind('@') {
-        Some(at) => format!("{REDACTED}@{}", &authority[at + 1..]),
-        None => authority.to_string(),
+    if parts.ambiguous {
+        // An `@` after the authority: the host cannot be told from a password
+        // that contained a raw `/?#`. Show the scheme only.
+        return format!("{}{REDACTED}", parts.scheme_prefix);
+    }
+    let host = if parts.had_userinfo {
+        format!("{REDACTED}@{}", parts.host)
+    } else {
+        parts.host.to_string()
     };
+    let tail = parts.remainder;
     let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
     let (path, query) = tail.split_at(path_end);
     let query = if query.is_empty() {
@@ -277,7 +345,7 @@ fn redact_one_url(url: &str) -> String {
     } else {
         format!("?{REDACTED}")
     };
-    format!("{scheme}{host}{path}{query}")
+    format!("{}{host}{path}{query}", parts.scheme_prefix)
 }
 
 /// `Authorization: <anything to end of line>`.
@@ -359,7 +427,7 @@ fn redact_sensitive_pairs(text: &str) -> String {
             .find(|&j| !is_key_byte(bytes[j]))
             .unwrap_or(bytes.len());
         let key = &text[i..key_end];
-        if !SENSITIVE_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+        if !is_sensitive_key(key) {
             i = key_end;
             continue;
         }

@@ -77,14 +77,27 @@ async fn replay_reproduces_failing_step() -> Result<()> {
 
     host.stop().await?;
 
-    let status = Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
+    let output = Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
         .arg("replay")
         .arg(&trace_path)
         .arg("--pack")
         .arg(&pack_path)
-        .status()
+        .output()
         .context("run greentic-runner replay")?;
-    assert!(status.success(), "replay command should exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "replay command should exit 0\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("step 1:"),
+        "replay should list steps: {stdout}"
+    );
+    assert!(
+        !stdout.contains("divergence"),
+        "replay must reproduce the recorded outputs: {stdout}"
+    );
 
     Ok(())
 }
@@ -218,4 +231,113 @@ fn qa_component_artifact() -> Result<PathBuf> {
         "qa_process.wasm missing after fixture build: {}",
         target_test.display()
     )
+}
+
+fn build_emit_pack(pack_path: &Path) -> Result<()> {
+    let flow_yaml = r#"
+id: emit.flow
+type: messaging
+start: emit
+nodes:
+  emit:
+    emit.response:
+      status: "ok"
+    routing:
+      - out: true
+"#;
+    let (_bundle, flow) = load_and_validate_bundle_with_flow(flow_yaml, None)?;
+    let manifest = PackManifest {
+        agents: Default::default(),
+        schema_version: "1.0".into(),
+        pack_id: "runner.emit.test".parse()?,
+        name: None,
+        version: Version::parse("0.0.0")?,
+        kind: PackKind::Application,
+        publisher: "test".into(),
+        components: Vec::new(),
+        flows: vec![PackFlowEntry {
+            id: flow.id.clone(),
+            kind: flow.kind,
+            flow: flow.clone(),
+            tags: Vec::new(),
+            entrypoints: vec!["default".into()],
+        }],
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        signatures: Default::default(),
+        secret_requirements: Vec::new(),
+        bootstrap: None,
+        extensions: None,
+    };
+    let mut writer = ZipWriter::new(fs::File::create(pack_path).context("create emit pack")?);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("manifest.cbor", options)?;
+    writer.write_all(&encode_pack_manifest(&manifest)?)?;
+    writer.finish().context("finalise emit pack")?;
+    Ok(())
+}
+
+#[test]
+fn replay_does_not_report_divergence_for_emit_nodes() -> Result<()> {
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("emit.gtpack");
+    build_emit_pack(&pack_path)?;
+
+    // An emit step records the hash of the emitted payload; replay cannot
+    // re-execute it, and must not compare it against a placeholder `null`.
+    let emitted = serde_json::json!({"status": "ok"});
+    let hash = |value: &serde_json::Value| -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "algorithm": "blake3",
+            "value": blake3::hash(&serde_json::to_vec(value)?).to_hex().to_string(),
+        }))
+    };
+    let trace = serde_json::json!({
+        "trace_version": 1,
+        "pack": {"pack_ref": pack_path.display().to_string()},
+        "flow": {"id": "emit.flow", "version": "0.0.0"},
+        "steps": [{
+            "node_id": "emit",
+            "component_id": "emit.response",
+            "operation": "emit.response",
+            "input_hash": hash(&serde_json::json!({}))?,
+            "invocation_json": {"payload": emitted},
+            "output_hash": hash(&emitted)?,
+            "duration_ms": 1
+        }]
+    });
+    let trace_path = temp.path().join("trace.json");
+    fs::write(&trace_path, serde_json::to_vec(&trace)?)?;
+
+    let run = |extra: &[&str]| -> Result<std::process::Output> {
+        Command::new(env!("CARGO_BIN_EXE_greentic-runner"))
+            .arg("replay")
+            .arg(&trace_path)
+            .arg("--pack")
+            .arg(&pack_path)
+            .args(extra)
+            .output()
+            .context("run greentic-runner replay")
+    };
+
+    let output = run(&[])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "replay of an emit-only trace must exit 0\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("emit.response"),
+        "emit step listed: {stdout}"
+    );
+    assert!(!stdout.contains("divergence"), "no divergence: {stdout}");
+
+    // Zero and out-of-range step selections are rejected.
+    for bad in ["0", "99"] {
+        assert!(!run(&["--step", bad])?.status.success(), "--step {bad}");
+    }
+    assert!(run(&["--step", "1"])?.status.success());
+    Ok(())
 }

@@ -150,9 +150,147 @@ impl TenantContext {
     }
 }
 
+/// Longest tenant / env / session id accepted from an untrusted source.
+const MAX_ID_LEN: usize = 256;
+
+/// Reject a tenant or env id that could escape its slot in a Redis key
+/// (`aw:{tenant}:{env}:...`) or a URL path: empty, over-long, or containing
+/// `:`, `/`, `\\`, `..` or a control character.
+pub fn validate_scope_id(kind: &str, id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err(format!("{kind} id is empty"));
+    }
+    if id.len() > MAX_ID_LEN {
+        return Err(format!("{kind} id is longer than {MAX_ID_LEN} bytes"));
+    }
+    if id.contains(['/', '\\', ':']) || id.contains("..") || id.chars().any(char::is_control) {
+        return Err(format!("{kind} id contains a forbidden character"));
+    }
+    Ok(())
+}
+
+/// Reject a dispatch `target` (agent id) taken from the wire before it is
+/// used to look a config up: empty, over-long, or containing `/`, `\\`, `?`,
+/// `#`, `%`, `..`, whitespace or a control character. Such a value could only
+/// ever be an attempt to steer a request path, never a real agent id.
+pub fn validate_target_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("target is empty".to_string());
+    }
+    if id.len() > MAX_ID_LEN {
+        return Err(format!("target is longer than {MAX_ID_LEN} bytes"));
+    }
+    if id.contains(['/', '\\', '?', '#', '%'])
+        || id.contains("..")
+        || id.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("target contains a forbidden character".to_string());
+    }
+    Ok(())
+}
+
+/// Longest session id accepted from an untrusted source.
+pub(crate) const MAX_SESSION_ID_LEN: usize = 512;
+
+/// Reject a session id that is empty, over-long, or carries a control
+/// character. Unlike tenant/env ids a session id MAY contain `:`, `/` and `..`:
+/// it derives from dispatch correlation ids that embed provider thread / reply
+/// ids (base64, email Message-IDs), and it is only ever the LAST variable
+/// segment of a key (`aw:{tenant}:{env}:{session}:...`), so it cannot alias
+/// another tenant's keys. Rejecting those characters made legitimate messages
+/// fail permanently.
+pub fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("session id is empty".to_string());
+    }
+    if id.len() > MAX_SESSION_ID_LEN {
+        return Err("session id is too long".to_string());
+    }
+    if id.chars().any(char::is_control) {
+        return Err("session id contains a forbidden character".to_string());
+    }
+    Ok(())
+}
+
+/// Whether `segment` is `.` or `..`: a path-traversal step that no amount of
+/// percent-encoding neutralises (URL parsers decode `%2E` before resolving it).
+pub fn is_dot_segment(segment: &str) -> bool {
+    matches!(segment, "." | "..")
+}
+
+/// Percent-encode one URL path segment (RFC 3986 unreserved characters pass
+/// through), so an id can never add `/`, `?` or `..` to a request path.
+///
+/// A segment of only dots (`.` / `..`) survives encoding and URL parsers treat
+/// even `%2E%2E` as a traversal step, so use [`is_dot_segment`] to refuse it.
+pub fn percent_encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_ids_reject_separators_traversal_and_empties() {
+        assert!(validate_scope_id("tenant", "acme-1").is_ok());
+        for bad in ["", "a:b", "a/b", "..", "a..b", "a\\b", "a\nb"] {
+            assert!(validate_scope_id("tenant", bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_scope_id("tenant", &"x".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn session_ids_allow_provider_ids_but_not_controls_or_oversize() {
+        assert!(validate_session_id("s1::pack=p::flow=f").is_ok());
+        // Provider thread / reply ids: base64 and email Message-IDs.
+        assert!(validate_session_id("s::thread=YWJj/ZGVm+==::reply=<a..b@mail.example>").is_ok());
+        for bad in ["", "a\u{0}b", "a\nb"] {
+            assert!(validate_session_id(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_session_id(&"x".repeat(513)).is_err());
+        assert!(validate_session_id(&"x".repeat(512)).is_ok());
+    }
+
+    #[test]
+    fn percent_encoding_neutralises_path_metacharacters() {
+        assert_eq!(percent_encode_segment("acme-1_x.y"), "acme-1_x.y");
+        assert_eq!(percent_encode_segment("a/b?c#d e"), "a%2Fb%3Fc%23d%20e");
+        assert_eq!(percent_encode_segment("é"), "%C3%A9");
+        assert_eq!(percent_encode_segment("a..b"), "a..b");
+        assert!(is_dot_segment("..") && is_dot_segment("."));
+        assert!(!is_dot_segment("a..b") && !is_dot_segment(""));
+    }
+
+    #[test]
+    fn target_ids_that_could_steer_a_path_are_rejected() {
+        for ok in ["bot", "8d2f0c1e-recipe", "agent_1.v2", "a:b"] {
+            assert!(validate_target_id(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "../tenant/me/mcp-servers",
+            "a/b",
+            "a?x=1",
+            "a#f",
+            "a%2Fb",
+            "..",
+            "a\\b",
+            "a b",
+            "a\nb",
+        ] {
+            assert!(validate_target_id(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_target_id(&"x".repeat(MAX_ID_LEN + 1)).is_err());
+    }
 
     #[test]
     fn key_prefix_formats_as_expected() {

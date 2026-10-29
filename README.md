@@ -153,14 +153,14 @@ To run the HTTP runtime directly:
 
 ```bash
 cargo run -p greentic-runner -- \
-  --bindings examples/bindings/demo.yaml \
+  --bindings ./bindings/acme.gtbind \
   --port 8080
 ```
 
 To run a pack directly with the local runner harness:
 
 ```bash
-cargo run -p greentic-runner --bin greentic-runner-cli -- \
+cargo run -p greentic-runner --features legacy-gen-bindings --bin greentic-runner-cli -- \
   --pack ./path/to/pack.gtpack \
   --input '{}'
 ```

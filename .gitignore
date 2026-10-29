@@ -28,3 +28,8 @@ DEPENDENCY_FIX_REPORT.md
 semver-output.txt
 SEMVER_FIX_REPORT.md
 .superpowers/
+
+# Local/CI scratch output (cargo logs, dependency-review artifacts)
+/*.err
+pr-comment.md
+pr-vulnerable-changes.json

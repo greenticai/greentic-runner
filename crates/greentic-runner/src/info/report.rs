@@ -113,7 +113,17 @@ pub fn collect() -> InfoReport {
     let mut disabled = Vec::new();
     for (feat, on) in [
         ("verify", cfg!(feature = "verify")),
-        ("telemetry", true),
+        ("telemetry", cfg!(feature = "telemetry")),
+        ("agentic-worker", cfg!(feature = "agentic-worker")),
+        (
+            "desktop-agent-ephemeral",
+            cfg!(feature = "desktop-agent-ephemeral"),
+        ),
+        ("dev-allow-unsigned", cfg!(feature = "dev-allow-unsigned")),
+        (
+            "greentic-llm-backend",
+            cfg!(feature = "greentic-llm-backend"),
+        ),
         ("session-redis", cfg!(feature = "session-redis")),
         ("fault-injection", cfg!(feature = "fault-injection")),
         (
@@ -179,6 +189,23 @@ mod tests {
                 "feature {f} appears in both enabled and disabled"
             );
         }
+    }
+
+    #[test]
+    fn feature_partition_reflects_compiled_cfg() {
+        let r = collect();
+        assert_eq!(
+            r.features.enabled.iter().any(|f| f == "verify"),
+            cfg!(feature = "verify")
+        );
+        assert_eq!(
+            r.features.enabled.iter().any(|f| f == "agentic-worker"),
+            cfg!(feature = "agentic-worker")
+        );
+        assert_eq!(
+            r.features.enabled.iter().any(|f| f == "telemetry"),
+            cfg!(feature = "telemetry")
+        );
     }
 
     #[test]

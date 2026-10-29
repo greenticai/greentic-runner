@@ -35,7 +35,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::tenant::TenantContext;
 
-use super::checkpoint::{CheckpointError, CheckpointStore, GraphRunRecord, RunStatus};
+use super::checkpoint::{
+    CheckpointError, CheckpointStore, GraphRunRecord, NodeVisitOutcome, RunStatus,
+};
 use super::model::{GraphConfig, GraphError, NodeKind};
 use super::router::route;
 use super::state::{GraphRole, GraphRunState};
@@ -310,6 +312,17 @@ struct BranchCursor {
     cursor: String,
     state_json: String,
     parked: bool,
+    /// This branch's visit counts (trunk counts plus its own), refreshed at
+    /// every checkpoint. Resume seeds the branch from it: attempt numbers
+    /// key the effect ledger, so a looping branch that restarted from the
+    /// trunk's counts would re-number its attempts from 1 and replay the
+    /// FIRST iteration's recorded result instead of running the next.
+    ///
+    /// `#[serde(default)]`, not a schema bump: a frontier written before this
+    /// field existed reads as empty (the old behaviour), and an older reader
+    /// ignores the field.
+    #[serde(default)]
+    visits: HashMap<String, u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -935,7 +948,8 @@ impl GraphExecutor {
                             };
 
                             let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
-                            self.store
+                            let outcome = self
+                                .store
                                 .record_node_visit(
                                     tenant,
                                     run_id,
@@ -944,12 +958,17 @@ impl GraphExecutor {
                                     &serde_json::json!({"decision": branch}),
                                 )
                                 .await?;
+                            // A visit already ledgered for this attempt (duplicate
+                            // resume racing another decision) wins: honour the
+                            // STORED decision so both resumes take the same edge.
+                            let (branch, replayed, next_cursor) =
+                                resolve_decision(&cfg, &cursor, branch, next_cursor, outcome)?;
 
                             trail.push(serde_json::json!({
                                 "node": cursor,
                                 "kind": "approval",
                                 "attempt": attempt,
-                                "replayed": false,
+                                "replayed": replayed,
                                 "branch": branch,
                             }));
 
@@ -1017,11 +1036,17 @@ impl GraphExecutor {
 
         // Effect not yet recorded — invoke and record before returning.
         let value = invoke().await?;
-        // Record BEFORE checkpoint (replayable resume ordering).
-        self.store
+        // Record BEFORE checkpoint (replayable resume ordering). If a concurrent
+        // duplicate resume recorded first, its stored value is canonical: return
+        // that (as replayed) so both resumes continue from the same result.
+        match self
+            .store
             .record_node_visit(tenant, run_id, node_id, attempt, &value)
-            .await?;
-        Ok((value, false))
+            .await?
+        {
+            NodeVisitOutcome::Recorded => Ok((value, false)),
+            NodeVisitOutcome::Replayed(stored) => Ok((stored, true)),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1072,6 +1097,7 @@ impl GraphExecutor {
                 cursor: target.clone(),
                 state_json: trunk_state_json.clone(),
                 parked: false,
+                visits: HashMap::new(),
             })
             .collect();
 
@@ -1178,9 +1204,20 @@ impl GraphExecutor {
             coord.checkpoint(self.store.as_ref(), tenant).await?;
         }
 
-        // Global visit counter, seeded with the trunk's current visit total.
+        // Global visit counter, seeded with the trunk's current visit total
+        // plus the visits each branch already made before a resume.
         let trunk_visit_total: u32 = trunk_visits.values().copied().sum();
-        let global_visits = Arc::new(AtomicU32::new(trunk_visit_total));
+        let resumed_branch_visits: u32 = frontier
+            .iter()
+            .flat_map(|bc| {
+                bc.visits
+                    .iter()
+                    .map(|(node, n)| n.saturating_sub(trunk_visits.get(node).copied().unwrap_or(0)))
+            })
+            .sum();
+        let global_visits = Arc::new(AtomicU32::new(
+            trunk_visit_total.saturating_add(resumed_branch_visits),
+        ));
 
         // Build one future per branch (skipping already-parked branches).
         let mut futs: Vec<BoxFut<'_, Result<BranchOutcome, GraphExecError>>> = Vec::new();
@@ -1191,6 +1228,10 @@ impl GraphExecutor {
             let bc = bc.clone();
             let coord = coord.clone();
             let global_visits = global_visits.clone();
+            // The trunk's counts, overlaid by what this branch had already
+            // done when the run was last checkpointed.
+            let mut branch_visits = trunk_visits.clone();
+            branch_visits.extend(bc.visits.clone());
             futs.push(Box::pin(self.drive_branch(
                 tenant,
                 run_id,
@@ -1198,7 +1239,7 @@ impl GraphExecutor {
                 join_id,
                 slot,
                 bc,
-                trunk_visits.clone(),
+                branch_visits,
                 coord,
                 global_visits,
             )));
@@ -1293,6 +1334,17 @@ impl GraphExecutor {
             }
         }
 
+        // Visit counts a branch persisted before parking (covers a branch that
+        // parked in an earlier run and so produced no fresh outcome now).
+        for bc in &ordered {
+            for (k, v) in &bc.visits {
+                merged_visits
+                    .entry(k.clone())
+                    .and_modify(|e| *e = (*e).max(*v))
+                    .or_insert(*v);
+            }
+        }
+
         // Also fold in any visit counts the coordinator accumulated (covers the
         // resume case where a branch parked via pure replay).
         for (k, v) in coord.collect_branch_visits().await {
@@ -1343,6 +1395,7 @@ impl GraphExecutor {
                 // Reached the join → park without executing it.
                 if bc.cursor == join_id {
                     bc.parked = true;
+                    bc.visits = visits.clone();
                     bc.state_json =
                         serde_json::to_string(&state).map_err(CheckpointError::Serde)?;
                     coord
@@ -1579,6 +1632,7 @@ impl GraphExecutor {
                 }
 
                 // Durably persist this branch's progress after every node.
+                bc.visits = visits.clone();
                 bc.state_json = serde_json::to_string(&state).map_err(CheckpointError::Serde)?;
                 coord
                     .save_slot(self.store.as_ref(), tenant, slot, &bc)
@@ -1725,6 +1779,48 @@ fn next_linear(cfg: &GraphConfig, id: &str) -> Result<String, GraphExecError> {
                 "node '{id}' has no outgoing edge"
             )))
         })
+}
+
+/// Reconcile an approval decision with the outcome of recording its node visit.
+///
+/// `Recorded` keeps the caller's decision. `Replayed(stored)` means another
+/// resume already ledgered this attempt, so the STORED decision is authoritative:
+/// its edge is looked up and returned so a duplicate resume cannot fork the run.
+/// Returns `(branch, replayed, next_cursor)`.
+fn resolve_decision(
+    cfg: &GraphConfig,
+    node_id: &str,
+    branch: String,
+    next_cursor: String,
+    outcome: NodeVisitOutcome,
+) -> Result<(String, bool, String), GraphExecError> {
+    let NodeVisitOutcome::Replayed(stored) = outcome else {
+        return Ok((branch, false, next_cursor));
+    };
+    let stored_branch = stored
+        .get("decision")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            GraphExecError::Graph(GraphError::Invalid(format!(
+                "approval node '{node_id}': stored decision record is malformed"
+            )))
+        })?;
+    if stored_branch == branch {
+        return Ok((branch, true, next_cursor));
+    }
+    let next = cfg
+        .graph
+        .edges_from(node_id)
+        .find(|e| e.branch.as_deref() == Some(stored_branch.as_str()))
+        .map(|e| e.to.clone())
+        .ok_or_else(|| {
+            GraphExecError::Graph(GraphError::Invalid(format!(
+                "approval node '{node_id}': stored decision branch '{stored_branch}' does not \
+                 match any outgoing edge"
+            )))
+        })?;
+    Ok((stored_branch, true, next))
 }
 
 /// Resolve the single join node for a parallel region by forward BFS from the
@@ -3050,6 +3146,150 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Looping parallel branch: crash and resume keeps per-branch attempts
+    // -----------------------------------------------------------------------
+
+    /// Branch `a` loops (`agent_a` → `router_a` → back to `agent_a` until the
+    /// router cap), branch `b` is one tool.
+    fn looping_branch_cfg() -> GraphConfig {
+        GraphConfig::from_json(
+            &serde_json::json!({
+                "schemaVersion": 2,
+                "entry": "entry",
+                "nodes": [
+                    {"id": "entry", "kind": "agent", "systemPrompt": "go", "model": "m", "tools": []},
+                    {"id": "fan", "kind": "parallel"},
+                    {"id": "agent_a", "kind": "agent", "systemPrompt": "a", "model": "m", "tools": []},
+                    {"id": "router_a", "kind": "router", "maxIterations": 3},
+                    {"id": "tool_b", "kind": "tool", "toolName": "b.process"},
+                    {"id": "meet", "kind": "join"},
+                    {"id": "respond", "kind": "respond"}
+                ],
+                "edges": [
+                    {"from": "entry", "to": "fan"},
+                    {"from": "fan", "to": "agent_a", "branch": "a"},
+                    {"from": "fan", "to": "tool_b", "branch": "b"},
+                    {"from": "agent_a", "to": "router_a"},
+                    {"from": "router_a", "to": "agent_a", "branch": "loop"},
+                    {"from": "router_a", "to": "meet", "branch": "resolved"},
+                    {"from": "tool_b", "to": "meet"},
+                    {"from": "meet", "to": "respond"}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("looping branch fixture is valid")
+    }
+
+    /// A crash in the SECOND iteration of a looping branch must resume at
+    /// attempt 2. Before the branch's visit counts were persisted, resume
+    /// re-numbered the branch from the trunk's counts, so attempt 2's effect
+    /// was served from the ledger as attempt 1's recorded reply and the agent
+    /// was never called.
+    #[tokio::test]
+    async fn parallel_resume_of_a_looping_branch_continues_at_the_next_attempt() {
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let t = tenant();
+        let cfg = looping_branch_cfg();
+
+        // Phase 1: agent_a succeeds once, then "crashes" on its second visit.
+        {
+            let a_calls = Arc::new(AtomicU32::new(0));
+            let calls = a_calls.clone();
+            let agent: AgentTurnFn = Arc::new(move |req: AgentTurnRequest| {
+                let node = req.node_id.clone();
+                let n = if node == "agent_a" {
+                    calls.fetch_add(1, Ordering::SeqCst) + 1
+                } else {
+                    1
+                };
+                Box::pin(async move {
+                    if node == "agent_a" && n >= 2 {
+                        Err(GraphExecError::AgentTurn("simulated crash".into()))
+                    } else {
+                        Ok(AgentTurnResult {
+                            reply: format!("first-{node}"),
+                            resolved: false,
+                        })
+                    }
+                })
+            });
+            let exec = GraphExecutor::new(
+                store.clone(),
+                agent,
+                Arc::new(|_r| Box::pin(async move { Ok(serde_json::json!({"b": "ok"})) })),
+                supervisor_fn_unreachable(),
+                approval_fn_awaiting(),
+            );
+            exec.start(&t, "run-loop-branch", &cfg, "go")
+                .await
+                .expect_err("phase 1 crashes in the branch loop");
+        }
+
+        // Phase 2: a healthy agent. It must be CALLED for attempt 2.
+        let a_calls = Arc::new(AtomicU32::new(0));
+        let attempts_seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let calls = a_calls.clone();
+            let agent: AgentTurnFn = Arc::new(move |req: AgentTurnRequest| {
+                let node = req.node_id.clone();
+                if node == "agent_a" {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async move {
+                    Ok(AgentTurnResult {
+                        reply: format!("second-{node}"),
+                        resolved: false,
+                    })
+                })
+            });
+            let exec = GraphExecutor::new(
+                store.clone(),
+                agent,
+                Arc::new(|_r| Box::pin(async move { Ok(serde_json::json!({"b": "ok"})) })),
+                supervisor_fn_unreachable(),
+                approval_fn_awaiting(),
+            );
+            let outcome = exec
+                .resume(&t, "run-loop-branch")
+                .await
+                .expect("resume completes");
+            assert_eq!(outcome.status, RunStatus::Succeeded);
+            attempts_seen
+                .lock()
+                .expect("lock")
+                .push(format!("{:?}", outcome.trail));
+        }
+        assert_eq!(
+            a_calls.load(Ordering::SeqCst),
+            1,
+            "attempt 2 of agent_a must run for real, not replay attempt 1"
+        );
+
+        let rec = store.load(&t, "run-loop-branch").await.unwrap().unwrap();
+        let state: GraphRunState = serde_json::from_str(&rec.state_json).unwrap();
+        let contents: Vec<&str> = state.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            contents.iter().any(|c| c.contains("second-agent_a")),
+            "the resumed iteration's reply is in the merged state: {contents:?}"
+        );
+        let visits: HashMap<String, u32> = serde_json::from_str(&rec.visits_json).unwrap();
+        assert_eq!(
+            visits.get("agent_a"),
+            Some(&2),
+            "merged visits keep the branch's attempt count: {visits:?}"
+        );
+    }
+
+    /// A frontier written before `visits` existed still loads (empty counts).
+    #[test]
+    fn a_frontier_without_visits_still_deserialises() {
+        let json = r#"[{"branch":"a","cursor":"agent_a","state_json":"{}","parked":false}]"#;
+        let frontier: Vec<BranchCursor> = serde_json::from_str(json).unwrap();
+        assert!(frontier[0].visits.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
     // Approval tests (Task C2)
     // -----------------------------------------------------------------------
     //
@@ -3075,6 +3315,48 @@ mod tests {
 
     fn approval_cfg() -> GraphConfig {
         GraphConfig::from_json(&approval_json()).expect("approval fixture is valid")
+    }
+
+    #[test]
+    fn resolve_decision_prefers_the_stored_decision_on_replay() {
+        let cfg = approval_cfg();
+        // Recorded: caller's decision stands.
+        let (b, replayed, next) = resolve_decision(
+            &cfg,
+            "approval",
+            "approved".into(),
+            "respond".into(),
+            NodeVisitOutcome::Recorded,
+        )
+        .expect("recorded");
+        assert_eq!(
+            (b.as_str(), replayed, next.as_str()),
+            ("approved", false, "respond")
+        );
+
+        // Replayed with a different stored branch that has no edge: surfaced, not ignored.
+        let err = resolve_decision(
+            &cfg,
+            "approval",
+            "approved".into(),
+            "respond".into(),
+            NodeVisitOutcome::Replayed(serde_json::json!({"decision": "rejected"})),
+        );
+        assert!(
+            err.is_err(),
+            "stored branch must be honoured, not discarded"
+        );
+
+        // Replayed with the same branch: flagged as replayed.
+        let (_, replayed, _) = resolve_decision(
+            &cfg,
+            "approval",
+            "approved".into(),
+            "respond".into(),
+            NodeVisitOutcome::Replayed(serde_json::json!({"decision": "approved"})),
+        )
+        .expect("same");
+        assert!(replayed);
     }
 
     /// Test 17: an approval node with an `Awaiting` `ApprovalFn` parks the run

@@ -66,7 +66,13 @@ pub fn is_wire_safe(name: &str) -> bool {
 #[must_use]
 pub fn wire_tool_name(extension_id: &str, tool_name: &str) -> String {
     let upstream = encode_tool_name(extension_id, tool_name);
-    if is_wire_safe(&upstream) {
+    // The unchanged branch is only taken when the name decodes back to the
+    // exact pair. An id that itself contains `_FN_` / `_DOT_` (or a dotted id
+    // next to one spelled with `_DOT_`) would otherwise collide with, or
+    // mis-split into, a different pair.
+    if is_wire_safe(&upstream)
+        && split_tool_name(&upstream) == (extension_id.into(), tool_name.into())
+    {
         return upstream;
     }
 
@@ -300,6 +306,65 @@ mod tests {
     }
 
     /// The digest is what keeps two ids that slugify identically apart.
+    /// Names that carry the codec's own escape tokens must neither collide
+    /// with a different pair nor decode to the wrong one.
+    #[test]
+    fn names_containing_escape_tokens_round_trip_through_the_codec() {
+        let a = wire_tool_name("a.b", "t");
+        let b = wire_tool_name("a_DOT_b", "t");
+        assert_ne!(a, b);
+        let tools = vec![schema("a.b", "t"), schema("a_DOT_b", "t")];
+        let codec = ToolNameCodec::for_tools(&tools);
+        assert_eq!(codec.decode(&a), ("a.b".to_string(), "t".to_string()));
+        assert_eq!(codec.decode(&b), ("a_DOT_b".to_string(), "t".to_string()));
+    }
+
+    /// Exhaustive-ish property check: over a grid of awkward fragments every
+    /// pair gets a provider-safe, unique wire name that the codec inverts.
+    #[test]
+    fn wire_names_are_safe_unique_and_invertible_over_a_fragment_grid() {
+        let frags = [
+            "",
+            "a",
+            "mcp:github",
+            "component:x",
+            "a.b",
+            "a_DOT_b",
+            "x_FN_y",
+            "_FN_",
+            "_DOT_",
+            "é",
+            "a/b@sha256:c",
+            "..",
+            "-",
+            "_",
+            "A-1",
+        ];
+        let long = "z".repeat(90);
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for e in frags.iter().chain(std::iter::once(&long.as_str())) {
+            for t in frags.iter().chain(std::iter::once(&long.as_str())) {
+                if t.is_empty() {
+                    continue;
+                }
+                pairs.push(((*e).to_string(), (*t).to_string()));
+            }
+        }
+        let mut seen: HashMap<String, (String, String)> = HashMap::new();
+        for (e, t) in &pairs {
+            let wire = wire_tool_name(e, t);
+            assert_safe(&wire);
+            if let Some(prev) = seen.insert(wire.clone(), (e.clone(), t.clone())) {
+                assert_eq!(&prev, &(e.clone(), t.clone()), "collision on {wire}");
+            }
+        }
+        let tools: Vec<LlmToolSchema> = pairs.iter().map(|(e, t)| schema(e, t)).collect();
+        let codec = ToolNameCodec::for_tools(&tools);
+        for (e, t) in &pairs {
+            assert_eq!(codec.decode(&wire_tool_name(e, t)), (e.clone(), t.clone()));
+        }
+    }
+
     #[test]
     fn ids_that_slugify_identically_still_get_distinct_names() {
         let a = wire_tool_name("mcp:srv-1", "quote");

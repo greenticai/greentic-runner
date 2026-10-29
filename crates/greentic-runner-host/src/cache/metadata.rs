@@ -16,6 +16,11 @@ pub struct ArtifactMetadata {
     pub created_at: String,
     pub last_access_at: String,
     pub hit_count: u64,
+    /// Hex sha256 of the serialized `.cwasm` bytes, verified on every read so
+    /// a tampered or truncated artifact is never deserialized. Entries written
+    /// before this field existed have `None` and are treated as a miss.
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
 }
 
 impl ArtifactMetadata {
@@ -34,7 +39,13 @@ impl ArtifactMetadata {
             created_at: ts.clone(),
             last_access_at: ts,
             hit_count: 0,
+            artifact_sha256: None,
         }
+    }
+
+    pub fn with_artifact_sha256(mut self, hex_digest: String) -> Self {
+        self.artifact_sha256 = Some(hex_digest);
+        self
     }
 
     pub fn validate_for_profile(&self, profile: &EngineProfile) -> Result<()> {

@@ -74,7 +74,7 @@ jobs:
 
       # Strip unpublishable internal deps before publishing.
       #
-      # greentic-aw-runtime (publish=false) and greentic-ext-runtime (private git)
+      # greentic-aw-runtime (private git deps on this branch) and greentic-ext-runtime (private git)
       # are feature-gated behind the `agentic-worker` feature in greentic-runner-host,
       # greentic-runner-desktop, and greentic-runner. crates.io rejects any manifest
       # that references a git source or an unpublished path dep, even optional ones.
@@ -82,7 +82,11 @@ jobs:
       # This step replicates what the org-level `dev-prepare` workflow does:
       # it removes the two dep entries and the `agentic-worker` feature declaration
       # (including its removal from `default`) from the three affected Cargo.toml
-      # files. The cfg(feature="agentic-worker") code is then dead-excluded, so the
+      # files, plus every feature that entails `agentic-worker` (directly or via a
+      # sibling crate's feature: greentic-llm-backend, operala-in-process,
+      # desktop-agent-ephemeral, dev-allow-unsigned) and any `greentic-aw-runtime?/..`
+      # forwarding token, so no feature is left pointing at something removed.
+      # The cfg(feature="agentic-worker") code is then dead-excluded, so the
       # crates compile and publish without those deps. The strip is CI-ephemeral and
       # is never committed back to the branch.
       #
@@ -99,81 +103,140 @@ jobs:
           UNPUBLISHABLE_FEATS = {"agentic-worker"}
 
           # Only crates that directly reference the deps or propagate the feature.
-          TARGET_CRATES = [
-              "crates/greentic-runner-host",
-              "crates/greentic-runner-desktop",
-              "crates/greentic-runner",
-          ]
+          TARGET_CRATES = {
+              "greentic-runner-host":    "crates/greentic-runner-host",
+              "greentic-runner-desktop": "crates/greentic-runner-desktop",
+              "greentic-runner":         "crates/greentic-runner",
+          }
 
-          def strip_manifest(manifest_path: pathlib.Path) -> bool:
-              """Remove unpublishable dep entries and the agentic-worker feature.
-              Returns True if the file was modified."""
-              text = manifest_path.read_text()
-              doc  = tomlkit.loads(text)
-              changed = False
+          def load(crate: str):
+              path = WORKSPACE_ROOT / TARGET_CRATES[crate] / "Cargo.toml"
+              return path, tomlkit.loads(path.read_text())
 
-              # Remove from [dependencies] and [dev-dependencies]
+          def token_dep(token: str):
+              """The dependency/package a feature token points at, or None for a bare feature."""
+              if token.startswith("dep:"):
+                  return token[4:]
+              if "/" in token:
+                  return token.split("/", 1)[0].rstrip("?")
+              return None
+
+          def token_feature(token: str):
+              """(package, feature) for `pkg/feat` / `pkg?/feat`; (None, feat) for a bare feature."""
+              if token.startswith("dep:"):
+                  return None, None
+              if "/" in token:
+                  pkg, feat = token.split("/", 1)
+                  return pkg.rstrip("?"), feat
+              return None, token
+
+          docs = {crate: load(crate) for crate in TARGET_CRATES}
+          changed = {crate: False for crate in TARGET_CRATES}
+
+          # 1. Remove the unpublishable dependencies.
+          for crate, (_, doc) in docs.items():
               for section in ("dependencies", "dev-dependencies"):
                   if section in doc:
-                      for dep_name in list(UNPUBLISHABLE_DEPS):
+                      for dep_name in UNPUBLISHABLE_DEPS:
                           if dep_name in doc[section]:
                               del doc[section][dep_name]
-                              print(f"  [{section}] removed {dep_name!r}")
-                              changed = True
+                              print(f"  {crate}: [{section}] removed {dep_name!r}")
+                              changed[crate] = True
 
-              # Remove feature declarations and scrub from default list
-              if "features" in doc:
-                  feats = doc["features"]
-                  for feat_name in list(UNPUBLISHABLE_FEATS):
-                      if feat_name in feats:
-                          del feats[feat_name]
-                          print(f"  [features] removed {feat_name!r}")
-                          changed = True
+          # 2. Remove the `agentic-worker` feature, then CASCADE: any feature that
+          #    entails a removed feature (bare name in its own crate, or `pkg/feat` for a
+          #    removed feature of a sibling target crate) can no longer resolve and is
+          #    removed too (greentic-llm-backend, operala-in-process, desktop-agent-ephemeral,
+          #    dev-allow-unsigned, ... all list `agentic-worker`). Repeat to a fixed point.
+          removed = {(crate, feat) for crate in TARGET_CRATES for feat in UNPUBLISHABLE_FEATS}
+          progress = True
+          while progress:
+              progress = False
+              for crate, (_, doc) in docs.items():
+                  feats = doc.get("features")
+                  if feats is None:
+                      continue
+                  for name in list(feats.keys()):
+                      if name == "default":
+                          continue
+                      drop = (crate, name) in removed
+                      if not drop:
+                          for token in feats[name]:
+                              pkg, feat = token_feature(str(token))
+                              owner = crate if pkg is None else pkg
+                              if feat is not None and (owner, feat) in removed:
+                                  drop = True
+                                  break
+                      if drop:
+                          del feats[name]
+                          removed.add((crate, name))
+                          changed[crate] = True
+                          progress = True
+                          print(f"  {crate}: [features] removed {name!r}")
 
-                  if "default" in feats:
-                      original_defaults = list(feats["default"])
-                      new_defaults      = [v for v in original_defaults if v not in UNPUBLISHABLE_FEATS]
-                      if new_defaults != original_defaults:
-                          rebuilt = tomlkit.array()
-                          for val in new_defaults:
-                              rebuilt.append(val)
-                          feats["default"] = rebuilt
-                          print(f"  [features.default] {original_defaults!r} -> {new_defaults!r}")
-                          changed = True
-
-              if changed:
-                  manifest_path.write_text(tomlkit.dumps(doc))
-              return changed
+          # 3. Scrub what is left: tokens that point at a removed dependency (e.g.
+          #    `state-disk = ["greentic-aw-runtime?/state-disk"]`) or a removed feature
+          #    (the `default` list). A feature that ends up empty stays as `[]`.
+          for crate, (_, doc) in docs.items():
+              feats = doc.get("features")
+              if feats is None:
+                  continue
+              for name in list(feats.keys()):
+                  original = [str(v) for v in feats[name]]
+                  kept = []
+                  for token in original:
+                      dep = token_dep(token)
+                      pkg, feat = token_feature(token)
+                      owner = crate if pkg is None else pkg
+                      if dep in UNPUBLISHABLE_DEPS:
+                          continue
+                      if feat is not None and (owner, feat) in removed:
+                          continue
+                      kept.append(token)
+                  if kept != original:
+                      rebuilt = tomlkit.array()
+                      for val in kept:
+                          rebuilt.append(val)
+                      feats[name] = rebuilt
+                      changed[crate] = True
+                      print(f"  {crate}: [features.{name}] {original!r} -> {kept!r}")
 
           any_changed = False
-          for crate_rel in TARGET_CRATES:
-              manifest_path = WORKSPACE_ROOT / crate_rel / "Cargo.toml"
-              print(f"Checking {crate_rel}/Cargo.toml ...")
-              if strip_manifest(manifest_path):
+          for crate, (path, doc) in docs.items():
+              print(f"Checking {TARGET_CRATES[crate]}/Cargo.toml ...")
+              if changed[crate]:
+                  path.write_text(tomlkit.dumps(doc))
                   any_changed = True
-                  print(f"  => stripped")
+                  print("  => stripped")
               else:
-                  print(f"  => no-op (already clean)")
+                  print("  => no-op (already clean)")
 
           print(f"\nStrip complete. {'Manifests modified.' if any_changed else 'No changes needed.'}")
           PYEOF
 
+          # Fail here, not at publish time, if the strip left a feature that
+          # points at a removed dependency or feature.
+          cargo metadata --format-version 1 --no-deps >/dev/null
+
       # Publish in dependency order (runner-core → greentic-runner-host →
       # greentic-runner-desktop → greentic-runner).
       #
-      # Crates excluded from this list because they have publish = false:
-      #   - crates/tests          (integration-test harness, never published)
-      #   - tests/fixtures/…      (test fixture component, never published)
-      #   - greentic-aw-runtime   (internal, no publish intent at this stage)
+      # Crates deliberately NOT in this list:
+      #   - crates/tests, crates/telco-x-event-bridge  (publish = false)
+      #   - greentic-aw-runtime, aw-event-bridge, greentic-a2a: these have no
+      #     `publish = false`, and the develop/main lanes (dev-publish.yml,
+      #     crates-publish.yml, release-binaries.yml) publish them. On this
+      #     branch greentic-aw-runtime carries private git dependencies, which
+      #     crates.io rejects, so the strip step above removes the
+      #     `agentic-worker` feature from the three crates below instead.
       #
       # --allow-dirty is required because the strip step above modifies Cargo.toml
       # files in-place without committing (CI-ephemeral operation).
       #
-      # warn-on-failure rather than hard-fail: if a partial publish run is
-      # re-triggered after fixing one crate, the already-published crates will
-      # return "already exists" — a warning lets the run continue to the
-      # remaining crates instead of aborting the whole job. The final step
-      # summarises which crates succeeded.
+      # Re-publishing an existing version returns "already exists", which is
+      # tolerated so a partial run can be re-triggered. Any other failure
+      # (auth, verification, a dependency issue) fails the job: continuing
+      # would publish dependents against a stale dependency.
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -181,16 +244,22 @@ jobs:
           set -euo pipefail
 
           published=()
-          failed=()
+          skipped=()
+          log="$(mktemp)"
 
           for crate in runner-core greentic-runner-host greentic-runner-desktop greentic-runner; do
             echo "==> publishing $crate"
-            if cargo publish -p "$crate" --allow-dirty --token "$CARGO_REGISTRY_TOKEN"; then
+            if cargo publish -p "$crate" --allow-dirty --token "$CARGO_REGISTRY_TOKEN" 2>&1 | tee "$log"; then
               published+=("$crate")
               echo "::notice::$crate published successfully"
+            elif grep -qiE 'already (exists|uploaded)' "$log"; then
+              skipped+=("$crate")
+              echo "::notice::$crate already published at this version; continuing"
             else
-              failed+=("$crate")
-              echo "::warning::publish of $crate failed (already published at this version, or a dependency issue) — continuing with remaining crates"
+              echo "::error::publish of $crate failed (not an 'already exists' error)"
+              echo "Published : ${published[*]:-none}"
+              echo "Skipped   : ${skipped[*]:-none}"
+              exit 1
             fi
             # Give the crates.io index time to ingest the new crate before the
             # next dependent crate tries to resolve it.
@@ -200,8 +269,4 @@ jobs:
           echo ""
           echo "===== Publish summary ====="
           echo "Published : ${published[*]:-none}"
-          echo "Failed    : ${failed[*]:-none}"
-
-          if [[ ${#failed[@]} -gt 0 ]]; then
-            echo "::warning::One or more crates failed to publish. Check the log above for details."
-          fi
+          echo "Skipped   : ${skipped[*]:-none}"

@@ -92,7 +92,7 @@ impl ProviderRegistry {
     ) -> Result<Self> {
         let inline = extract_inline_providers(manifest)?;
         let tenant_ctx = TenantCtx::new(
-            EnvId::from_str(env).unwrap_or_else(|_| EnvId::from_str("local").expect("local env")),
+            EnvId::from_str(env).with_context(|| format!("invalid env id `{env}`"))?,
             TenantId::from_str(tenant).with_context(|| format!("invalid tenant id `{tenant}`"))?,
         );
         let pack_ref = Some(format!(
@@ -228,7 +228,9 @@ impl ProviderRegistry {
             return Ok(binding);
         }
 
-        let provider_type = provider_type.unwrap();
+        let Some(provider_type) = provider_type else {
+            bail!("provider selection requires a provider_id or a provider_type");
+        };
         let matches: Vec<_> = self
             .inline
             .iter()
@@ -373,6 +375,36 @@ mod tests {
             state_store: None,
             tenant,
         }
+    }
+
+    fn empty_manifest() -> PackManifest {
+        PackManifest {
+            agents: Default::default(),
+            schema_version: "1.0".into(),
+            pack_id: greentic_types::PackId::new("vendor.providers").expect("pack id"),
+            name: None,
+            version: semver::Version::new(0, 1, 0),
+            kind: greentic_types::PackKind::Application,
+            publisher: "test".into(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: Default::default(),
+            bootstrap: None,
+            extensions: None,
+        }
+    }
+
+    #[test]
+    fn invalid_env_is_rejected_not_silently_local() {
+        let manifest = empty_manifest();
+        assert!(ProviderRegistry::new(&manifest, None, "demo", "local").is_ok());
+        let err = ProviderRegistry::new(&manifest, None, "demo", "not a valid env!")
+            .err()
+            .expect("invalid env must fail");
+        assert!(err.to_string().contains("invalid env id"));
     }
 
     #[test]

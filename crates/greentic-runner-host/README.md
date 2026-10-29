@@ -6,7 +6,7 @@ Provider execution is **provider-core only**: packs declare provider runtimes vi
 
 ## Architecture highlights
 
-- **Pack ingestion** – consumes a JSON index (local path, HTTPS, or cloud bucket) via `runner-core`, verifies signatures/digests (`PACK_PUBLIC_KEY`, `PACK_VERIFY_STRICT`), caches artifacts under `PACK_CACHE_DIR`, and supports ordered overlays per tenant.
+- **Pack ingestion** – consumes a JSON index (local path, HTTPS, or cloud bucket) via `runner-core`, verifies signatures/digests (trust keys from `packs.trust.public_keys`, `PACK_VERIFY_STRICT`), caches artifacts under the configured `packs.cache_dir`, and supports ordered overlays per tenant.
 - **Hot reload** – `PACK_REFRESH_INTERVAL` drives a watcher that resolves the index, preloads packs, and swaps tenant runtimes atomically; `/admin/packs/reload` triggers the same path on demand. Overlays can be added/removed without touching the base pack.
 - **Canonical ingress** – all adapters normalize raw provider payloads into the shared schema:
   ```json
@@ -159,11 +159,11 @@ async fn main() -> anyhow::Result<()> {
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `PACK_SOURCE` | Default resolver scheme when the index omits one (`fs`, `http`, `oci`, `s3`, `gcs`, `azblob`) | `fs` |
-| `PACK_INDEX_URL` | URI or path to the pack index consumed by the watcher | _required_ |
-| `PACK_CACHE_DIR` | Location for the content-addressed pack cache | `.packs` |
-| `PACK_PUBLIC_KEY` | Optional Ed25519 key (`ed25519:BASE64...`) to enforce signature checks | _unset_ |
-| `PACK_VERIFY_STRICT` | Force signature verification even when no `PACK_PUBLIC_KEY` is provided (`1/true`), or opt out when the key is present (`0/false`) | `PACK_PUBLIC_KEY` driven |
+| `PACK_VERIFY_STRICT` | Truthy (`1/true/yes/on`) enables strict verification: a trust key is required, signatures must be canonical, remote packs need a pinned digest, `fs://` locators are confined. It only adds checks; it cannot switch verification off when a trust key is configured | `false` |
+| `PACK_FS_ALLOWED_ROOTS` | Extra roots (platform path list) absolute `fs://` locators may point into; setting it turns confinement on | _unset_ |
+| `PACK_ALLOW_LEGACY_SIGNATURES` | Accept legacy digest-only signatures under strict mode | `false` |
+| `GREENTIC_TRACE_OUT` | Trace file path; setting it enables trace capture (unset = off) | _unset_ |
+| `GREENTIC_TRACE_CAPTURE_INPUTS` | `1` also records node inputs in the trace | _unset_ |
 | `PACK_REFRESH_INTERVAL` | Interval used by the background watcher (`30s`, `5m`, etc.) | `30s` |
 | `TENANT_RESOLVER` | Router mode for HTTP requests (`host`, `header`, `jwt`, `env`) | `env` |
 | `DEFAULT_TENANT` | Fallback tenant identifier when the resolver cannot infer one | `demo` |
@@ -171,10 +171,12 @@ async fn main() -> anyhow::Result<()> {
 | `OTEL_SERVICE_NAME` | Overrides the OTLP service name advertised to the collector | `greentic-runner-host` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Explicit OTLP collector endpoint | provider preset / unset |
 | `ADMIN_TOKEN` | Bearer token required for `/admin` endpoints (loopback-only access if unset) | _unset_ |
-| `SLACK_SIGNING_SECRET` | HMAC secret for Slack Events/Interactive adapters | _unset_ |
-| `WEBEX_WEBHOOK_SECRET` | Signature key for Cisco Webex webhook validation | _unset_ |
-| `WHATSAPP_VERIFY_TOKEN` / `WHATSAPP_APP_SECRET` | Verification + signature secrets for WhatsApp Cloud API | _unset_ |
-| `PACK_VERIFY_STRICT` | Enforce signature checks even without a public key | driven by key |
+
+> Provider secrets such as `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`,
+> `WHATSAPP_VERIFY_TOKEN` and `WHATSAPP_APP_SECRET` are **not read from process
+> env by the host**. Provider credentials are resolved through the secrets
+> backend (`SECRETS_BACKEND`; the `env` backend maps secret keys to env vars)
+> by the provider-core components that need them.
 
 ## Admin API
 

@@ -10,11 +10,12 @@ use reqwest::Client;
 use serde_json::Value;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
 use crate::engine::runtime::StateMachineRuntime;
-use crate::oauth::{OAuthBrokerConfig, request_resource_token};
+use crate::oauth::{OAuthBrokerConfig, request_resource_token_with_auth};
 use crate::operator_metrics::OperatorMetrics;
 use crate::operator_registry::OperatorRegistry;
 use crate::pack::{ComponentResolution, PackRuntime};
@@ -173,11 +174,18 @@ impl ActivePacks {
 
     /// Insert (or replace) a single tenant-only runtime, preserving all other
     /// entries — including revision-keyed ones.
+    ///
+    /// A runtime this replaces has its cron timers stopped
+    /// ([`TenantRuntime::abort_timers`]): it can stay referenced by an embedder
+    /// or in-flight work, and without this its timers kept firing alongside the
+    /// replacement's (a double fire per tick). Re-inserting the SAME runtime is
+    /// not a replacement and cancels nothing.
     pub fn insert_pack(&self, tenant: &str, runtime: Arc<TenantRuntime>) {
         let _guard = self.write_lock.lock();
         let mut next = (*self.inner.load_full()).clone();
-        next.insert(RuntimeKey::legacy(tenant), runtime);
+        let replaced = next.insert(RuntimeKey::legacy(tenant), Arc::clone(&runtime));
         self.inner.store(Arc::new(next));
+        retire_replaced(replaced, &runtime);
     }
 
     /// Insert (or replace) a single revision-keyed runtime, preserving every
@@ -226,8 +234,11 @@ impl ActivePacks {
         }
         let _guard = self.write_lock.lock();
         let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
-        let next = insert_keyed_entry(&self.inner.load_full(), key, runtime);
+        let prev = self.inner.load_full();
+        let replaced = prev.get(&key).cloned();
+        let next = insert_keyed_entry(&prev, key, Arc::clone(&runtime));
         self.inner.store(Arc::new(next));
+        retire_replaced(replaced, &runtime);
         Ok(())
     }
 
@@ -258,6 +269,9 @@ impl ActivePacks {
         let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
         let (next, removed) = remove_keyed_entry(&prev, &key)?;
         self.inner.store(Arc::new(next));
+        // Retired for good: stop its cron timers even though the caller (and
+        // in-flight work) may keep the returned `Arc` alive for a while.
+        removed.abort_timers();
         Some(removed)
     }
 
@@ -274,6 +288,16 @@ impl ActivePacks {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Stop the timers of a runtime that was just replaced by `current`, unless it
+/// IS `current` (re-inserting the same runtime must not cancel its own timers).
+fn retire_replaced(replaced: Option<Arc<TenantRuntime>>, current: &Arc<TenantRuntime>) {
+    if let Some(old) = replaced
+        && !Arc::ptr_eq(&old, current)
+    {
+        old.abort_timers();
     }
 }
 
@@ -301,6 +325,14 @@ pub struct TenantRuntime {
     http_client: Client,
     mocks: Option<Arc<MockLayer>>,
     timer_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Cancelled when this runtime's cron timers must stop. The timer tasks
+    /// only observe it while SLEEPING, so a tick that is already running its
+    /// flow finishes (and saves its snapshot) instead of being torn down.
+    timer_cancel: CancellationToken,
+    /// NATS response listeners and the MCP warm listener this runtime spawned.
+    /// Aborted on drop so a reload (which swaps in a fresh `TenantRuntime`)
+    /// does not leave the old listeners running beside the new ones.
+    background_handles: Mutex<Vec<JoinHandle<()>>>,
     secrets: DynSecretsManager,
     operator_registry: OperatorRegistry,
     operator_metrics: Arc<OperatorMetrics>,
@@ -510,14 +542,79 @@ impl RevisionHostOptions {
 }
 
 /// Block on a future whether or not we're already inside a tokio runtime.
-pub fn block_on<F: Future<Output = R>, R>(future: F) -> R {
-    if let Ok(handle) = Handle::try_current() {
-        handle.block_on(future)
-    } else {
-        Runtime::new()
-            .expect("failed to create tokio runtime")
-            .block_on(future)
+///
+/// `Handle::block_on` panics when called from async context, so inside a
+/// multi-thread runtime this yields the worker via `block_in_place`, and inside
+/// a current-thread runtime (where `block_in_place` also panics) it drives the
+/// future on a short-lived helper thread with its own runtime.
+///
+/// Infallible by signature; if even the fallback runtime cannot be built it
+/// degrades to a runtime-less executor rather than panicking. Prefer
+/// [`try_block_on`] when the caller can surface the error.
+pub fn block_on<F, R>(future: F) -> R
+where
+    F: Future<Output = R> + Send,
+    R: Send,
+{
+    match Handle::try_current() {
+        Ok(handle) => block_in_context(&handle, future).unwrap_or_else(|(future, err)| {
+            tracing::warn!(error = %err, "falling back to a runtime-less executor");
+            futures::executor::block_on(future)
+        }),
+        Err(_) => match build_scoped_runtime() {
+            Ok(rt) => rt.block_on(future),
+            Err(err) => {
+                tracing::warn!(error = %err, "falling back to a runtime-less executor");
+                futures::executor::block_on(future)
+            }
+        },
     }
+}
+
+/// [`block_on`], surfacing a failure to build the helper runtime or a panic on
+/// the helper thread as an error.
+pub fn try_block_on<F, R>(future: F) -> Result<R>
+where
+    F: Future<Output = R> + Send,
+    R: Send,
+{
+    match Handle::try_current() {
+        Ok(handle) => block_in_context(&handle, future).map_err(|(_, err)| err),
+        Err(_) => Ok(build_scoped_runtime()?.block_on(future)),
+    }
+}
+
+fn build_scoped_runtime() -> Result<Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")
+}
+
+/// Run `future` to completion from inside a tokio runtime context. On failure
+/// the future is handed back alongside the error when it was never polled.
+fn block_in_context<F, R>(handle: &Handle, future: F) -> std::result::Result<R, (F, anyhow::Error)>
+where
+    F: Future<Output = R> + Send,
+    R: Send,
+{
+    use tokio::runtime::RuntimeFlavor;
+    if matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread) {
+        return Ok(tokio::task::block_in_place(|| handle.block_on(future)));
+    }
+    let rt = match build_scoped_runtime() {
+        Ok(rt) => rt,
+        Err(err) => return Err((future, err)),
+    };
+    // `std::thread::scope` joins before returning, so `future` may borrow.
+    std::thread::scope(|scope| {
+        match scope.spawn(move || rt.block_on(future)).join() {
+            Ok(value) => Ok(value),
+            // The future panicked: surface that panic to the caller as it
+            // would have been on a direct poll.
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 impl TenantRuntime {
@@ -1702,6 +1799,23 @@ impl TenantRuntime {
             ));
         }
 
+        // Built BEFORE any listener task is spawned: a fallible step after the
+        // spawns would drop their JoinHandles, which detaches (not aborts) them.
+        // Guarded like the pack's blocking client: this client carries the
+        // email/OAuth broker traffic, so it must not reach link-local or
+        // cloud-metadata addresses (SSRF), including via redirects. The DNS half
+        // of the guard does NOT apply behind an `HTTP(S)_PROXY` (the proxy
+        // resolves the name; an IP literal is never resolved): this client keeps
+        // the environment proxy on purpose, because it talks to operator-set
+        // broker/OAuth/mail URLs that some deployments reach only via a proxy.
+        let http_guard = crate::http_guard::HttpGuard::from_env();
+        let http_client = Client::builder()
+            .dns_resolver(Arc::new(crate::http_guard::GuardedResolver {
+                guard: http_guard,
+            }))
+            .redirect(crate::http_guard::redirect_policy(http_guard))
+            .build()?;
+
         // Spawn the response listeners now that the ingress handle
         // (`state_machine`) exists. Each listener resumes paused flows by feeding
         // a synthesized ingress envelope through `StateMachineRuntime::handle`
@@ -1710,18 +1824,44 @@ impl TenantRuntime {
         // we run one listener per runtime so every `*.call` node's responses
         // (`greentic.<runtime>.response.v1`) are consumed. Only started when the
         // dispatcher above connected successfully.
+        let mut background_handles: Vec<JoinHandle<()>> = Vec::new();
         if let Some(client) = dispatch_nats_client {
             let resumer = Arc::new(
                 crate::runner::runtime_session_resumer::RuntimeSessionResumer::new(Arc::clone(
                     &state_machine,
-                )),
+                ))
+                .with_watchdog_notifier(
+                    crate::runner::dispatch_listener::nats_watchdog_notifier(
+                        client.clone(),
+                        config.tenant.clone(),
+                    ),
+                ),
             );
-            for runtime_name in ["sorla", "operala", "agentic", "telco-x", "approval"] {
-                tokio::spawn(crate::runner::dispatch_listener::run_response_listener(
+            background_handles.push(spawn_listener_logged(
+                "watchdog-cancel",
+                crate::runner::dispatch_listener::run_watchdog_cancel_listener(
                     client.clone(),
-                    runtime_name.to_string(),
-                    Arc::clone(&resumer)
-                        as Arc<dyn crate::runner::dispatch_listener::SessionResumer>,
+                    config.tenant.clone(),
+                    crate::runner::dispatch_listener::process_cancel_origin().to_string(),
+                ),
+            ));
+            for runtime_name in ["sorla", "operala", "agentic", "telco-x", "approval"] {
+                // Per-tenant queue group + tenant filter: replicas and reloaded
+                // runtimes of one tenant share a delivery, and one tenant's
+                // runtime never resumes another tenant's response.
+                let scope = crate::runner::dispatch_listener::ListenerScope {
+                    queue_group: Some(format!("runner-{}-{runtime_name}", config.tenant)),
+                    tenant: Some(config.tenant.clone()),
+                };
+                background_handles.push(spawn_listener_logged(
+                    runtime_name,
+                    crate::runner::dispatch_listener::run_response_listener_scoped(
+                        client.clone(),
+                        runtime_name.to_string(),
+                        Arc::clone(&resumer)
+                            as Arc<dyn crate::runner::dispatch_listener::SessionResumer>,
+                        scope,
+                    ),
                 ));
             }
             // Eagerly pre-cache local-wasm MCP components when the admin publishes
@@ -1729,14 +1869,14 @@ impl TenantRuntime {
             // `mcp_store_pull` lives in `greentic-aw-runtime` which is only
             // present when that feature is enabled.
             #[cfg(feature = "agentic-worker")]
-            tokio::spawn(crate::runner::mcp_warm_listener::run_mcp_warm_listener(
-                client.clone(),
+            background_handles.push(spawn_listener_logged(
+                "mcp-warm",
+                crate::runner::mcp_warm_listener::run_mcp_warm_listener(client.clone()),
             ));
             tracing::info!(
                 "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call / telco-x.call"
             );
         }
-        let http_client = Client::builder().build()?;
         Ok(Arc::new(Self {
             tenant: config.tenant.clone(),
             config,
@@ -1748,6 +1888,8 @@ impl TenantRuntime {
             http_client,
             mocks,
             timer_handles: Mutex::new(Vec::new()),
+            timer_cancel: CancellationToken::new(),
+            background_handles: Mutex::new(background_handles),
             secrets: secrets_manager,
             operator_registry,
             operator_metrics,
@@ -1866,6 +2008,30 @@ impl TenantRuntime {
         self.timer_handles.lock().extend(handles);
     }
 
+    /// Token the cron timer tasks select on while sleeping.
+    pub(crate) fn timer_cancel_token(&self) -> CancellationToken {
+        self.timer_cancel.clone()
+    }
+
+    /// Stop this runtime's cron timers now. Used when a reload supersedes the
+    /// runtime: it may stay referenced by in-flight work for a while, and its
+    /// timers must not fire alongside the replacement's.
+    ///
+    /// Cooperative, not `JoinHandle::abort`: a timer sleeping stops before its
+    /// NEXT tick, but a tick already inside `state_machine().handle(..)` runs
+    /// to completion, so its effects are never left without the snapshot/state
+    /// save that follows them. The handles are detached; each task exits on
+    /// its own.
+    pub fn abort_timers(&self) {
+        self.timer_cancel.cancel();
+        self.timer_handles.lock().clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timer_count(&self) -> usize {
+        self.timer_handles.lock().len()
+    }
+
     /// Read a RUNTIME-level secret, at the `_runner` pseudo-pack segment.
     ///
     /// **Deliberately NOT unit-scoped**, unlike every pack secret a component
@@ -1918,7 +2084,15 @@ impl TenantRuntime {
         request: &EmailSendRequest,
     ) -> Result<()> {
         let plan = self.build_events_email_execution_plan(tenant, request)?;
-        let token = request_resource_token(self.http_client(), &plan.token_request).await?;
+        // The broker authenticates the runner with its shared secret; the
+        // un-authenticated variant would be rejected by a secured broker.
+        let shared_secret = self.oauth_config().and_then(|c| c.shared_secret);
+        let token = request_resource_token_with_auth(
+            self.http_client(),
+            &plan.token_request,
+            shared_secret.as_deref(),
+        )
+        .await?;
         self.execute_events_email_request(&token.access_token, request)
             .await
     }
@@ -1953,14 +2127,120 @@ impl TenantRuntime {
     }
 }
 
+/// Spawn a long-running listener future, logging (rather than discarding) the
+/// error if it ends. Returns the task handle so the owner can abort it:
+/// aborting drops the inner future, which closes its subscription.
+fn spawn_listener_logged<F>(name: &'static str, listener: F) -> JoinHandle<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) = listener.await {
+            tracing::warn!(listener = name, %error, "background listener stopped");
+        }
+    })
+}
+
 impl Drop for TenantRuntime {
     fn drop(&mut self) {
-        for handle in self.timer_handles.lock().drain(..) {
+        // Cooperative (see `abort_timers`): a task mid-tick holds a strong
+        // `Arc` to this runtime, so Drop can only race a sleeping timer.
+        self.timer_cancel.cancel();
+        self.timer_handles.lock().clear();
+        for handle in self.background_handles.lock().drain(..) {
             handle.abort();
         }
         if let Some(inbox) = &self.approval_inbox {
             inbox.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod timer_retirement_tests {
+    use super::*;
+
+    const CRON: &str = r#"[{ flow_id: "flow.main", cron: "0 0 1 1 *" }]"#;
+
+    async fn runtime_with_timers() -> (impl Sized, Arc<TenantRuntime>) {
+        let (workspace, runtime) = crate::test_support::build_test_runtime_with_timers(CRON)
+            .await
+            .expect("runtime");
+        let timers = crate::runner::adapt_timer::spawn_timers(Arc::clone(&runtime)).expect("spawn");
+        runtime.register_timers(timers);
+        (workspace, runtime)
+    }
+
+    #[tokio::test]
+    async fn insert_pack_stops_the_timers_of_the_runtime_it_replaces() {
+        let (_w1, old) = runtime_with_timers().await;
+        let (_w2, new) = runtime_with_timers().await;
+        let active = ActivePacks::new();
+        active.insert_pack("demo", Arc::clone(&old));
+        assert!(!old.timer_cancel_token().is_cancelled());
+
+        active.insert_pack("demo", Arc::clone(&new));
+        assert!(
+            old.timer_cancel_token().is_cancelled(),
+            "the replaced runtime must stop firing"
+        );
+        assert!(
+            !new.timer_cancel_token().is_cancelled(),
+            "the replacement keeps its timers"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_inserting_the_same_runtime_keeps_its_timers() {
+        let (_w, runtime) = runtime_with_timers().await;
+        let active = ActivePacks::new();
+        active.insert_pack("demo", Arc::clone(&runtime));
+        active.insert_pack("demo", Arc::clone(&runtime));
+        assert!(!runtime.timer_cancel_token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn remove_revision_stops_the_timers_of_the_removed_runtime() {
+        let (_w, runtime) = runtime_with_timers().await;
+        let (deployment, bundle, revision) = (
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        let active = ActivePacks::new();
+        // Install under a revision key directly: building a runtime whose
+        // rollout identity matches is covered by `insert_revision`'s own tests.
+        let mut map = HashMap::new();
+        map.insert(
+            RuntimeKey::revision("demo", deployment, bundle.clone(), revision),
+            Arc::clone(&runtime),
+        );
+        active.replace(map);
+        let removed = active.remove_revision("demo", deployment, bundle, revision);
+        assert!(removed.is_some());
+        assert!(runtime.timer_cancel_token().is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod block_on_tests {
+    use super::*;
+
+    #[test]
+    fn works_without_a_runtime() {
+        assert_eq!(block_on(async { 7 }), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn does_not_panic_inside_a_multi_thread_runtime() {
+        assert_eq!(block_on(async { 8 }), 8);
+        assert_eq!(try_block_on(async { 9 }).ok(), Some(9));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_panic_inside_a_current_thread_runtime() {
+        assert_eq!(block_on(async { 10 }), 10);
+        assert_eq!(try_block_on(async { 11 }).ok(), Some(11));
     }
 }
 

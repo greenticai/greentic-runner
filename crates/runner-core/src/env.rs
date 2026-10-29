@@ -46,13 +46,13 @@ impl PackConfig {
                 IndexLocation::from_value(url)?
             }
             greentic_config_types::PackSourceConfig::OciRegistry { reference } => {
-                IndexLocation::from_value(reference)?
+                bail!(
+                    "OCI registry pack sources are not supported (reference `{reference}`); \
+                     use a local or HTTP(S) index"
+                )
             }
         };
-        let public_key = cfg
-            .trust
-            .as_ref()
-            .and_then(|trust| trust.public_keys.first().cloned());
+        let public_key = join_public_keys(cfg.trust.as_ref().map(|t| t.public_keys.as_slice()));
         Ok(Self {
             source: PackSource::Fs,
             index_location,
@@ -60,6 +60,23 @@ impl PackConfig {
             public_key,
             network: None,
         })
+    }
+}
+
+/// Join configured trust keys into one multi-key value (comma separated) so
+/// every key is tried during verification (key rotation).
+pub fn join_public_keys(keys: Option<&[String]>) -> Option<String> {
+    let keys = keys?;
+    let joined = keys
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
     }
 }
 
@@ -208,6 +225,29 @@ mod tests {
             }
             IndexLocation::File(_) => panic!("expected remote index"),
         }
+    }
+
+    #[test]
+    fn from_packs_joins_all_trust_keys_and_rejects_oci_sources() {
+        let mut cfg = PacksConfig {
+            source: PackSourceConfig::LocalIndex {
+                path: PathBuf::from("/tmp/index.json"),
+            },
+            cache_dir: PathBuf::from("/tmp/packs-cache"),
+            index_cache_ttl_secs: None,
+            trust: Some(PackTrustConfig {
+                public_keys: vec!["ed25519:one".into(), "ed25519:two".into()],
+                require_signatures: false,
+            }),
+        };
+        let pack = PackConfig::from_packs(&cfg).expect("pack config");
+        assert_eq!(pack.public_key.as_deref(), Some("ed25519:one,ed25519:two"));
+
+        cfg.source = PackSourceConfig::OciRegistry {
+            reference: "oci://example/packs".into(),
+        };
+        let err = PackConfig::from_packs(&cfg).expect_err("oci unsupported");
+        assert!(err.to_string().contains("not supported"));
     }
 
     #[test]

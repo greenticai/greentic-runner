@@ -230,6 +230,32 @@ mod aw {
         Some(greentic_aw_runtime::guardrail_provider::HttpGuardrailPolicy::new(endpoint, token))
     }
 
+    /// Install the platform guardrail policy on `runtime`: the admin-served
+    /// policy when `GREENTIC_AW_ADMIN_ENDPOINT`/`_TOKEN` are set (an
+    /// undeterminable policy fails CLOSED in the runtime), else a static one
+    /// built from `fallback`.
+    ///
+    /// The single builder shared by the out-of-process serve path, the
+    /// in-process `dw.agent` handler and graph turns, so none of them can run
+    /// an agent with fewer guardrails than another.
+    pub(crate) fn attach_guardrails(
+        runtime: AgentRuntime,
+        ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
+        fallback: Vec<greentic_aw_runtime::config::GuardrailRef>,
+    ) -> AgentRuntime {
+        let policy: Arc<dyn greentic_aw_runtime::guardrail::GuardrailPolicy> =
+            match guardrail_policy_from_env() {
+                Some(http) => Arc::new(http),
+                None => Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
+                    fallback,
+                )),
+            };
+        runtime.with_guardrails(
+            policy,
+            Arc::new(greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator { ext_runtime }),
+        )
+    }
+
     /// Production [`AgentNodeHandler`] wrapping the agentic-worker runtime.
     ///
     /// Holds a shared [`AgentRuntime`] and translates a `DwAgent` flow node's
@@ -368,16 +394,26 @@ mod aw {
 
     /// Build a [`greentic_types::TenantCtx`] for the agent-audit observer from
     /// the flow node's plain `tenant_id`/`env_id` strings. Mirrors
-    /// `HostConfig::tenant_ctx`'s fallback-to-"local" pattern: an id that fails
-    /// the newtype's validation (which should not happen once a flow has been
-    /// routed to a tenant) still yields a well-formed `TenantCtx` rather than
-    /// panicking — the audit event is best-effort, never load-bearing.
-    fn tenant_ctx_for_audit(tenant_id: &str, env_id: &str) -> greentic_types::TenantCtx {
-        let env = greentic_types::EnvId::from_str(env_id)
-            .unwrap_or_else(|_| greentic_types::EnvId::new("local").expect("local env id"));
-        let tenant = greentic_types::TenantId::from_str(tenant_id)
-            .unwrap_or_else(|_| greentic_types::TenantId::new("local").expect("local tenant id"));
-        greentic_types::TenantCtx::new(env, tenant)
+    /// An id that fails the newtype's validation is an error: silently mapping
+    /// it to a shared `local` tenant would attribute audit and metering events
+    /// to the wrong tenant.
+    pub(crate) fn tenant_ctx_for_audit(
+        tenant_id: &str,
+        env_id: &str,
+    ) -> Result<greentic_types::TenantCtx> {
+        // A bad id is deterministic, and its message echoes the id, which can
+        // contain a word `should_retry`'s text heuristic treats as transient
+        // ("internal", "timeout", ...). Terminal, so re-running the turn is
+        // never attempted for it.
+        let env = greentic_types::EnvId::from_str(env_id).map_err(|err| {
+            crate::runner::engine::terminal_flow_error(format!("invalid env id `{env_id}`: {err}"))
+        })?;
+        let tenant = greentic_types::TenantId::from_str(tenant_id).map_err(|err| {
+            crate::runner::engine::terminal_flow_error(format!(
+                "invalid tenant id `{tenant_id}`: {err}"
+            ))
+        })?;
+        Ok(greentic_types::TenantCtx::new(env, tenant))
     }
 
     #[async_trait::async_trait]
@@ -468,7 +504,9 @@ mod aw {
             if let Some(sink) = &self.audit_sink {
                 observers.push(Arc::new(AgentAuditObserver::new(
                     sink.clone(),
-                    tenant_ctx_for_audit(tenant_id, env_id),
+                    // Before `runtime.step`: nothing has run yet.
+                    tenant_ctx_for_audit(tenant_id, env_id)
+                        .map_err(crate::runner::engine::pre_effect)?,
                     agent_id.to_string(),
                     session_id.to_string(),
                 )));
@@ -530,7 +568,7 @@ mod aw {
                     // mirrors the audit-sink "off" branch's byte-identical
                     // behaviour above.
                     if let Some(sink) = &self.audit_sink {
-                        let tenant_ctx = tenant_ctx_for_audit(tenant_id, env_id);
+                        let tenant_ctx = tenant_ctx_for_audit(tenant_id, env_id)?;
                         sink.emit(
                             metering_subject(tenant_id),
                             &build_agent_run_metering_event(
@@ -578,12 +616,16 @@ mod aw {
                         %code,
                         "DwAgent blocked by guardrail"
                     );
-                    Ok(guardrail_denied_json(
-                        direction,
-                        &code,
-                        &message,
-                        details.as_deref(),
-                    ))
+                    let mut out =
+                        guardrail_denied_json(direction, &code, &message, details.as_deref());
+                    // A denial must not strand a `flow:` tool that is still
+                    // parked on its card: re-offer it like any other failed turn
+                    // so the engine keeps its await armed.
+                    if let Some(card) = self.runtime.parked_card(&tenant_for_card, session_id).await
+                    {
+                        reoffer_parked_card(&mut out, card);
+                    }
+                    Ok(out)
                 }
                 Err(error) => {
                     // Never leak the internal AgentError to the flow output. Log
@@ -650,8 +692,8 @@ mod aw {
     /// Resolve the extension discovery directory for tool dispatch.
     ///
     /// Honours `GREENTIC_EXTENSIONS_DIR`; otherwise falls back to
-    /// `~/.greentic/extensions` (the platform convention), and finally to a
-    /// temp-dir path when no home directory can be resolved. A missing or
+    /// `~/.greentic/extensions` (the platform convention), and finally to
+    /// `/var/lib/greentic/extensions` when no home directory can be resolved. A missing or
     /// empty directory is harmless — `list_tools`/`invoke_tool` simply return
     /// empty/NotFound, which is correct for tool-less agents.
     fn extension_discovery_dir() -> PathBuf {
@@ -663,13 +705,15 @@ mod aw {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(".greentic").join("extensions");
         }
-        std::env::temp_dir().join("greentic").join("extensions")
+        // Not the temp dir: a predictable path under a world-writable
+        // directory is one another local user can pre-create.
+        PathBuf::from("/var/lib/greentic/extensions")
     }
 
     /// Resolve the directory scanned for `<agent_id>.json` Digital Worker manifests.
     ///
     /// Honours `GREENTIC_AGENT_MANIFESTS_DIR`; otherwise `~/.greentic/agents`, and
-    /// finally a temp-dir path when no home is resolvable (keeps the fn total). A
+    /// finally `/var/lib/greentic/agents` when no home is resolvable (keeps the fn total). A
     /// missing dir is harmless — the overlay provider simply finds no manifest and
     /// returns the YAML base unchanged.
     fn manifests_discovery_dir() -> PathBuf {
@@ -681,7 +725,7 @@ mod aw {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(".greentic").join("agents");
         }
-        std::env::temp_dir().join("greentic").join("agents")
+        PathBuf::from("/var/lib/greentic/agents")
     }
 
     /// Build an [`HttpConfigProvider`] from `GREENTIC_AW_ADMIN_ENDPOINT` +
@@ -979,9 +1023,7 @@ mod aw {
 
     impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
-            let name = env_var_name_for_secret(uri);
-            std::env::var(&name)
-                .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
+            env_secret_lookup(uri)
         }
     }
 
@@ -1014,10 +1056,7 @@ mod aw {
             tenant: String,
             unit: Option<String>,
         ) -> Self {
-            let env = std::env::var("GREENTIC_ENV")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "dev".to_string());
+            let env = crate::config::greentic_env().unwrap_or_else(|| "dev".to_string());
             Self {
                 secrets,
                 tenant,
@@ -1105,9 +1144,7 @@ mod aw {
                 }
             }
             // Fallback: env var (preserves pre-store behaviour).
-            let name = env_var_name_for_secret(uri);
-            std::env::var(&name)
-                .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
+            env_secret_lookup(uri)
         }
     }
 
@@ -1120,6 +1157,111 @@ mod aw {
     /// process (built off the async runtime) and hand out cheap clones — a
     /// clone dropped in async context never drops the underlying runtime, which
     /// is released only at process exit (outside any runtime).
+    /// DNS resolver for the extension runtime's (reqwest 0.12) client: applies
+    /// the same address policy as the host `http-client`
+    /// ([`crate::http_guard::GuardedResolver`] targets reqwest 0.13's trait, so
+    /// it cannot be reused directly).
+    struct ToolGuardedResolver {
+        guard: crate::http_guard::HttpGuard,
+    }
+
+    impl greentic_ext_runtime::reqwest::dns::Resolve for ToolGuardedResolver {
+        fn resolve(
+            &self,
+            name: greentic_ext_runtime::reqwest::dns::Name,
+        ) -> greentic_ext_runtime::reqwest::dns::Resolving {
+            let guard = self.guard;
+            Box::pin(async move {
+                let addrs: Vec<std::net::SocketAddr> =
+                    tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+                guard.check_addrs(&addrs).map_err(
+                    |reason| -> Box<dyn std::error::Error + Send + Sync> { reason.into() },
+                )?;
+                let iter: greentic_ext_runtime::reqwest::dns::Addrs = Box::new(addrs.into_iter());
+                Ok(iter)
+            })
+        }
+    }
+
+    /// Address of a local listener that accepts and immediately drops every
+    /// connection, started once per process. See [`build_tool_http_client_with`].
+    fn blackhole_proxy_url() -> Option<String> {
+        use std::sync::OnceLock;
+        static URL: OnceLock<Option<String>> = OnceLock::new();
+        // Initialised once, so every failure below is logged once: a `None` here
+        // means the tool HTTP client is never built (see
+        // `shared_blocking_http_client`), which fails every extension HTTP call.
+        URL.get_or_init(|| {
+            let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::error!(%error, "tool http blackhole listener could not bind 127.0.0.1; extension tool HTTP calls will fail for the life of this process");
+                    return None;
+                }
+            };
+            let addr = match listener.local_addr() {
+                Ok(addr) => addr,
+                Err(error) => {
+                    tracing::error!(%error, "tool http blackhole listener has no local address; extension tool HTTP calls will fail for the life of this process");
+                    return None;
+                }
+            };
+            let spawned = std::thread::Builder::new()
+                .name("tool-http-blackhole".into())
+                .spawn(move || {
+                    for stream in listener.incoming() {
+                        drop(stream);
+                    }
+                });
+            if let Err(error) = spawned {
+                tracing::error!(%error, "tool http blackhole thread could not start; extension tool HTTP calls will fail for the life of this process");
+                return None;
+            }
+            Some(format!("http://{addr}"))
+        })
+        .clone()
+    }
+
+    /// Build the tool-extension HTTP client: no redirect following (an
+    /// extension's request is not allowed to be bounced to another host, per
+    /// the ext-runtime contract) and the outbound address guard on DNS.
+    fn build_tool_http_client() -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
+        build_tool_http_client_with(crate::http_guard::HttpGuard::from_env())
+    }
+
+    /// The resolver guard never runs for an IP-LITERAL URL (nothing to
+    /// resolve), and `greentic_ext_runtime` hands the extension a finished
+    /// `reqwest::blocking::Client` with no pre-request hook, so a literal
+    /// metadata address (IPv4, or its v4-mapped IPv6 spelling) would otherwise
+    /// connect straight out. The only per-request seam a built client exposes
+    /// is its proxy selector, so a forbidden literal is routed to a local
+    /// listener that drops the connection: the request fails without a byte
+    /// reaching the target. Domain hosts and permitted literals select no
+    /// proxy and go direct, subject to the DNS guard as before.
+    fn build_tool_http_client_with(
+        guard: crate::http_guard::HttpGuard,
+    ) -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
+        let blackhole = blackhole_proxy_url()?;
+        greentic_ext_runtime::reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(greentic_ext_runtime::reqwest::redirect::Policy::none())
+            .proxy(greentic_ext_runtime::reqwest::Proxy::custom(move |url| {
+                match guard.check_url_literal(url) {
+                    Ok(()) => None,
+                    Err(reason) => {
+                        tracing::warn!(%reason, "tool http request to a blocked IP literal refused");
+                        Some(blackhole.clone())
+                    }
+                }
+            }))
+            .dns_resolver(std::sync::Arc::new(ToolGuardedResolver { guard }))
+            .build()
+            .inspect_err(|error| {
+                tracing::error!(%error, "tool http client could not be built; extension tool HTTP calls will fail for the life of this process");
+            })
+            .ok()
+    }
+
     fn shared_blocking_http_client() -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
         use std::sync::OnceLock;
         static CLIENT: OnceLock<Option<greentic_ext_runtime::reqwest::blocking::Client>> =
@@ -1128,17 +1270,186 @@ mod aw {
             .get_or_init(|| {
                 // Build on a plain OS thread so reqwest's internal runtime is
                 // not constructed inside a tokio context.
-                std::thread::spawn(|| {
-                    greentic_ext_runtime::reqwest::blocking::Client::builder()
-                        .timeout(std::time::Duration::from_secs(30))
-                        .build()
-                        .ok()
-                })
-                .join()
-                .ok()
-                .flatten()
+                let client = std::thread::spawn(build_tool_http_client)
+                    .join()
+                    .inspect_err(|_| {
+                        tracing::error!("tool http client builder thread panicked; extension tool HTTP calls will fail for the life of this process");
+                    })
+                    .ok()
+                    .flatten();
+                if client.is_none() {
+                    // Cached as `None` for the process: say so loudly, once.
+                    tracing::error!("tool http client unavailable; every extension tool HTTP call will fail until the process restarts");
+                }
+                client
             })
             .clone()
+    }
+
+    /// Env vars an extension's `secret://` reference may NEVER resolve to.
+    /// The env fallback maps `secret://a/b` to `A_B` with no allow-list, so
+    /// without this a signed extension asking for `secret://admin/token` read
+    /// the host's own `ADMIN_TOKEN`. Anything the runner itself is configured
+    /// with (`GREENTIC_*`, `TENANT_JWT_*`, the admin/operator bearer tokens and
+    /// the provider webhook secrets) is host configuration, not a tool secret.
+    const ENV_SECRET_DENY_EXACT: &[&str] = &[
+        "ADMIN_TOKEN",
+        "OPERATOR_TOKEN",
+        "PACK_PUBLIC_KEY",
+        "SLACK_SIGNING_SECRET",
+        "WEBEX_WEBHOOK_SECRET",
+        "WHATSAPP_VERIFY_TOKEN",
+        "WHATSAPP_APP_SECRET",
+        "TELEGRAM_BOT_TOKEN",
+        // Host infrastructure endpoints/credentials the runner itself reads:
+        // the shared Redis (may embed a password) and the OTLP exporter
+        // (headers commonly carry an auth token).
+        "REDIS_URL",
+        "OTLP_ENDPOINT",
+        "OTLP_HEADERS",
+        // Ambient credentials of common tooling the runner process may inherit.
+        "PGPASSWORD",
+        "KUBECONFIG",
+        "NPM_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+        "SSH_AUTH_SOCK",
+        // The runner's own cloud identity (see the prefix list below for the
+        // families). Exact names only where a prefix would also catch a
+        // legitimate third-party key.
+        "AWS_ACCESS_KEY_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_CREDENTIALS",
+        "AZURE_ACCESS_TOKEN",
+        "AZURE_DEVOPS_EXT_PAT",
+        "AZURE_USERNAME",
+        "AZURE_PASSWORD",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CREDENTIALS",
+        "GOOGLE_ACCESS_TOKEN",
+        // Azure managed identity (App Service / Functions / Container Apps):
+        // `IDENTITY_HEADER` is the secret that authorises a token request to
+        // `IDENTITY_ENDPOINT`; `MSI_*` is the legacy pair.
+        "IDENTITY_HEADER",
+        "IDENTITY_ENDPOINT",
+        "MSI_SECRET",
+        "MSI_ENDPOINT",
+        // Datastore/broker credentials and connection strings (these embed a
+        // password in the URI).
+        "REDIS_PASSWORD",
+        "PGPASSFILE",
+        "MONGODB_URI",
+        "AMQP_URL",
+        // The OTLP exporter headers carry the collector auth token; the
+        // per-signal `OTEL_EXPORTER_OTLP_*HEADERS` names are covered in
+        // [`env_secret_name_is_denied`].
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        // Proxy URLs routinely embed `user:pass@` (the lowercase spellings
+        // are folded by `env_secret_name_is_denied`). `NO_PROXY` is a host
+        // list, not a secret, and stays resolvable.
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        // Sentry DSN carries the project ingest key; `GIT_ASKPASS` and
+        // `DOCKER_CONFIG` point at a credential helper / registry auth dir.
+        "SENTRY_DSN",
+        "GIT_ASKPASS",
+        "DOCKER_CONFIG",
+    ];
+    /// Prefix families of host configuration and ambient credentials a tool's
+    /// `secret://` reference may never resolve to.
+    ///
+    /// Host configuration: `GREENTIC_*`, `TENANT_JWT_*`, `SECRETS_*` (backend
+    /// selector, `SECRETS_BROKER_*` broker bearer, cache knobs) and `PACK_*`
+    /// (pack trust key and verification switches).
+    ///
+    /// Cloud identity of the runner's own process: `AWS_SECRET_*`,
+    /// `AWS_SESSION_*`, `AWS_CONTAINER_*`, `AWS_WEB_IDENTITY_*`, `AWS_SHARED_*`,
+    /// `AWS_BEARER_*`, `AWS_SECURITY_*`, `AWS_ACCESS_KEY*`, `AZURE_FEDERATED_*`,
+    /// `AZURE_CLIENT_CERTIFICATE_*`, `AZURE_STORAGE_*`, `ARM_*`, `GOOGLE_CLOUD_*`,
+    /// `GOOGLE_OAUTH_*`, `GCP_*`, `CLOUDSDK_*`. `VAULT_*` is denied whole
+    /// (`VAULT_TOKEN` is the credential; `VAULT_ADDR`/`VAULT_NAMESPACE` come
+    /// with it, and a tool that needs its own Vault should use the secrets
+    /// backend instead).
+    ///
+    /// Connection settings of the runner's infrastructure: `DATABASE_*`,
+    /// `NATS_*`, `POSTGRES_*`, `MYSQL_*`, `KUBERNETES_*`. Beyond the prefixes,
+    /// the exact names above and `AZURE_*_CONNECTION_STRING` are denied, and so
+    /// is any `OTEL_EXPORTER_OTLP_*HEADERS` name.
+    ///
+    /// Deliberately NOT denied (a documented decision): `OPENAI_API_KEY` (the
+    /// runner reads it as its LLM fallback, but `secret://openai/api_key` is the
+    /// documented way for a tool to get its own OpenAI key from the env, and an
+    /// allow-list would break that fallback for every other tool); third-party
+    /// API keys that merely share a vendor prefix (`GOOGLE_API_KEY` for Gemini,
+    /// `AZURE_OPENAI_API_KEY`, any `*_API_KEY`); `GITHUB_TOKEN`, `GH_TOKEN` and
+    /// `HF_TOKEN`, the natural names for a tool's own token; and identifiers
+    /// rather than secrets: `AWS_REGION`, `AWS_PROFILE`, `AZURE_TENANT_ID`,
+    /// `AZURE_CLIENT_ID`.
+    const ENV_SECRET_DENY_PREFIXES: &[&str] = &[
+        "VAULT_",
+        "GREENTIC_",
+        "TENANT_JWT_",
+        "SECRETS_",
+        "PACK_",
+        "AWS_SECRET_",
+        "AWS_SESSION_",
+        "AWS_CONTAINER_",
+        "AWS_WEB_IDENTITY_",
+        "AWS_SHARED_",
+        // Bedrock bearer key, legacy `AWS_SECURITY_TOKEN`, legacy
+        // `AWS_ACCESS_KEY` (+ `_ID`).
+        "AWS_BEARER_",
+        "AWS_SECURITY_",
+        "AWS_ACCESS_KEY",
+        // Terraform/azurerm service principal (`ARM_CLIENT_SECRET`, ...).
+        "ARM_",
+        // gcloud CLI auth (`CLOUDSDK_AUTH_ACCESS_TOKEN`, ...).
+        "CLOUDSDK_",
+        "GOOGLE_OAUTH_",
+        "AZURE_FEDERATED_",
+        "AZURE_CLIENT_CERTIFICATE_",
+        "AZURE_STORAGE_",
+        "GOOGLE_CLOUD_",
+        "GCP_",
+        "DATABASE_",
+        "NATS_",
+        "POSTGRES_",
+        "MYSQL_",
+        "KUBERNETES_",
+    ];
+
+    pub(crate) fn env_secret_name_is_denied(name: &str) -> bool {
+        // `env_var_name_for_secret` already upper-cases; fold here too so a
+        // caller passing `https_proxy` cannot slip past the exact list.
+        let upper = name.to_ascii_uppercase();
+        let name = upper.as_str();
+        // `AZURE_<SERVICE>_CONNECTION_STRING` embeds an account key.
+        (name.starts_with("AZURE_") && name.ends_with("_CONNECTION_STRING"))
+            // `OTEL_EXPORTER_OTLP_HEADERS` and its per-signal forms
+            // (`..._TRACES_HEADERS`, `..._METRICS_HEADERS`, `..._LOGS_HEADERS`).
+            || (name.starts_with("OTEL_EXPORTER_OTLP_") && name.contains("HEADERS"))
+            || ENV_SECRET_DENY_EXACT.contains(&name)
+            || ENV_SECRET_DENY_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    }
+
+    /// Resolve a tool-secret reference from the process env, refusing the
+    /// host-configuration names above (reported as not found, so the refusal is
+    /// indistinguishable from an unset variable).
+    fn env_secret_lookup(uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+        let name = env_var_name_for_secret(uri);
+        if env_secret_name_is_denied(&name) {
+            tracing::warn!(
+                env_var = %name,
+                "tool secret reference maps to a host configuration variable; refused"
+            );
+            return Err(greentic_ext_runtime::SecretsError::NotFound(
+                uri.to_string(),
+            ));
+        }
+        std::env::var(&name)
+            .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
     }
 
     pub(crate) fn env_var_name_for_secret(uri: &str) -> String {
@@ -1937,15 +2248,35 @@ mod aw {
     /// `greentic_llm::LlmProvider` key for the in-process `operala.call`
     /// (`DeepWorkerInvoker`) wiring, so the two in-process LLM paths (dw.agent,
     /// operala.call) share one key-resolution policy instead of drifting.
+    /// The credential reference of the lexicographically first agent that names
+    /// one. `HashMap` order is arbitrary and differs run to run, so picking
+    /// "whichever came first" made the in-process key (and so the billed
+    /// account) change between restarts whenever agents disagree.
+    fn first_credential_ref(merged_agents: &HashMap<String, AgentConfig>) -> Option<String> {
+        let mut ids: Vec<&String> = merged_agents.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .find_map(|id| merged_agents.get(id)?.llm.credential_ref.clone())
+    }
+
     pub(crate) async fn resolve_in_process_llm_key(
         secrets: &crate::secrets::DynSecretsManager,
         tenant: &str,
         merged_agents: &HashMap<String, AgentConfig>,
     ) -> Option<String> {
-        let credential_ref = merged_agents
-            .values()
-            .find_map(|agent| agent.llm.credential_ref.clone())?;
-        let uri = format!("secrets://default/{tenant}/_/llm/{credential_ref}");
+        let credential_ref = first_credential_ref(merged_agents)?;
+        let uri = match greentic_aw_runtime::scoped_secrets::secret_uri(
+            "llm",
+            tenant,
+            None,
+            &credential_ref,
+        ) {
+            Ok(uri) => uri,
+            Err(err) => {
+                tracing::warn!(error = %err, "llm credential_ref rejected; no in-process key resolved");
+                return None;
+            }
+        };
         let bytes = secrets.read(&uri).await.ok()?;
         let key = String::from_utf8(bytes).ok()?.trim().to_string();
         if key.is_empty() { None } else { Some(key) }
@@ -2231,6 +2562,16 @@ mod aw {
             Some(remote_tool_secrets.clone()),
             unit.as_deref(),
         );
+        // The same MCP source feeds the main runtime and every nested playbook
+        // turn, so a skill whose allow-list names an MCP tool can call it.
+        let mcp = mcp_source_from_env(Some(remote_tool_secrets.clone())).or_else(|| {
+            mcp_source_from_packs(
+                &packs,
+                &tenant,
+                Some(remote_tool_secrets.clone()),
+                unit.as_deref(),
+            )
+        });
         // A playbook's own turn gets every source above and deliberately NOT a
         // playbook one, so a skill cannot call a skill — see `playbook_turn`.
         let playbooks = crate::runner::playbook_turn::playbook_source_from_packs(
@@ -2242,11 +2583,12 @@ mod aw {
                 telemetry: telemetry.clone(),
                 token_meter: token_meter.clone(),
                 ledger: ledger.clone(),
-                mcp: None,
+                mcp: mcp.clone(),
                 components: components.clone(),
                 flows: flows.clone(),
                 sorla: sorla.clone(),
                 a2a: a2a.clone(),
+                billing_meter: billing_meter.clone(),
             },
         );
 
@@ -2275,14 +2617,7 @@ mod aw {
             // A per-server merge (pack fills only the servers the admin catalog
             // lacks) is a strictly better v2 and is out of scope: it needs a
             // merge rule for a server present in both with different URLs.
-            mcp_source_from_env(Some(remote_tool_secrets.clone())).or_else(|| {
-                mcp_source_from_packs(
-                    &packs,
-                    &tenant,
-                    Some(remote_tool_secrets.clone()),
-                    unit.as_deref(),
-                )
-            }),
+            mcp,
         )
         .with_component_source(components)
         .with_flow_source(flows)
@@ -2291,6 +2626,9 @@ mod aw {
         .with_playbook_source(playbooks)
         .with_share_policy(share_policy)
         .with_user_ledger(ledger_binding);
+        // The same mandatory-guardrail policy the serve path installs; without
+        // it an in-process worker ran with no guardrails at all.
+        let base = attach_guardrails(base, ext_runtime.clone(), Vec::new());
 
         // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
         // `dw.agent` workers ground on the ingested corpus exactly as the
@@ -2853,24 +3191,8 @@ mod aw {
             // tools are still ADVERTISED to the LLM from the agent config's own
             // `ToolRef` schemas.
             mcp_source_from_env(crate::runner::mcp_node::aw::secrets_from_env()),
-        )
-        .with_guardrails(
-            {
-                let policy: Arc<dyn greentic_aw_runtime::guardrail::GuardrailPolicy> =
-                    match guardrail_policy_from_env() {
-                        Some(http) => Arc::new(http),
-                        None => Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
-                            Vec::new(),
-                        )),
-                    };
-                policy
-            },
-            Arc::new(
-                greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
-                    ext_runtime: ext_runtime.clone(),
-                },
-            ),
         );
+        let base = attach_guardrails(base, ext_runtime.clone(), Vec::new());
         // Short-term ("working") memory: in-memory provider is always available
         // (no external deps); the remember/recall tools stay gated by
         // config.memory.short_term in the loop.
@@ -2975,7 +3297,7 @@ mod aw {
                 };
 
                 tracing::info!(
-                    nats_url,
+                    nats_url = %greentic_aw_runtime::url_redact::redact_url(nats_url),
                     dispatch_ledger_active = ledger_active,
                     "agentic serve mode starting"
                 );
@@ -3062,6 +3384,25 @@ mod aw {
         use serde_json::json;
 
         #[test]
+        fn a_guardrail_denial_with_a_kept_park_offers_the_denial_then_the_card() {
+            use greentic_aw_runtime::guardrail::GuardrailDirection;
+            let mut out = super::guardrail_denied_json(
+                GuardrailDirection::Inbound,
+                "permission_denied",
+                "not allowed",
+                None,
+            );
+            let card = json!({ "type": "AdaptiveCard", "body": [] });
+            super::reoffer_parked_card(&mut out, card.clone());
+            assert_eq!(out["terminated_by"], "awaiting_tool_input");
+            assert_eq!(out["guardrail"]["blocked"], true);
+            let rendered = crate::runner::engine::rendered_park(&out);
+            let items = rendered.as_array().expect("reply + card");
+            assert_eq!(items[0]["reply"], "not allowed");
+            assert_eq!(items[1], card);
+        }
+
+        #[test]
         fn a_failed_turn_with_a_kept_park_offers_its_reply_then_the_card() {
             let mut out = json!({
                 "reply": super::SANITISED_ERROR_REPLY,
@@ -3097,6 +3438,208 @@ mod aw {
 
         fn aid(c: char) -> String {
             format!("artifact://{}", c.to_string().repeat(64))
+        }
+
+        #[test]
+        fn host_configuration_env_vars_are_not_readable_as_tool_secrets() {
+            for denied in [
+                "secret://admin/token",
+                "secret://operator/token",
+                "secret://tenant/jwt/secret",
+                "secret://greentic/llm/api/key",
+                "secret://telegram/bot/token",
+                "secret://secrets/broker/token",
+                "secret://secrets/broker/endpoint",
+                "secret://secrets/backend",
+                "secret://pack/public/key",
+                "secret://redis/url",
+                "secret://otlp/headers",
+                "secret://aws/secret_access_key",
+                "secret://aws/session_token",
+                "secret://aws/access_key_id",
+                "secret://aws/container/credentials_full_uri",
+                "secret://aws/web_identity_token_file",
+                "secret://azure/client_secret",
+                "secret://azure/federated/token_file",
+                "secret://azure/storage/key",
+                "secret://google/application_credentials",
+                "secret://google/cloud/project",
+                "secret://gcp/project",
+                "secret://database/url",
+                "secret://nats/url",
+                "secret://kubeconfig",
+                "secret://aws/bearer/token/bedrock",
+                "secret://aws/security_token",
+                "secret://aws/access_key",
+                "secret://azure/credentials",
+                "secret://azure/cosmos/connection_string",
+                "secret://azure/devops/ext_pat",
+                "secret://arm/client_secret",
+                "secret://arm/subscription_id",
+                "secret://google/oauth/access_token",
+                "secret://cloudsdk/auth/access_token",
+                "secret://otel/exporter/otlp/headers",
+                "secret://otel/exporter/otlp/traces/headers",
+                "secret://otel/exporter/otlp/logs/headers",
+                "secret://identity/header",
+                "secret://identity/endpoint",
+                "secret://msi/secret",
+                "secret://msi/endpoint",
+                "secret://vault/token",
+                "secret://vault/addr",
+                "secret://redis/password",
+                "secret://pgpassfile",
+                "secret://google/credentials",
+                "secret://google/access_token",
+                "secret://mongodb/uri",
+                "secret://amqp/url",
+                "secret://http/proxy",
+                "secret://https/proxy",
+                "secret://all/proxy",
+                "secret://sentry/dsn",
+                "secret://git/askpass",
+                "secret://docker/config",
+            ] {
+                let name = env_var_name_for_secret(denied);
+                assert!(
+                    env_secret_name_is_denied(&name),
+                    "{denied} -> {name} must be refused"
+                );
+            }
+            for lower in ["http_proxy", "https_proxy", "all_proxy"] {
+                assert!(env_secret_name_is_denied(lower), "{lower} must be refused");
+            }
+            for ok in [
+                "secret://no/proxy",
+                "secret://tavily/api_key",
+                "secret://openai/api_key",
+                "secret://google/api_key",
+                "secret://azure/openai/api_key",
+                "secret://github/token",
+                "secret://gh/token",
+                "secret://aws/region",
+                "secret://aws/profile",
+                "secret://azure/tenant_id",
+                "secret://azure/client_id",
+                "secret://anthropic/api_key",
+                "secret://alarm/key",
+                "secret://hf/token",
+                "secret://otel/exporter/otlp/endpoint",
+                "secret://identity/provider",
+                "secret://vaulted/key",
+            ] {
+                let name = env_var_name_for_secret(ok);
+                assert!(!env_secret_name_is_denied(&name), "{ok} -> {name}");
+            }
+        }
+
+        #[test]
+        fn tool_http_client_does_not_follow_redirects() {
+            use std::io::{Read, Write};
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            let addr = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let server = std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf);
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            });
+            let url = format!("http://{addr}/");
+            let status = std::thread::spawn(move || {
+                let client = build_tool_http_client()?;
+                client.get(url).send().ok().map(|r| r.status().as_u16())
+            })
+            .join()
+            .ok()
+            .flatten();
+            let _ = server.join();
+            assert_eq!(status, Some(302), "the 302 must be returned, not followed");
+        }
+
+        #[test]
+        fn tool_http_client_refuses_ip_literal_metadata_targets() {
+            // A listener standing in for the "metadata service": it must never
+            // see a connection, whatever the literal spelling.
+            let target = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            let port = target.local_addr().map(|a| a.port()).unwrap_or(0);
+            if target.set_nonblocking(true).is_err() {
+                return;
+            }
+            // deny_private makes the loopback listener a forbidden literal too,
+            // so the test can observe that nothing reached it.
+            let guard = crate::http_guard::HttpGuard::from_raw(None, Some("1"), None);
+            let urls = vec![
+                format!("http://127.0.0.1:{port}/"),
+                "http://169.254.169.254/latest/meta-data/".to_string(),
+                "http://[::ffff:a9fe:a9fe]/".to_string(),
+                "http://0xa9fea9fe/".to_string(),
+            ];
+            let results = std::thread::spawn(move || {
+                let client = build_tool_http_client_with(guard)?;
+                Some(
+                    urls.into_iter()
+                        .map(|url| (url.clone(), client.get(url).send().is_err()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .join()
+            .ok()
+            .flatten();
+            let Some(results) = results else {
+                panic!("tool http client must build");
+            };
+            for (url, refused) in results {
+                assert!(refused, "{url} must be refused");
+            }
+            assert!(
+                target.accept().is_err(),
+                "no connection may reach a forbidden literal"
+            );
+        }
+
+        #[test]
+        fn tool_http_client_lets_permitted_literals_go_direct() {
+            use std::io::{Read, Write};
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            let addr = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let server = std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf);
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            });
+            let url = format!("http://{addr}/");
+            let guard = crate::http_guard::HttpGuard::from_raw(None, None, None);
+            let status = std::thread::spawn(move || {
+                let client = build_tool_http_client_with(guard)?;
+                client.get(url).send().ok().map(|r| r.status().as_u16())
+            })
+            .join()
+            .ok()
+            .flatten();
+            let _ = server.join();
+            assert_eq!(status, Some(200));
         }
 
         #[test]
@@ -3440,6 +3983,20 @@ mod aw {
                 conversational: false,
                 opening_message: None,
                 on_text_while_parked: Default::default(),
+            }
+        }
+
+        #[test]
+        fn the_in_process_llm_credential_ref_choice_is_deterministic() {
+            let mut agents = HashMap::new();
+            for (id, cred) in [("zeta", "cred-z"), ("alpha", "cred-a"), ("mid", "cred-m")] {
+                let mut cfg = sample_agent_config(id);
+                cfg.llm.credential_ref = Some(cred.into());
+                agents.insert(id.to_string(), cfg);
+            }
+            agents.insert("none".to_string(), sample_agent_config("none"));
+            for _ in 0..20 {
+                assert_eq!(first_credential_ref(&agents).as_deref(), Some("cred-a"));
             }
         }
 
@@ -4233,18 +4790,46 @@ mod aw {
 
         #[test]
         fn tenant_ctx_for_audit_uses_real_ids_when_valid() {
-            let ctx = super::tenant_ctx_for_audit("acme", "prod");
+            let ctx = super::tenant_ctx_for_audit("acme", "prod").expect("valid ids");
             assert_eq!(ctx.tenant.as_str(), "acme");
             assert_eq!(ctx.env.as_str(), "prod");
         }
 
+        #[tokio::test]
+        async fn invalid_ids_fail_pre_effect_and_terminal_before_the_runtime_steps() {
+            // The id echoes into the message and contains words the retry text
+            // heuristic reads as transient; the failure must still be terminal
+            // and proven pre-effect (nothing ran, nothing to repeat).
+            let runtime = runtime_with_scripted_remember_call("t1", "e1");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let handler =
+                RuntimeAgentNodeHandler::new(runtime, Some(AuditSink::from_sender(tx)), None, None);
+            let err = handler
+                .execute(
+                    "internal timeout unavailable!",
+                    "e1",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "hi"}),
+                    false,
+                    None,
+                )
+                .await
+                .expect_err("an invalid tenant id must fail");
+            assert!(crate::runner::engine::is_pre_effect_error(&err), "{err:#}");
+            assert!(
+                crate::runner::engine::is_terminal_flow_error(&err),
+                "{err:#}"
+            );
+            assert!(rx.try_recv().is_err(), "no step ran, so no audit event");
+        }
+
         #[test]
-        fn tenant_ctx_for_audit_falls_back_to_local_on_invalid_ids() {
-            // Empty strings fail the newtype validation; the helper must not
-            // panic and should fall back to "local" for both fields.
-            let ctx = super::tenant_ctx_for_audit("", "");
-            assert_eq!(ctx.tenant.as_str(), "local");
-            assert_eq!(ctx.env.as_str(), "local");
+        fn tenant_ctx_for_audit_rejects_invalid_ids() {
+            // Empty strings fail the newtype validation: an error, never a
+            // silent fall back to a shared "local" tenant.
+            assert!(super::tenant_ctx_for_audit("", "prod").is_err());
+            assert!(super::tenant_ctx_for_audit("acme", "").is_err());
         }
 
         #[tokio::test]
@@ -5937,9 +6522,10 @@ pub use aw::{build_agent_node_handler_ephemeral, build_agent_node_wiring_ephemer
 
 #[cfg(feature = "agentic-worker")]
 pub(crate) use aw::{
-    EnvSecretsBackend, attachments_from_flow_input, build_agent_node_wiring_metered,
-    build_ext_runtime, build_llm_backend, component_source_from_packs, mcp_secrets_manager,
-    mcp_source_from_env, text_with_skipped_notices,
+    EnvSecretsBackend, attach_guardrails, attachments_from_flow_input,
+    build_agent_node_wiring_metered, build_ext_runtime, build_llm_backend,
+    component_source_from_packs, mcp_secrets_manager, mcp_source_from_env, tenant_ctx_for_audit,
+    text_with_skipped_notices,
 };
 
 #[cfg(feature = "desktop-agent-ephemeral")]

@@ -38,6 +38,34 @@ fn url_queries_and_userinfo_are_removed_but_host_and_path_kept() {
 }
 
 #[test]
+fn url_userinfo_with_raw_delimiters_does_not_leak() {
+    for (text, secret) in [
+        ("GET https://svc:Ab,cd@host/x) failed", "cd"),
+        ("GET https://svc:Ab;cd@host/x failed", "cd"),
+        ("GET https://svc:Ab)cd@host/x failed", "cd"),
+        ("GET https://svc:Ab]cd@host/x failed", "cd"),
+        ("GET https://svc:Ab'cd@host/x failed", "cd"),
+        ("GET https://svc:Ab/cd@host/x failed", "cd"),
+        ("GET https://svc:Ab?cd@host/x failed", "cd"),
+        ("GET https://svc:Ab#cd@host/x failed", "cd"),
+    ] {
+        let out = redact(text);
+        assert!(!out.contains(secret), "{text} -> {out}");
+        assert!(!out.contains("Ab"), "{text} -> {out}");
+        assert!(out.ends_with(" failed"), "{text} -> {out}");
+    }
+    // The ordinary shape still keeps host and path.
+    let out = redact("GET https://svc:Ab,cd@host/x) failed");
+    assert!(out.contains("https://[redacted]@host/x)"), "{out}");
+    // Prose punctuation after a plain URL is not swallowed.
+    assert_eq!(
+        redact("see https://host/x, then"),
+        "see https://host/x, then"
+    );
+    assert_eq!(redact("(https://host)"), "(https://host)");
+}
+
+#[test]
 fn credential_pairs_are_removed() {
     for text in [
         r#"body {"access_token": "tok-123", "ok": false}"#,
@@ -123,4 +151,46 @@ fn chain_text_joins_every_source() {
     );
     let io = std::io::Error::other("disk");
     assert_eq!(chain_text(&io), "disk");
+}
+
+#[test]
+fn compound_credential_keys_are_redacted() {
+    for (input, secret) in [
+        ("x-amz-security-token: FwoGZXIvYXdz", "FwoGZXIvYXdz"),
+        ("bot_token=123:ABCdef", "123:ABCdef"),
+        ("x-goog-api-key: AIzaSyXYZ", "AIzaSyXYZ"),
+        ("Ocp-Apim-Subscription-Key: 0123abcd", "0123abcd"),
+        ("retry with key=hunter2 now", "hunter2"),
+        ("X-Amz-Signature=deadbeef", "deadbeef"),
+        (r#"{"client_credential": "zzz9"}"#, "zzz9"),
+        ("accountkey=Zm9vYmFy", "Zm9vYmFy"),
+        ("AccountKey=Zm9vYmFy", "Zm9vYmFy"),
+        ("signingkey: s1gn", "s1gn"),
+        ("encryptionkey=3ncr", "3ncr"),
+        (r#"{"sessionKey": "sk-1234"}"#, "sk-1234"),
+        (r#"{"storageKey": "stor-9"}"#, "stor-9"),
+        ("clientKey=cl13nt", "cl13nt"),
+    ] {
+        let out = redact(input);
+        assert!(!out.contains(secret), "{input} -> {out}");
+        assert!(out.contains("[redacted]"), "{input} -> {out}");
+    }
+}
+
+#[test]
+fn ordinary_keys_survive_the_substring_match() {
+    for input in [
+        "design: rejected by the planner",
+        "max_tokens: 100",
+        "keyboard=us layout=en",
+        "signal: terminated",
+        "author: bob",
+        "status: 502",
+        "session_id: 7f3a",
+        "sessionId=7f3a",
+        "monkey=banana",
+        "hotkey: ctrl",
+    ] {
+        assert_eq!(redact(input), input, "over-redacted: {input}");
+    }
 }

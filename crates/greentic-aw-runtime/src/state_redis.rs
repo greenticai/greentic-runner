@@ -23,7 +23,10 @@ const STATE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 const LOCK_TTL_SECS: i64 = 90;
 const LOCK_POLL_MS: u64 = 50;
 
-/// Lua: refresh the lock TTL only if we still own it (value matches).
+/// Lua: refresh the lock TTL only if we still own it (value matches). A
+/// missing key or a different owner both return 0 (lock lost): the lock is
+/// never re-created, because a lapsed lock may have been taken, used and
+/// released by another turn whose newer state our stale copy would overwrite.
 const REFRESH_LUA: &str = r#"
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -184,12 +187,13 @@ impl SessionLockInner for RedisSessionLock {
                 .await
                 .map_err(|e| StateError::Redis(format!("refresh eval: {e}")))?;
             if refreshed == 1 {
-                Ok(())
-            } else {
-                Err(StateError::Redis(
-                    "lock no longer owned by this holder".into(),
-                ))
+                return Ok(());
             }
+            // Absent (the TTL lapsed) or held by another owner. Both are a
+            // lost lock: an absent key does NOT mean nobody ran in the gap
+            // (another turn may have taken it, saved and released), so it is
+            // never re-acquired here and the step aborts without saving.
+            Err(StateError::LockLost)
         })
     }
 

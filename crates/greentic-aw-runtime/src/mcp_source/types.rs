@@ -24,6 +24,16 @@ pub(super) const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 /// that do work.
 pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Budget for the FIRST store-pull of a `local-wasm` component (download,
+/// verify, install) before its tools are listed. Separate from
+/// [`PROBE_TIMEOUT`]: an artifact download is not a reachability probe.
+pub(super) const PULL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How many servers a catalog build probes at once. Bounded so a tenant with
+/// many servers cannot open an unbounded burst of connections, but wide enough
+/// that a cold build costs about one probe budget rather than N of them.
+pub(super) const MAX_CONCURRENT_PROBES: usize = 8;
+
 /// Default budget for a tool CALL (connect → initialize → tools/call).
 ///
 /// This is a different question from the probe budget and needs a different

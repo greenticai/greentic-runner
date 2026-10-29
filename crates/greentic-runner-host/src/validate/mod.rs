@@ -75,7 +75,29 @@ fn validate_with_required(envelope: &Value, required: &[&str]) -> Vec<Validation
         }
     }
 
-    issues.extend(validate_schema(envelope));
+    // The JSON schema also flags missing / mistyped required fields; those are
+    // already reported above with a clearer code, so drop the duplicates.
+    let already: Vec<(String, String)> = issues
+        .iter()
+        .map(|issue| (issue.code.clone(), issue.path.clone()))
+        .collect();
+    let is_duplicate = |schema_issue: &ValidationIssue| {
+        let missing_dup = required.iter().any(|key| {
+            schema_issue.message == format!("\"{key}\" is a required property")
+                && already.iter().any(|(code, path)| {
+                    code == "missing_required_field" && *path == format!("/{key}")
+                })
+        });
+        let type_dup = already
+            .iter()
+            .any(|(code, path)| code == "invalid_type" && *path == schema_issue.path);
+        missing_dup || type_dup
+    };
+    issues.extend(
+        validate_schema(envelope)
+            .into_iter()
+            .filter(|i| !is_duplicate(i)),
+    );
     issues.extend(validate_metadata(envelope));
     issues
 }
@@ -205,5 +227,20 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "missing_required_field")
         );
+    }
+
+    #[test]
+    fn missing_required_field_is_reported_once() {
+        let issues = validate_component_envelope(&json!({ "operation": "run" }));
+        let for_component: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.message.contains("component_id"))
+            .collect();
+        assert_eq!(
+            for_component.len(),
+            1,
+            "duplicate reports: {for_component:?}"
+        );
+        assert_eq!(for_component[0].code, "missing_required_field");
     }
 }

@@ -10,11 +10,45 @@ use super::{FetchResponse, PackResolver};
 #[derive(Debug)]
 pub struct FsResolver {
     root: PathBuf,
+    /// When `Some`, absolute locators must resolve under `root` or one of
+    /// these roots. `None` keeps the permissive dev behaviour.
+    allowed_roots: Option<Vec<PathBuf>>,
 }
 
 impl FsResolver {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            allowed_roots: None,
+        }
+    }
+
+    /// Confine absolute locators to `root` plus the given extra roots.
+    pub fn with_allowed_roots(mut self, extra_roots: Vec<PathBuf>) -> Self {
+        let mut roots = vec![self.root.clone()];
+        roots.extend(extra_roots);
+        self.allowed_roots = Some(roots);
+        self
+    }
+
+    fn ensure_allowed(&self, path: &Path) -> Result<()> {
+        let Some(roots) = &self.allowed_roots else {
+            return Ok(());
+        };
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+        let allowed = roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|root| canonical.starts_with(&root));
+        if !allowed {
+            anyhow::bail!(
+                "fs resolver: {} is outside the allowed pack roots (working directory plus PACK_FS_ALLOWED_ROOTS)",
+                canonical.display()
+            );
+        }
+        Ok(())
     }
 
     fn parse_path(&self, locator: &str) -> Result<PathBuf> {
@@ -62,9 +96,54 @@ impl PackResolver for FsResolver {
     fn fetch(&self, locator: &str) -> Result<FetchResponse> {
         let path = self.parse_path(locator)?;
         let path = self.normalize(path)?;
+        self.ensure_allowed(&path)?;
         if !path.exists() {
             anyhow::bail!("fs resolver: {} does not exist", path.display());
         }
         Ok(FetchResponse::from_path(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confined_resolver_rejects_absolute_path_outside_roots() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let file = outside.path().join("pack.gtpack");
+        std::fs::write(&file, b"x").expect("write");
+        let resolver = FsResolver::new(root.path().to_path_buf()).with_allowed_roots(Vec::new());
+        let err = resolver
+            .fetch(&format!("fs://{}", file.display()))
+            .err()
+            .expect("outside path must be rejected");
+        assert!(err.to_string().contains("outside the allowed"));
+    }
+
+    #[test]
+    fn confined_resolver_accepts_extra_allowed_root() {
+        let root = tempfile::tempdir().expect("root");
+        let extra = tempfile::tempdir().expect("extra");
+        let file = extra.path().join("pack.gtpack");
+        std::fs::write(&file, b"x").expect("write");
+        let resolver = FsResolver::new(root.path().to_path_buf())
+            .with_allowed_roots(vec![extra.path().to_path_buf()]);
+        resolver
+            .fetch(&format!("fs://{}", file.display()))
+            .expect("allowed root accepted");
+    }
+
+    #[test]
+    fn unconfined_resolver_keeps_dev_behaviour() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let file = outside.path().join("pack.gtpack");
+        std::fs::write(&file, b"x").expect("write");
+        let resolver = FsResolver::new(root.path().to_path_buf());
+        resolver
+            .fetch(&format!("fs://{}", file.display()))
+            .expect("permissive by default");
     }
 }

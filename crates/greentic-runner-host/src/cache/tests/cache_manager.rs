@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::Digest;
 use tempfile::TempDir;
 
 use crate::cache::engine_profile::{CpuPolicy, EngineProfile};
@@ -298,7 +299,8 @@ async fn corrupt_disk_entry_logs_and_recompiles() {
         &profile,
         key.wasm_digest.clone(),
         corrupt_bytes.len() as u64,
-    );
+    )
+    .with_artifact_sha256(hex::encode(sha2::Sha256::digest(&corrupt_bytes)));
     let disk_root = config.disk_root(profile.id());
     let artifacts_dir = disk_root.join("artifacts");
     std::fs::create_dir_all(&artifacts_dir).expect("create artifacts dir");

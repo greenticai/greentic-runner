@@ -1089,3 +1089,109 @@ fn agentic_worker_component_invoker_lists_and_invokes() -> Result<()> {
     );
     Ok(())
 }
+
+/// A direct flow run / resumed tool flow reloads the pack through
+/// `load_flow_engine`. It must resolve the SAME tenant-scoped `/state` as the
+/// parent (it used to re-scope an already scoped policy, giving
+/// `<host>/tenants/demo/tenants/demo`).
+#[test]
+fn nested_flow_load_resolves_same_state_dir_as_parent() -> Result<()> {
+    use greentic_runner_host::wasi::PreopenSpec;
+
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let gtpack = temp.path().join("runner-components.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_pack(&gtpack)?;
+    let state_root = temp.path().join("host-state");
+    std::fs::create_dir_all(&state_root)?;
+    let policy = RunnerWasiPolicy::new().with_preopen(PreopenSpec::new(&state_root, "/state"));
+
+    let pack = rt.block_on(PackRuntime::load(
+        &gtpack,
+        Arc::new(host_config(&bindings_path)),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(policy),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?;
+    let state_dir = |p: &RunnerWasiPolicy| {
+        p.preopens
+            .iter()
+            .find(|s| s.guest_path == "/state")
+            .map(|s| s.host_path.clone())
+    };
+    let parent = state_dir(&pack.effective_wasi_policy());
+    let nested = state_dir(&*rt.block_on(pack.nested_load_wasi_policy())?);
+    assert_eq!(parent, Some(state_root.join("tenants").join("demo")));
+    assert_eq!(nested, parent);
+    Ok(())
+}
+
+/// The nested pack a direct flow run loads must keep the parent's unit scope
+/// and non-secret runtime config (it used to come back with both empty).
+#[test]
+fn nested_flow_load_keeps_unit_and_runtime_config() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let gtpack = temp.path().join("runner-components.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_pack(&gtpack)?;
+    let mut pack = rt.block_on(PackRuntime::load(
+        &gtpack,
+        Arc::new(host_config(&bindings_path)),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?;
+    let mut cfg = std::collections::BTreeMap::new();
+    cfg.insert("k".to_string(), serde_json::json!("v"));
+    let cfg = Arc::new(cfg);
+    pack.set_unit_id(Some("unit-1".to_string()));
+    pack.set_runtime_config_non_secret(Some(Arc::clone(&cfg)));
+    let (unit, config) = rt.block_on(pack.nested_load_scope())?;
+    assert_eq!(unit.as_deref(), Some("unit-1"));
+    assert_eq!(config, Some(cfg));
+    Ok(())
+}
+
+/// A materialized pack directory whose manifest is corrupt, with no archive to
+/// fall back to, must fail to load rather than come back as an empty pack.
+#[test]
+fn corrupt_materialized_manifest_without_archive_fails_to_load() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_dir = temp.path().join("pack");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(pack_dir.join("manifest.cbor"), b"\xff\xff not cbor")?;
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    let result = rt.block_on(PackRuntime::load(
+        &pack_dir,
+        Arc::new(host_config(&bindings_path)),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ));
+    assert!(result.is_err(), "corrupt manifest must not load as empty");
+    Ok(())
+}

@@ -1,7 +1,7 @@
 name: Codex Semver Fix
 on:
   schedule:
-    # 05:01 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
+    # 03:30 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
     - cron: "30 3 * * *"
   workflow_dispatch:
     inputs:

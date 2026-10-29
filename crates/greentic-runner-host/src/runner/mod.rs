@@ -87,6 +87,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::response::IntoResponse as _;
 use axum::routing::{get, post};
 use axum::{Router, serve};
 use tokio::net::TcpListener;
@@ -181,13 +182,31 @@ impl HostServer {
     }
 
     pub async fn serve(self) -> Result<()> {
+        self.serve_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    /// Like [`serve`](Self::serve), but stops accepting connections and lets
+    /// in-flight requests finish once `shutdown` resolves.
+    pub async fn serve_with_shutdown<F>(self, shutdown: F) -> Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         tracing::info!(addr = %self.addr, "starting host server");
+        if !self._state.admin.operator_protected() {
+            tracing::warn!(
+                addr = %self.addr,
+                "POST /operator/op/invoke is UNAUTHENTICATED and bound to {}: set OPERATOR_TOKEN \
+                 (or ADMIN_TOKEN) to require a bearer token",
+                self.addr
+            );
+        }
         let listener = TcpListener::bind(self.addr).await?;
         serve(
             listener,
             self.router
                 .into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown)
         .await?;
         Ok(())
     }
@@ -199,8 +218,68 @@ impl HostServer {
 /// router — route registration included — without binding a socket. Mirrors the
 /// `sql::routes::router` precedent.
 pub(crate) fn router(state: ServerState) -> Router {
-    let router = Router::new()
+    with_request_timeout(
+        base_router(state),
+        request_timeout_from_raw(std::env::var(REQUEST_TIMEOUT_ENV).ok().as_deref()),
+    )
+}
+
+/// Per-request wall-clock limit in seconds for every route except the
+/// [`LONG_RUNNING_PATHS`]. `0` disables.
+pub(crate) const REQUEST_TIMEOUT_ENV: &str = "GREENTIC_HTTP_REQUEST_TIMEOUT_SECS";
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+/// Routes that legitimately stay open longer than the request timeout because
+/// their work has its own deadline: the agent loop (graceful termination, state
+/// save, lock release must not be pre-empted by a 408) and the component
+/// invocation (`GREENTIC_WASM_MAX_EXEC_SECS`; a 408 plus a client retry could
+/// repeat a side effect).
+const LONG_RUNNING_PATHS: &[&str] = &["/agent/chat", "/agent/chat/stream", "/operator/op/invoke"];
+
+/// Whether `path` is exempt from the request timeout.
+pub(crate) fn is_long_running_path(path: &str) -> bool {
+    LONG_RUNNING_PATHS.contains(&path)
+}
+
+/// `None` = disabled. Absent or unparseable falls back to the default: a
+/// malformed knob must not silently remove the limit.
+pub(crate) fn request_timeout_from_raw(raw: Option<&str>) -> Option<std::time::Duration> {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Wrap `router` so a request not answered within `timeout` gets a 408.
+/// (`tower-http` is not a dependency; this is the same behaviour as its
+/// `TimeoutLayer`, with the long-running routes exempt.)
+pub(crate) fn with_request_timeout(router: Router, timeout: Option<std::time::Duration>) -> Router {
+    let Some(timeout) = timeout else {
+        return router;
+    };
+    router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            if is_long_running_path(req.uri().path()) {
+                return next.run(req).await;
+            }
+            match tokio::time::timeout(timeout, next.run(req)).await {
+                Ok(response) => response,
+                Err(_) => axum::http::StatusCode::REQUEST_TIMEOUT.into_response(),
+            }
+        },
+    ))
+}
+
+fn base_router(state: ServerState) -> Router {
+    // `/operator/op/invoke` is guarded by the operator/admin bearer token when
+    // one is configured; with none it stays open (see `warn_if_operator_open`).
+    let operator_routes = Router::new()
         .route("/operator/op/invoke", post(operator::invoke))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::http::auth::require_operator,
+        ));
+    let router = Router::new()
+        .merge(operator_routes)
         .route("/healthz", get(http::health::handler))
         .route("/admin/packs/status", get(admin::status))
         .route("/admin/packs/reload", post(admin::reload))
@@ -302,6 +381,86 @@ impl axum::extract::FromRef<ServerState> for SqlGateway {
     }
 }
 
+#[cfg(test)]
+mod request_timeout_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::time::Duration;
+    use tower::ServiceExt as _;
+
+    #[test]
+    fn timeout_env_resolution() {
+        assert_eq!(
+            request_timeout_from_raw(None),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            request_timeout_from_raw(Some("5")),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(request_timeout_from_raw(Some("0")), None);
+        assert_eq!(
+            request_timeout_from_raw(Some("junk")),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    fn slow_app(timeout: Option<Duration>) -> Router {
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            "done"
+        };
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .route("/agent/chat", get(slow))
+            .route("/agent/chat/stream", get(slow))
+            .route("/operator/op/invoke", get(slow))
+            .route("/admin/packs/status", get(slow));
+        with_request_timeout(app, timeout)
+    }
+
+    async fn status(app: Router, path: &str) -> Result<StatusCode> {
+        let req = Request::builder().uri(path).body(Body::empty())?;
+        Ok(app.oneshot(req).await?.status())
+    }
+
+    #[tokio::test]
+    async fn slow_handler_times_out_with_408() -> Result<()> {
+        let app = slow_app(Some(Duration::from_millis(50)));
+        assert_eq!(status(app, "/slow").await?, StatusCode::REQUEST_TIMEOUT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_running_routes_are_exempt() -> Result<()> {
+        for path in ["/agent/chat", "/agent/chat/stream", "/operator/op/invoke"] {
+            let app = slow_app(Some(Duration::from_millis(50)));
+            assert_eq!(status(app, path).await?, StatusCode::OK, "{path}");
+            assert!(is_long_running_path(path));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_route_is_not_exempt() -> Result<()> {
+        let app = slow_app(Some(Duration::from_millis(50)));
+        assert_eq!(
+            status(app, "/admin/packs/status").await?,
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert!(!is_long_running_path("/admin/packs/status"));
+        assert!(!is_long_running_path("/healthz"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_timeout_lets_slow_handlers_finish() -> Result<()> {
+        assert_eq!(status(slow_app(None), "/slow").await?, StatusCode::OK);
+        Ok(())
+    }
+}
+
 #[cfg(all(test, feature = "agentic-worker"))]
 mod router_tests {
     use super::*;
@@ -313,6 +472,53 @@ mod router_tests {
     /// `AdminGuard` 500s without `ConnectInfo`; `oneshot` does not supply it.
     fn loopback() -> ConnectInfo<SocketAddr> {
         ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap())
+    }
+
+    async fn operator_status(
+        admin: crate::http::auth::AdminAuth,
+        bearer: Option<&str>,
+    ) -> StatusCode {
+        let mut state = ServerState::for_test();
+        state.admin = admin;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/operator/op/invoke")
+            .extension(loopback());
+        if let Some(b) = bearer {
+            req = req.header("authorization", format!("Bearer {b}"));
+        }
+        router(state)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn operator_invoke_requires_token_when_configured() {
+        let admin =
+            crate::http::auth::AdminAuth::default().with_operator_token(Some("op-secret".into()));
+        assert_eq!(
+            operator_status(admin.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            operator_status(admin.clone(), Some("wrong")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Right token passes the layer; the handler then answers (not 401).
+        assert_ne!(
+            operator_status(admin, Some("op-secret")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_invoke_open_without_token() {
+        assert_ne!(
+            operator_status(crate::http::auth::AdminAuth::default(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

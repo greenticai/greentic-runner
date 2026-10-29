@@ -295,6 +295,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "agentic-worker")]
     fn tenant_ctx_named(tenant: &str, env: &str) -> TenantCtx {
         TenantCtx::new(
             EnvId::try_from(env).expect("valid env id"),

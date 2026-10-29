@@ -15,18 +15,10 @@ use tempfile::TempDir;
 
 #[test]
 #[serial]
-fn wasi_preview2_policy_enforced() -> Result<()> {
-    if is_offline() {
-        eprintln!("skipping wasm fixture test in offline mode");
-        return Ok(());
-    }
-    let wasm_path = match build_fixture() {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("skipping wasm fixture test (fixture build failed: {err:?})");
-            return Ok(());
-        }
-    };
+fn wasi_preview2_env_allowlist_is_enforced() -> Result<()> {
+    // A missing `wasm-tools` or failed fixture build must fail loudly rather
+    // than silently skipping the policy assertions.
+    let wasm_path = build_fixture().context("failed to build the wasi-p2-smoke fixture")?;
     let workspace = workspace_root();
     let bindings = workspace.join("examples/bindings/default.bindings.yaml");
     let config = Arc::new(HostConfig::load_from_path(&bindings)?);
@@ -34,21 +26,32 @@ fn wasi_preview2_policy_enforced() -> Result<()> {
     let tempdir = TempDir::new()?;
     let data_file = tempdir.path().join("hello.txt");
     fs::write(&data_file, "wasi preview-2 preopen")?;
-    let _env = EnvGuard::set("GT_TEST", "ok");
+    let _allowed = EnvGuard::set("GT_TEST", "ok");
+    // Present in the host process but NOT allow-listed: the guest must not see it.
+    let _hidden = EnvGuard::set("GT_TEST_HIDDEN", "secret");
 
-    let base_policy = RunnerWasiPolicy::new()
+    let preopen = PreopenSpec::new(tempdir.path(), "/data").read_only(true);
+    // Policy-builder level: the preopen is recorded read-only. (The fixture
+    // does not exercise the filesystem, so the read-only enforcement itself
+    // is Wasmtime's `DirPerms::READ`, set in `RunnerWasiPolicy::install_preopen`.)
+    assert!(preopen.read_only);
+    let policy = RunnerWasiPolicy::new()
         .allow_env("GT_TEST")
-        .with_preopen(PreopenSpec::new(tempdir.path(), "/data").read_only(true));
-    run_component(&wasm_path, Arc::clone(&config), base_policy.clone())?;
+        .with_preopen(preopen);
+    assert_eq!(policy.env_allow, vec!["GT_TEST".to_string()]);
+    assert_eq!(policy.preopens.len(), 1);
+    assert!(policy.preopens[0].read_only);
 
+    // The guest traps unless it sees exactly `GT_TEST=ok`.
+    run_component(&wasm_path, Arc::clone(&config), policy)?;
+
+    // Control: with an empty allow-list the same guest must trap, proving the
+    // fixture actually inspects the environment.
+    assert!(
+        run_component(&wasm_path, config, RunnerWasiPolicy::new()).is_err(),
+        "guest must fail when GT_TEST is not allow-listed"
+    );
     Ok(())
-}
-
-fn is_offline() -> bool {
-    matches!(
-        std::env::var("CARGO_NET_OFFLINE"),
-        Ok(val) if val == "true" || val == "1"
-    )
 }
 
 fn run_component(wasm: &Path, config: Arc<HostConfig>, policy: RunnerWasiPolicy) -> Result<()> {
@@ -89,14 +92,39 @@ fn build_fixture() -> Result<PathBuf> {
     std::fs::create_dir_all(&target_dir)?;
     let wat_path = target_dir.join("wasi_p2_smoke.wat");
     let artifact = target_dir.join("wasi_p2_smoke.wasm");
+    // The guest reads its WASI environment and traps unless it holds exactly
+    // `GT_TEST=ok`: the allow-listed variable is visible and nothing else leaks.
     let wat = r#"
 (component
+  (import "wasi:cli/environment@0.2.0" (instance $env
+    (export "get-environment" (func (result (list (tuple string string)))))))
+  (core module $libc
+    (memory (export "memory") 1)
+    (global $bump (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (global.get $bump))
+      (global.set $bump (i32.add (global.get $bump) (local.get 3)))
+      (local.get $p)))
+  (core instance $libc (instantiate $libc))
+  (core func $get_env (canon lower (func $env "get-environment")
+    (memory $libc "memory") (realloc (func $libc "realloc"))))
   (core module $m
-    (func (export "run"))
-  )
-  (core instance $i (instantiate $m))
-  (func (export "run") (canon lift (core func $i "run")))
-)
+    (import "libc" "memory" (memory 1))
+    (import "host" "get-environment" (func $get (param i32)))
+    (func (export "run")
+      (local $ptr i32)
+      (call $get (i32.const 0))
+      (if (i32.ne (i32.load (i32.const 4)) (i32.const 1)) (then unreachable))
+      (local.set $ptr (i32.load (i32.const 0)))
+      (if (i32.ne (i32.load offset=4 (local.get $ptr)) (i32.const 7)) (then unreachable))
+      (if (i32.ne (i32.load offset=12 (local.get $ptr)) (i32.const 2)) (then unreachable))
+      (if (i32.ne (i32.load8_u (i32.load (local.get $ptr))) (i32.const 71)) (then unreachable))
+      (if (i32.ne (i32.load8_u (i32.load offset=8 (local.get $ptr))) (i32.const 111)) (then unreachable))))
+  (core instance $i (instantiate $m
+    (with "libc" (instance $libc))
+    (with "host" (instance (export "get-environment" (func $get_env))))))
+  (func (export "run") (canon lift (core func $i "run"))))
 "#;
     std::fs::write(&wat_path, wat)?;
     let status = Command::new("wasm-tools")

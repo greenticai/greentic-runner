@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use anyhow::{Result, anyhow};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use ed25519_dalek::{Signer, SigningKey};
 use greentic_pack::builder::{FlowBundle, PACK_VERSION, PackBuilder, PackMeta};
-use runner_core::packs::PackDigest;
+use runner_core::packs::{PackDigest, PackPolicy};
 use runner_core::{Index, IndexLocation, PackConfig, PackManager, PackSource};
 use semver::Version;
 use serde_json::json;
@@ -161,5 +164,239 @@ fn resolves_http_pack() -> Result<()> {
     let resolved = manager.resolve_all_for_index(&index)?;
     let tenant = resolved.tenants().get("demo").expect("tenant missing");
     assert_eq!(tenant.main.digest.as_str(), digest.as_str());
+    Ok(())
+}
+
+/// The server answers exactly one request. A pinned-digest pack that is already
+/// cached must resolve again without a second download.
+#[test]
+fn pinned_http_pack_is_not_downloaded_again_once_cached() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pack_path = build_test_pack(temp.path())?;
+    let digest = compute_digest(&pack_path)?;
+    let bytes = fs::read(&pack_path)?;
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipping http cache test: {err}");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let addr = listener.local_addr()?;
+    let server =
+        Server::from_listener(listener, None).map_err(|err| anyhow!("server error: {err}"))?;
+    let handle = thread::spawn(move || {
+        if let Ok(request) = server.recv() {
+            let _ = request.respond(Response::from_data(bytes));
+        }
+        // `server` drops here: any further request is refused.
+    });
+
+    let locator = format!("http://{}/pack.gtpack", addr);
+    let index_path = temp.path().join("index.json");
+    write_index(&index_path, &locator, &digest)?;
+    let config = build_config(&index_path, &temp.path().join("cache"), PackSource::Http);
+    let index = Index::load(&config.index_location)?;
+    let manager = PackManager::new(config)?;
+    let first = manager.resolve_all_for_index(&index)?;
+    handle
+        .join()
+        .map_err(|_| anyhow!("server thread panicked"))?;
+    let second = manager.resolve_all_for_index(&index)?;
+    let first_main = &first.tenants().get("demo").expect("tenant").main;
+    let second_main = &second.tenants().get("demo").expect("tenant").main;
+    assert_eq!(first_main.path, second_main.path);
+    assert_eq!(second_main.digest.as_str(), digest.as_str());
+    Ok(())
+}
+
+fn write_signed_index(path: &Path, locator: &str, digest: &PackDigest, signature: Option<&str>) {
+    let index = json!({
+        "demo": {
+            "main_pack": {
+                "name": "runner.demo",
+                "version": "0.1.0",
+                "locator": locator,
+                "digest": digest.as_str(),
+                "signature": signature,
+            },
+            "overlays": []
+        }
+    });
+    fs::write(path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+}
+
+fn pub_value(key: &SigningKey) -> String {
+    format!(
+        "ed25519:{}",
+        STANDARD.encode(key.verifying_key().as_bytes())
+    )
+}
+
+#[test]
+fn strict_without_public_key_fails_closed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let index = temp.path().join("index.json");
+    let config = build_config(&index, &temp.path().join("cache"), PackSource::Fs);
+    let policy = PackPolicy::default().strict(true);
+    assert!(PackManager::with_policy(config, policy).is_err());
+    Ok(())
+}
+
+#[test]
+fn strict_requires_signature_and_accepts_any_rotated_key() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pack_path = build_test_pack(temp.path())?;
+    let digest = compute_digest(&pack_path)?;
+    let index_path = temp.path().join("index.json");
+    let locator = pack_path.to_str().unwrap();
+    let old_key = SigningKey::from_bytes(&[11u8; 32]);
+    let new_key = SigningKey::from_bytes(&[12u8; 32]);
+
+    let mut config = build_config(&index_path, &temp.path().join("cache"), PackSource::Fs);
+    config.public_key = Some(format!("{},{}", pub_value(&old_key), pub_value(&new_key)));
+    let policy = PackPolicy {
+        verify_strict: true,
+        fs_allowed_roots: Some(vec![temp.path().to_path_buf()]),
+        allow_legacy_signatures: false,
+    };
+    let manager = PackManager::with_policy(config.clone(), policy)?;
+
+    // Missing signature is rejected.
+    write_signed_index(&index_path, locator, &digest, None);
+    let index = Index::load(&config.index_location)?;
+    assert!(manager.resolve_all_for_index(&index).is_err());
+
+    // Canonical message signed by the second (rotated-in) key is accepted.
+    let message = format!(
+        "greentic-pack-sig-v1\nname=runner.demo\nversion=0.1.0\ndigest={}",
+        digest.as_str()
+    );
+    let sig = STANDARD.encode(new_key.sign(message.as_bytes()).to_bytes());
+    write_signed_index(&index_path, locator, &digest, Some(&sig));
+    let index = Index::load(&config.index_location)?;
+    manager.resolve_all_for_index(&index)?;
+
+    // A signature from an unknown key is rejected.
+    let rogue = SigningKey::from_bytes(&[99u8; 32]);
+    let bad = STANDARD.encode(rogue.sign(message.as_bytes()).to_bytes());
+    write_signed_index(&index_path, locator, &digest, Some(&bad));
+    let index = Index::load(&config.index_location)?;
+    assert!(manager.resolve_all_for_index(&index).is_err());
+    Ok(())
+}
+
+#[test]
+fn strict_confines_absolute_fs_locators() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pack_path = build_test_pack(temp.path())?;
+    let digest = compute_digest(&pack_path)?;
+    let index_path = temp.path().join("index.json");
+    let key = SigningKey::from_bytes(&[21u8; 32]);
+    let message = format!(
+        "greentic-pack-sig-v1\nname=runner.demo\nversion=0.1.0\ndigest={}",
+        digest.as_str()
+    );
+    let sig = STANDARD.encode(key.sign(message.as_bytes()).to_bytes());
+    write_signed_index(
+        &index_path,
+        pack_path.to_str().unwrap(),
+        &digest,
+        Some(&sig),
+    );
+
+    let mut config = build_config(&index_path, &temp.path().join("cache"), PackSource::Fs);
+    config.public_key = Some(pub_value(&key));
+    // No allowed roots configured: temp dir is outside cwd, so it is rejected.
+    let manager = PackManager::with_policy(config, PackPolicy::default().strict(true))?;
+    let index = Index::load(&IndexLocation::File(index_path))?;
+    let err = manager.resolve_all_for_index(&index).expect_err("rejected");
+    assert!(format!("{err:#}").contains("outside the allowed"));
+    Ok(())
+}
+
+#[test]
+fn strict_rejects_legacy_digest_only_signature_unless_allowed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pack_path = build_test_pack(temp.path())?;
+    let digest = compute_digest(&pack_path)?;
+    let index_path = temp.path().join("index.json");
+    let locator = pack_path.to_str().unwrap();
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    let legacy = STANDARD.encode(key.sign(digest.as_str().as_bytes()).to_bytes());
+    write_signed_index(&index_path, locator, &digest, Some(&legacy));
+
+    let mut config = build_config(&index_path, &temp.path().join("cache"), PackSource::Fs);
+    config.public_key = Some(pub_value(&key));
+    let index = Index::load(&config.index_location)?;
+    let roots = Some(vec![temp.path().to_path_buf()]);
+
+    let strict = PackPolicy {
+        verify_strict: true,
+        fs_allowed_roots: roots.clone(),
+        allow_legacy_signatures: false,
+    };
+    let manager = PackManager::with_policy(config.clone(), strict)?;
+    assert!(manager.resolve_all_for_index(&index).is_err());
+
+    let allowed = PackPolicy {
+        verify_strict: true,
+        fs_allowed_roots: roots.clone(),
+        allow_legacy_signatures: true,
+    };
+    PackManager::with_policy(config.clone(), allowed)?.resolve_all_for_index(&index)?;
+
+    let lax = PackPolicy {
+        verify_strict: false,
+        fs_allowed_roots: roots,
+        allow_legacy_signatures: false,
+    };
+    PackManager::with_policy(config, lax)?.resolve_all_for_index(&index)?;
+    Ok(())
+}
+
+/// An index may spell the pinned digest `SHA256:<UPPER HEX>`. The cache-hit
+/// path used to verify the signature against (and report) that raw spelling,
+/// while the miss path used the computed lowercase one, so a signature-required
+/// tenant failed after a restart with a warm cache.
+#[test]
+fn uppercase_pinned_digest_verifies_and_reports_canonically_on_a_warm_cache() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pack_path = build_test_pack(temp.path())?;
+    let digest = compute_digest(&pack_path)?;
+    let upper = PackDigest::parse(format!("SHA256:{}", digest.value().to_ascii_uppercase()))?;
+    assert_ne!(upper.as_str(), digest.as_str());
+    let index_path = temp.path().join("index.json");
+    let locator = pack_path.to_str().unwrap();
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    // Signed over the canonical (computed, lowercase) digest.
+    let message = format!(
+        "greentic-pack-sig-v1\nname=runner.demo\nversion=0.1.0\ndigest={}",
+        digest.as_str()
+    );
+    let sig = STANDARD.encode(key.sign(message.as_bytes()).to_bytes());
+    write_signed_index(&index_path, locator, &upper, Some(&sig));
+
+    let mut config = build_config(&index_path, &temp.path().join("cache"), PackSource::Fs);
+    config.public_key = Some(pub_value(&key));
+    let policy = PackPolicy {
+        verify_strict: true,
+        fs_allowed_roots: Some(vec![temp.path().to_path_buf()]),
+        allow_legacy_signatures: false,
+    };
+    let index = Index::load(&config.index_location)?;
+    let manager = PackManager::with_policy(config, policy)?;
+
+    // Cold cache: the miss path.
+    let cold = manager.resolve_all_for_index(&index)?;
+    // Warm cache: the pinned-digest hit path.
+    let warm = manager.resolve_all_for_index(&index)?;
+    let cold_main = &cold.tenants().get("demo").expect("tenant").main;
+    let warm_main = &warm.tenants().get("demo").expect("tenant").main;
+    assert_eq!(cold_main.digest.as_str(), digest.as_str());
+    assert_eq!(warm_main.digest.as_str(), digest.as_str());
+    assert_eq!(warm_main.path, cold_main.path);
     Ok(())
 }

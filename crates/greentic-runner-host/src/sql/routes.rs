@@ -34,14 +34,10 @@ fn default_max_rows() -> u32 {
 
 // ── Bearer helper ─────────────────────────────────────────────────────────────
 
-/// Extract the token from `Authorization: Bearer <token>`.
+/// Extract the token from `Authorization: Bearer <token>` (shared extractor:
+/// case-insensitive scheme, trimmed, empty rejected).
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::to_string)
+    crate::http::auth::bearer_from_headers(headers, &axum::http::header::AUTHORIZATION)
 }
 
 fn auth_ok(gateway: &crate::sql::SqlGateway, headers: &HeaderMap) -> bool {

@@ -6,9 +6,7 @@ use crate::cli;
 use crate::info;
 use clap::{Parser, Subcommand, ValueEnum};
 use greentic_config::{ConfigFileFormat, ConfigLayer, ConfigResolver};
-use greentic_runner_host::cache::{
-    ArtifactKey, CacheConfig, CacheManager, CpuPolicy, EngineProfile,
-};
+use greentic_runner_host::cache::{ArtifactKey, CacheConfig, CacheManager};
 use greentic_runner_host::config::{
     FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
     WebhookPolicy,
@@ -143,9 +141,9 @@ struct RunArgs {
     #[arg(long = "bindings-dir", value_name = "DIR")]
     bindings_dir: Vec<PathBuf>,
 
-    /// Port to serve the HTTP server on (default 8080)
-    #[arg(long, default_value = "8080")]
-    port: u16,
+    /// Port to serve the HTTP server on (overrides the PORT env var; default 8080)
+    #[arg(long)]
+    port: Option<u16>,
 
     /// Disable the component compilation cache
     #[arg(long)]
@@ -160,12 +158,12 @@ struct RunArgs {
     trace_out: Option<PathBuf>,
 
     /// Trace emission mode
-    #[arg(long = "trace", value_enum, default_value = "on")]
-    trace: TraceArg,
+    #[arg(long = "trace", value_enum)]
+    trace: Option<TraceArg>,
 
     /// Capture invocation inputs into trace.json (default off)
-    #[arg(long = "trace-capture-inputs", value_enum, default_value = "off")]
-    trace_capture_inputs: TraceCaptureArg,
+    #[arg(long = "trace-capture-inputs", value_enum)]
+    trace_capture_inputs: Option<TraceCaptureArg>,
 
     /// Invocation envelope validation mode
     #[arg(long = "validation", value_enum)]
@@ -301,9 +299,6 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
             std::env::set_var("GREENTIC_NO_CACHE", "1");
         }
     }
-    if run.bindings.is_empty() && run.bindings_dir.is_empty() {
-        bail!("at least one --bindings path is required");
-    }
     let (resolver, _) = build_resolver(run.config.as_deref(), run.allow_dev)?;
     let resolved = resolver.load()?;
     if run.config_explain {
@@ -312,19 +307,17 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
         println!("{}", report.text);
         return Ok(());
     }
+    if run.bindings.is_empty() && run.bindings_dir.is_empty() {
+        bail!("at least one --bindings path is required");
+    }
     let bindings =
         greentic_runner_host::gtbind::collect_gtbind_paths(&run.bindings, &run.bindings_dir)?;
-    let trace_out = std::env::var_os("GREENTIC_TRACE_OUT").map(PathBuf::from);
-    let trace_config = TraceConfig::from_env()
-        .with_overrides(
-            match run.trace {
-                TraceArg::Off => TraceMode::Off,
-                TraceArg::On => TraceMode::On,
-                TraceArg::Always => TraceMode::Always,
-            },
-            trace_out.or(run.trace_out.clone()),
-        )
-        .with_capture_inputs(matches!(run.trace_capture_inputs, TraceCaptureArg::On));
+    let trace_config = build_trace_config(
+        TraceConfig::from_env(),
+        run.trace,
+        run.trace_out.clone(),
+        run.trace_capture_inputs,
+    );
     let validation_mode = run.validation.map(|value| match value {
         ValidationArg::Off => ValidationMode::Off,
         ValidationArg::Warn => ValidationMode::Warn,
@@ -333,10 +326,37 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
     let validation_config = validation_mode
         .map(|mode| ValidationConfig::from_env().with_mode(mode))
         .unwrap_or_else(ValidationConfig::from_env);
-    let mut cfg = RunnerConfig::from_config(resolved, bindings)?.with_port(run.port);
+    // `--port` wins and skips `PORT` entirely, so a bad `PORT` cannot fail it.
+    let mut cfg = RunnerConfig::from_config_with_port(resolved, bindings, run.port)?;
     cfg.trace = trace_config;
     cfg.validation = validation_config;
     run_host(cfg).await
+}
+
+/// Layer explicit CLI flags over the env-derived trace config. A flag that was
+/// not given leaves the env/default value untouched, so CLI beats env only when
+/// the user actually passed it.
+fn build_trace_config(
+    base: TraceConfig,
+    mode: Option<TraceArg>,
+    out_path: Option<PathBuf>,
+    capture_inputs: Option<TraceCaptureArg>,
+) -> TraceConfig {
+    let mode = match mode {
+        Some(TraceArg::Off) => TraceMode::Off,
+        Some(TraceArg::On) => TraceMode::On,
+        Some(TraceArg::Always) => TraceMode::Always,
+        // `--trace-out` alone is an explicit request for a trace file; without
+        // this the path would be stored while the mode stayed Off, silently.
+        None if out_path.is_some() && base.mode == TraceMode::Off => TraceMode::On,
+        None => base.mode,
+    };
+    let capture = match capture_inputs {
+        Some(value) => matches!(value, TraceCaptureArg::On),
+        None => base.capture_inputs,
+    };
+    base.with_overrides(mode, out_path)
+        .with_capture_inputs(capture)
 }
 
 fn emit_json_error(err: &anyhow::Error) {
@@ -430,21 +450,33 @@ impl PackLockComponent {
         }
     }
 
-    fn bundled_path(&self) -> Option<&str> {
+    fn bundled_path(&self) -> Result<Option<&str>> {
         match (&self.bundled_path, &self.legacy_path) {
-            (Some(primary), Some(legacy)) if primary == legacy => Some(primary.as_str()),
-            (Some(primary), None) => Some(primary.as_str()),
-            (None, Some(legacy)) => Some(legacy.as_str()),
-            _ => None,
+            (Some(primary), Some(legacy)) if primary == legacy => Ok(Some(primary.as_str())),
+            (Some(primary), Some(legacy)) => bail!(
+                "pack.lock component {} has conflicting paths: {} vs {}",
+                self.name,
+                primary,
+                legacy
+            ),
+            (Some(primary), None) => Ok(Some(primary.as_str())),
+            (None, Some(legacy)) => Ok(Some(legacy.as_str())),
+            (None, None) => Ok(None),
         }
     }
 
-    fn wasm_digest(&self) -> Option<String> {
+    fn wasm_digest(&self) -> Result<Option<String>> {
         match (&self.wasm_sha256, &self.legacy_sha256) {
-            (Some(primary), Some(legacy)) if primary == legacy => Some(primary.clone()),
-            (Some(primary), None) => Some(primary.clone()),
-            (None, Some(legacy)) => Some(legacy.clone()),
-            _ => None,
+            (Some(primary), Some(legacy)) if primary == legacy => Ok(Some(primary.clone())),
+            (Some(primary), Some(legacy)) => bail!(
+                "pack.lock component {} has conflicting wasm digests: {} vs {}",
+                self.name,
+                primary,
+                legacy
+            ),
+            (Some(primary), None) => Ok(Some(primary.clone())),
+            (None, Some(legacy)) => Ok(Some(legacy.clone())),
+            (None, None) => Ok(None),
         }
     }
 }
@@ -459,8 +491,7 @@ async fn run_cache(cmd: CacheCommand) -> Result<()> {
 
 async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
     let (root, lock) = read_pack_lock(&args.pack).await?;
-    let engine = wasmtime::Engine::default();
-    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let (engine, profile) = greentic_runner_host::runtime_cache_engine_and_profile()?;
     let config = CacheConfig {
         memory_enabled: matches!(args.mode, CacheWarmupMode::Memory),
         ..CacheConfig::default()
@@ -474,14 +505,32 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
 
     for entry in lock.components {
         let source_ref = entry.source_ref()?;
-        let wasm_digest = entry
-            .wasm_digest()
+        // `wasm_sha256` is, by definition, the hash of the wasm bytes. The
+        // `resolved_digest` / `digest` fallbacks are what the OCI distributor
+        // recorded, which is the OCI *manifest* digest when the registry
+        // returned one, so it is not necessarily a hash of the bytes.
+        let declared_wasm_digest = entry.wasm_digest()?;
+        let wasm_digest = declared_wasm_digest
+            .clone()
             .or_else(|| entry.resolved_digest.clone())
             .or_else(|| entry.digest.clone())
             .ok_or_else(|| anyhow::anyhow!("pack.lock component {} missing digest", entry.name))?;
-        let wasm_digest = normalize_digest(&wasm_digest);
-        let key = ArtifactKey::new(cache.engine_profile_id().to_string(), wasm_digest);
-        let bytes = resolve_component_bytes(&root, &entry, source_ref, &dist_client).await?;
+        let wasm_digest = normalize_digest(&wasm_digest)
+            .with_context(|| format!("pack.lock component {}", entry.name))?;
+        let (bytes, from_local) =
+            resolve_component_bytes(&root, &entry, source_ref, &dist_client).await?;
+        // A bytes-hash is authoritative when it is declared as such, or when
+        // the bytes came from a local bundled file: a local file cannot be an
+        // OCI manifest, so a sha256 digest recorded for it must match.
+        let authoritative =
+            declared_wasm_digest.is_some() || (from_local && wasm_digest.starts_with("sha256:"));
+        check_lock_digest(&entry.name, &wasm_digest, &bytes, authoritative)?;
+        // Key by the digest of the bytes actually in hand, never the lock's
+        // claim: a non-authoritative lock digest is only warned about above,
+        // and keying by it would let a tampered lock store these bytes under a
+        // legitimate component's digest, which the runtime (keyed by the true
+        // sha256) would then hit.
+        let key = warmup_artifact_key(cache.engine_profile_id(), &bytes);
         let _ = cache
             .get_component(&engine, &key, || Ok(bytes))
             .await
@@ -490,9 +539,14 @@ async fn warmup_cache(args: CacheWarmupArgs) -> Result<()> {
     Ok(())
 }
 
+/// The compiled-artifact cache key for `bytes`: always their own sha256, the
+/// same key the runtime derives when it loads the component.
+fn warmup_artifact_key(engine_profile_id: &str, bytes: &[u8]) -> ArtifactKey {
+    ArtifactKey::new(engine_profile_id.to_string(), sha256_prefixed(bytes))
+}
+
 async fn doctor_cache() -> Result<()> {
-    let engine = wasmtime::Engine::default();
-    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let (_engine, profile) = greentic_runner_host::runtime_cache_engine_and_profile()?;
     let cache = CacheManager::new(CacheConfig::default(), profile);
     let metrics = cache.metrics();
     let memory = cache.memory_stats();
@@ -511,8 +565,7 @@ async fn doctor_cache() -> Result<()> {
 }
 
 async fn prune_cache(args: CachePruneArgs) -> Result<()> {
-    let engine = wasmtime::Engine::default();
-    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let (_engine, profile) = greentic_runner_host::runtime_cache_engine_and_profile()?;
     let cache = CacheManager::new(CacheConfig::default(), profile);
     let report = cache.prune_disk(args.dry_run).await?;
     if args.dry_run {
@@ -586,13 +639,14 @@ async fn resolve_component_bytes(
     entry: &PackLockComponent,
     source_ref: &str,
     dist_client: &DistClient,
-) -> Result<Vec<u8>> {
-    if let Some(relative) = entry.bundled_path() {
+) -> Result<(Vec<u8>, bool)> {
+    if let Some(relative) = entry.bundled_path()? {
         let path = root.join(relative);
         if path.exists() {
-            return async_fs::read(&path)
+            let bytes = async_fs::read(&path)
                 .await
-                .with_context(|| format!("failed to read {}", path.display()));
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            return Ok((bytes, true));
         }
     }
 
@@ -605,9 +659,10 @@ async fn resolve_component_bytes(
 
     if let Some(digest) = entry.resolved_digest.as_deref().or(entry.digest.as_deref()) {
         let cache_path = dist_client.fetch_digest(digest).await?;
-        return async_fs::read(&cache_path)
+        let bytes = async_fs::read(&cache_path)
             .await
-            .with_context(|| format!("failed to read {}", cache_path.display()));
+            .with_context(|| format!("failed to read {}", cache_path.display()))?;
+        return Ok((bytes, false));
     }
 
     let source = dist_client.parse_source(source_ref)?;
@@ -616,16 +671,59 @@ async fn resolve_component_bytes(
     let cache_path = resolved
         .cache_path
         .ok_or_else(|| anyhow::anyhow!("component {} missing cache path", entry.name))?;
-    async_fs::read(&cache_path)
+    let bytes = async_fs::read(&cache_path)
         .await
-        .with_context(|| format!("failed to read {}", cache_path.display()))
+        .with_context(|| format!("failed to read {}", cache_path.display()))?;
+    Ok((bytes, false))
 }
 
-fn normalize_digest(digest: &str) -> String {
-    if digest.starts_with("sha256:") || digest.starts_with("blake3:") {
-        digest.to_string()
-    } else {
-        format!("sha256:{digest}")
+/// Check that `bytes` hash to the digest recorded in pack.lock before they are
+/// cached under it. Supports the `sha256:` and `blake3:` prefixes.
+fn verify_component_digest(name: &str, digest: &str, bytes: &[u8]) -> Result<()> {
+    let (algo, expected) = digest.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("component {name} digest {digest} has no algorithm prefix")
+    })?;
+    let actual = match algo {
+        "sha256" => to_hex(&Sha256::digest(bytes)),
+        "blake3" => blake3::hash(bytes).to_hex().to_string(),
+        other => bail!("component {name} uses unsupported digest algorithm {other}"),
+    };
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!(
+            "component {name} digest mismatch: pack.lock has {digest}, content hashes to {algo}:{actual}"
+        );
+    }
+    Ok(())
+}
+
+/// Verify `bytes` against a pack.lock digest. A mismatch is fatal only when the
+/// digest is an authoritative hash of the wasm (`wasm_sha256`). A
+/// `resolved_digest` may be an OCI manifest digest, which can never equal the
+/// hash of the component bytes, so there a mismatch (or an unknown scheme) is
+/// logged and skipped rather than rejecting a valid component.
+fn check_lock_digest(name: &str, digest: &str, bytes: &[u8], authoritative: bool) -> Result<()> {
+    match verify_component_digest(name, digest, bytes) {
+        Ok(()) => Ok(()),
+        Err(err) if authoritative => Err(err),
+        Err(err) => {
+            tracing::warn!(
+                component = %name,
+                digest = %digest,
+                "skipping digest verification: lock digest is not verifiable against the component bytes ({err})"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Give a bare hex digest its `sha256:` prefix. A prefixed digest must use a
+/// supported algorithm (`sha256` / `blake3`); anything else is rejected rather
+/// than being wrapped into a nonsense `sha256:sha512:...` cache key.
+fn normalize_digest(digest: &str) -> Result<String> {
+    match digest.split_once(':') {
+        Some(("sha256" | "blake3", _)) => Ok(digest.to_string()),
+        Some((algo, _)) => bail!("unsupported digest algorithm {algo} in {digest}"),
+        None => Ok(format!("sha256:{digest}")),
     }
 }
 
@@ -838,15 +936,15 @@ fn select_operation_from_describe(
     let ops = &payload.operations;
     let requested = ops
         .iter()
-        .find_map(operation_name)
-        .filter(|name| *name == requested_operation)
+        .filter_map(operation_name)
+        .find(|name| *name == requested_operation)
         .map(ToString::to_string);
     if requested.is_some() {
         return requested;
     }
     ops.iter()
-        .find_map(operation_name)
-        .filter(|name| *name == "run")
+        .filter_map(operation_name)
+        .find(|name| *name == "run")
         .map(ToString::to_string)
         .or_else(|| {
             ops.first()

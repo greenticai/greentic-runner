@@ -71,14 +71,27 @@ impl HttpGraphProvider {
         _tenant: &TenantContext,
         graph_id: &str,
     ) -> Result<GraphConfig, ConfigError> {
-        let url = format!("{}/api/v1/designer/agent-graphs/{graph_id}", self.base_url);
+        // `..` stays a traversal step even percent-encoded: never send it.
+        if crate::tenant::is_dot_segment(graph_id) {
+            return Err(ConfigError::AgentNotFound(graph_id.to_string()));
+        }
+        let url = format!(
+            "{}/api/v1/designer/agent-graphs/{}",
+            self.base_url,
+            crate::tenant::percent_encode_segment(graph_id)
+        );
         let resp = self
             .client
             .get(&url)
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|e| ConfigError::Internal(format!("graph registry request failed: {e}")))?;
+            .map_err(|e| {
+                ConfigError::Internal(format!(
+                    "graph registry request failed: {}",
+                    e.without_url()
+                ))
+            })?;
 
         match resp.status().as_u16() {
             200 => {
@@ -86,10 +99,9 @@ impl HttpGraphProvider {
                 // Any failure — invalid JSON, wrong schemaVersion, structural
                 // validation error — is `Misconfigured` (mirrors HttpConfigProvider's
                 // `.json::<AgentConfig>()` decode-error → Misconfigured mapping).
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| ConfigError::Misconfigured(format!("graph config read: {e}")))?;
+                let body = resp.text().await.map_err(|e| {
+                    ConfigError::Misconfigured(format!("graph config read: {}", e.without_url()))
+                })?;
                 GraphConfig::from_json(&body)
                     .map_err(|e| ConfigError::Misconfigured(format!("graph config decode: {e}")))
             }
@@ -455,6 +467,25 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             2,
             "separate tenants must not share a cache entry for the same graph_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_graph_id_cannot_steer_the_request_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let provider = HttpGraphProvider::new(server.uri(), "tok");
+        let tenant = TenantContext::new("t", "e");
+        let _ = provider
+            .graph_config(&tenant, "../tenant/me/mcp-servers")
+            .await;
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].url.path(),
+            "/api/v1/designer/agent-graphs/..%2Ftenant%2Fme%2Fmcp-servers"
         );
     }
 }

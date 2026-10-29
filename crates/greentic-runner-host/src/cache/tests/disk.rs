@@ -147,3 +147,105 @@ fn prune_removes_oldest_entries() {
 
     let _ = fs::metadata(root);
 }
+
+#[test]
+fn tampered_artifact_fails_integrity_check_and_is_deleted() {
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let root = build_cache_root(&temp, &profile);
+    let cache = DiskCache::new(root.clone(), profile.clone(), None);
+
+    let digest = "sha256:feed".to_string();
+    let key = ArtifactKey::new(profile.id().to_string(), digest.clone());
+    let bytes = b"hello".to_vec();
+    let meta = ArtifactMetadata::new(&profile, digest.clone(), bytes.len() as u64);
+    cache.write_atomic(&key, &bytes, &meta).expect("write");
+
+    // Same length, different content: size check passes, hash check must not.
+    let (artifact_path, meta_path) = artifact_paths(&root, &digest);
+    std::fs::write(&artifact_path, b"HELLO").expect("tamper");
+    assert_eq!(cache.try_read(&key).expect("read"), None);
+    assert!(!artifact_path.exists());
+    assert!(!meta_path.exists());
+}
+
+fn backdate(path: &Path) {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for backdate");
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .expect("backdate");
+}
+
+#[test]
+fn fresh_artifact_without_metadata_is_not_deleted_by_a_reader() {
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let root = build_cache_root(&temp, &profile);
+    let cache = DiskCache::new(root.clone(), profile.clone(), None);
+    let digest = "sha256:cafe".to_string();
+    let key = ArtifactKey::new(profile.id().to_string(), digest.clone());
+    // A writer that has renamed the artifact but not yet the metadata.
+    let (artifact_path, _meta_path) = artifact_paths(&root, &digest);
+    fs::create_dir_all(artifact_path.parent().expect("parent")).expect("dir");
+    fs::write(&artifact_path, b"in flight").expect("write");
+
+    assert_eq!(cache.try_read(&key).expect("read"), None);
+    assert!(artifact_path.exists(), "in-flight write must survive");
+
+    backdate(&artifact_path);
+    assert_eq!(cache.try_read(&key).expect("read"), None);
+    assert!(!artifact_path.exists(), "abandoned artifact is removed");
+}
+
+#[test]
+fn prune_sweeps_old_orphans_and_stale_temp_files_only() {
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let root = build_cache_root(&temp, &profile);
+    let cache = DiskCache::new(root.clone(), profile.clone(), None);
+    let artifacts = root.join("artifacts");
+    let tmp = root.join("tmp");
+    fs::create_dir_all(&artifacts).expect("artifacts");
+    fs::create_dir_all(&tmp).expect("tmp");
+    let old_orphan = artifacts.join("sha256_old.cwasm");
+    let young_orphan = artifacts.join("sha256_young.cwasm");
+    let old_tmp = tmp.join("tmp_1_2_artifact");
+    let young_tmp = tmp.join("tmp_3_4_meta");
+    for path in [&old_orphan, &young_orphan, &old_tmp, &young_tmp] {
+        fs::write(path, b"x").expect("write");
+    }
+    backdate(&old_orphan);
+    backdate(&old_tmp);
+
+    let report = cache.prune_to_limit(false).expect("prune");
+    assert_eq!(report.removed_entries, 2);
+    assert!(!old_orphan.exists());
+    assert!(!old_tmp.exists());
+    assert!(young_orphan.exists());
+    assert!(young_tmp.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_dirs_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let root = temp.path().join("fresh-cache");
+    let cache = DiskCache::new(root.clone(), profile.clone(), None);
+    let digest = "sha256:beef".to_string();
+    let key = ArtifactKey::new(profile.id().to_string(), digest.clone());
+    let meta = ArtifactMetadata::new(&profile, digest, 1);
+    cache.write_atomic(&key, b"x", &meta).expect("write");
+    let mode = std::fs::metadata(root.join("artifacts"))
+        .expect("stat")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0);
+}

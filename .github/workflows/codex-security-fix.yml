@@ -1,7 +1,7 @@
 name: Codex Security Fix
 on:
   schedule:
-    # 04:01 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
+    # 03:12 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
     - cron: "12 3 * * *"
   workflow_dispatch:
     inputs:

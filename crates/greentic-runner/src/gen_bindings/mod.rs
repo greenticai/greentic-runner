@@ -1,16 +1,11 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_yaml_bw::{self as serde_yaml, Value};
-use std::{
-    collections::HashSet,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, fs, path::Path};
 use url::Url;
 
 use self::component::ComponentFeatures;
 use greentic_types::cbor::decode_pack_manifest;
-use runner_core::normalize_under_root;
 
 pub mod component;
 pub mod input;
@@ -80,23 +75,12 @@ pub struct McpServer {
 }
 
 pub fn load_pack(pack_dir: &Path) -> Result<PackMetadata> {
-    // Accept absolute or relative input but normalize it under its parent to avoid escapes.
-    let (root, candidate) = if pack_dir.is_absolute() {
-        let parent = pack_dir.parent().ok_or_else(|| {
-            anyhow::anyhow!("pack directory has no parent: {}", pack_dir.display())
-        })?;
-        let root = parent
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", parent.display()))?;
-        let name = pack_dir
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("pack directory has no name: {}", pack_dir.display()))?;
-        (root, PathBuf::from(name))
-    } else {
-        let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-        (cwd, pack_dir.to_path_buf())
-    };
-    let pack_dir = normalize_under_root(&root, &candidate)?;
+    // The path comes straight from the user (CLI argument), so there is no
+    // trust boundary to enforce: canonicalize it directly. This accepts
+    // relative paths containing `..` that a root-confined check would reject.
+    let pack_dir = pack_dir
+        .canonicalize()
+        .with_context(|| format!("pack directory {} does not exist", pack_dir.display()))?;
     if !pack_dir.is_dir() {
         anyhow::bail!("pack directory {} does not exist", pack_dir.display());
     }
@@ -118,13 +102,17 @@ pub fn load_pack(pack_dir: &Path) -> Result<PackMetadata> {
     let flows_dir = pack_dir.join("flows");
     let mut flows = Vec::new();
     if flows_dir.is_dir() {
+        let mut paths = Vec::new();
         for entry in fs::read_dir(&flows_dir)? {
-            let entry = entry?;
-            let path = entry.path();
+            let path = entry?.path();
             if path.extension().and_then(|s| s.to_str()) == Some("yaml") {
-                let flow = load_flow(&path)?;
-                flows.push(flow);
+                paths.push(path);
             }
+        }
+        // read_dir order is filesystem-dependent; sort for deterministic output.
+        paths.sort();
+        for path in paths {
+            flows.push(load_flow(&path)?);
         }
     }
 
@@ -365,21 +353,41 @@ fn collect_mcp_components(value: &Value, bindings: &mut FlowBindings) {
     }
 }
 
+/// Extract identifiers following `prefix` (e.g. `secrets.`) but only when they
+/// appear inside a `{{ ... }}` template expression, so plain text such as
+/// "see env.docs" is not mistaken for a placeholder.
 fn extract_placeholders(value: &str, prefix: &str) -> Vec<String> {
     let mut results = Vec::new();
+    let mut remaining = value;
+    while let Some(open) = remaining.find("{{") {
+        let after_open = &remaining[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            break;
+        };
+        collect_prefixed_identifiers(&after_open[..close], prefix, &mut results);
+        remaining = &after_open[close + 2..];
+    }
+    results
+}
+
+fn collect_prefixed_identifiers(expr: &str, prefix: &str, results: &mut Vec<String>) {
     let mut start = 0;
-    while let Some(idx) = value[start..].find(prefix) {
-        let idx = start + idx + prefix.len();
-        let rest = &value[idx..];
+    while let Some(idx) = expr[start..].find(prefix) {
+        let at = start + idx;
+        let after = at + prefix.len();
+        let preceded_by_ident = expr[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+        let rest = &expr[after..];
         let end = rest
             .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .unwrap_or(rest.len());
-        if end > 0 {
+        if !preceded_by_ident && end > 0 {
             results.push(rest[..end].to_string());
         }
-        start = idx + end;
+        start = after + end;
     }
-    results
 }
 
 fn extract_origin(text: &str) -> Option<String> {
@@ -419,11 +427,7 @@ pub fn generate_bindings(
     for flow in &flows {
         network.extend(flow.urls.clone());
     }
-    let mut network = unique_sorted(network);
-
-    if opts.complete && network.is_empty() {
-        network.push("https://*".to_string());
-    }
+    let network = unique_sorted(network);
 
     if opts.complete {
         for value in base_env_passthrough() {
@@ -445,7 +449,7 @@ pub fn generate_bindings(
         }
         if opts.strict {
             bail!(
-                "MCP component '{}' referenced but no server hint; add hints or rerun with --complete",
+                "MCP component '{}' referenced but no server hint; add an `mcp.servers` entry to bindings.hints.yaml or run without --strict to infer a default",
                 component
             );
         }
@@ -460,12 +464,12 @@ pub fn generate_bindings(
     if opts.strict {
         if opts.component.as_ref().map(|c| c.http).unwrap_or(false) && network.is_empty() {
             bail!(
-                "HTTP capability detected but no network allow rules; add hints or use --complete"
+                "HTTP capability detected but no network allow rules; add `network.allow` entries to bindings.hints.yaml or run without --strict"
             );
         }
         if opts.component.as_ref().map(|c| c.secrets).unwrap_or(false) && secrets.is_empty() {
             bail!(
-                "Secrets capability detected but no secrets.required hints; add hints or use --complete"
+                "Secrets capability detected but no secrets.required hints; add `secrets.required` entries to bindings.hints.yaml or run without --strict"
             );
         }
     }
@@ -551,5 +555,60 @@ fn value_to_list(value: &Value) -> Vec<String> {
             .collect(),
         Value::String(s, _) => vec![s.clone()],
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholders_are_only_read_inside_template_braces() {
+        assert_eq!(
+            extract_placeholders("a {{ env.FOO }} b {{secrets.BAR}}", "env."),
+            vec!["FOO".to_string()]
+        );
+        assert!(extract_placeholders("see env.DOCS for details", "env.").is_empty());
+        assert!(extract_placeholders("{{ myenv.X }}", "env.").is_empty());
+        assert!(extract_placeholders("{{ env.UNCLOSED", "env.").is_empty());
+    }
+
+    #[test]
+    fn complete_mode_does_not_add_wildcard_egress() {
+        let metadata = PackMetadata {
+            tenant: "t".into(),
+            pack_id: "p".into(),
+            pack_ref: "p@1".into(),
+            flows: Vec::new(),
+            hints: BindingsHints::default(),
+        };
+        let out = generate_bindings(
+            &metadata,
+            GeneratorOptions {
+                complete: true,
+                ..Default::default()
+            },
+        )
+        .expect("generate");
+        assert!(out.network_allow.is_empty());
+    }
+
+    #[test]
+    fn relative_pack_dir_with_parent_components_loads_and_flows_are_sorted() {
+        let temp = tempfile::tempdir().expect("tmp");
+        let pack = temp.path().join("pack");
+        fs::create_dir_all(pack.join("flows")).expect("flows dir");
+        fs::write(pack.join("pack.yaml"), "pack_id: p\nversion: 0.1.0\n").expect("manifest");
+        for name in ["c", "a", "b"] {
+            fs::write(
+                pack.join("flows").join(format!("{name}.yaml")),
+                "nodes: {}\n",
+            )
+            .expect("flow");
+        }
+        let with_dotdot = pack.join("..").join("pack");
+        let meta = load_pack(&with_dotdot).expect("load pack with ..");
+        let names: Vec<_> = meta.flows.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
     }
 }

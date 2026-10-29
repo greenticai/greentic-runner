@@ -152,10 +152,9 @@ impl A2aToolSource {
     }
 
     fn build(routes: Vec<A2aRoute>, credentials: CredentialScope) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(CALL_TIMEOUT)
-            .build()?;
+        // A route's URL comes from the pack: refuse link-local / metadata
+        // destinations (see `outbound_guard`). Redirects stay off outright.
+        let client = build_http_client(crate::outbound_guard::HttpGuard::from_env())?;
         let mut agents = HashMap::with_capacity(routes.len());
         for route in routes {
             agents.entry(route.agent_id.clone()).or_insert(route);
@@ -315,6 +314,42 @@ impl Transport {
         want_card: bool,
         answer: Option<&Value>,
     ) -> Result<A2aReply, String> {
+        let first = self
+            .send_once(agent_id, text, prior, want_card, answer)
+            .await;
+        match (first, prior) {
+            // The remote refused a message that named a task: that task is
+            // probably gone (collected, expired, restarted). Keep the context
+            // (the conversation), drop the task id, and ask once more; a task
+            // id the remote has forgotten would otherwise fail every call
+            // until the one-hour idle expiry.
+            (Err(SendError::Rejected(reason)), Some(held)) if held.task_id.is_some() => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %reason,
+                    "a2a agent rejected a message naming a task; retrying once without the task id"
+                );
+                let without_task = A2aContinuation {
+                    task_id: None,
+                    ..held.clone()
+                };
+                self.send_once(agent_id, text, Some(&without_task), want_card, answer)
+                    .await
+                    .map_err(SendError::into_message)
+            }
+            (result, _) => result.map_err(SendError::into_message),
+        }
+    }
+
+    /// One attempt of [`send`](Self::send).
+    async fn send_once(
+        &self,
+        agent_id: &str,
+        text: &str,
+        prior: Option<&A2aContinuation>,
+        want_card: bool,
+        answer: Option<&Value>,
+    ) -> Result<A2aReply, SendError> {
         let route = self
             .agents
             .get(agent_id)
@@ -327,7 +362,7 @@ impl Transport {
             .map_err(|err| format!("fetching card for a2a agent {agent_id} failed: {err}"))?;
 
         if let Some(reason) = unsupported_required_extensions(&card) {
-            return Err(format!("a2a agent {agent_id} {reason}"));
+            return Err(format!("a2a agent {agent_id} {reason}").into());
         }
 
         let interface = card
@@ -347,8 +382,14 @@ impl Transport {
         if !target.username().is_empty() || target.password().is_some() {
             return Err(format!(
                 "a2a agent {agent_id} names an interface URL carrying userinfo; refusing it"
-            ));
+            )
+            .into());
         }
+
+        // hyper-util skips the DNS resolver for an IP-literal host, so the
+        // client's `GuardedResolver` never sees `http://169.254.169.254/...`:
+        // check the literal here, before any secret is read or byte is sent.
+        check_target_literal(agent_id, &target)?;
 
         // A credential goes only to the host and port the admin configured.
         // Checked before the secret is read, so a card naming another host
@@ -397,10 +438,9 @@ impl Transport {
             if let Some((name, value)) = auth {
                 post = post.header(name, value);
             }
-            let response = post
-                .send()
-                .await
-                .map_err(|err| format!("calling a2a agent {agent_id} failed: {err}"))?;
+            let response = post.send().await.map_err(|err| {
+                format!("calling a2a agent {agent_id} failed: {}", err.without_url())
+            })?;
             if oauth && !retried && response.status() == reqwest::StatusCode::UNAUTHORIZED {
                 self.credentials.invalidate(route).await;
                 retried = true;
@@ -415,19 +455,29 @@ impl Transport {
         // JSON would otherwise report only "unreadable reply".
         let status = response.status();
         if !status.is_success() {
-            return Err(format!("a2a agent {agent_id} answered HTTP {status}"));
+            let message = format!("a2a agent {agent_id} answered HTTP {status}");
+            // A 4xx other than auth/rate-limit says the REQUEST was refused
+            // (e.g. an unknown task id); 5xx and the rest are not about it.
+            return Err(
+                if status.is_client_error() && !is_auth_or_rate_limit(status) {
+                    SendError::Rejected(message)
+                } else {
+                    SendError::Failed(message)
+                },
+            );
         }
 
-        let body: JsonRpcResponse<SendMessageResult> = response
-            .json()
+        let bytes = read_capped(response, MAX_REPLY_BYTES)
             .await
+            .map_err(|err| format!("a2a agent {agent_id} sent an unreadable reply: {err}"))?;
+        let body: JsonRpcResponse<SendMessageResult> = serde_json::from_slice(&bytes)
             .map_err(|err| format!("a2a agent {agent_id} sent an unreadable reply: {err}"))?;
 
         if let Some(error) = body.error {
-            return Err(format!(
+            return Err(SendError::Rejected(format!(
                 "a2a agent {agent_id} returned an error: {}",
                 error.message
-            ));
+            )));
         }
 
         match body.result {
@@ -444,11 +494,66 @@ impl Transport {
                 task_id: None,
             }),
             Some(SendMessageResult::Task(task)) => Ok(task_reply(agent_id, task)),
-            None => Err(format!(
-                "a2a agent {agent_id} returned neither a result nor an error"
-            )),
+            None => {
+                Err(format!("a2a agent {agent_id} returned neither a result nor an error").into())
+            }
         }
     }
+}
+
+/// Largest `SendMessage` reply body read. A reply is text and a few structured
+/// artifacts; a remote that sends more is broken or hostile, and the body is
+/// otherwise buffered whole.
+const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Why one `SendMessage` attempt failed.
+enum SendError {
+    /// The remote answered and refused THIS request (a JSON-RPC error, or an
+    /// HTTP 4xx other than auth/rate limit): the one failure that a stale
+    /// task id can cause.
+    Rejected(String),
+    /// Anything else: we could not reach it, it errored, or its reply was
+    /// unusable. Retrying without the task id would not help.
+    Failed(String),
+}
+
+impl SendError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Rejected(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
+impl From<String> for SendError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// 401/403 (credential problems) and 429 (rate limit) are about the caller,
+/// not about the task the message named.
+fn is_auth_or_rate_limit(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 429)
+}
+
+/// Read `response`'s body, refusing more than `cap` bytes (declared by
+/// `Content-Length` or actually received).
+async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > cap as u64)
+    {
+        return Err(format!("reply larger than {cap} bytes"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > cap {
+            return Err(format!("reply larger than {cap} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// The parts of the message we send: the text (when there is any) and, when
@@ -598,5 +703,136 @@ fn task_reply(agent_id: &str, task: Task) -> A2aReply {
         outcome,
         context_id: task.context_id,
         task_id: open.then_some(task.id),
+    }
+}
+
+/// Refuse an interface URL whose host is an IP literal in a blocked range
+/// (link-local / cloud metadata). Domains are covered by the resolver.
+fn check_target_literal(agent_id: &str, target: &url::Url) -> Result<(), String> {
+    crate::outbound_guard::HttpGuard::from_env()
+        .check_url_literal(target)
+        .map_err(|reason| format!("a2a agent {agent_id} interface URL refused: {reason}"))
+}
+
+/// The A2A HTTP client. `no_proxy()` is load-bearing: the guard sits in the DNS
+/// resolver, which an `HTTP(S)_PROXY` / `ALL_PROXY` in the environment would
+/// bypass (the proxy resolves the name, and an IP literal is never resolved).
+fn build_http_client(
+    guard: crate::outbound_guard::HttpGuard,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(Arc::new(crate::outbound_guard::GuardedResolver { guard }))
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(CALL_TIMEOUT)
+        .build()
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+
+    const CHILD_FLAG: &str = "GREENTIC_TEST_PROXY_CHILD";
+
+    /// Serve one canned 200 on `listener` in a thread; report whether it was hit.
+    fn spawn_stub(listener: TcpListener) -> std::thread::JoinHandle<bool> {
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).ok();
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    );
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        })
+    }
+
+    /// In the child (the env proxy points at `proxy`), the client must reach
+    /// `target` directly and never touch the proxy.
+    #[test]
+    fn a2a_client_ignores_the_environment_proxy() {
+        if std::env::var_os(CHILD_FLAG).is_none() {
+            let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+            let target_url = format!("http://{}/", target.local_addr().unwrap());
+            let proxy_hit = spawn_stub(proxy);
+            let target_hit = spawn_stub(target);
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "a2a_source::source::proxy_tests::a2a_client_ignores_the_environment_proxy",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_FLAG, &target_url)
+                .env("HTTP_PROXY", &proxy_url)
+                .env("http_proxy", &proxy_url)
+                .env("ALL_PROXY", &proxy_url)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child failed");
+            assert!(
+                target_hit.join().unwrap(),
+                "target must be reached directly"
+            );
+            assert!(!proxy_hit.join().unwrap(), "the env proxy must not be used");
+            return;
+        }
+        let url = std::env::var(CHILD_FLAG).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client =
+            super::build_http_client(crate::outbound_guard::HttpGuard::from_env()).unwrap();
+        let body =
+            rt.block_on(async { client.get(&url).send().await.unwrap().text().await.unwrap() });
+        assert_eq!(body, "ok");
+    }
+}
+
+#[cfg(test)]
+mod literal_guard_tests {
+    use super::check_target_literal;
+
+    fn refused(raw: &str) -> bool {
+        match url::Url::parse(raw) {
+            Ok(u) => check_target_literal("a1", &u).is_err(),
+            Err(_) => false,
+        }
+    }
+
+    fn allowed(raw: &str) -> bool {
+        match url::Url::parse(raw) {
+            Ok(u) => check_target_literal("a1", &u).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn metadata_and_link_local_literals_are_refused() {
+        assert!(refused("http://169.254.169.254/latest/meta-data/"));
+        assert!(refused("http://[fd00:ec2::254]/"));
+        assert!(refused("http://169.254.1.1:8080/rpc"));
+    }
+
+    #[test]
+    fn ordinary_hosts_and_loopback_pass() {
+        assert!(allowed("https://agent.example.com/rpc"));
+        assert!(allowed("http://127.0.0.1:9000/rpc"));
     }
 }

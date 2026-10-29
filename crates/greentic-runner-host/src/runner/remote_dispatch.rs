@@ -11,6 +11,119 @@ use greentic_types::{
 };
 use serde_json::Value;
 
+/// Deadline watchdogs in flight, keyed by correlation id. Each entry carries the
+/// generation it was registered under, so a task removes only its OWN entry and
+/// never a newer watchdog registered under the same (deterministic) id.
+///
+/// Process-global because the task that publishes a request
+/// ([`NatsDispatcher`]) and the task that receives its response
+/// (`dispatch_listener`) are separate objects. An ADMITTED response cancels the
+/// matching watchdog so a call that already completed never publishes a late
+/// `timeout`.
+type WatchdogMap = std::collections::HashMap<String, (u64, tokio::task::JoinHandle<()>)>;
+
+static WATCHDOGS: std::sync::LazyLock<parking_lot::Mutex<WatchdogMap>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+static WATCHDOG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_watchdog_generation() -> u64 {
+    WATCHDOG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Register `handle` as the watchdog for `correlation_id` under `generation`,
+/// aborting any previous one registered under the same id.
+#[cfg(test)]
+fn register_watchdog(correlation_id: String, generation: u64, handle: tokio::task::JoinHandle<()>) {
+    if let Some((_, previous)) = WATCHDOGS
+        .lock()
+        .insert(correlation_id, (generation, handle))
+    {
+        previous.abort();
+    }
+}
+
+/// Remove the entry for `correlation_id` only if it is still `generation`'s.
+fn deregister_watchdog(correlation_id: &str, generation: u64) {
+    let mut watchdogs = WATCHDOGS.lock();
+    if watchdogs
+        .get(correlation_id)
+        .is_some_and(|(current, _)| *current == generation)
+    {
+        watchdogs.remove(correlation_id);
+    }
+}
+
+/// Spawn the watchdog task and register it under `correlation_id` at once.
+/// After `deadline_ms` it deregisters itself (so its own echo through the
+/// listener does not abort the running task) and then runs `on_timeout`.
+/// Returns the generation it was registered under.
+fn arm_watchdog<F>(correlation_id: String, deadline_ms: u64, on_timeout: F) -> u64
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let generation = next_watchdog_generation();
+    let key = correlation_id.clone();
+    // The map lock is held across spawn + insert (no await in between), so a
+    // task with a tiny deadline cannot reach `deregister_watchdog` before its
+    // own entry exists: it blocks on this lock instead of finding nothing to
+    // remove and leaving a finished handle behind.
+    let mut watchdogs = WATCHDOGS.lock();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(deadline_ms)).await;
+        deregister_watchdog(&key, generation);
+        on_timeout.await;
+    });
+    if let Some((_, previous)) = watchdogs.insert(correlation_id, (generation, handle)) {
+        previous.abort();
+    }
+    generation
+}
+
+/// Abort and remove the watchdog `generation` registered, if still current.
+fn disarm_watchdog(correlation_id: &str, generation: u64) {
+    let mut watchdogs = WATCHDOGS.lock();
+    if watchdogs
+        .get(correlation_id)
+        .is_some_and(|(current, _)| *current == generation)
+        && let Some((_, handle)) = watchdogs.remove(correlation_id)
+    {
+        handle.abort();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn register_watchdog_for_test(
+    correlation_id: &str,
+    handle: tokio::task::JoinHandle<()>,
+) -> u64 {
+    let generation = next_watchdog_generation();
+    register_watchdog(correlation_id.to_string(), generation, handle);
+    generation
+}
+
+#[cfg(test)]
+pub(crate) fn deregister_watchdog_for_test(correlation_id: &str, generation: u64) {
+    deregister_watchdog(correlation_id, generation);
+}
+
+#[cfg(test)]
+pub(crate) fn watchdog_pending(correlation_id: &str) -> bool {
+    WATCHDOGS.lock().contains_key(correlation_id)
+}
+
+/// Cancel the deadline watchdog for `correlation_id`, if one is pending.
+/// Returns whether one was cancelled. Called when a response arrives.
+pub fn cancel_watchdog(correlation_id: &str) -> bool {
+    match WATCHDOGS.lock().remove(correlation_id) {
+        Some((_, handle)) => {
+            handle.abort();
+            true
+        }
+        None => false,
+    }
+}
+
 /// Everything needed to dispatch one unit of work to a runtime.
 pub struct RemoteDispatch {
     pub tenant: String,
@@ -38,6 +151,14 @@ pub struct RemoteDispatch {
 pub enum RemoteDispatchAction {
     AwaitingResponse { correlation_id: String },
     Dispatched,
+}
+
+/// A fresh random per-publish dispatch id (32 lowercase hex characters).
+fn new_dispatch_id() -> String {
+    use rand::RngExt as _;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill(&mut bytes);
+    hex::encode(bytes)
 }
 
 /// A built NATS message (broker-free; unit-testable).
@@ -80,6 +201,11 @@ pub fn build_request(req: &RemoteDispatch) -> Result<BuiltRequest> {
     headers.insert("Greentic-Tenant", req.tenant.as_str());
     headers.insert("Greentic-Env", req.env.as_str());
     headers.insert("Greentic-Idempotency-Key", req.correlation_id.as_str());
+    // Unique per publish (stable across broker redelivery of this message), so a
+    // consumer can dedup a redelivery without replaying an earlier turn of the
+    // same conversation. Kept OUT of the correlation id, which bridges reuse as
+    // the downstream session id.
+    headers.insert("Greentic-Dispatch-Id", new_dispatch_id().as_str());
 
     let action = match req.mode {
         DispatchMode::Await => RemoteDispatchAction::AwaitingResponse {
@@ -186,6 +312,12 @@ impl NatsDispatcher {
     }
 }
 
+/// Mark a failure that happened before anything reached the wire, so a
+/// transient one still lets the flow retry the turn.
+fn pre_effect_failure(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    crate::runner::engine::pre_effect(error)
+}
+
 #[async_trait]
 impl RemoteDispatchHandler for NatsDispatcher {
     async fn dispatch(&self, request: RemoteDispatch) -> Result<RemoteDispatchAction> {
@@ -203,38 +335,54 @@ impl RemoteDispatchHandler for NatsDispatcher {
             _ => None,
         };
 
-        let built = build_request(&request)?;
-        self.client
-            .publish_with_headers(built.subject, built.headers, built.body.into())
-            .await?;
+        // Nothing has been sent when the request cannot even be built or the
+        // publish is refused, so both are provably pre-effect: a transient one
+        // still lets the flow retry the turn (see `engine::pre_effect`).
+        let built = build_request(&request).map_err(pre_effect_failure)?;
 
-        // Spawn the deadline watchdog AFTER the request is on the wire.
-        if let Some((deadline_ms, runtime, correlation_id, tenant, env, decision_token)) =
-            maybe_timeout
-        {
-            let timeout_client = self.client.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(deadline_ms)).await;
-                let (subject, headers, body) = build_timeout_response_message_with_token(
-                    &runtime,
-                    &correlation_id,
-                    &tenant,
-                    &env,
-                    deadline_ms,
-                    decision_token.as_deref(),
-                );
-                if let Err(publish_error) = timeout_client
-                    .publish_with_headers(subject, headers, body.into())
-                    .await
-                {
-                    tracing::warn!(
-                        %publish_error,
-                        %correlation_id,
+        // Arm the deadline watchdog BEFORE the request is on the wire: a fast
+        // response can be admitted before this task resumes, and its cancel
+        // must find the watchdog rather than let it arm afterwards and fire a
+        // spurious timeout.
+        let armed = maybe_timeout.map(
+            |(deadline_ms, runtime, correlation_id, tenant, env, decision_token)| {
+                let timeout_client = self.client.clone();
+                let watchdog_key = correlation_id.clone();
+                let generation = arm_watchdog(watchdog_key.clone(), deadline_ms, async move {
+                    let (subject, headers, body) = build_timeout_response_message_with_token(
+                        &runtime,
+                        &correlation_id,
+                        &tenant,
+                        &env,
                         deadline_ms,
-                        "failed to publish timeout response for awaited dispatch"
+                        decision_token.as_deref(),
                     );
-                }
-            });
+                    if let Err(publish_error) = timeout_client
+                        .publish_with_headers(subject, headers, body.into())
+                        .await
+                    {
+                        tracing::warn!(
+                            %publish_error,
+                            correlation_id = %crate::log_safe::log_safe(&correlation_id),
+                            deadline_ms,
+                            "failed to publish timeout response for awaited dispatch"
+                        );
+                    }
+                });
+                (watchdog_key, generation)
+            },
+        );
+
+        if let Err(error) = self
+            .client
+            .publish_with_headers(built.subject, built.headers, built.body.into())
+            .await
+        {
+            // Nothing was sent, so there is nothing to time out.
+            if let Some((key, generation)) = armed {
+                disarm_watchdog(&key, generation);
+            }
+            return Err(pre_effect_failure(error));
         }
 
         Ok(built.action)
@@ -260,6 +408,166 @@ mod tests {
             deadline_ms: Some(1000),
             decision_token: None,
         }
+    }
+
+    #[test]
+    fn pre_effect_failure_marks_without_changing_the_message() {
+        let err = pre_effect_failure(anyhow::anyhow!("publish refused"));
+        assert!(crate::runner::engine::is_pre_effect_error(&err));
+        assert_eq!(err.to_string(), "publish refused");
+    }
+
+    /// Minimal NATS stand-in that completes the handshake (answers `PING`).
+    async fn fake_nats_server() -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (read, mut write) = stream.into_split();
+            let info = r#"INFO {"server_id":"fake","server_name":"fake","version":"2.10.0","proto":1,"max_payload":1024,"headers":true,"host":"127.0.0.1","port":0}"#;
+            if write
+                .write_all(format!("{info}\r\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("PING") && write.write_all(b"PONG\r\n").await.is_err() {
+                    return;
+                }
+            }
+        });
+        format!("nats://{addr}")
+    }
+
+    /// A publish the client refuses (here: an invalid subject)
+    /// fails `dispatch` as a pre-effect error and leaves no watchdog armed.
+    #[tokio::test]
+    async fn a_refused_publish_is_pre_effect_and_disarms_the_watchdog() {
+        let url = fake_nats_server().await;
+        let client = async_nats::connect(url).await.expect("fake server connect");
+        let dispatcher = NatsDispatcher::new(client);
+        let mut request = sample(DispatchMode::Await);
+        request.correlation_id = "corr-refused-publish".into();
+        // A subject with whitespace fails the client's subject validation,
+        // after the watchdog was armed and before anything is sent.
+        request.runtime = "bad runtime".into();
+        let err = dispatcher
+            .dispatch(request)
+            .await
+            .expect_err("a publish to an invalid subject is refused");
+        assert!(crate::runner::engine::is_pre_effect_error(&err), "{err:#}");
+        assert!(
+            !watchdog_pending("corr-refused-publish"),
+            "the watchdog armed before the publish is disarmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expiring_watchdog_never_removes_a_newer_one() {
+        let old =
+            register_watchdog_for_test("corr-gen", tokio::spawn(std::future::pending::<()>()));
+        let newer =
+            register_watchdog_for_test("corr-gen", tokio::spawn(std::future::pending::<()>()));
+        assert_ne!(old, newer);
+        deregister_watchdog_for_test("corr-gen", old);
+        assert!(watchdog_pending("corr-gen"), "stale generation is a no-op");
+        deregister_watchdog_for_test("corr-gen", newer);
+        assert!(!watchdog_pending("corr-gen"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_watchdog_that_expires_at_once_leaves_no_entry_behind() {
+        for i in 0..200 {
+            arm_watchdog(format!("corr-instant-{i}"), 0, async {});
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for i in 0..200 {
+            assert!(
+                !watchdog_pending(&format!("corr-instant-{i}")),
+                "a finished watchdog must deregister itself (iteration {i})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_response_admitted_right_after_arming_prevents_the_timeout() {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&fired);
+        // Armed first (before publish); the response then cancels it.
+        arm_watchdog("corr-early".to_string(), 30, async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            cancel_watchdog("corr-early"),
+            "cancel must find the armed watchdog"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_failed_publish_disarms_only_its_own_watchdog() {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&fired);
+        let old = arm_watchdog("corr-disarm".to_string(), 30, async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let newer = arm_watchdog("corr-disarm".to_string(), 10_000, async {});
+        disarm_watchdog("corr-disarm", old);
+        assert!(
+            watchdog_pending("corr-disarm"),
+            "stale generation is a no-op"
+        );
+        disarm_watchdog("corr-disarm", newer);
+        assert!(!watchdog_pending("corr-disarm"));
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_response_cancels_the_pending_watchdog() {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&fired);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        register_watchdog_for_test("corr-cancel", handle);
+        assert!(cancel_watchdog("corr-cancel"));
+        assert!(!cancel_watchdog("corr-cancel"), "second cancel is a no-op");
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "cancelled watchdog must never fire"
+        );
+    }
+
+    #[test]
+    fn each_publish_gets_its_own_dispatch_id_but_the_same_correlation() {
+        let first = build_request(&sample(DispatchMode::Await)).unwrap();
+        let second = build_request(&sample(DispatchMode::Await)).unwrap();
+        let id = |built: &BuiltRequest| {
+            built
+                .headers
+                .get("Greentic-Dispatch-Id")
+                .map(|v| v.as_str().to_string())
+        };
+        let (a, b) = (id(&first), id(&second));
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(a, b, "two turns must not share a dispatch id");
+        let key = |built: &BuiltRequest| {
+            built
+                .headers
+                .get("Greentic-Idempotency-Key")
+                .map(|v| v.as_str().to_string())
+        };
+        assert_eq!(key(&first), key(&second), "the session hint is unchanged");
     }
 
     #[test]

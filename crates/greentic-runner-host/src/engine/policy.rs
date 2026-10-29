@@ -48,6 +48,11 @@ where
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) => {
+                // The effects already happened (or the failure is deterministic);
+                // running `op` again repeats them / fails the same way.
+                if err.is_terminal() {
+                    return Err(err);
+                }
                 attempt += 1;
                 if attempt >= policy.max_attempts {
                     return Err(err);
@@ -215,5 +220,33 @@ mod tests {
             other => panic!("expected policy error, got {other:?}"),
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn post_effect_persistence_failures_are_never_retried() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&attempts);
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        };
+
+        let result = retry_with_jitter::<_, _, ()>(&policy, move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Err(RunnerError::PostEffectPersistence {
+                    reason: "store down".into(),
+                })
+            }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RunnerError::PostEffectPersistence { .. })
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

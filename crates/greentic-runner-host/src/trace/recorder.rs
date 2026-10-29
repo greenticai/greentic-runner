@@ -47,12 +47,20 @@ pub struct TraceConfig {
 }
 
 impl TraceConfig {
+    /// Trace capture is opt-in: without `GREENTIC_TRACE_OUT` the mode is `Off`,
+    /// so a stock deployment does not write `./trace.json` (shared by every
+    /// flow in the process) on each failure. Setting the variable, or passing
+    /// an explicit mode via [`Self::with_overrides`], turns it on.
     pub fn from_env() -> Self {
-        let out_path = env::var_os("GREENTIC_TRACE_OUT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_TRACE_FILE));
+        let explicit = env::var_os("GREENTIC_TRACE_OUT").map(PathBuf::from);
+        let mode = if explicit.is_some() {
+            TraceMode::On
+        } else {
+            TraceMode::Off
+        };
+        let out_path = explicit.unwrap_or_else(|| PathBuf::from(DEFAULT_TRACE_FILE));
         Self {
-            mode: TraceMode::On,
+            mode,
             out_path,
             buffer_size: DEFAULT_BUFFER_SIZE,
             capture_inputs: env::var("GREENTIC_TRACE_CAPTURE_INPUTS").ok().as_deref() == Some("1"),
@@ -350,6 +358,10 @@ impl ExecutionObserver for TraceRecorder {
         };
         self.emit_audit(event, &step, Outcome::Ok);
         state.buffer.push_back(step);
+        // New content since the last flush: re-arm the final flush, or a node
+        // that failed and then succeeded on retry leaves the file frozen at
+        // the failed attempt.
+        state.flushed = false;
         while state.buffer.len() > self.config.buffer_size {
             state.buffer.pop_front();
         }
@@ -403,6 +415,10 @@ impl ExecutionObserver for TraceRecorder {
         };
         self.emit_audit(event, &step, Outcome::Error);
         state.buffer.push_back(step);
+        // New content since the last flush: re-arm the final flush, or a node
+        // that failed and then succeeded on retry leaves the file frozen at
+        // the failed attempt.
+        state.flushed = false;
         while state.buffer.len() > self.config.buffer_size {
             state.buffer.pop_front();
         }
@@ -466,11 +482,19 @@ fn write_trace_atomic(path: &Path, trace: &TraceEnvelope) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(DEFAULT_TRACE_FILE);
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    // Unique per write: concurrent flows (or processes) targeting the same
+    // output path must not interleave bytes in one shared temp file.
+    let tmp = path.with_file_name(format!(
+        "{file_name}.{}.{}.tmp",
+        std::process::id(),
+        generate_audit_event_id()
+    ));
     let payload = serde_json::to_vec_pretty(trace).context("serialize trace")?;
     fs::write(&tmp, payload).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
+    }
     Ok(())
 }
 
@@ -685,6 +709,41 @@ mod tests {
 
         let written = fs::read_to_string(&out_path).expect("trace file was written");
         assert!(written.contains("\"node_id\": \"n1\""));
+    }
+
+    #[test]
+    fn final_flush_overwrites_a_trace_flushed_by_an_earlier_node_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out_path = dir.path().join("trace.json");
+        let recorder = TraceRecorder::new(trace_config(out_path.clone()), trace_context());
+
+        let ctx = flow_context(Some("s1"));
+        let node = HostNode::for_test("greentic:http", Some("call"));
+        let payload = json!({"foo": "bar"});
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "n1",
+            node: &node,
+            payload: &payload,
+        };
+        // Attempt 1 fails (flushes immediately), attempt 2 succeeds.
+        recorder.on_node_start(&event);
+        recorder.on_node_error(&event, &std::io::Error::other("transient"));
+        let after_error = fs::read_to_string(&out_path)?;
+        assert!(after_error.contains("transient"));
+
+        recorder.on_node_start(&event);
+        recorder.on_node_end(&event, &json!({"ok": true}));
+        recorder.flush_success()?;
+
+        let steps = serde_json::from_str::<Value>(&fs::read_to_string(&out_path)?)?;
+        let steps = steps["steps"].as_array().cloned().unwrap_or_default();
+        assert_eq!(steps.len(), 2, "both attempts are recorded");
+        assert!(
+            steps[1]["error"].is_null(),
+            "final flush must include the successful retry"
+        );
+        Ok(())
     }
 
     #[test]

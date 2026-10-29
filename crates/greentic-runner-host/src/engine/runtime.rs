@@ -180,6 +180,14 @@ impl FlowResumeStore {
         Ok(reply_scope)
     }
 
+    /// The key of the in-process turn lock for the session `envelope`
+    /// addresses: the same tenant/env and derived user id the park is stored
+    /// under, so two envelopes that address one park share one lock.
+    pub(crate) fn turn_key(envelope: &IngressEnvelope) -> GResult<String> {
+        let (ctx, user, _, _) = build_store_ctx(envelope)?;
+        Ok(format!("{}:{}:{}", ctx.env, ctx.tenant_id, user.as_str()))
+    }
+
     pub async fn clear(&self, envelope: &IngressEnvelope) -> GResult<()> {
         let (ctx, user, _, scope) = build_store_ctx(envelope)?;
         let mut scopes = vec![scope.clone()];
@@ -240,7 +248,7 @@ fn build_store_ctx(envelope: &IngressEnvelope) -> GResult<(TenantCtx, UserId, St
             reason: "Cannot suspend: reply_scope missing; provider plugin must supply ReplyScope"
                 .to_string(),
         })?;
-    let mut ctx = envelope.tenant_ctx();
+    let mut ctx = envelope.tenant_ctx()?;
     ctx = ctx.with_session(hint.clone());
     ctx = ctx.with_user(Some(user.clone()));
     Ok((ctx, user, hint, scope))
@@ -680,7 +688,7 @@ mod tests {
     fn tenant_ctx_stamps_messaging_endpoint_id() {
         let mut envelope = sample_envelope();
         envelope.messaging_endpoint_id = Some("teams-legal".into());
-        let ctx = envelope.tenant_ctx();
+        let ctx = envelope.tenant_ctx().unwrap();
         assert_eq!(
             ctx.attributes.get(attr_keys::MESSAGING_ENDPOINT_ID),
             Some(&"teams-legal".to_string())
@@ -688,13 +696,65 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tenant_or_env_is_an_error_not_a_shared_default() {
+        let mut envelope = sample_envelope();
+        envelope.tenant = "Not A Tenant!".into();
+        assert!(envelope.tenant_ctx().is_err());
+        let mut envelope = sample_envelope();
+        envelope.env = Some("bad env".into());
+        assert!(envelope.tenant_ctx().is_err());
+    }
+
+    #[test]
     fn tenant_ctx_omits_messaging_endpoint_id_when_unset() {
         let envelope = sample_envelope();
-        let ctx = envelope.tenant_ctx();
+        let ctx = envelope.tenant_ctx().unwrap();
         assert!(
             !ctx.attributes
                 .contains_key(attr_keys::MESSAGING_ENDPOINT_ID)
         );
+    }
+    #[test]
+    fn a_terminal_flow_error_is_not_classified_as_a_retryable_adapter_call() {
+        let terminal = crate::runner::engine::terminal_flow_error("flow_step_limit_exceeded: x")
+            .context("running flow");
+        assert!(matches!(
+            classify_flow_error(&terminal),
+            RunnerError::FlowTerminal { .. }
+        ));
+        let transient = anyhow!("upstream hiccup");
+        assert!(matches!(
+            classify_flow_error(&transient),
+            RunnerError::AdapterCall { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_step_limit_runaway_runs_the_turn_once_not_five_times() {
+        use crate::engine::policy::{RetryPolicy, retry_with_jitter};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let runs = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&runs);
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        };
+        let result = retry_with_jitter::<_, _, ()>(&policy, move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                // The same conversion `call_traced_unlocked` applies to the
+                // error `check_step_budget` raises.
+                let err = crate::runner::engine::terminal_flow_error(
+                    "flow_step_limit_exceeded: flow `f` ran more than 10000 nodes in one turn",
+                );
+                Err(classify_flow_error(&err))
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(RunnerError::FlowTerminal { .. })));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -850,6 +910,29 @@ impl StateMachineRuntime {
         Ok(snapshot.map(|snapshot| snapshot.state.pending_approvals()))
     }
 
+    /// The turn-lock key of the session `envelope` addresses, or `None` when
+    /// this runtime never parks (no resume store) or the envelope carries no
+    /// session identity.
+    pub(crate) fn turn_lock_key(&self, envelope: &IngressEnvelope) -> Option<String> {
+        self.resume.as_ref()?;
+        FlowResumeStore::turn_key(&envelope.clone().canonicalize()).ok()
+    }
+
+    /// Run `fut` under the turn lock `key` (see [`super::turn_lock`]). Used by
+    /// the dispatch resumer so its admission-check-then-resume sequence
+    /// excludes a concurrent user turn; the nested `handle` inside `fut`
+    /// skips the lock (same task).
+    pub(crate) async fn with_turn_lock<F: std::future::Future>(
+        &self,
+        key: Option<String>,
+        fut: F,
+    ) -> F::Output {
+        match key {
+            Some(key) => super::turn_lock::global().run(key, fut).await,
+            None => fut.await,
+        }
+    }
+
     /// Execute the flow associated with the provided ingress event.
     pub async fn handle(&self, envelope: IngressEnvelope) -> Result<Value> {
         let result = self.run_flow_result(envelope).await?;
@@ -876,7 +959,7 @@ impl StateMachineRuntime {
         &self,
         envelope: IngressEnvelope,
     ) -> Result<super::api::RunFlowResult> {
-        let tenant_ctx = envelope.tenant_ctx();
+        let tenant_ctx = envelope.tenant_ctx()?;
         let session_hint = envelope
             .session_hint
             .clone()
@@ -1030,6 +1113,40 @@ impl Adapter for PackFlowAdapter {
         &self,
         call: &AdapterCall,
     ) -> GResult<(Value, serde_json::Map<String, Value>)> {
+        // One turn per session at a time: `fetch` does not consume the parked
+        // snapshot, so without this two concurrent messages both resume it.
+        // A payload that does not parse (or has no session identity) is left
+        // to the body, which reports the same error it always did.
+        let key = turn_key_for_payload(&call.payload);
+        match key {
+            Some(key) => {
+                super::turn_lock::global()
+                    .run(key, self.call_traced_unlocked(call))
+                    .await
+            }
+            None => self.call_traced_unlocked(call).await,
+        }
+    }
+}
+
+/// The per-session turn-lock key for an adapter call payload, or `None` when
+/// the payload is not an ingress envelope with a session identity.
+///
+/// The ONE derivation used both by [`PackFlowAdapter::call_traced`] (the
+/// per-attempt lock) and by the whole-turn retry loop in the state machine
+/// (which holds the same lock across attempts so another message cannot slip in
+/// between a failed attempt and its retry).
+pub(crate) fn turn_key_for_payload(payload: &Value) -> Option<String> {
+    serde_json::from_value::<IngressEnvelope>(payload.clone())
+        .ok()
+        .and_then(|envelope| FlowResumeStore::turn_key(&envelope.canonicalize()).ok())
+}
+
+impl PackFlowAdapter {
+    async fn call_traced_unlocked(
+        &self,
+        call: &AdapterCall,
+    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
         let envelope: IngressEnvelope =
             serde_json::from_value(call.payload.clone()).map_err(|err| {
                 RunnerError::AdapterCall {
@@ -1117,7 +1234,11 @@ impl Adapter for PackFlowAdapter {
             // on the async execution path, so `AuditSink::new`'s
             // `tokio::spawn` runs inside a live tokio runtime context.
             let sink = self.audit_nats_client.clone().map(AuditSink::new);
-            let audit_tenant = sink.is_some().then(|| envelope.tenant_ctx());
+            let audit_tenant = if sink.is_some() {
+                Some(envelope.tenant_ctx()?)
+            } else {
+                None
+            };
             Some(TraceRecorder::new_with_audit(
                 trace_config,
                 trace_ctx,
@@ -1202,7 +1323,9 @@ impl Adapter for PackFlowAdapter {
                     flow_id: resume_flow_id.as_str(),
                     ..ctx
                 };
-                self.engine.resume(resume_ctx, snapshot, payload).await
+                self.engine
+                    .resume_surfacing_failures(resume_ctx, snapshot, payload)
+                    .await
             } else if let Some(entry) = envelope.entry_node.as_deref() {
                 self.engine.execute_from(ctx, payload, entry).await
             } else {
@@ -1260,13 +1383,7 @@ impl Adapter for PackFlowAdapter {
                         );
                     }
                 }
-                return Err(RunnerError::AdapterCall {
-                    // `{:#}` flattens the full anyhow source chain; a bare
-                    // `to_string()` keeps only the outermost context and drops
-                    // the real root cause (e.g. the underlying LLM/dispatch
-                    // error behind "in-process operala dispatch … failed").
-                    reason: format!("{err:#}"),
-                });
+                return Err(classify_flow_error(&err));
             }
         };
 
@@ -1284,12 +1401,15 @@ impl Adapter for PackFlowAdapter {
                 if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
                     reporter.record(turn.completed(&observed, &output));
                 }
-                self.resume.clear(&envelope).await?;
+                persist_after_effects(|| self.resume.clear(&envelope)).await?;
                 Ok((output, node_outputs))
             }
             FlowStatus::Waiting(wait) => {
                 let marker = turn.as_ref().map(|turn| turn.marker_after(&observed));
-                let reply_scope = self.resume.save_with_run(&envelope, &wait, marker).await?;
+                let reply_scope = persist_after_effects(|| {
+                    self.resume.save_with_run(&envelope, &wait, marker.clone())
+                })
+                .await?;
                 if let (Some(reporter), Some(turn)) = (self.run_outcome.as_ref(), turn.as_ref()) {
                     reporter.record(turn.waiting(&observed, &wait));
                 }
@@ -1304,6 +1424,40 @@ impl Adapter for PackFlowAdapter {
             }
         }
     }
+}
+
+/// Map a flow-run failure onto the error the state machine's whole-turn retry
+/// reads. A [`TerminalFlowError`](crate::runner::engine::TerminalFlowError) in
+/// the chain (step budget, `redirect_limit`, unknown node, ...) becomes the
+/// non-retryable [`RunnerError::FlowTerminal`]; everything else stays a
+/// retryable [`RunnerError::AdapterCall`].
+fn classify_flow_error(err: &anyhow::Error) -> RunnerError {
+    // `{:#}` flattens the full anyhow source chain; a bare `to_string()` keeps
+    // only the outermost context and drops the real root cause (e.g. the
+    // underlying LLM/dispatch error behind "in-process operala dispatch ...
+    // failed").
+    let reason = format!("{err:#}");
+    if crate::runner::engine::is_terminal_flow_error(err) {
+        RunnerError::FlowTerminal { reason }
+    } else {
+        RunnerError::AdapterCall { reason }
+    }
+}
+
+/// Run an idempotent resume-store write that happens AFTER a flow's side
+/// effects, retrying the write itself (never the flow) and reporting a final
+/// failure as the non-retryable `PostEffectPersistence`.
+async fn persist_after_effects<F, Fut, T>(op: F) -> GResult<T>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = GResult<T>> + Send,
+    T: Send,
+{
+    super::policy::retry_with_jitter(&super::policy::RetryPolicy::default(), op)
+        .await
+        .map_err(|err| RunnerError::PostEffectPersistence {
+            reason: err.to_string(),
+        })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1466,13 +1620,18 @@ impl IngressEnvelope {
         )
     }
 
-    pub fn tenant_ctx(&self) -> TenantCtx {
+    /// The tenant context this envelope runs under. An invalid tenant or env id
+    /// is an error: mapping it onto a shared default would run (and store the
+    /// parked wait of) one caller's traffic in another's namespace.
+    pub fn tenant_ctx(&self) -> GResult<TenantCtx> {
         let env_raw = self.env.clone().unwrap_or_else(|| DEFAULT_ENV.into());
-        let env = EnvId::from_str(env_raw.as_str())
-            .unwrap_or_else(|_| EnvId::from_str(DEFAULT_ENV).expect("default env must be valid"));
-        let tenant_id = TenantId::from_str(self.tenant.as_str()).unwrap_or_else(|_| {
-            TenantId::from_str("tenant.default").expect("tenant fallback must be valid")
-        });
+        let env = EnvId::from_str(env_raw.as_str()).map_err(|err| RunnerError::Session {
+            reason: format!("invalid env id `{env_raw}`: {err}"),
+        })?;
+        let tenant_id =
+            TenantId::from_str(self.tenant.as_str()).map_err(|err| RunnerError::Session {
+                reason: format!("invalid tenant id `{}`: {err}", self.tenant),
+            })?;
         let mut ctx = TenantCtx::new(env, tenant_id).with_flow(self.flow_id.clone());
         if let Some(provider) = &self.provider {
             ctx = ctx.with_provider(provider.clone());
@@ -1487,6 +1646,6 @@ impl IngressEnvelope {
             ctx.attributes
                 .insert(attr_keys::MESSAGING_ENDPOINT_ID.to_string(), eid.clone());
         }
-        ctx
+        Ok(ctx)
     }
 }

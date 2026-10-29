@@ -12,30 +12,46 @@ use greentic_runner_host::secrets::default_manager;
 use greentic_runner_host::wasi::RunnerWasiPolicy;
 use reqwest::blocking::Client as BlockingClient;
 use serde_json::Value;
+use serial_test::serial;
 use tempfile::TempDir;
 
+/// CI exports `GREENTIC_PROVIDER_CORE_ONLY=1`, so each test pins the flag
+/// explicitly: the gate test and the success-path test must both always run.
 #[test]
-fn secrets_store_end_to_end_missing_and_success() -> Result<()> {
+#[serial]
+fn secrets_store_is_blocked_in_provider_core_only_mode() -> Result<()> {
+    let _core_only = EnvGuard::set("GREENTIC_PROVIDER_CORE_ONLY", "1");
     let wasm = build_fixture_component()?;
     let config = write_minimal_config()?;
 
-    if provider_core_only::is_enabled() {
-        let err = invoke_component(&wasm, Arc::clone(&config))
-            .expect_err("secrets host should be blocked when provider-core only is enabled");
-        assert!(
-            err.to_string().contains("provider-core"),
-            "error should mention provider-core gate: {err}"
-        );
-        return Ok(());
-    }
+    let err = invoke_component(&wasm, config)
+        .expect_err("secrets host should be blocked when provider-core only is enabled");
+    assert!(
+        err.to_string().contains("provider-core"),
+        "error should mention provider-core gate: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn secrets_store_end_to_end_missing_and_success() -> Result<()> {
+    let _core_only = EnvGuard::set("GREENTIC_PROVIDER_CORE_ONLY", "0");
+    let _env = EnvGuard::set("GREENTIC_ENV", "local");
+    let wasm = build_fixture_component()?;
+    let config = write_minimal_config()?;
 
     let missing = invoke_component(&wasm, Arc::clone(&config))?;
     let missing_json: Value = serde_json::from_str(&missing)?;
     assert_eq!(missing_json["ok"], Value::Bool(false));
     assert_eq!(missing_json["error"], Value::String("missing".into()));
 
-    // Provide TEST_API_KEY via env -> component observes it.
-    let _secret = EnvGuard::set("TEST_API_KEY", "super-secret");
+    // The host resolves the secret at its pack-scoped URI, and the env-backed
+    // store reads the variable named by the full URI.
+    let _secret = EnvGuard::set(
+        "secrets://local/demo/_/secrets-store-smoke/test_api_key",
+        "super-secret",
+    );
     let success = invoke_component(&wasm, config)?;
     let success_json: Value = serde_json::from_str(&success)?;
     assert_eq!(success_json["ok"], Value::Bool(true));

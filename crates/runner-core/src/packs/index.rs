@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::env::{IndexLocation, PackSource};
 
+use super::resolver::{DEFAULT_MAX_INDEX_DOWNLOAD_MB, copy_capped, env_cap_bytes};
 use super::{PackDigest, PackRef, PackVersion};
 
 #[derive(Debug, Clone)]
@@ -31,15 +32,39 @@ impl Index {
                 Self::from_reader_with_base(BufReader::new(file), base_dir.as_deref())
             }
             IndexLocation::Remote(url) => {
-                let client = Client::builder().build()?;
-                let response = client
+                let client = Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()?;
+                let mut response = client
                     .get(url.clone())
                     .send()
-                    .with_context(|| format!("failed to fetch index {}", url))?
+                    .map_err(reqwest::Error::without_url)
+                    .with_context(|| {
+                        format!(
+                            "failed to fetch index {}",
+                            super::resolver::redact_locator(url.as_str())
+                        )
+                    })?
                     .error_for_status()
-                    .with_context(|| format!("index download failed {}", url))?;
-                let bytes = response
-                    .bytes()
+                    .map_err(reqwest::Error::without_url)
+                    .with_context(|| {
+                        format!(
+                            "index download failed {}",
+                            super::resolver::redact_locator(url.as_str())
+                        )
+                    })?;
+                let cap =
+                    env_cap_bytes("GREENTIC_PACK_INDEX_MAX_MB", DEFAULT_MAX_INDEX_DOWNLOAD_MB);
+                if let (Some(cap), Some(len)) = (cap, response.content_length())
+                    && len > cap
+                {
+                    bail!(
+                        "index {} is {len} bytes, over the {cap} byte limit",
+                        super::resolver::redact_locator(url.as_str())
+                    );
+                }
+                let mut bytes = Vec::new();
+                copy_capped(&mut response, &mut bytes, cap, "index")
                     .context("failed to read index response body")?;
                 Self::from_slice_with_base(&bytes, None)
             }
@@ -171,6 +196,7 @@ struct RawPackEntry {
 
 impl RawPackEntry {
     fn into_entry(self, base_dir: Option<&Path>) -> Result<PackEntry> {
+        validate_pack_name(&self.name)?;
         let (version, digest) = parse_version_and_digest(self.version, self.digest)?;
         let locator = resolve_locator(&self.locator, base_dir);
         Ok(PackEntry {
@@ -191,6 +217,19 @@ impl TryFrom<RawPackEntry> for PackEntry {
     fn try_from(value: RawPackEntry) -> Result<Self> {
         value.into_entry(None)
     }
+}
+
+/// A pack name is an identifier, not a path. Namespaced names (`acme/pack`)
+/// are legitimate; the cache never uses the raw name as a path, it goes through
+/// `sanitize_segment`, which maps separators away and keeps `..` from escaping.
+/// So only names that are meaningless or unsafe to sanitize are rejected:
+/// empty, `.`, `..` and NUL. One bad entry aborts the whole reload for every
+/// tenant, which is why this stays as permissive as the cache allows.
+fn validate_pack_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('\0') {
+        bail!("invalid pack name `{name}`: must be non-empty, not `.`/`..`, and contain no NUL");
+    }
+    Ok(())
 }
 
 fn parse_version_and_digest(
@@ -223,4 +262,82 @@ fn resolve_locator(locator: &str, base_dir: Option<&Path>) -> String {
         }
     }
     locator.to_string()
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    fn raw(name: &str) -> RawPackEntry {
+        RawPackEntry {
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            digest: None,
+            locator: "file:///tmp/x.gtpack".to_string(),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_dot_dotdot_and_nul_names() {
+        for bad in ["", ".", "..", "a\0b"] {
+            assert!(
+                raw(bad).into_entry(None).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ordinary_names() {
+        for good in [
+            "demo",
+            "acme.pack-v2",
+            "a_b",
+            "a/b",
+            "a\\b",
+            "a/../b",
+            "../x",
+        ] {
+            assert!(
+                raw(good).into_entry(None).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_error_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// A server that announces a body far over the default index cap and hangs up.
+    fn oversized_index_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn oversized_index_error_does_not_leak_the_url_query() {
+        let port = oversized_index_server();
+        let url = url::Url::parse(&format!(
+            "http://127.0.0.1:{port}/index.json?X-Amz-Signature=SECRET123"
+        ))
+        .expect("url");
+        let err = Index::load(&IndexLocation::Remote(url)).expect_err("over the cap");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("byte limit"), "{chain}");
+        assert!(!chain.contains("SECRET123"), "{chain}");
+    }
 }

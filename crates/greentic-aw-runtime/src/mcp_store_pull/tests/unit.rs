@@ -197,3 +197,87 @@ fn map_trust_error_folds_into_signature() {
         other => panic!("expected Signature, got {other:?}"),
     }
 }
+
+#[test]
+fn validate_component_ref_rejects_traversal_and_separators() {
+    for bad in [
+        "", "..", "../x", "a/b", "a\\b", ".hidden", "a..b", "a b", "a?b", "a%2fb",
+    ] {
+        assert!(
+            validate_component_ref(bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    for good in ["router_echo", "my-ext.v2", "A1"] {
+        assert!(validate_component_ref(good).is_ok(), "{good:?} must pass");
+    }
+}
+
+#[tokio::test]
+async fn ensure_cached_rejects_traversal_ref_before_any_io() {
+    let err = ensure_cached("../../etc/x", "1.0.0", "00")
+        .await
+        .expect_err("traversal must fail");
+    assert!(matches!(err, StorePullError::Config(_)), "{err:?}");
+    let err = ensure_cached("ok", "1/../2", "00")
+        .await
+        .expect_err("bad version must fail");
+    assert!(matches!(err, StorePullError::Config(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn collect_capped_returns_a_body_within_the_cap() {
+    let chunks: Vec<Result<Vec<u8>, String>> = vec![Ok(vec![1; 4]), Ok(vec![2; 4])];
+    let body = collect_capped(futures::stream::iter(chunks), 8, "http://store/x")
+        .await
+        .expect("exactly at the cap is allowed");
+    assert_eq!(body.len(), 8);
+}
+
+#[tokio::test]
+async fn collect_capped_stops_a_chunked_body_with_no_content_length() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pulled = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = pulled.clone();
+    // An endless stream: it can only end because the cap stopped reading it.
+    let endless = futures::stream::repeat_with(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok::<Vec<u8>, String>(vec![0u8; 1024])
+    });
+    let error = collect_capped(Box::pin(endless), 4096, "http://store/x")
+        .await
+        .expect_err("over the cap");
+    assert!(matches!(error, StorePullError::Integrity(_)), "{error:?}");
+    assert!(
+        pulled.load(Ordering::SeqCst) <= 5,
+        "must stop at the cap, not drain the body"
+    );
+}
+
+#[tokio::test]
+async fn collect_capped_messages_never_carry_the_url_query() {
+    let url = "https://store/x.gtxpack?X-Amz-Signature=SECRET";
+    let over: Vec<Result<Vec<u8>, String>> = vec![Ok(vec![0; 16])];
+    let integrity = collect_capped(futures::stream::iter(over), 4, url)
+        .await
+        .expect_err("over the cap");
+    let broken: Vec<Result<Vec<u8>, String>> = vec![Err("reset".to_string())];
+    let network = collect_capped(futures::stream::iter(broken), 4, url)
+        .await
+        .expect_err("stream error");
+    for error in [integrity, network] {
+        let text = error.to_string();
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(text.contains("https://store"), "{text}");
+        assert!(!text.contains("x.gtxpack"), "path is not shown: {text}");
+    }
+}
+
+#[tokio::test]
+async fn collect_capped_reports_a_stream_error_as_network() {
+    let chunks: Vec<Result<Vec<u8>, String>> = vec![Ok(vec![1; 2]), Err("reset".to_string())];
+    let error = collect_capped(futures::stream::iter(chunks), 100, "http://store/x")
+        .await
+        .expect_err("stream error");
+    assert!(matches!(error, StorePullError::Network(_)), "{error:?}");
+}

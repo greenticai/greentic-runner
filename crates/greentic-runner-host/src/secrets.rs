@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::runtime::block_on;
@@ -145,6 +146,10 @@ pub struct CachingSecretsManager {
     inner: DynSecretsManager,
     cache: Mutex<LruCache<String, CacheEntry>>,
     ttl: Duration,
+    /// Bumped by every write/delete. A read only populates the cache when no
+    /// write landed while its backend fetch was in flight, so a stale value
+    /// fetched before a write cannot overwrite the invalidation.
+    generation: AtomicU64,
 }
 
 impl CachingSecretsManager {
@@ -166,6 +171,7 @@ impl CachingSecretsManager {
             inner,
             cache: Mutex::new(LruCache::new(max)),
             ttl,
+            generation: AtomicU64::new(0),
         })
     }
 }
@@ -185,32 +191,43 @@ impl SecretsManager for CachingSecretsManager {
             }
         }
 
+        let generation = self.generation.load(Ordering::SeqCst);
         let data = self.inner.read(path).await?;
 
         {
             let mut cache = self.cache.lock();
-            cache.put(
-                path.to_owned(),
-                CacheEntry {
-                    data: data.clone(),
-                    inserted_at: Instant::now(),
-                },
-            );
+            // Writers bump the generation before and after touching the
+            // backend and pop the entry afterwards, so a read that raced a
+            // write sees a changed generation and skips the insert.
+            if self.generation.load(Ordering::SeqCst) == generation {
+                cache.put(
+                    path.to_owned(),
+                    CacheEntry {
+                        data: data.clone(),
+                        inserted_at: Instant::now(),
+                    },
+                );
+            }
         }
         Ok(data)
     }
 
     async fn write(&self, path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
-        self.inner.write(path, bytes).await?;
-        // Invalidate so the next read sees the fresh value.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.write(path, bytes).await;
+        // Invalidate (also after a failed write: its outcome is unknown) so
+        // the next read sees the fresh value.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.cache.lock().pop(path);
-        Ok(())
+        result
     }
 
     async fn delete(&self, path: &str) -> greentic_secrets_lib::Result<()> {
-        self.inner.delete(path).await?;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.delete(path).await;
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.cache.lock().pop(path);
-        Ok(())
+        result
     }
 }
 
@@ -310,7 +327,14 @@ fn short_hash(raw: &str) -> String {
 ///    a 40-byte prefix) still get different segments — and so no two
 ///    `(pack, unit)` pairs can produce one string by splitting at a different
 ///    `_unit_`;
-/// 3. a pack id whose slug is empty (punctuation only) falls back to
+/// 3. the pack id likewise carries a `sha256` suffix of the RAW id whenever
+///    its slug is lossy (differs from the id: case, punctuation, collapsed or
+///    truncated), so `my.pack` / `my_pack` cannot share an address. A pack id
+///    that is already its own slug is left unhashed. BREAKING for lossy pack
+///    ids' existing per-unit secrets (they must be re-staged); see
+///    `docs/audit-breaking-changes.md`. No read fallback to the old address:
+///    it is exactly the address the colliding ids share;
+/// 4. a pack id whose slug is empty (punctuation only) falls back to
 ///    `pack_<hash>` rather than an empty leading segment, which would put a
 ///    leading `_` in the output and break the fixed point.
 ///
@@ -324,10 +348,19 @@ pub fn unit_pack_segment(pack_id: &str, unit_id: &str) -> Option<String> {
     }
 
     let pack_slug = underscore_slug(pack_raw, UNIT_SEGMENT_SLUG_MAX);
+    // A slug that differs from the raw id (case folded, punctuation mapped to
+    // `_`, runs collapsed, or cut at the length cap) can be shared by several
+    // distinct pack ids: `my.pack` / `my_pack` / `My-Pack`, or two ids with
+    // one 40-byte prefix. Hash the RAW id in whenever the slug is lossy so
+    // those never meet on one per-unit address. A lossless slug (already
+    // `[a-z0-9_]`, canonical, within the cap) is the id itself, so it keeps
+    // its historical, unhashed address.
     let pack_part = if pack_slug.is_empty() {
         format!("pack_{}", short_hash(pack_raw))
-    } else {
+    } else if pack_slug == pack_raw {
         pack_slug
+    } else {
+        format!("{pack_slug}_{}", short_hash(pack_raw))
     };
 
     let unit_hash = short_hash(unit_raw);
@@ -409,19 +442,61 @@ pub fn read_pack_secret_blocking(
     pack_id: &str,
     unit_id: Option<&str>,
     key: &str,
-) -> Result<Vec<u8>> {
-    let candidates = pack_secret_path_candidates(ctx, pack_id, unit_id, key)?;
-    let mut last_error = anyhow!("no scope tried");
+) -> std::result::Result<Vec<u8>, PackSecretError> {
+    let candidates = pack_secret_path_candidates(ctx, pack_id, unit_id, key)
+        .map_err(|err| PackSecretError::Backend(err.to_string()))?;
+    let mut failures = Vec::new();
     for candidate in &candidates {
         match block_on(manager.read(candidate.as_str())) {
             Ok(bytes) => return Ok(bytes),
-            Err(err) => last_error = anyhow!(err.to_string()),
+            Err(err) => failures.push(err),
         }
     }
-    Err(anyhow!(
-        "no secret at {} ({last_error})",
-        candidates.join(" or ")
-    ))
+    Err(classify_pack_secret_failures(&candidates, failures))
+}
+
+/// Why [`read_pack_secret_blocking`] failed. Typed so callers can tell a real
+/// miss from a permission or backend failure without parsing a message.
+#[derive(Debug, thiserror::Error)]
+pub enum PackSecretError {
+    /// Every scope tried reported the secret as absent.
+    #[error("no secret at {0}")]
+    NotFound(String),
+    /// At least one scope refused the read.
+    #[error("secret read denied: {0}")]
+    Denied(String),
+    /// At least one scope failed for a reason other than absence or denial.
+    #[error("secret backend error: {0}")]
+    Backend(String),
+}
+
+/// A miss is only a miss when EVERY scope said so: a denied or failing scope
+/// says nothing about whether a value exists there, so it must not be folded
+/// into "not found" by whichever scope happened to be tried last.
+fn classify_pack_secret_failures(
+    candidates: &[String],
+    failures: Vec<greentic_secrets_lib::SecretError>,
+) -> PackSecretError {
+    let mut denied: Option<String> = None;
+    let mut backend: Option<String> = None;
+    for failure in failures {
+        match failure {
+            greentic_secrets_lib::SecretError::NotFound(_) => {}
+            greentic_secrets_lib::SecretError::Permission(detail) => {
+                denied.get_or_insert(detail);
+            }
+            other => {
+                backend.get_or_insert(other.to_string());
+            }
+        }
+    }
+    if let Some(detail) = denied {
+        return PackSecretError::Denied(detail);
+    }
+    if let Some(detail) = backend {
+        return PackSecretError::Backend(detail);
+    }
+    PackSecretError::NotFound(candidates.join(" or "))
 }
 
 /// Write a pack secret for one deployed unit.
@@ -507,6 +582,17 @@ pub fn agent_tool_secret_uri(
         Some(segment) => segment,
         None => provider.to_string(),
     };
+    // Provider and key come from pack / agent config; env and tenant from the
+    // host. The category is either the raw provider or a generated unit
+    // segment; every segment lands verbatim in the URI, so an unsafe value
+    // (`..`, `/`, `%2e%2e`) yields no address rather than one in another
+    // tenant's path.
+    if ![env, tenant, category.as_str(), key]
+        .into_iter()
+        .all(crate::secrets_broker::is_safe_secret_segment)
+    {
+        return None;
+    }
     Some(format!("secrets://{env}/{tenant}/_/{category}/{key}"))
 }
 
@@ -546,6 +632,19 @@ pub fn scoped_secret_path_for_pack(ctx: &TenantCtx, pack_id: &str, key: &str) ->
         team: team.map(|value| value.as_str().to_string()),
     };
     let team_segment = normalize_team_segment(scope.team.as_deref());
+    // `pack_id` and the key are normalised to `[a-z0-9_-]` below, so they cannot
+    // escape; env / tenant / team are written verbatim and must be checked.
+    for (label, value) in [
+        ("env", scope.env.as_str()),
+        ("tenant", scope.tenant.as_str()),
+        ("team", team_segment.as_str()),
+    ] {
+        if !crate::secrets_broker::is_safe_secret_segment(value) {
+            return Err(anyhow!(
+                "secret {label} is not a safe secret-path segment; refusing to build a secrets uri"
+            ));
+        }
+    }
     let pack_segment = pack_id.trim();
     if pack_segment.is_empty() {
         return Err(anyhow!("pack_id must not be empty for scoped secrets"));
@@ -582,7 +681,26 @@ pub fn write_secret_blocking(
 }
 
 fn ensure_env_secrets_allowed() -> Result<()> {
-    let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+    check_env_secrets_allowed(crate::config::greentic_env().as_deref())
+}
+
+/// `env` is the already-normalised `GREENTIC_ENV` (`None` = unset OR blank).
+fn check_env_secrets_allowed(env: Option<&str>) -> Result<()> {
+    // A blank value is "not configured", the same branch as unset: it keeps the
+    // documented `local` default (and the warning) rather than being refused as
+    // an env named "". This is exactly as permissive as unset, no more.
+    let env = match env {
+        Some(value) => value.to_string(),
+        None => {
+            // Documented default, kept for local dev flows. Failing closed is
+            // safer for production but changes behaviour (deferred).
+            tracing::warn!(
+                "GREENTIC_ENV is unset: assuming `local` and allowing the env secrets backend; \
+                 set GREENTIC_ENV explicitly in deployed environments"
+            );
+            "local".to_string()
+        }
+    };
     let env = env.trim().to_ascii_lowercase();
     if matches!(env.as_str(), "local" | "dev" | "test") {
         Ok(())
@@ -590,6 +708,33 @@ fn ensure_env_secrets_allowed() -> Result<()> {
         Err(anyhow!(
             "env secrets backend is disabled for env '{env}' (dev/test only)"
         ))
+    }
+}
+
+#[cfg(test)]
+mod env_secrets_gate_tests {
+    use super::*;
+    use crate::config::non_blank;
+
+    #[test]
+    fn blank_takes_the_same_branch_as_unset() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert!(
+                check_env_secrets_allowed(non_blank(raw).as_deref()).is_ok(),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployed_envs_are_still_refused() {
+        for raw in ["prod", "staging", " Prod "] {
+            assert!(
+                check_env_secrets_allowed(non_blank(Some(raw)).as_deref()).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(check_env_secrets_allowed(Some("dev")).is_ok());
     }
 }
 
@@ -754,7 +899,7 @@ mod tests {
         );
         assert_eq!(
             unit_pack_segment("pack.dw.support", "Web Assistant (prod)").expect("segment"),
-            "pack_dw_support_unit_web_assistant_prod_3ee04e3f306a"
+            "pack_dw_support_339461568342_unit_web_assistant_prod_3ee04e3f306a"
         );
     }
 
@@ -785,6 +930,30 @@ mod tests {
                 unit_pack_segment(pack_r, unit_r),
                 "`{pack_l}`/`{unit_l}` and `{pack_r}`/`{unit_r}` must not share a segment"
             );
+        }
+    }
+
+    #[test]
+    fn lossy_pack_slugs_do_not_collide_but_lossless_ids_stay_unhashed() {
+        let a = unit_pack_segment("my.pack", "u").expect("a");
+        let b = unit_pack_segment("my_pack", "u").expect("b");
+        let c = unit_pack_segment("My-Pack", "u").expect("c");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        // Lossless id: historical address, no pack hash.
+        assert!(b.starts_with("my_pack_unit_"), "got {b}");
+        let long_a = format!("{}-one", "x".repeat(44));
+        let long_b = format!("{}-two", "x".repeat(44));
+        assert_ne!(
+            unit_pack_segment(&long_a, "u"),
+            unit_pack_segment(&long_b, "u"),
+            "ids sharing a 40-byte prefix must not collide"
+        );
+        for id in ["my.pack", "My-Pack", long_a.as_str()] {
+            let seg = unit_pack_segment(id, "u").expect("seg");
+            assert_eq!(canonicalize_secret_key(&seg), seg);
+            assert_eq!(greentic_secrets_lib::spec::canonical_secret_name(&seg), seg);
         }
     }
 
@@ -908,6 +1077,29 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, shared);
         assert_ne!(b, shared);
+    }
+
+    #[test]
+    fn unsafe_segments_have_no_agent_tool_address() {
+        for bad in ["..", "a/b", "%2e%2e", "../x", ".h"] {
+            assert!(agent_tool_secret_uri("dev", "acme", bad, "api_key", None).is_none());
+            assert!(agent_tool_secret_uri("dev", "acme", "tavily", bad, None).is_none());
+            assert!(agent_tool_secret_uri(bad, "acme", "tavily", "api_key", None).is_none());
+            assert!(agent_tool_secret_uri("dev", bad, "tavily", "api_key", None).is_none());
+        }
+    }
+
+    #[test]
+    fn scoped_pack_path_normalises_hostile_pack_id() {
+        let ctx = greentic_types::TenantCtx::new(
+            EnvId::new("dev").expect("env"),
+            TenantId::new("acme").expect("tenant"),
+        );
+        let path = scoped_secret_path_for_pack(&ctx, "../../evil/pack%2e", "k")
+            .expect("pack_id is normalised, not rejected");
+        assert!(!path.contains(".."), "{path}");
+        assert!(!path.contains('%'), "{path}");
+        assert_eq!(path.matches('/').count(), 6, "{path}");
     }
 
     #[test]
@@ -1195,6 +1387,7 @@ mod tests {
             inner: inner as DynSecretsManager,
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             ttl: Duration::from_secs(300),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -1246,12 +1439,72 @@ mod tests {
             inner: Arc::clone(&inner) as DynSecretsManager,
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             ttl: Duration::from_millis(1), // expires almost immediately
+            generation: AtomicU64::new(0),
         };
 
         cached.read("secrets://dev/t/team/pack/key").await.unwrap();
         std::thread::sleep(Duration::from_millis(5));
         cached.read("secrets://dev/t/team/pack/key").await.unwrap();
         assert_eq!(inner.reads(), 2, "expired entry should re-fetch");
+    }
+
+    /// Backend whose first read returns the old value only after the test lets
+    /// it go, modelling a slow read racing a write.
+    struct GatedManager {
+        value: Mutex<Vec<u8>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        first: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SecretsManager for GatedManager {
+        async fn read(&self, _path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            let snapshot = self.value.lock().clone();
+            if self.first.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(snapshot)
+        }
+
+        async fn write(&self, _path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+            *self.value.lock() = bytes.to_vec();
+            Ok(())
+        }
+
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_read_does_not_repopulate_cache_after_write() {
+        let inner = Arc::new(GatedManager {
+            value: Mutex::new(b"old".to_vec()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            first: AtomicUsize::new(0),
+        });
+        let cached = Arc::new(CachingSecretsManager {
+            inner: Arc::clone(&inner) as DynSecretsManager,
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())),
+            ttl: Duration::from_secs(300),
+            generation: AtomicU64::new(0),
+        });
+
+        let reader = {
+            let cached = Arc::clone(&cached);
+            tokio::spawn(async move { cached.read("secrets://dev/t/_/p/k").await })
+        };
+        inner.started.notified().await;
+        cached.write("secrets://dev/t/_/p/k", b"new").await.unwrap();
+        inner.release.notify_one();
+        let stale = reader.await.unwrap().unwrap();
+        assert_eq!(stale, b"old");
+
+        let fresh = cached.read("secrets://dev/t/_/p/k").await.unwrap();
+        assert_eq!(fresh, b"new", "stale value must not be cached");
     }
 
     #[test]
@@ -1266,5 +1519,51 @@ mod tests {
         let ptr_after = Arc::as_ptr(&wrapped);
         // When TTL is 0, wrap should return the same Arc (no caching layer).
         assert_eq!(ptr_before, ptr_after);
+    }
+}
+
+#[cfg(test)]
+mod pack_secret_error_tests {
+    use super::*;
+    use greentic_secrets_lib::SecretError;
+
+    fn candidates() -> Vec<String> {
+        vec!["secrets://a".to_string(), "secrets://b".to_string()]
+    }
+
+    #[test]
+    fn not_found_only_when_every_scope_is_not_found() {
+        let err = classify_pack_secret_failures(
+            &candidates(),
+            vec![
+                SecretError::NotFound("a".into()),
+                SecretError::NotFound("b".into()),
+            ],
+        );
+        assert!(matches!(err, PackSecretError::NotFound(_)));
+    }
+
+    #[test]
+    fn permission_error_is_not_masked_by_a_later_not_found() {
+        let err = classify_pack_secret_failures(
+            &candidates(),
+            vec![
+                SecretError::Permission("no".into()),
+                SecretError::NotFound("b".into()),
+            ],
+        );
+        assert!(matches!(err, PackSecretError::Denied(_)));
+    }
+
+    #[test]
+    fn words_like_missing_in_a_backend_message_do_not_become_not_found() {
+        let err = classify_pack_secret_failures(
+            &candidates(),
+            vec![
+                SecretError::Backend("config missing".into()),
+                SecretError::NotFound("b".into()),
+            ],
+        );
+        assert!(matches!(err, PackSecretError::Backend(_)));
     }
 }

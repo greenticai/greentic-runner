@@ -11,10 +11,12 @@ use semver::Version;
 
 use crate::env::PackConfig;
 
-pub use cache::PackCache;
+pub use cache::{CachedPack, PackCache};
 pub use index::{Index, PackEntry, TenantRecord};
 pub use resolver::{FetchResponse, FsResolver, ResolverRegistry};
 pub use verify::PackVerifier;
+
+use verify::parse_verifiers;
 
 mod cache;
 mod index;
@@ -122,8 +124,20 @@ impl PackDigest {
     }
 
     pub fn matches_file(&self, path: &Path) -> Result<bool> {
+        Ok(self.verified_file_digest(path)?.is_some())
+    }
+
+    /// Hash `path`; when it matches `self` (case-insensitively), return the
+    /// digest COMPUTED from the file, in its canonical lowercase
+    /// `sha256:<hex>` form. The pinned digest's own spelling (an index may
+    /// write `SHA256:ABC...`) must never reach a signature check, because the
+    /// canonical signing message embeds the digest string verbatim.
+    pub fn verified_file_digest(&self, path: &Path) -> Result<Option<PackDigest>> {
         let computed = compute_digest(path)?;
-        Ok(computed.raw.eq_ignore_ascii_case(&self.raw))
+        Ok(computed
+            .raw
+            .eq_ignore_ascii_case(&self.raw)
+            .then_some(computed))
     }
 }
 
@@ -156,47 +170,191 @@ impl ResolvedSet {
     }
 }
 
+/// Verification policy for [`PackManager`].
+#[derive(Debug, Clone, Default)]
+pub struct PackPolicy {
+    /// Fail closed: a public key and a valid signature are required for every
+    /// pack, and non-filesystem sources must pin a digest.
+    pub verify_strict: bool,
+    /// Extra roots (besides the working directory) that absolute `fs://`
+    /// locators may point into. Confinement is enforced when this is `Some`
+    /// or when `verify_strict` is set; otherwise absolute paths are
+    /// unrestricted (dev behaviour).
+    pub fs_allowed_roots: Option<Vec<PathBuf>>,
+    /// Accept legacy digest-only signatures while `verify_strict` is set.
+    /// Those signatures do not bind the pack name/version, so strict mode
+    /// rejects them unless this is enabled (`PACK_ALLOW_LEGACY_SIGNATURES`).
+    pub allow_legacy_signatures: bool,
+}
+
+impl PackPolicy {
+    /// Read `PACK_VERIFY_STRICT` and `PACK_FS_ALLOWED_ROOTS` (path list).
+    pub fn from_env() -> Self {
+        let verify_strict = std::env::var("PACK_VERIFY_STRICT")
+            .map(|value| is_truthy(&value))
+            .unwrap_or(false);
+        let fs_allowed_roots = std::env::var_os("PACK_FS_ALLOWED_ROOTS")
+            .map(|raw| std::env::split_paths(&raw).collect::<Vec<_>>());
+        let allow_legacy_signatures = std::env::var("PACK_ALLOW_LEGACY_SIGNATURES")
+            .map(|value| is_truthy(&value))
+            .unwrap_or(false);
+        Self {
+            verify_strict,
+            fs_allowed_roots,
+            allow_legacy_signatures,
+        }
+    }
+
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.verify_strict = strict;
+        self
+    }
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Coordinates resolvers, cache, and verification.
 pub struct PackManager {
     cfg: PackConfig,
     cache: PackCache,
     registry: ResolverRegistry,
-    verifier: Option<PackVerifier>,
+    verifiers: Vec<PackVerifier>,
+    policy: PackPolicy,
 }
 
 impl PackManager {
+    /// Build a manager using the policy from the process environment.
     pub fn new(cfg: PackConfig) -> Result<Self> {
-        let verifier = cfg
-            .public_key
-            .as_deref()
-            .map(PackVerifier::from_env_value)
-            .transpose()?;
+        Self::with_policy(cfg, PackPolicy::from_env())
+    }
+
+    pub fn with_policy(cfg: PackConfig, policy: PackPolicy) -> Result<Self> {
+        let verifiers = match cfg.public_key.as_deref() {
+            Some(value) => parse_verifiers(value)?,
+            None => Vec::new(),
+        };
+        if policy.verify_strict && verifiers.is_empty() {
+            bail!("strict pack verification is enabled but no public key is configured");
+        }
         let mut registry = ResolverRegistry::default();
         let fs_root = std::env::current_dir()
             .context("failed to resolve current directory")?
             .canonicalize()
             .context("failed to canonicalize current directory")?;
-        registry.register_builtin(fs_root, cfg.network.as_ref())?;
+        let fs_allowed_roots = match (&policy.fs_allowed_roots, policy.verify_strict) {
+            (Some(roots), _) => Some(roots.clone()),
+            (None, true) => Some(Vec::new()),
+            (None, false) => None,
+        };
+        registry.register_builtin_confined(fs_root, cfg.network.as_ref(), fs_allowed_roots)?;
         Ok(Self {
             cache: PackCache::new(cfg.cache_dir.clone()),
             cfg,
             registry,
-            verifier,
+            verifiers,
+            policy,
         })
+    }
+
+    /// Size the cache prune idle gate from the watcher refresh interval
+    /// (`max(1h, 2 x interval)`, see [`cache::prune_min_idle`]).
+    pub fn with_refresh_interval(mut self, refresh_interval: std::time::Duration) -> Self {
+        self.cache
+            .set_min_idle(cache::prune_min_idle(Some(refresh_interval)));
+        self
+    }
+
+    /// Mark a cached archive as used just now (no-op for paths outside the
+    /// cache). The watcher calls this for runtimes it keeps after a failed
+    /// republish so their archive is not pruned.
+    pub fn touch_cached_archive(&self, path: &Path) {
+        self.cache.touch_archive(path);
+    }
+
+    /// Verify the entry signature against any configured key. The canonical
+    /// identity message `{name, version, digest}` is tried first; the legacy
+    /// digest-only message is still accepted for existing signatures.
+    fn verify_signature(&self, entry: &PackEntry, digest: &PackDigest) -> Result<()> {
+        if self.verifiers.is_empty() {
+            return Ok(());
+        }
+        let signature = entry.signature.as_deref().ok_or_else(|| {
+            anyhow!(
+                "signature missing for pack {} but a public key is configured",
+                entry.reference.name
+            )
+        })?;
+        let canonical = canonical_signing_message(&entry.reference, digest);
+        let mut last_err = None;
+        for verifier in &self.verifiers {
+            match verifier.verify(canonical.as_bytes(), signature) {
+                Ok(()) => return Ok(()),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        for verifier in &self.verifiers {
+            if verifier
+                .verify(digest.as_str().as_bytes(), signature)
+                .is_ok()
+            {
+                // Legacy digest-only signature: it does not bind name/version,
+                // so strict mode refuses it unless explicitly allowed.
+                if self.policy.verify_strict && !self.policy.allow_legacy_signatures {
+                    bail!(
+                        "pack {} carries a legacy digest-only signature; re-sign with the canonical \
+                         {{name, version, digest}} message or set PACK_ALLOW_LEGACY_SIGNATURES=1",
+                        entry.reference.name
+                    );
+                }
+                tracing::warn!(
+                    pack = %entry.reference.name,
+                    "accepting legacy digest-only pack signature"
+                );
+                return Ok(());
+            }
+        }
+        match last_err {
+            Some(err) => Err(err.context(format!(
+                "no configured public key verified the signature for pack {}",
+                entry.reference.name
+            ))),
+            None => bail!("no public key configured"),
+        }
     }
 
     /// Resolve all packs referenced in the provided index.
     pub fn resolve_all_for_index(&self, index: &Index) -> Result<ResolvedSet> {
         let mut tenants = BTreeMap::new();
         for (tenant, record) in index.tenants() {
-            let main = self.resolve_entry(&record.main_pack)?;
-            let mut overlays = Vec::new();
-            for overlay in &record.overlays {
-                overlays.push(self.resolve_entry(overlay)?);
-            }
-            tenants.insert(tenant.clone(), TenantPacks { main, overlays });
+            tenants.insert(tenant.clone(), self.resolve_tenant(record)?);
         }
         Ok(ResolvedSet { tenants })
+    }
+
+    /// Resolve every tenant independently. A failing tenant yields an `Err`
+    /// entry instead of aborting the whole set, so callers can keep serving
+    /// the previous runtime for it while applying the others.
+    pub fn resolve_each_for_index(&self, index: &Index) -> BTreeMap<String, Result<TenantPacks>> {
+        index
+            .tenants()
+            .iter()
+            .map(|(tenant, record)| (tenant.clone(), self.resolve_tenant(record)))
+            .collect()
+    }
+
+    /// Resolve the main pack and overlays for one tenant.
+    pub fn resolve_tenant(&self, record: &TenantRecord) -> Result<TenantPacks> {
+        let main = self.resolve_entry(&record.main_pack)?;
+        let mut overlays = Vec::new();
+        for overlay in &record.overlays {
+            overlays.push(self.resolve_entry(overlay)?);
+        }
+        Ok(TenantPacks { main, overlays })
     }
 
     fn resolve_entry(&self, entry: &PackEntry) -> Result<ResolvedPack> {
@@ -204,10 +362,37 @@ impl PackManager {
             .locator
             .with_fallback(self.cfg.source)
             .context("pack locator missing scheme")?;
-        let response = self
-            .registry
-            .fetch(&locator)
-            .with_context(|| format!("resolver failed for {}", locator))?;
+        let pinned = entry
+            .content_digest
+            .as_ref()
+            .or_else(|| entry.reference.version.as_digest());
+        if self.policy.verify_strict
+            && pinned.is_none()
+            && !locator.to_ascii_lowercase().starts_with("fs://")
+        {
+            bail!(
+                "strict verification requires a pinned digest for remote pack {}",
+                entry.reference.name
+            );
+        }
+
+        // A pinned digest names the bytes exactly, so a cached file that
+        // hashes to it needs no download. Without this every watcher refresh
+        // re-downloaded every remote pack.
+        if let Some(pinned) = pinned
+            && let Some(cached) = self.cache.lookup(&entry.reference, pinned)?
+        {
+            // The digest computed from the cached file (canonical lowercase),
+            // exactly what the miss path below uses: signatures and the
+            // watcher's `applied` digest string must not depend on how the
+            // index happened to spell the pin.
+            self.verify_signature(entry, &cached.digest)?;
+            return self.open_resolved(entry, locator, cached.path, cached.digest);
+        }
+
+        let response = self.registry.fetch(&locator).with_context(|| {
+            format!("resolver failed for {}", resolver::redact_locator(&locator))
+        })?;
 
         let fetched_digest = compute_digest(response.path())?;
         if entry
@@ -235,17 +420,19 @@ impl PackManager {
             );
         }
 
-        if let Some(verifier) = &self.verifier {
-            let signature = entry.signature.as_deref().ok_or_else(|| {
-                anyhow!(
-                    "signature missing for pack {} but PACK_PUBLIC_KEY is configured",
-                    entry.reference.name
-                )
-            })?;
-            verifier.verify(fetched_digest.as_str().as_bytes(), signature)?;
-        }
+        self.verify_signature(entry, &fetched_digest)?;
 
         let cached = self.cache.store(entry, response.path(), &fetched_digest)?;
+        self.open_resolved(entry, locator, cached, fetched_digest)
+    }
+
+    fn open_resolved(
+        &self,
+        entry: &PackEntry,
+        locator: String,
+        cached: PathBuf,
+        fetched_digest: PackDigest,
+    ) -> Result<ResolvedPack> {
         let PackLoad {
             manifest, report, ..
         } = open_pack(&cached, SigningPolicy::DevOk).map_err(|err| {
@@ -265,6 +452,18 @@ impl PackManager {
             report,
         })
     }
+}
+
+/// Canonical message signed by pack publishers: binds the pack identity to
+/// its content digest so a valid signature cannot be replayed for another
+/// name/version.
+pub fn canonical_signing_message(reference: &PackRef, digest: &PackDigest) -> String {
+    format!(
+        "greentic-pack-sig-v1\nname={}\nversion={}\ndigest={}",
+        reference.name,
+        reference.version.cache_label(),
+        digest.as_str()
+    )
 }
 
 fn compute_digest(path: &Path) -> Result<PackDigest> {
@@ -287,16 +486,63 @@ fn compute_digest(path: &Path) -> Result<PackDigest> {
     PackDigest::parse(format!("sha256:{digest_hex}"))
 }
 
+/// Turn a pack name into one safe path segment.
+///
+/// Characters that could add a path component (`/`, `\`, `:`) map to `_`, and
+/// `.`/`..` (which would resolve to the cache root / its parent) become `_`.
+/// That mapping is lossy (`a/b` and `a_b` agree), so whenever it changed
+/// anything a short digest of the RAW name is appended: `a/b` and `a_b` get
+/// different cache directories instead of sharing, and overwriting, one.
+/// A name the mapping leaves alone (the ordinary case) is unchanged, so
+/// existing cache directories keep their names.
 fn sanitize_segment(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' => '_',
-            other => other,
-        })
-        .collect()
+    let mapped: String = match value {
+        "." | ".." => "_".to_string(),
+        _ => value
+            .chars()
+            .map(|ch| match ch {
+                '/' | '\\' | ':' => '_',
+                other => other,
+            })
+            .collect(),
+    };
+    if mapped == value {
+        return mapped;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{mapped}-{}", to_hex(&digest[..4]))
 }
 
 fn to_hex(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_segment;
+
+    #[test]
+    fn dot_segments_cannot_escape_the_cache_root() {
+        for hostile in [".", "..", "a/../b", "../x", "..\\x", "/abs", "a/b"] {
+            let seg = sanitize_segment(hostile);
+            assert!(
+                !seg.contains(['/', '\\']) && seg != "." && seg != "..",
+                "{hostile:?} -> {seg:?}"
+            );
+        }
+        assert_eq!(sanitize_segment("pack.v2"), "pack.v2");
+    }
+
+    #[test]
+    fn names_the_mapping_conflates_get_distinct_segments() {
+        let slash = sanitize_segment("a/b");
+        let underscore = sanitize_segment("a_b");
+        assert_eq!(underscore, "a_b", "ordinary names are unchanged");
+        assert_ne!(slash, underscore);
+        assert!(slash.starts_with("a_b-"));
+        // Deterministic.
+        assert_eq!(slash, sanitize_segment("a/b"));
+        assert_ne!(sanitize_segment("a/b"), sanitize_segment("a:b"));
+    }
 }

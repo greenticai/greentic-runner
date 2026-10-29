@@ -19,9 +19,10 @@ use crate::runner::adapt_timer;
 use crate::runner::engine::FlowEngine;
 use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::secrets::{DynSecretsManager, default_manager};
+#[cfg(test)]
+use crate::storage::session_host_from;
 use crate::storage::{
-    DynSessionStore, DynStateStore, StorageConfig, session_host_from, state_host_from,
-    stores_from_config,
+    DynSessionStore, DynStateStore, StorageConfig, state_host_from, stores_from_config,
 };
 use crate::wasi::RunnerWasiPolicy;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
@@ -66,6 +67,20 @@ pub type ArtifactReaderPort = Arc<dyn greentic_aw_runtime::ArtifactReader>;
 #[cfg(feature = "agentic-worker")]
 pub type ExtArtifactPort = Arc<dyn greentic_ext_runtime::host_ports::ArtifactPort>;
 
+/// Pick the effective storage: the embedder's explicit config always wins and
+/// the env resolver is not even consulted; otherwise the env decides.
+fn resolve_storage(
+    configured: &StorageConfig,
+    explicit: bool,
+    from_env: impl FnOnce() -> Result<StorageConfig, crate::storage::StorageConfigError>,
+) -> Result<StorageConfig, crate::storage::StorageConfigError> {
+    if explicit {
+        Ok(configured.clone())
+    } else {
+        from_env()
+    }
+}
+
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
@@ -73,6 +88,8 @@ pub struct HostBuilder {
     wasi_policy: RunnerWasiPolicy,
     secrets: Option<DynSecretsManager>,
     storage: StorageConfig,
+    /// `true` once an embedder called `with_storage`; that always beats env.
+    storage_explicit: bool,
     #[cfg(feature = "agentic-worker")]
     ext_llm_port: Option<ExtLlmPort>,
     #[cfg(feature = "agentic-worker")]
@@ -93,6 +110,7 @@ impl HostBuilder {
             wasi_policy: RunnerWasiPolicy::default(),
             secrets: None,
             storage: StorageConfig::default(),
+            storage_explicit: false,
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: None,
             #[cfg(feature = "agentic-worker")]
@@ -151,6 +169,7 @@ impl HostBuilder {
     /// ```
     pub fn with_storage(mut self, storage: StorageConfig) -> Self {
         self.storage = storage;
+        self.storage_explicit = true;
         self
     }
 
@@ -254,6 +273,13 @@ impl HostBuilder {
         if self.configs.is_empty() {
             bail!("at least one tenant configuration is required");
         }
+        // Fail at startup on a tenant/env that is not a valid identifier,
+        // rather than letting `tenant_ctx()` silently fall back to `local`.
+        for config in self.configs.values() {
+            config
+                .try_tenant_ctx()
+                .with_context(|| format!("invalid host config for tenant `{}`", config.tenant))?;
+        }
         let wasi_policy = Arc::new(self.wasi_policy);
         #[cfg(all(feature = "agentic-worker", feature = "greentic-llm-backend"))]
         let artifact_reader = host_artifact_reader(
@@ -283,41 +309,35 @@ impl HostBuilder {
             .into_iter()
             .map(|(tenant, cfg)| (tenant, Arc::new(cfg)))
             .collect();
-        let (session_store, state_store) = stores_from_config(&self.storage)?;
-        // `SessionStoreHost` is deliberately NOT pointed at a durable store.
-        //
-        // It is write-only by construction: `put` goes through
-        // `SessionStore::create_session`, which does not add the row to the
-        // per-user wait index — and `get` reads exactly that index, via
-        // `find_by_user`. Both backends behave this way, so `get` never returns
-        // what `put` wrote, `state_machine::step`'s `is_new` is always true, and
-        // every turn writes a fresh row under a random UUID.
-        //
-        // In memory that is a bounded-by-process-lifetime map nobody reads. On
-        // Redis it would be one permanent key PER TURN — `create_session` takes
-        // no TTL argument, so there is no expiry to attach and the
-        // `DefaultWaitTtl` decorator cannot reach it — growing without bound
-        // while buying nothing, because nothing can read it back.
+        // An embedder's `with_storage` always wins; env only fills the gap.
+        // A bad env value is a hard error here, never a fall back to memory.
+        let storage = resolve_storage(&self.storage, self.storage_explicit, || {
+            StorageConfig::from_redis_url_env()
+        })
+        .context("invalid session/state Redis environment configuration")?;
+        let (session_store, state_store) = stores_from_config(&storage)?;
+        // The engine-level `SessionHost` is write-only by construction: the
+        // store's `create_session` does not add the row to the per-user wait
+        // index that `get` reads (`find_by_user`), on either backend, so `get`
+        // never returns what `put` wrote, `state_machine::step`'s `is_new` is
+        // always true, and every turn would write a fresh row under a random id
+        // that nothing can read back. `create_session` takes no TTL, so those
+        // rows never expire: unbounded growth in memory, one permanent key per
+        // turn on Redis. So the host is `DiscardSessionHost`, which keeps the
+        // observable behaviour (`get` -> `None`) and stores nothing.
         //
         // The parked-flow snapshot, which is what durability is for, does NOT
         // travel this path: `FlowResumeStore` uses `register_wait` /
-        // `find_wait_by_scope` and gets `session_store` below. Closing the
-        // write-only behaviour itself is an upstream change in greentic-session.
-        let session_host = if self.storage.session.is_durable() {
-            session_host_from(crate::storage::new_session_store())
-        } else {
-            // Unchanged for every caller that names no storage: one store,
-            // shared, exactly as before.
-            session_host_from(Arc::clone(&session_store))
-        };
+        // `find_wait_by_scope` and gets `session_store` below.
+        let session_host: Arc<dyn SessionHost> = Arc::new(DiscardSessionHost);
         let state_host = state_host_from(Arc::clone(&state_store));
-        if self.storage.is_durable() {
+        if storage.is_durable() {
             // Names, never the configured values: a Redis URL may carry
             // `redis://user:password@host`, and a startup log line is the last
             // place a credential should land.
             tracing::info!(
-                session = self.storage.session.describe(),
-                state = self.storage.state.describe(),
+                session = storage.session.describe(),
+                state = storage.state.describe(),
                 "runner host using durable storage; parked flows survive a restart"
             );
         }
@@ -983,7 +1003,7 @@ impl RunnerHost {
         let mut envelope = IngressEnvelope {
             entry_node,
             tenant: tenant.to_string(),
-            env: std::env::var("GREENTIC_ENV").ok(),
+            env: crate::config::greentic_env(),
             pack_id: Some(pack_id.clone()),
             flow_id: flow_id.clone(),
             flow_type: resolved_flow_type,
@@ -1310,6 +1330,12 @@ async fn apply_welcome_flow_override(
     Ok(())
 }
 
+/// How long a welcome-seen marker lives. Passed explicitly because `None`
+/// would let the Redis store's default wait TTL (24h) apply, and the marker is
+/// the DURABLE first-contact gate: expiring it would greet a returning user
+/// again the next day.
+const WELCOME_MARKER_TTL: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
 /// Persists a per-`(tenant, env, eid, user)` welcome-seen marker on first
 /// contact and returns `true` only when this turn observed no marker AND
 /// wrote one. Subsequent turns short-circuit to `false`.
@@ -1348,7 +1374,14 @@ async fn try_mark_welcome_first_contact(
         let data = marker_session_data(&ctx, &user);
         let session_key = marker_session_key(&ctx, &user, &scope);
         store
-            .register_wait(&ctx, &user, &scope, &session_key, data, None)
+            .register_wait(
+                &ctx,
+                &user,
+                &scope,
+                &session_key,
+                data,
+                Some(WELCOME_MARKER_TTL),
+            )
             .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
         Ok(true)
     })
@@ -2197,5 +2230,141 @@ mod fast2flow_tests {
             routed.payload()["fast2flow"]["entities"][0]["formats"]["iso"],
             "2026-06-11"
         );
+    }
+}
+
+#[cfg(test)]
+mod build_validation_tests {
+    use super::*;
+    use crate::gtbind::TenantBindings;
+
+    #[test]
+    fn build_rejects_a_tenant_that_is_not_a_valid_identifier() {
+        let config = HostConfig::from_gtbind(TenantBindings {
+            tenant: "bad tenant!".into(),
+            packs: Vec::new(),
+            env_passthrough: Vec::new(),
+        });
+        let result = HostBuilder::new().with_config(config).build();
+        let message = result.err().map(|err| format!("{err:#}"));
+        assert!(
+            message.is_some_and(|m| m.contains("bad tenant!")),
+            "build must fail naming the invalid tenant"
+        );
+    }
+}
+
+#[cfg(test)]
+mod storage_resolution_tests {
+    use super::*;
+    use crate::storage::{StateBackend, StorageConfigError, stores_from_config};
+
+    #[test]
+    fn explicit_embedder_storage_wins_and_env_is_not_consulted() {
+        let explicit = StorageConfig::redis("redis://embedder", "ns").expect("config");
+        let got = resolve_storage(&explicit, true, || {
+            Err(StorageConfigError::MissingSessionNamespace)
+        })
+        .expect("env resolver must not be consulted");
+        assert_eq!(got, explicit);
+    }
+
+    #[test]
+    fn without_explicit_storage_env_decides() {
+        let from_env = StorageConfig {
+            state: StateBackend::redis("redis://env").expect("state"),
+            ..StorageConfig::default()
+        };
+        let got = resolve_storage(&StorageConfig::default(), false, || Ok(from_env.clone()))
+            .expect("resolve");
+        assert_eq!(got, from_env);
+    }
+
+    #[test]
+    fn env_resolution_error_propagates() {
+        let err = resolve_storage(&StorageConfig::default(), false, || {
+            StorageConfig::from_redis_url_vars(Some("redis://x"), None, None, None, None)
+        })
+        .expect_err("missing namespace");
+        assert_eq!(err, StorageConfigError::MissingSessionNamespace);
+    }
+
+    #[test]
+    fn an_invalid_redis_url_is_a_build_time_error_not_a_memory_fallback() {
+        let config = StorageConfig::from_redis_url_vars(
+            Some("not-a-redis-url"),
+            Some("not-a-redis-url"),
+            None,
+            Some("test"),
+            None,
+        )
+        .expect("config parses; the URL is only checked on connect");
+        assert!(stores_from_config(&config).is_err());
+    }
+}
+
+/// A [`SessionHost`] that retains nothing. See the comment where
+/// [`HostBuilder::build`] installs it for why the store-backed host was a leak.
+struct DiscardSessionHost;
+
+#[async_trait::async_trait]
+impl SessionHost for DiscardSessionHost {
+    async fn get(
+        &self,
+        _key: &crate::engine::host::SessionKey,
+    ) -> crate::engine::error::GResult<Option<crate::engine::host::SessionSnapshot>> {
+        Ok(None)
+    }
+
+    async fn put(
+        &self,
+        _snapshot: crate::engine::host::SessionSnapshot,
+    ) -> crate::engine::error::GResult<()> {
+        Ok(())
+    }
+
+    async fn update_cas(
+        &self,
+        _snapshot: crate::engine::host::SessionSnapshot,
+        _expected_revision: u64,
+    ) -> crate::engine::error::GResult<bool> {
+        // Nothing is ever stored, so there is no revision to match.
+        Ok(false)
+    }
+
+    async fn delete(
+        &self,
+        _key: &crate::engine::host::SessionKey,
+    ) -> crate::engine::error::GResult<()> {
+        Ok(())
+    }
+
+    async fn touch(
+        &self,
+        _key: &crate::engine::host::SessionKey,
+        _ttl: std::time::Duration,
+    ) -> crate::engine::error::GResult<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod discard_session_host_tests {
+    use super::*;
+    use crate::engine::host::{SessionKey, SessionSnapshot};
+
+    #[tokio::test]
+    async fn put_retains_nothing() {
+        let host = DiscardSessionHost;
+        let key = SessionKey {
+            tenant_key: "dev::acme".into(),
+            pack_id: "p".into(),
+            flow_id: "f".into(),
+            session_hint: Some("s".into()),
+        };
+        let snapshot = SessionSnapshot::new(key.clone(), "id".into());
+        assert!(host.put(snapshot.clone()).await.is_ok());
+        assert!(matches!(host.get(&key).await, Ok(None)));
+        assert!(matches!(host.update_cas(snapshot, 0).await, Ok(false)));
     }
 }

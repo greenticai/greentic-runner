@@ -27,12 +27,59 @@ pub(crate) const STATE_PREFIX: &str = "runner";
 /// serialise every state access in the process behind one connection.
 pub struct StateStoreHost {
     store: Offloaded<dyn StateStore>,
+    /// Expiry applied to every `set_json`. `None` keeps entries until deleted.
+    ttl_secs: Option<u32>,
 }
+
+/// Env var bounding the lifetime of flow state (seconds). Unset or `0` keeps
+/// the historical "never expires" behaviour, which on Redis means abandoned
+/// conversations leave permanent keys.
+pub const STATE_TTL_ENV: &str = "GREENTIC_FLOW_STATE_TTL_SECS";
 
 impl StateStoreHost {
     pub fn new(store: DynStateStore) -> Self {
         Self {
             store: Offloaded::new(store, StoreKind::State),
+            ttl_secs: None,
+        }
+    }
+
+    /// Expire every state entry written through this host after `ttl_secs`.
+    #[must_use]
+    pub fn with_ttl_secs(mut self, ttl_secs: Option<u32>) -> Self {
+        self.ttl_secs = ttl_secs.filter(|secs| *secs > 0);
+        self
+    }
+}
+
+fn ttl_from_env() -> Option<u32> {
+    parse_ttl(std::env::var(STATE_TTL_ENV).ok().as_deref())
+}
+
+/// Parse the TTL setting. `0`/unset means "never expire"; a value above
+/// `u32::MAX` is clamped (and warned about) rather than silently disabling the
+/// TTL; an unparsable value is warned about and ignored.
+fn parse_ttl(raw: Option<&str>) -> Option<u32> {
+    let raw = raw?.trim();
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => match u32::try_from(secs) {
+            Ok(secs) => Some(secs),
+            Err(_) => {
+                tracing::warn!(
+                    value = secs,
+                    max = u32::MAX,
+                    "{STATE_TTL_ENV} exceeds the maximum; clamping"
+                );
+                Some(u32::MAX)
+            }
+        },
+        Err(_) => {
+            tracing::warn!(
+                value = raw,
+                "{STATE_TTL_ENV} is not a valid number of seconds; flow state will not expire"
+            );
+            None
         }
     }
 }
@@ -81,7 +128,7 @@ fn probe(store: &DynStateStore) -> Result<()> {
 }
 
 pub fn state_host_from(store: DynStateStore) -> Arc<dyn StateHost> {
-    Arc::new(StateStoreHost::new(store))
+    Arc::new(StateStoreHost::new(store).with_ttl_secs(ttl_from_env()))
 }
 
 #[async_trait]
@@ -89,8 +136,52 @@ impl StateHost for StateStoreHost {
     async fn get_json(&self, key: &SessionKey) -> GResult<Option<Value>> {
         let tenant = tenant_ctx_from_key(key)?;
         let state_key = derive_state_key(key);
+        let legacy_key = legacy_state_key(key);
+        let ttl_secs = self.ttl_secs;
         self.store
-            .call(move |store| store.get_json(&tenant, STATE_PREFIX, &state_key, None))
+            .call(move |store| {
+                if let Some(value) = store.get_json(&tenant, STATE_PREFIX, &state_key, None)? {
+                    return Ok(Some(value));
+                }
+                // Ids containing `%` or `/` were stored under an unescaped key
+                // before escaping was introduced: migrate on read.
+                let Some(legacy_key) = legacy_key else {
+                    return Ok(None);
+                };
+                let Some(value) = store.get_json(&tenant, STATE_PREFIX, &legacy_key, None)? else {
+                    return Ok(None);
+                };
+                // Write-if-absent: a `set_json` that landed on the current key
+                // between the read above and this write is NEWER than the legacy
+                // value, and a plain `set_json` here would overwrite it with the
+                // stale one. A backend without the primitive (its default is an
+                // error) keeps the old unconditional write.
+                let value = match store.set_json_if_absent(
+                    &tenant,
+                    STATE_PREFIX,
+                    &state_key,
+                    &value,
+                    ttl_secs,
+                ) {
+                    Ok(true) => value,
+                    Ok(false) => store
+                        .get_json(&tenant, STATE_PREFIX, &state_key, None)?
+                        .unwrap_or(value),
+                    Err(_) => {
+                        store.set_json(
+                            &tenant,
+                            STATE_PREFIX,
+                            &state_key,
+                            None,
+                            &value,
+                            ttl_secs,
+                        )?;
+                        value
+                    }
+                };
+                store.del(&tenant, STATE_PREFIX, &legacy_key)?;
+                Ok(Some(value))
+            })
             .await
             .map_err(map_state_error)
     }
@@ -98,9 +189,10 @@ impl StateHost for StateStoreHost {
     async fn set_json(&self, key: &SessionKey, value: Value) -> GResult<()> {
         let tenant = tenant_ctx_from_key(key)?;
         let state_key = derive_state_key(key);
+        let ttl_secs = self.ttl_secs;
         self.store
             .call(move |store| {
-                store.set_json(&tenant, STATE_PREFIX, &state_key, None, &value, None)
+                store.set_json(&tenant, STATE_PREFIX, &state_key, None, &value, ttl_secs)
             })
             .await
             .map_err(map_state_error)
@@ -109,21 +201,29 @@ impl StateHost for StateStoreHost {
     async fn del(&self, key: &SessionKey) -> GResult<()> {
         let tenant = tenant_ctx_from_key(key)?;
         let state_key = derive_state_key(key);
+        let legacy_key = legacy_state_key(key);
         self.store
-            .call(move |store| store.del(&tenant, STATE_PREFIX, &state_key))
+            .call(move |store| {
+                if let Some(legacy_key) = &legacy_key {
+                    store.del(&tenant, STATE_PREFIX, legacy_key)?;
+                }
+                store.del(&tenant, STATE_PREFIX, &state_key)
+            })
             .await
             .map_err(map_state_error)?;
         Ok(())
     }
 
     async fn del_prefix(&self, _key_prefix: &str) -> GResult<()> {
-        // Deliberately a no-op, and it must stay one until someone decides
-        // otherwise on purpose. `RedisStateStore::del_prefix` runs an unbounded
-        // `SCAN MATCH` across the whole keyspace, which on a shared Redis is a
-        // cost paid by every other tenant on the box. Nothing in this crate
-        // needs prefix deletion; forwarding would make that cost arrive by
-        // accident. Pinned by `del_prefix_never_reaches_the_backing_store`.
-        Ok(())
+        // Deliberately NOT forwarded: `RedisStateStore::del_prefix` runs an
+        // unbounded `SCAN MATCH` across the whole keyspace, which on a shared
+        // Redis is a cost paid by every other tenant on the box. It used to
+        // return `Ok(())`, which told the caller the keys were deleted when
+        // they were not; it now reports the operation as unsupported so the
+        // caller finds out. Pinned by `del_prefix_is_unsupported_and_never_reaches_the_backing_store`.
+        Err(RunnerError::State {
+            reason: "del_prefix is not supported by the durable state store".to_string(),
+        })
     }
 }
 
@@ -143,12 +243,66 @@ fn tenant_ctx_from_key(key: &SessionKey) -> GResult<TenantCtx> {
     Ok(TenantCtx::new(env_id, tenant_id))
 }
 
+/// Escape `%` and `/` so a segment can never contain the key separator.
+fn escape_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for ch in segment.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Injective key for one session's state.
+///
+/// Segments are escaped (`%` and `/`), so `pack/a/flow/b/session/x` cannot be
+/// produced by a different `(pack, flow, hint)` triple. `-` is the marker for
+/// "no hint"; a literal `-` hint is escaped to `%2D` so the two cannot alias.
+/// Keys without `%`, `/` or a bare `-` hint are identical to the historical
+/// format, so existing state stays addressable; for ids that DO contain `%` or
+/// `/` the historical (unescaped) key is [`legacy_state_key`], which
+/// `get_json` falls back to and migrates from.
 fn derive_state_key(key: &SessionKey) -> StoreStateKey {
-    let hint = key.session_hint.as_deref().unwrap_or("-");
+    let hint = match key.session_hint.as_deref() {
+        None => "-".to_string(),
+        Some("-") => "%2D".to_string(),
+        Some(hint) => escape_segment(hint),
+    };
     StoreStateKey::from(format!(
         "pack/{}/flow/{}/session/{hint}",
-        key.pack_id, key.flow_id
+        escape_segment(&key.pack_id),
+        escape_segment(&key.flow_id),
     ))
+}
+
+/// The pre-escaping key for `key`, when it differs from [`derive_state_key`].
+///
+/// `None` for a literal `-` hint: its historical key is the "no hint" key, so
+/// reading it back would hand one session another's state.
+fn legacy_state_key(key: &SessionKey) -> Option<StoreStateKey> {
+    if key.session_hint.as_deref() == Some("-") {
+        return None;
+    }
+    // Only a raw `/` makes the legacy key distinguishable: it then has more
+    // than five slashes, so it can never equal any escaped (current) key. A
+    // `%`-only id's legacy key can equal ANOTHER session's current key
+    // (`a/b` escapes to `a%2Fb`, which is the raw hint `a%2Fb`'s legacy key),
+    // so falling back to it would read, migrate and delete that session's state.
+    let has_slash = key.pack_id.contains('/')
+        || key.flow_id.contains('/')
+        || key.session_hint.as_deref().is_some_and(|h| h.contains('/'));
+    if !has_slash {
+        return None;
+    }
+    let hint = key.session_hint.as_deref().unwrap_or("-");
+    let legacy = StoreStateKey::from(format!(
+        "pack/{}/flow/{}/session/{hint}",
+        key.pack_id, key.flow_id
+    ));
+    (legacy != derive_state_key(key)).then_some(legacy)
 }
 
 fn map_state_error(err: greentic_types::GreenticError) -> RunnerError {
@@ -159,6 +313,19 @@ fn map_state_error(err: greentic_types::GreenticError) -> RunnerError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ttl_parsing_clamps_instead_of_disabling() {
+        use super::parse_ttl;
+        assert_eq!(parse_ttl(None), None);
+        assert_eq!(parse_ttl(Some("0")), None);
+        assert_eq!(parse_ttl(Some(" 3600 ")), Some(3600));
+        assert_eq!(parse_ttl(Some("4294967295")), Some(u32::MAX));
+        assert_eq!(parse_ttl(Some("4294967296")), Some(u32::MAX));
+        assert_eq!(parse_ttl(Some("99999999999999")), Some(u32::MAX));
+        assert_eq!(parse_ttl(Some("abc")), None);
+        assert_eq!(parse_ttl(Some("-5")), None);
+    }
+
     use super::*;
     use greentic_state::StatePath;
     use greentic_types::GResult as TypesResult;
@@ -246,15 +413,15 @@ mod tests {
 
     /// `RedisStateStore::del_prefix` walks the WHOLE keyspace with an unbounded
     /// `SCAN MATCH`, a cost every other tenant on a shared Redis pays. Nothing
-    /// in this crate needs prefix deletion, so the adapter answers it without
-    /// touching the store. If that ever changes it must be a decision, and this
-    /// test is what forces it to be one.
+    /// in this crate needs prefix deletion, so the adapter refuses it (rather
+    /// than pretending to succeed) without touching the store. If that ever
+    /// changes it must be a decision, and this test is what forces it to be one.
     #[tokio::test]
-    async fn del_prefix_never_reaches_the_backing_store() {
+    async fn del_prefix_is_unsupported_and_never_reaches_the_backing_store() {
         let store = Arc::new(RecordingStore::default());
         let host = StateStoreHost::new(store.clone());
 
-        host.del_prefix("runner/pack").await.expect("del_prefix");
+        assert!(host.del_prefix("runner/pack").await.is_err());
 
         assert!(
             store.calls().is_empty(),
@@ -276,6 +443,295 @@ mod tests {
         host.del(&key).await.expect("del");
 
         assert_eq!(store.calls(), vec!["set_json", "get_json", "del"]);
+    }
+
+    #[test]
+    fn state_keys_do_not_alias() {
+        let mut a = sample_key();
+        a.pack_id = "p/flow/f".into();
+        a.flow_id = "x".into();
+        let mut b = sample_key();
+        b.pack_id = "p".into();
+        b.flow_id = "f/session/h".into();
+        b.session_hint = None;
+        assert_ne!(derive_state_key(&a), derive_state_key(&b));
+
+        let mut none = sample_key();
+        none.session_hint = None;
+        let mut dash = sample_key();
+        dash.session_hint = Some("-".into());
+        assert_ne!(derive_state_key(&none), derive_state_key(&dash));
+
+        // Plain keys keep the historical shape.
+        assert_eq!(
+            derive_state_key(&sample_key()),
+            StoreStateKey::from("pack/pack.demo/flow/flow.main/session/hint")
+        );
+    }
+
+    #[derive(Default)]
+    struct TtlRecorder(Mutex<Vec<Option<u32>>>);
+
+    impl StateStore for TtlRecorder {
+        fn get_json(
+            &self,
+            _t: &TenantCtx,
+            _p: &str,
+            _k: &StoreStateKey,
+            _path: Option<&StatePath>,
+        ) -> TypesResult<Option<Value>> {
+            Ok(None)
+        }
+        fn set_json(
+            &self,
+            _t: &TenantCtx,
+            _p: &str,
+            _k: &StoreStateKey,
+            _path: Option<&StatePath>,
+            _v: &Value,
+            ttl_secs: Option<u32>,
+        ) -> TypesResult<()> {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(ttl_secs);
+            }
+            Ok(())
+        }
+        fn set_json_if_absent(
+            &self,
+            _t: &TenantCtx,
+            _p: &str,
+            _k: &StoreStateKey,
+            _v: &Value,
+            _ttl: Option<u32>,
+        ) -> TypesResult<bool> {
+            Ok(true)
+        }
+        fn del(&self, _t: &TenantCtx, _p: &str, _k: &StoreStateKey) -> TypesResult<bool> {
+            Ok(true)
+        }
+        fn del_prefix(&self, _t: &TenantCtx, _p: &str) -> TypesResult<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_ttl_reaches_set_json() {
+        let store = Arc::new(TtlRecorder::default());
+        let host = StateStoreHost::new(store.clone()).with_ttl_secs(Some(90));
+        host.set_json(&sample_key(), Value::Null)
+            .await
+            .expect("set");
+        let plain = StateStoreHost::new(store.clone());
+        plain
+            .set_json(&sample_key(), Value::Null)
+            .await
+            .expect("set");
+        let zero = StateStoreHost::new(store.clone()).with_ttl_secs(Some(0));
+        zero.set_json(&sample_key(), Value::Null)
+            .await
+            .expect("set");
+        let seen = store.0.lock().map(|v| v.clone()).unwrap_or_default();
+        assert_eq!(seen, vec![Some(90), None, None]);
+    }
+
+    #[tokio::test]
+    async fn state_under_a_pre_escaping_key_is_found_and_migrated() {
+        let store = Arc::new(InMemoryStateStore::new());
+        let host = StateStoreHost::new(store.clone());
+        let mut key = sample_key();
+        key.flow_id = "flow/main%x".into();
+        let tenant = tenant_ctx_from_key(&key).expect("tenant");
+        let legacy = legacy_state_key(&key).expect("differs from current key");
+        assert_ne!(legacy, derive_state_key(&key));
+        let value = serde_json::json!({"n": 1});
+        store
+            .set_json(&tenant, STATE_PREFIX, &legacy, None, &value, None)
+            .expect("seed");
+
+        assert_eq!(host.get_json(&key).await.expect("get"), Some(value.clone()));
+        // Migrated: legacy key gone, current key populated.
+        assert!(
+            store
+                .get_json(&tenant, STATE_PREFIX, &legacy, None)
+                .expect("legacy")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_json(&tenant, STATE_PREFIX, &derive_state_key(&key), None)
+                .expect("current"),
+            Some(value)
+        );
+    }
+
+    /// An in-memory store that, right after the LEGACY key is read, lets a
+    /// concurrent `set_json` land on the current key (the migrate-on-read race).
+    struct RacingStore {
+        inner: InMemoryStateStore,
+        legacy: StoreStateKey,
+        current: StoreStateKey,
+        newer: Value,
+        supports_if_absent: bool,
+    }
+
+    impl StateStore for RacingStore {
+        fn get_json(
+            &self,
+            tenant: &TenantCtx,
+            prefix: &str,
+            key: &StoreStateKey,
+            path: Option<&greentic_state::StatePath>,
+        ) -> greentic_types::GResult<Option<Value>> {
+            let found = self.inner.get_json(tenant, prefix, key, path)?;
+            if *key == self.legacy && found.is_some() {
+                self.inner
+                    .set_json(tenant, prefix, &self.current, None, &self.newer, None)?;
+            }
+            Ok(found)
+        }
+
+        fn set_json(
+            &self,
+            tenant: &TenantCtx,
+            prefix: &str,
+            key: &StoreStateKey,
+            path: Option<&greentic_state::StatePath>,
+            value: &Value,
+            ttl_secs: Option<u32>,
+        ) -> greentic_types::GResult<()> {
+            self.inner
+                .set_json(tenant, prefix, key, path, value, ttl_secs)
+        }
+
+        fn del(
+            &self,
+            tenant: &TenantCtx,
+            prefix: &str,
+            key: &StoreStateKey,
+        ) -> greentic_types::GResult<bool> {
+            self.inner.del(tenant, prefix, key)
+        }
+
+        fn del_prefix(&self, tenant: &TenantCtx, prefix: &str) -> greentic_types::GResult<u64> {
+            self.inner.del_prefix(tenant, prefix)
+        }
+
+        fn set_json_if_absent(
+            &self,
+            tenant: &TenantCtx,
+            prefix: &str,
+            key: &StoreStateKey,
+            value: &Value,
+            ttl_secs: Option<u32>,
+        ) -> greentic_types::GResult<bool> {
+            if self.supports_if_absent {
+                self.inner
+                    .set_json_if_absent(tenant, prefix, key, value, ttl_secs)
+            } else {
+                Err(greentic_types::GreenticError::new(
+                    greentic_types::ErrorCode::InvalidInput,
+                    "unsupported",
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_does_not_overwrite_a_write_that_raced_it() {
+        let mut key = sample_key();
+        key.flow_id = "flow/main%x".into();
+        let tenant = tenant_ctx_from_key(&key).expect("tenant");
+        let legacy = legacy_state_key(&key).expect("differs from current key");
+        let current = derive_state_key(&key);
+        let stale = serde_json::json!({"n": "stale"});
+        let newer = serde_json::json!({"n": "newer"});
+        let store = Arc::new(RacingStore {
+            inner: InMemoryStateStore::new(),
+            legacy: legacy.clone(),
+            current: current.clone(),
+            newer: newer.clone(),
+            supports_if_absent: true,
+        });
+        store
+            .inner
+            .set_json(&tenant, STATE_PREFIX, &legacy, None, &stale, None)
+            .expect("seed");
+        let host = StateStoreHost::new(store.clone());
+
+        // The racing write wins: the caller sees it, and so does the store.
+        assert_eq!(host.get_json(&key).await.expect("get"), Some(newer.clone()));
+        assert_eq!(
+            store
+                .inner
+                .get_json(&tenant, STATE_PREFIX, &current, None)
+                .expect("current"),
+            Some(newer)
+        );
+        assert!(
+            store
+                .inner
+                .get_json(&tenant, STATE_PREFIX, &legacy, None)
+                .expect("legacy")
+                .is_none(),
+            "the legacy key is still removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_falls_back_to_a_plain_write_without_if_absent_support() {
+        let mut key = sample_key();
+        key.flow_id = "flow/main%x".into();
+        let tenant = tenant_ctx_from_key(&key).expect("tenant");
+        let legacy = legacy_state_key(&key).expect("differs from current key");
+        let current = derive_state_key(&key);
+        let value = serde_json::json!({"n": 2});
+        let store = Arc::new(RacingStore {
+            inner: InMemoryStateStore::new(),
+            legacy: legacy.clone(),
+            current: current.clone(),
+            newer: value.clone(),
+            supports_if_absent: false,
+        });
+        // No racing write here: seed only the legacy key, with the race value
+        // equal to it, so the fallback path is what is observed.
+        store
+            .inner
+            .set_json(&tenant, STATE_PREFIX, &legacy, None, &value, None)
+            .expect("seed");
+        let host = StateStoreHost::new(store.clone());
+        assert_eq!(host.get_json(&key).await.expect("get"), Some(value.clone()));
+        assert_eq!(
+            store
+                .inner
+                .get_json(&tenant, STATE_PREFIX, &current, None)
+                .expect("current"),
+            Some(value)
+        );
+    }
+
+    #[tokio::test]
+    async fn percent_only_ids_never_touch_another_sessions_current_key() {
+        let store = Arc::new(InMemoryStateStore::new());
+        let host = StateStoreHost::new(store.clone());
+        let mut a = sample_key();
+        a.session_hint = Some("a/b".into());
+        let mut b = sample_key();
+        b.session_hint = Some("a%2Fb".into());
+        assert!(legacy_state_key(&b).is_none());
+        let value = serde_json::json!({"owner": "a"});
+        host.set_json(&a, value.clone()).await.expect("set a");
+
+        assert_eq!(host.get_json(&b).await.expect("get b"), None);
+        host.del(&b).await.expect("del b");
+        assert_eq!(host.get_json(&a).await.expect("get a"), Some(value));
+    }
+
+    #[test]
+    fn plain_ids_and_a_dash_hint_have_no_legacy_key() {
+        let mut key = sample_key();
+        assert!(legacy_state_key(&key).is_none());
+        key.session_hint = Some("-".into());
+        assert!(legacy_state_key(&key).is_none());
     }
 
     /// The in-memory default must still be reachable with no configuration.

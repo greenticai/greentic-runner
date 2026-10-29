@@ -72,6 +72,7 @@ pub struct PackMcpRoute {
 
 impl PackMcpRoute {
     /// The non-secret OAuth parameters of this record.
+    #[cfg(feature = "agentic-worker")]
     pub fn auth_spec(&self) -> greentic_aw_runtime::oauth::RouteAuthSpec<'_> {
         greentic_aw_runtime::oauth::RouteAuthSpec {
             auth_mode: self.auth_mode.as_deref(),
@@ -100,6 +101,15 @@ where
 
 fn default_transport() -> String {
     "http".to_string()
+}
+
+fn route_segments_are_safe(route: &PackMcpRoute) -> bool {
+    use crate::secrets_broker::is_safe_secret_segment;
+    is_safe_secret_segment(&route.server_id)
+        && route
+            .auth_team
+            .as_deref()
+            .is_none_or(|team| team.is_empty() || is_safe_secret_segment(team))
 }
 
 /// Every route a pack declares, keyed by server id.
@@ -142,8 +152,18 @@ impl PackMcpRoutes {
         let mut by_server = HashMap::new();
         for (index, record) in records.into_iter().enumerate() {
             match serde_json::from_value::<PackMcpRoute>(record) {
+                Ok(route) if !route_segments_are_safe(&route) => {
+                    // server_id and auth_team become secret-path segments.
+                    tracing::warn!(
+                        index,
+                        "mcp-routes: record has an unsafe server_id or auth_team; dropped"
+                    );
+                }
                 Ok(route) => {
-                    by_server.insert(route.server_id.clone(), route);
+                    // First record wins, like the a2a and sorla sidecar
+                    // readers: a later duplicate must not silently replace
+                    // the route an earlier record declared.
+                    by_server.entry(route.server_id.clone()).or_insert(route);
                 }
                 Err(e) => {
                     tracing::warn!(index, error = %e, "mcp-routes: record unreadable; dropped");
@@ -176,6 +196,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_duplicate_server_id_keeps_the_first_record() {
+        let routes = PackMcpRoutes::from_sidecar_bytes(
+            br#"[{"server_id":"srv-1","transport_url":"https://first/"},
+                 {"server_id":"srv-1","transport_url":"https://second/"}]"#,
+        )
+        .expect("sidecar parses");
+        assert_eq!(
+            routes.get("srv-1").unwrap().transport_url.as_deref(),
+            Some("https://first/")
+        );
+    }
+
+    #[test]
     fn auth_team_round_trips_from_the_sidecar() {
         let routes = PackMcpRoutes::from_sidecar_bytes(
             br#"[{"server_id":"srv-1","transport_url":"https://x/","auth_team":"sales"}]"#,
@@ -185,6 +218,25 @@ mod tests {
             routes.get("srv-1").unwrap().auth_team.as_deref(),
             Some("sales")
         );
+    }
+
+    #[test]
+    fn records_with_traversal_in_server_id_or_auth_team_are_dropped() {
+        let routes = PackMcpRoutes::from_sidecar_bytes(
+            br#"[
+                {"server_id":"..","transport_url":"https://x/"},
+                {"server_id":"a/b","transport_url":"https://x/"},
+                {"server_id":"%2e%2e","transport_url":"https://x/"},
+                {"server_id":"a?b","transport_url":"https://x/"},
+                {"server_id":"a#b","transport_url":"https://x/"},
+                {"server_id":"bad-team","auth_team":"../other","transport_url":"https://x/"},
+                {"server_id":"bad-team2","auth_team":"a/b","transport_url":"https://x/"},
+                {"server_id":"ok","auth_team":"sales","transport_url":"https://x/"}
+            ]"#,
+        )
+        .expect("sidecar parses");
+        let ids: Vec<&str> = routes.iter().map(|r| r.server_id.as_str()).collect();
+        assert_eq!(ids, ["ok"]);
     }
 
     #[test]

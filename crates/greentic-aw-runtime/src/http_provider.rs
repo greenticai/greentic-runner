@@ -30,6 +30,14 @@ impl HttpConfigProvider {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
+        Self::with_client(base_url, token, client)
+    }
+
+    fn with_client(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
@@ -45,7 +53,15 @@ impl ConfigProvider for HttpConfigProvider {
         agent_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<AgentConfig, ConfigError>> + Send + 'a>> {
         Box::pin(async move {
-            let url = format!("{}/api/v1/designer/agents/{agent_id}", self.base_url);
+            // `..` stays a traversal step even percent-encoded: never send it.
+            if crate::tenant::is_dot_segment(agent_id) {
+                return Err(ConfigError::AgentNotFound(agent_id.to_string()));
+            }
+            let url = format!(
+                "{}/api/v1/designer/agents/{}",
+                self.base_url,
+                crate::tenant::percent_encode_segment(agent_id)
+            );
             let resp = self
                 .client
                 .get(&url)
@@ -53,14 +69,16 @@ impl ConfigProvider for HttpConfigProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ConfigError::Internal(format!("agent registry request failed: {e}"))
+                    ConfigError::Internal(format!(
+                        "agent registry request failed: {}",
+                        e.without_url()
+                    ))
                 })?;
 
             match resp.status().as_u16() {
-                200 => resp
-                    .json::<AgentConfig>()
-                    .await
-                    .map_err(|e| ConfigError::Misconfigured(format!("agent config decode: {e}"))),
+                200 => resp.json::<AgentConfig>().await.map_err(|e| {
+                    ConfigError::Misconfigured(format!("agent config decode: {}", e.without_url()))
+                }),
                 404 => Err(ConfigError::AgentNotFound(agent_id.to_string())),
                 // Auth failures are operator-actionable misconfig, not a
                 // transient fault — surface them (Misconfigured is NOT swallowed
@@ -85,6 +103,16 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// No proxy: `HTTP(S)_PROXY` / `ALL_PROXY` in the environment must not
+    /// reroute these loopback requests.
+    fn direct() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
+    }
+
     fn agent_config_json() -> serde_json::Value {
         serde_json::json!({
             "agent_id": "bot",
@@ -105,7 +133,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let tenant = TenantContext::new("t", "e");
         let cfg = provider.agent_config(&tenant, "bot").await.unwrap();
         assert_eq!(cfg.agent_id, "bot");
@@ -120,7 +148,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "ghost").await;
         assert!(matches!(result, Err(ConfigError::AgentNotFound(_))));
@@ -133,7 +161,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Internal(_))));
@@ -146,10 +174,38 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("{not json"))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Misconfigured(_))));
+    }
+
+    #[tokio::test]
+    async fn decode_and_transport_errors_do_not_carry_the_request_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not json"))
+            .mount(&server)
+            .await;
+        let tenant = TenantContext::new("t", "e");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_x", direct());
+        let decode = provider.agent_config(&tenant, "bot").await.unwrap_err();
+        let text = decode.to_string();
+        assert!(text.contains("agent config decode"), "{text}");
+        assert!(!text.contains("/api/v1/designer/agents"), "{text}");
+        assert!(!text.contains(&server.uri()), "{text}");
+
+        // Nothing listens on port 1: the send itself fails.
+        let provider = HttpConfigProvider::with_client(
+            "http://127.0.0.1:1/secret-path",
+            "gtc_live_x",
+            direct(),
+        );
+        let send = provider.agent_config(&tenant, "bot").await.unwrap_err();
+        let text = send.to_string();
+        assert!(text.contains("agent registry request failed"), "{text}");
+        assert!(!text.contains("secret-path"), "{text}");
+        assert!(!text.contains("/api/v1/designer/agents"), "{text}");
     }
 
     #[tokio::test]
@@ -159,9 +215,35 @@ mod tests {
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
-        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_bad");
+        let provider = HttpConfigProvider::with_client(server.uri(), "gtc_live_bad", direct());
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Misconfigured(_))));
+    }
+
+    #[tokio::test]
+    async fn an_agent_id_cannot_steer_the_request_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let provider = HttpConfigProvider::with_client(server.uri(), "tok", direct());
+        let tenant = TenantContext::new("t", "e");
+        let err = provider
+            .agent_config(&tenant, "../tenant/me/mcp-servers")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::AgentNotFound(_)));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url.path(),
+            "/api/v1/designer/agents/..%2Ftenant%2Fme%2Fmcp-servers"
+        );
+        // A bare `..` is refused without any request being made.
+        let err = provider.agent_config(&tenant, "..").await.unwrap_err();
+        assert!(matches!(err, ConfigError::AgentNotFound(_)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

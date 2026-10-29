@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 use crate::cache::PruneReport;
 use crate::cache::engine_profile::EngineProfile;
@@ -32,7 +33,10 @@ impl DiskCache {
     pub fn try_read(&self, key: &ArtifactKey) -> Result<Option<Vec<u8>>> {
         let paths = self.paths_for(key)?;
         if !paths.meta_path.exists() {
-            if paths.artifact_path.exists() {
+            // `write_entry` renames the artifact before its metadata, so an
+            // artifact without metadata may be a write in flight. Only a
+            // pair that has stayed incomplete past the grace period is junk.
+            if paths.artifact_path.exists() && older_than_grace(&paths.artifact_path) {
                 let _ = fs::remove_file(&paths.artifact_path);
             }
             return Ok(None);
@@ -59,7 +63,9 @@ impl DiskCache {
             return Ok(None);
         }
         if !paths.artifact_path.exists() {
-            self.delete_entry(&paths)?;
+            if older_than_grace(&paths.meta_path) {
+                self.delete_entry(&paths)?;
+            }
             return Ok(None);
         }
         let artifact_bytes = fs::read(&paths.artifact_path).ok();
@@ -68,6 +74,17 @@ impl DiskCache {
             return Ok(None);
         };
         if meta.artifact_bytes != artifact_bytes.len() as u64 {
+            self.delete_entry(&paths)?;
+            return Ok(None);
+        }
+        // Integrity: the artifact is later passed to `Component::deserialize`
+        // (unsafe), so refuse anything whose hash does not match the metadata.
+        let expected_hash = meta.artifact_sha256.as_deref();
+        if expected_hash != Some(sha256_hex(&artifact_bytes).as_str()) {
+            tracing::warn!(
+                wasm_digest = %key.wasm_digest,
+                "cached artifact failed integrity check; deleting entry"
+            );
             self.delete_entry(&paths)?;
             return Ok(None);
         }
@@ -87,26 +104,44 @@ impl DiskCache {
             bail!("cache metadata digest does not match artifact key");
         }
         let paths = self.paths_for(key)?;
-        fs::create_dir_all(&paths.artifacts_dir).with_context(|| {
+        create_private_dir(&paths.artifacts_dir).with_context(|| {
             format!(
                 "failed to create cache dir {}",
                 paths.artifacts_dir.display()
             )
         })?;
-        fs::create_dir_all(&paths.tmp_dir).with_context(|| {
+        create_private_dir(&paths.tmp_dir).with_context(|| {
             format!("failed to create cache tmp dir {}", paths.tmp_dir.display())
         })?;
         let tmp_artifact = paths.tmp_path("artifact");
         let tmp_meta = paths.tmp_path("meta");
-        fs::write(&tmp_artifact, bytes)
+        let result = self.write_entry(&paths, &tmp_artifact, &tmp_meta, bytes, meta);
+        if result.is_err() {
+            // Never leave partial temp files behind after a failed write.
+            let _ = fs::remove_file(&tmp_artifact);
+            let _ = fs::remove_file(&tmp_meta);
+        }
+        result
+    }
+
+    fn write_entry(
+        &self,
+        paths: &DiskPaths,
+        tmp_artifact: &Path,
+        tmp_meta: &Path,
+        bytes: &[u8],
+        meta: &ArtifactMetadata,
+    ) -> Result<()> {
+        let meta = meta.clone().with_artifact_sha256(sha256_hex(bytes));
+        write_private_file(tmp_artifact, bytes)
             .with_context(|| format!("failed to write {}", tmp_artifact.display()))?;
         let meta_json =
-            serde_json::to_vec_pretty(meta).context("failed to serialize cache metadata")?;
-        fs::write(&tmp_meta, meta_json)
+            serde_json::to_vec_pretty(&meta).context("failed to serialize cache metadata")?;
+        write_private_file(tmp_meta, &meta_json)
             .with_context(|| format!("failed to write {}", tmp_meta.display()))?;
-        fs::rename(&tmp_artifact, &paths.artifact_path)
+        fs::rename(tmp_artifact, &paths.artifact_path)
             .with_context(|| format!("failed to rename {}", paths.artifact_path.display()))?;
-        fs::rename(&tmp_meta, &paths.meta_path)
+        fs::rename(tmp_meta, &paths.meta_path)
             .with_context(|| format!("failed to rename {}", paths.meta_path.display()))?;
         Ok(())
     }
@@ -131,19 +166,54 @@ impl DiskCache {
         Ok(total)
     }
 
+    /// Remove files nothing can ever read again: an artifact without
+    /// metadata (or the reverse), and leftover temp files from a crashed
+    /// write. Anything younger than [`INCOMPLETE_ENTRY_GRACE`] is left alone
+    /// because a writer may still be between its renames.
+    fn sweep_orphans(&self, dry_run: bool) -> PruneReport {
+        let mut report = PruneReport {
+            removed_entries: 0,
+            removed_bytes: 0,
+        };
+        let mut remove = |path: &Path| {
+            if !older_than_grace(path) {
+                return;
+            }
+            let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if dry_run || fs::remove_file(path).is_ok() {
+                report.removed_entries = report.removed_entries.saturating_add(1);
+                report.removed_bytes = report.removed_bytes.saturating_add(size);
+            }
+        };
+        if let Ok(entries) = fs::read_dir(self.root.join("artifacts")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match path.extension().and_then(|ext| ext.to_str()) {
+                    Some("cwasm") if !path.with_extension("json").exists() => remove(&path),
+                    Some("json") if !path.with_extension("cwasm").exists() => remove(&path),
+                    _ => {}
+                }
+            }
+        }
+        if let Ok(entries) = fs::read_dir(self.root.join("tmp")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    remove(&path);
+                }
+            }
+        }
+        report
+    }
+
     pub fn prune_to_limit(&self, dry_run: bool) -> Result<PruneReport> {
+        let mut report = self.sweep_orphans(dry_run);
         let Some(limit) = self.disk_max_bytes else {
-            return Ok(PruneReport {
-                removed_entries: 0,
-                removed_bytes: 0,
-            });
+            return Ok(report);
         };
         let artifacts_dir = self.root.join("artifacts");
         if !artifacts_dir.exists() {
-            return Ok(PruneReport {
-                removed_entries: 0,
-                removed_bytes: 0,
-            });
+            return Ok(report);
         }
         let mut entries = Vec::new();
         let mut total_bytes = 0u64;
@@ -187,10 +257,9 @@ impl DiskCache {
             removed_bytes = removed_bytes.saturating_add(size);
             remaining = remaining.saturating_sub(size);
         }
-        Ok(PruneReport {
-            removed_entries,
-            removed_bytes,
-        })
+        report.removed_entries = report.removed_entries.saturating_add(removed_entries);
+        report.removed_bytes = report.removed_bytes.saturating_add(removed_bytes);
+        Ok(report)
     }
 
     pub fn artifact_count(&self) -> Result<u64> {
@@ -220,9 +289,14 @@ impl DiskCache {
         meta.touch();
         let tmp = paths.tmp_path("meta");
         let json = serde_json::to_vec_pretty(&meta)?;
-        let _ = fs::create_dir_all(&paths.tmp_dir);
-        fs::write(&tmp, json).ok();
-        let _ = fs::rename(&tmp, &paths.meta_path);
+        let _ = create_private_dir(&paths.tmp_dir);
+        if write_private_file(&tmp, &json).is_ok() {
+            if fs::rename(&tmp, &paths.meta_path).is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
         Ok(())
     }
 
@@ -266,6 +340,51 @@ impl DiskPaths {
         let pid = std::process::id();
         self.tmp_dir.join(format!("tmp_{}_{}_{}", pid, now, suffix))
     }
+}
+
+/// How long a half-written cache entry (or a temp file) is left alone before
+/// it counts as abandoned. Generous next to a write, which is two renames.
+pub(crate) const INCOMPLETE_ENTRY_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// True when `path` was last modified more than [`INCOMPLETE_ENTRY_GRACE`]
+/// ago. A file whose age cannot be read is treated as young, so uncertainty
+/// never deletes something a writer may own.
+fn older_than_grace(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > INCOMPLETE_ENTRY_GRACE)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Create `path` (and parents) restricted to the owner (0700) on unix.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Write `bytes` to `path`, owner read/write only (0600) on unix.
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)
 }
 
 fn digest_to_filename(digest: &str) -> String {

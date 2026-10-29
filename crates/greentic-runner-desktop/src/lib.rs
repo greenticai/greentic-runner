@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use greentic_pack::reader::{VerifyReport, open_pack};
 use greentic_runner_host::RunnerWasiPolicy;
 use greentic_runner_host::config::{
@@ -16,9 +16,9 @@ use greentic_runner_host::storage::{new_session_store, new_state_store};
 use greentic_runner_host::trace::TraceConfig;
 use greentic_runner_host::validate::ValidationConfig;
 use parking_lot::Mutex;
-use runner_core::normalize_under_root;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, File};
@@ -66,7 +66,11 @@ pub struct DevProfile {
     pub tenant_id: String,
     pub team_id: String,
     pub user_id: String,
+    /// NOT enforced yet: there is no per-node timeout seam in the engine. Kept
+    /// for API compatibility.
     pub max_node_wall_time_ms: u64,
+    /// Wall-clock limit for one `run_pack` call in milliseconds; `0` disables.
+    /// Exceeding it aborts the run with an error.
     pub max_run_wall_time_ms: u64,
 }
 
@@ -297,6 +301,17 @@ pub fn desktop_defaults() -> RunOptions {
     }
 }
 
+/// Directory packs carry no signature, so they cannot satisfy a strict
+/// signing policy. Refuse them rather than silently skipping verification.
+fn ensure_directory_pack_allowed(signing: SigningPolicy) -> Result<()> {
+    if signing == SigningPolicy::Strict {
+        bail!(
+            "pack verification failed: directory packs are unsigned and cannot be run under the strict signing policy"
+        );
+    }
+    Ok(())
+}
+
 fn resolve_secrets_manager(opts: &RunOptions) -> Result<DynSecretsManager> {
     if let Some(manager) = opts.secrets_manager.clone() {
         Ok(manager)
@@ -368,6 +383,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             }
         }
     } else {
+        ensure_directory_pack_allowed(opts.signing)?;
         note_verify_outcome(&recorder, VerifyOutcome::DirectorySkipped);
     }
 
@@ -568,27 +584,57 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         opts.session_state_dir.as_deref(),
         resolved_profile.session_id.as_str(),
     );
-    let resume_snapshot = session_snapshot_path
-        .as_deref()
-        .and_then(load_session_snapshot);
-
-    let execution = if let Some(snapshot) = resume_snapshot {
-        // A parked snapshot OUTRANKS `entry_node`. A card parks awaiting the
-        // user's submit, and only re-dispatching THAT node on resume attaches
-        // the submitted `answers` to its output — which is what the nodes
-        // downstream read (`{{node.<card>.answers.<field>}}`). Jumping to an
-        // entry node instead skips the card, so the answers never exist and
-        // every downstream binding resolves empty.
-        engine.resume(ctx, snapshot, opts.input.clone()).await
-    } else if let Some(entry_node) = opts.entry_node.as_deref() {
-        // No parked run to continue, so this is the caller's first hop into
-        // the flow: start at the node it named.
-        engine
-            .execute_from(ctx, opts.input.clone(), entry_node)
-            .await
-    } else {
-        engine.execute(ctx, opts.input.clone()).await
+    let legacy_snapshot_path = legacy_session_snapshot_file(
+        opts.session_state_dir.as_deref(),
+        resolved_profile.session_id.as_str(),
+    );
+    let session_id_str = resolved_profile.session_id.as_str();
+    let mut loaded_from_legacy = false;
+    let resume_snapshot = match session_snapshot_path.as_deref() {
+        Some(path) => {
+            // Snapshots saved before the escaping scheme changed live under
+            // the legacy name; fall back to it so those parks still resume.
+            let load_path = snapshot_load_path(path, legacy_snapshot_path.as_deref());
+            if load_path != path {
+                let loaded = load_legacy_session_snapshot(load_path, session_id_str);
+                loaded_from_legacy = loaded.is_some();
+                loaded
+            } else {
+                load_session_snapshot(load_path, session_id_str)?
+            }
+        }
+        None => None,
     };
+
+    let run_limit_ms = resolved_profile.max_run_wall_time_ms;
+    let run_future = async {
+        if let Some(snapshot) = resume_snapshot {
+            // A parked snapshot OUTRANKS `entry_node`. A card parks awaiting the
+            // user's submit, and only re-dispatching THAT node on resume attaches
+            // the submitted `answers` to its output — which is what the nodes
+            // downstream read (`{{node.<card>.answers.<field>}}`). Jumping to an
+            // entry node instead skips the card, so the answers never exist and
+            // every downstream binding resolves empty.
+            //
+            // A resume that fails AFTER one of its own effects is answered as a
+            // completed failure envelope (`resume_surfacing_failures`), so the
+            // `Completed` arm below deletes the snapshot; with plain `resume` the
+            // `Err` kept it and the next activity repeated the effect. A failure
+            // before any effect stays an `Err` and keeps the park.
+            engine
+                .resume_surfacing_failures(ctx, snapshot, opts.input.clone())
+                .await
+        } else if let Some(entry_node) = opts.entry_node.as_deref() {
+            // No parked run to continue, so this is the caller's first hop into
+            // the flow: start at the node it named.
+            engine
+                .execute_from(ctx, opts.input.clone(), entry_node)
+                .await
+        } else {
+            engine.execute(ctx, opts.input.clone()).await
+        }
+    };
+    let execution = run_with_wall_limit(run_limit_ms, run_future).await;
     let finished_at = OffsetDateTime::now_utc();
 
     let status = match execution {
@@ -596,7 +642,18 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             greentic_runner_host::runner::engine::FlowStatus::Completed => {
                 // Flow ran to a real terminator — discard any stale resume
                 // snapshot so the next activity starts fresh at the entry.
-                if let Some(path) = session_snapshot_path.as_deref() {
+                // The legacy path is only ours when this session actually
+                // resumed from it; otherwise it may be another session's
+                // live snapshot (`a/b` legacy-maps onto `a_b`).
+                let legacy_to_remove = if loaded_from_legacy {
+                    legacy_snapshot_path.as_deref()
+                } else {
+                    None
+                };
+                for path in [session_snapshot_path.as_deref(), legacy_to_remove]
+                    .into_iter()
+                    .flatten()
+                {
                     let _ = std::fs::remove_file(path);
                 }
                 RunCompletion::Ok
@@ -607,7 +664,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                     .clone()
                     .unwrap_or_else(|| "flow paused unexpectedly".to_string());
                 if let Some(path) = session_snapshot_path.as_deref() {
-                    if let Err(err) = save_session_snapshot(path, &wait.snapshot) {
+                    if let Err(err) = save_session_snapshot(path, session_id_str, &wait.snapshot) {
                         // Persisting the snapshot is best-effort — losing
                         // it just means the next activity restarts at the
                         // entry, which is the pre-fix behaviour. Surface
@@ -621,6 +678,15 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                         // Successfully paused. Surface the run as Ok so
                         // greentic-start can emit the rendered card and
                         // wait for the user's next submission.
+                        //
+                        // The park now lives under the current-scheme name, so
+                        // the legacy bare file we resumed from is stale: drop
+                        // it, or a later NEW conversation with the same
+                        // session id would resurrect it.
+                        remove_migrated_legacy_snapshot(
+                            legacy_snapshot_path.as_deref(),
+                            loaded_from_legacy,
+                        );
                         RunCompletion::Ok
                     }
                 } else {
@@ -643,6 +709,24 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     Ok(result)
 }
 
+/// Run `future` under the profile's `max_run_wall_time_ms` (`0` disables the
+/// limit). Hitting the limit drops the run and returns a clear error; the
+/// per-node limit (`max_node_wall_time_ms`) has no enforcement seam yet.
+async fn run_with_wall_limit<T>(
+    limit_ms: u64,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if limit_ms == 0 {
+        return future.await;
+    }
+    match tokio::time::timeout(std::time::Duration::from_millis(limit_ms), future).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "run exceeded max_run_wall_time_ms ({limit_ms} ms) and was aborted"
+        )),
+    }
+}
+
 /// Resolve the snapshot file path for a given session id.
 ///
 /// Returns `None` if the caller didn't wire up `session_state_dir` or the
@@ -653,43 +737,295 @@ fn session_snapshot_file(session_state_dir: Option<&Path>, session_id: &str) -> 
     if session_id.is_empty() {
         return None;
     }
+    // Escape every byte outside a small safe set so distinct session ids
+    // always map to distinct files ("a/b" -> "a%2fb", never colliding with
+    // "a_b"). The escape character itself is escaped, which keeps the
+    // mapping injective.
+    let mut safe_id = String::with_capacity(session_id.len());
+    for byte in session_id.bytes() {
+        let ch = char::from(byte);
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+            safe_id.push(ch);
+        } else {
+            safe_id.push_str(&format!("%{byte:02x}"));
+        }
+    }
+    // Escaping can triple the length (non-ASCII bytes become `%xx`), and most
+    // filesystems cap a name at 255 bytes. Keep a readable prefix and append a
+    // digest of the FULL id so long ids stay distinct. `~` never appears in an
+    // escaped id, so a hashed name cannot collide with an unhashed one.
+    if safe_id.len() > MAX_SNAPSHOT_STEM_LEN {
+        let digest = Sha256::digest(session_id.as_bytes());
+        let hash: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        // `safe_id` is ASCII by construction, so byte slicing is char-safe.
+        safe_id = format!("{}~{hash}", &safe_id[..MAX_SNAPSHOT_STEM_LEN - 33]);
+    }
+    Some(dir.join(format!("{safe_id}.snapshot.json")))
+}
+
+/// Prefer the current snapshot name; use the legacy one only when it is the
+/// only file present.
+fn snapshot_load_path<'a>(current: &'a Path, legacy: Option<&'a Path>) -> &'a Path {
+    match legacy {
+        Some(legacy) if !current.exists() && legacy.exists() => legacy,
+        _ => current,
+    }
+}
+
+/// Longest snapshot file stem. Leaves room for `.snapshot.json` (14 bytes)
+/// under the common 255-byte filename limit.
+const MAX_SNAPSHOT_STEM_LEN: usize = 200;
+
+/// The snapshot path used before `%xx` escaping (every byte outside the safe
+/// set became `_`). Only ever read, so parks saved by an older build resume.
+fn legacy_session_snapshot_file(
+    session_state_dir: Option<&Path>,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let dir = session_state_dir?;
+    if session_id.is_empty() {
+        return None;
+    }
     let safe_id: String = session_id
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ':' {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
                 c
             } else {
                 '_'
             }
         })
         .collect();
+    // An id made only of safe characters has a legacy name equal to its
+    // current name; there is nothing to fall back to, and the "legacy" file
+    // would really be the current one.
+    if safe_id == session_id {
+        return None;
+    }
     Some(dir.join(format!("{safe_id}.snapshot.json")))
 }
 
-/// Load a persisted `FlowSnapshot` from disk if one exists. Returns `None`
-/// when the file is missing or unreadable — the caller falls back to a
-/// fresh execution in that case (which is also the pre-resume behaviour).
-fn load_session_snapshot(
-    path: &Path,
-) -> Option<greentic_runner_host::runner::engine::FlowSnapshot> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// On-disk wrapper that records which session a snapshot belongs to, so a
+/// file reached through a lossy name (hash-truncated, or the legacy `_`
+/// mapping) is never resumed by a different session.
+#[derive(serde::Deserialize)]
+struct SnapshotFile {
+    session_id: String,
+    snapshot: greentic_runner_host::runner::engine::FlowSnapshot,
 }
 
-/// Persist a `FlowSnapshot` to disk for later resume. Errors propagate to
-/// the caller so the run can surface "we paused but lost the snapshot" as
-/// a hard error rather than silently looping back to the flow entry.
+#[derive(serde::Serialize)]
+struct SnapshotFileRef<'a> {
+    session_id: &'a str,
+    snapshot: &'a greentic_runner_host::runner::engine::FlowSnapshot,
+}
+
+/// Parse snapshot bytes. Returns the snapshot plus the recorded session id
+/// (`None` for a bare snapshot written before ids were recorded).
+fn parse_snapshot_bytes(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(
+    greentic_runner_host::runner::engine::FlowSnapshot,
+    Option<String>,
+)> {
+    let corrupt = || {
+        format!(
+            "corrupt session snapshot {}; delete this file to discard the parked run and start the session fresh",
+            path.display()
+        )
+    };
+    let value: serde_json::Value = serde_json::from_slice(bytes).with_context(corrupt)?;
+    let wrapped = value
+        .as_object()
+        .is_some_and(|o| o.contains_key("session_id") && o.contains_key("snapshot"));
+    if wrapped {
+        let file: SnapshotFile = serde_json::from_value(value).with_context(corrupt)?;
+        Ok((file.snapshot, Some(file.session_id)))
+    } else {
+        let snapshot = serde_json::from_value(value).with_context(corrupt)?;
+        Ok((snapshot, None))
+    }
+}
+
+/// Load a persisted `FlowSnapshot` from its current-scheme path. A missing
+/// file means "no parked run" (`Ok(None)`); an unreadable or corrupt file is
+/// an error, since silently restarting at the flow entry would drop the
+/// user's parked state. A snapshot that records a different session id is
+/// refused (error), never resumed.
+fn load_session_snapshot(
+    path: &Path,
+    session_id: &str,
+) -> Result<Option<greentic_runner_host::runner::engine::FlowSnapshot>> {
+    remove_stale_snapshot_temps(path, STALE_TEMP_AGE);
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read session snapshot {}", path.display()));
+        }
+    };
+    let (snapshot, recorded) = parse_snapshot_bytes(&bytes, path)?;
+    if let Some(recorded) = recorded
+        && recorded != session_id
+    {
+        anyhow::bail!(
+            "session snapshot {} belongs to a different session; refusing to load it",
+            path.display()
+        );
+    }
+    Ok(Some(snapshot))
+}
+
+/// Load a snapshot from the LEGACY lossy name. That name is shared with other
+/// sessions (`a/b` and `a_b` both map to `a_b`), so anything we cannot prove
+/// is ours (unreadable, corrupt, or recording another session id) is treated
+/// as "not ours" rather than aborting or resuming it. A bare snapshot with no
+/// recorded id predates id recording and is accepted: the caller only reaches
+/// here for ids containing unsafe characters.
+///
+/// RESIDUAL RISK (accepted, behaviour deliberately unchanged): the legacy name
+/// maps every unsafe byte to `_`, so distinct ids collide (`a/b` and `a_b`
+/// both map to `a_b.snapshot.json`). A bare legacy file carries no owner, so
+/// the session whose lossy name matches ADOPTS it: `a/b` can resume the park a
+/// build predating id recording saved for `a_b` (or the reverse). Wrapped files
+/// are checked against the recorded id, so this affects only pre-recording
+/// files, which no current build writes and which disappear as those parks
+/// resume or expire. Anyone sharing a session state dir between untrusted
+/// session ids on such an upgrade should clear the bare `*.snapshot.json` files.
+/// (A bare file this session DID adopt is deleted once its park is re-saved
+/// under the current name, so it cannot be resurrected later.)
+fn load_legacy_session_snapshot(
+    path: &Path,
+    session_id: &str,
+) -> Option<greentic_runner_host::runner::engine::FlowSnapshot> {
+    let bytes = fs::read(path).ok()?;
+    match parse_snapshot_bytes(&bytes, path) {
+        Ok((snapshot, None)) => Some(snapshot),
+        Ok((snapshot, Some(recorded))) if recorded == session_id => Some(snapshot),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "ignoring unreadable legacy session snapshot"
+            );
+            None
+        }
+    }
+}
+
+/// Delete the legacy-named snapshot once its contents have been re-saved under
+/// the current name. Only acts when this session actually resumed from that
+/// file (`loaded_from_legacy`); otherwise the legacy path may be another
+/// session's live snapshot (`a/b` legacy-maps onto `a_b`), so it is left alone.
+fn remove_migrated_legacy_snapshot(legacy: Option<&Path>, loaded_from_legacy: bool) {
+    if !loaded_from_legacy {
+        return;
+    }
+    if let Some(path) = legacy
+        && let Err(err) = fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to remove migrated legacy session snapshot"
+        );
+    }
+}
+
+/// A leftover `<name>.tmp-*` older than this belongs to a writer that died
+/// before its rename; younger ones may be a live concurrent save.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Unique per save: pid separates processes, the counter separates concurrent
+/// saves of the same session inside one process.
+fn snapshot_temp_path(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(format!(".tmp-{}-{seq}", std::process::id()));
+    path.with_file_name(tmp_name)
+}
+
+/// Best-effort removal of `<name>.tmp-*` siblings of `path` older than `age`.
+fn remove_stale_snapshot_temps(path: &Path, age: std::time::Duration) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let mut prefix = name.to_os_string();
+    prefix.push(".tmp-");
+    let prefix = prefix.to_string_lossy().into_owned();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|elapsed| elapsed >= age);
+        if old_enough && let Err(err) = fs::remove_file(entry.path()) {
+            tracing::debug!(path = %entry.path().display(), error = %err, "cannot remove stale snapshot temp");
+        }
+    }
+}
+
+/// Persist a `FlowSnapshot` to disk for later resume, recording the owning
+/// session id. Errors propagate to the caller so the run can surface "we
+/// paused but lost the snapshot" as a hard error rather than silently
+/// looping back to the flow entry.
 fn save_session_snapshot(
     path: &Path,
+    session_id: &str,
     snapshot: &greentic_runner_host::runner::engine::FlowSnapshot,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create session snapshot dir {}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec_pretty(snapshot)
-        .with_context(|| "serialize session snapshot for persistence")?;
-    fs::write(path, bytes).with_context(|| format!("write session snapshot {}", path.display()))?;
+    let bytes = serde_json::to_vec_pretty(&SnapshotFileRef {
+        session_id,
+        snapshot,
+    })
+    .with_context(|| "serialize session snapshot for persistence")?;
+    // Write-then-rename: a crash mid-write must not leave a truncated file at
+    // `path`, because a corrupt snapshot is a hard error on the next load and
+    // would wedge the session. The temp file sits beside the target so the
+    // rename stays on one filesystem.
+    remove_stale_snapshot_temps(path, STALE_TEMP_AGE);
+    let tmp_path = snapshot_temp_path(path);
+    let write_result = (|| -> std::io::Result<()> {
+        // `create_new`: a temp name is never shared with another writer.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(&bytes)?;
+        // Best effort: make the bytes durable before the rename publishes them.
+        // A failure here (some filesystems) must not fail the save.
+        if let Err(err) = file.sync_all() {
+            tracing::debug!(path = %tmp_path.display(), error = %err, "snapshot fsync failed");
+        }
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("write session snapshot {}", tmp_path.display()));
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("write session snapshot {}", path.display()));
+    }
     Ok(())
 }
 
@@ -703,32 +1039,12 @@ fn apply_otlp_hook(hook: &OtlpHook) {
 }
 
 fn normalize_pack_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("pack path {} has no parent", path.display()))?;
-        let root = parent
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", parent.display()))?;
-        let file = path
-            .file_name()
-            .ok_or_else(|| anyhow!("pack path {} has no file name", path.display()))?;
-        return normalize_under_root(&root, Path::new(file));
-    }
-
-    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    let base = if let Some(parent) = path.parent() {
-        cwd.join(parent)
-    } else {
-        cwd
-    };
-    let root = base
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", base.display()))?;
-    let file = path
-        .file_name()
-        .ok_or_else(|| anyhow!("pack path {} has no file name", path.display()))?;
-    normalize_under_root(&root, Path::new(file))
+    // The path comes straight from the user (CLI argument), so there is no trust
+    // boundary to enforce: canonicalize it directly. That accepts `.`/`..`
+    // (a pack directory given as `--pack .`) and symlinked packs, which a
+    // root-confined check on the parent directory rejected.
+    path.canonicalize()
+        .with_context(|| format!("failed to resolve pack path {}", path.display()))
 }
 
 fn prepare_run_dirs(root_override: Option<PathBuf>) -> Result<RunDirectories> {
@@ -936,7 +1252,7 @@ fn build_host_config(
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // `max_node_wall_time_ms` is carried but not enforced yet.
 #[derive(Clone, Debug)]
 struct ResolvedProfile {
     tenant_id: String,
@@ -1484,7 +1800,32 @@ fn redact_recursive(value: &Value, path: &str, acc: &mut Vec<String>) -> Value {
 
 fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    const MARKERS: [&str; 5] = ["secret", "token", "password", "authorization", "cookie"];
+    // LLM usage counters contain "token" but are not credentials.
+    const TOKEN_COUNTERS: [&str; 8] = [
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    ];
+    if TOKEN_COUNTERS.contains(&lower.as_str()) {
+        return false;
+    }
+    const MARKERS: [&str; 10] = [
+        "secret",
+        "token",
+        "password",
+        "authorization",
+        "cookie",
+        "api_key",
+        "apikey",
+        "private_key",
+        "credential",
+        "bearer",
+    ];
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
@@ -1565,7 +1906,7 @@ mod tests {
             resolve_entry_flow(None, &metadata, &flows).unwrap(),
             "entry.flow"
         );
-        assert!(
+        assert_eq!(
             resolve_entry_flow(
                 None,
                 &PackMetadata {
@@ -1574,7 +1915,8 @@ mod tests {
                 },
                 &flows
             )
-            .is_ok()
+            .unwrap(),
+            "fallback.flow"
         );
     }
 
@@ -1591,6 +1933,53 @@ mod tests {
         let normalized = normalize_pack_path(&relative).expect("normalized path");
 
         assert_eq!(normalized, pack.canonicalize().expect("canonical"));
+    }
+
+    #[test]
+    fn normalize_pack_path_accepts_dot_dotdot_and_symlinks() {
+        let temp = TempDir::new().expect("tempdir");
+        let pack_dir = temp.path().join("pack");
+        fs::create_dir_all(&pack_dir).expect("pack dir");
+        let canonical = pack_dir.canonicalize().expect("canonical");
+
+        // `..` segments inside an absolute path.
+        let dotdot = pack_dir.join("..").join("pack");
+        assert_eq!(normalize_pack_path(&dotdot).expect("dotdot"), canonical);
+
+        // A bare `.` resolves to the current directory.
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(
+            normalize_pack_path(Path::new(".")).expect("dot"),
+            cwd.canonicalize().expect("canonical cwd")
+        );
+        assert!(normalize_pack_path(Path::new("..")).is_ok());
+
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("link");
+            std::os::unix::fs::symlink(&pack_dir, &link).expect("symlink");
+            assert_eq!(normalize_pack_path(&link).expect("symlink"), canonical);
+        }
+
+        assert!(normalize_pack_path(&temp.path().join("missing")).is_err());
+    }
+
+    #[tokio::test]
+    async fn run_wall_limit_aborts_slow_runs_and_zero_disables() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            Ok::<_, anyhow::Error>(1)
+        };
+        let err = run_with_wall_limit(20, slow).await.expect_err("timeout");
+        assert!(err.to_string().contains("max_run_wall_time_ms"), "{err}");
+
+        let quick = async { Ok::<_, anyhow::Error>(7) };
+        assert_eq!(run_with_wall_limit(5_000, quick).await.expect("ok"), 7);
+        let unlimited = async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            Ok::<_, anyhow::Error>(9)
+        };
+        assert_eq!(run_with_wall_limit(0, unlimited).await.expect("ok"), 9);
     }
 
     #[test]
@@ -1912,8 +2301,10 @@ mod tests {
         let original: greentic_runner_host::runner::engine::FlowSnapshot =
             serde_json::from_value(snapshot_json.clone()).expect("deserialize seed snapshot");
 
-        save_session_snapshot(&snapshot_path, &original).expect("save snapshot");
-        let reloaded = load_session_snapshot(&snapshot_path).expect("load snapshot");
+        save_session_snapshot(&snapshot_path, "session-1", &original).expect("save snapshot");
+        let reloaded = load_session_snapshot(&snapshot_path, "session-1")
+            .expect("load snapshot")
+            .expect("snapshot present");
 
         let original_value = serde_json::to_value(&original).unwrap();
         let reloaded_value = serde_json::to_value(&reloaded).unwrap();
@@ -1932,10 +2323,259 @@ mod tests {
             .file_name()
             .and_then(|n| n.to_str())
             .expect("file name");
-        // `/` -> `_`, but `:`, `-`, `.` are preserved.
-        assert_eq!(file_name, "tenant_team:user-1.session.snapshot.json");
+        // `/` -> `%2f`, but `:`, `-`, `.` are preserved.
+        assert_eq!(file_name, "tenant%2fteam:user-1.session.snapshot.json");
         assert!(session_snapshot_file(None, "any").is_none());
         assert!(session_snapshot_file(Some(tmp.path()), "").is_none());
+    }
+
+    #[test]
+    fn session_snapshot_file_is_injective_for_lookalike_ids() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let slash = session_snapshot_file(Some(tmp.path()), "a/b").expect("path");
+        let underscore = session_snapshot_file(Some(tmp.path()), "a_b").expect("path");
+        let escaped = session_snapshot_file(Some(tmp.path()), "a%2fb").expect("path");
+        assert_ne!(slash, underscore);
+        assert_ne!(slash, escaped);
+    }
+
+    #[test]
+    fn long_and_non_ascii_session_ids_stay_within_filename_limit_and_distinct() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let long_a = format!("{}a", "é".repeat(300));
+        let long_b = format!("{}b", "é".repeat(300));
+        let a = session_snapshot_file(Some(tmp.path()), &long_a).expect("path");
+        let b = session_snapshot_file(Some(tmp.path()), &long_b).expect("path");
+        assert_ne!(a, b);
+        for path in [&a, &b] {
+            let name = path.file_name().and_then(|n| n.to_str()).expect("name");
+            assert!(name.len() <= 255, "{} bytes", name.len());
+            // The OS must actually accept it.
+            std::fs::write(path, b"{}").expect("write long-named snapshot");
+        }
+        assert_eq!(
+            a,
+            session_snapshot_file(Some(tmp.path()), &long_a).expect("path"),
+            "hashed name must be deterministic"
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_name_matches_pre_escaping_scheme() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let legacy = legacy_session_snapshot_file(Some(tmp.path()), "a/b:c d").expect("path");
+        assert_eq!(
+            legacy.file_name().and_then(|n| n.to_str()),
+            Some("a_b:c_d.snapshot.json")
+        );
+        assert!(legacy_session_snapshot_file(None, "x").is_none());
+
+        let current = session_snapshot_file(Some(tmp.path()), "a/b:c d").expect("path");
+        assert_eq!(snapshot_load_path(&current, Some(&legacy)), current);
+        std::fs::write(&legacy, b"{}").expect("write legacy");
+        assert_eq!(snapshot_load_path(&current, Some(&legacy)), legacy);
+        std::fs::write(&current, b"{}").expect("write current");
+        assert_eq!(snapshot_load_path(&current, Some(&legacy)), current);
+    }
+
+    fn seed_snapshot() -> greentic_runner_host::runner::engine::FlowSnapshot {
+        serde_json::from_value(json!({
+            "pack_id": "pack.demo",
+            "flow_id": "flow.welcome",
+            "next_node": "card-confirm",
+            "state": {
+                "entry": {}, "input": {}, "nodes": {}, "egress": [], "redirect_count": 0
+            }
+        }))
+        .expect("seed snapshot")
+    }
+
+    #[test]
+    fn safe_id_has_no_legacy_fallback() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert!(legacy_session_snapshot_file(Some(tmp.path()), "a_b").is_none());
+        assert!(legacy_session_snapshot_file(Some(tmp.path()), "a/b").is_some());
+    }
+
+    #[test]
+    fn lookalike_sessions_do_not_cross_read() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let safe = session_snapshot_file(Some(tmp.path()), "a_b").expect("path");
+        let legacy_of_slash = legacy_session_snapshot_file(Some(tmp.path()), "a/b").expect("path");
+        assert_eq!(safe, legacy_of_slash, "the collision this guards against");
+
+        // a_b parks; its file records its own id.
+        save_session_snapshot(&safe, "a_b", &seed_snapshot()).expect("save");
+        // a/b must not resume it, via legacy or direct load.
+        assert!(load_legacy_session_snapshot(&legacy_of_slash, "a/b").is_none());
+        assert!(load_session_snapshot(&legacy_of_slash, "a/b").is_err());
+        // a_b still resumes its own.
+        assert!(load_session_snapshot(&safe, "a_b").expect("load").is_some());
+        // The file was never touched (no cross-delete: removal is gated on
+        // having actually loaded from the legacy path, which returned None).
+        assert!(safe.exists());
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("s1.snapshot.json");
+        // Overwrite an existing (even garbage) file in place via rename.
+        std::fs::write(&path, b"old").expect("seed");
+        save_session_snapshot(&path, "s1", &seed_snapshot()).expect("save");
+        assert!(load_session_snapshot(&path, "s1").expect("load").is_some());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_saves_of_one_session_do_not_collide() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("s1.snapshot.json");
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || save_session_snapshot(&path, "s1", &seed_snapshot()))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread").expect("save must succeed");
+        }
+        assert!(load_session_snapshot(&path, "s1").expect("load").is_some());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn temp_names_are_unique_per_call() {
+        let path = Path::new("/x/s1.snapshot.json");
+        assert_ne!(snapshot_temp_path(path), snapshot_temp_path(path));
+    }
+
+    #[test]
+    fn stale_temps_are_removed_but_fresh_ones_and_other_sessions_are_kept() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("s1.snapshot.json");
+        let stale = tmp.path().join("s1.snapshot.json.tmp-999-0");
+        let other = tmp.path().join("s2.snapshot.json.tmp-999-0");
+        std::fs::write(&stale, b"x").expect("stale");
+        std::fs::write(&other, b"x").expect("other");
+        // Zero age: everything matching this session's prefix is "old enough".
+        remove_stale_snapshot_temps(&path, std::time::Duration::ZERO);
+        assert!(!stale.exists());
+        assert!(other.exists(), "another session's temp is never touched");
+
+        let fresh = tmp.path().join("s1.snapshot.json.tmp-999-1");
+        std::fs::write(&fresh, b"x").expect("fresh");
+        remove_stale_snapshot_temps(&path, STALE_TEMP_AGE);
+        assert!(fresh.exists(), "a possibly-live temp is kept");
+    }
+
+    #[test]
+    fn corrupt_snapshot_error_names_the_file_and_says_to_delete_it() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("s2.snapshot.json");
+        std::fs::write(&path, b"{\"truncated").expect("write");
+        let err = load_session_snapshot(&path, "s2").expect_err("corrupt");
+        let text = format!("{err:#}");
+        assert!(text.contains("s2.snapshot.json"), "{text}");
+        assert!(text.contains("delete this file"), "{text}");
+    }
+
+    #[test]
+    fn migrated_legacy_snapshot_is_removed_only_when_ours() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let legacy = tmp.path().join("a_b.snapshot.json");
+        std::fs::write(&legacy, b"{}").expect("write");
+        // Not loaded from legacy: may be another session's park, keep it.
+        remove_migrated_legacy_snapshot(Some(&legacy), false);
+        assert!(legacy.exists());
+        remove_migrated_legacy_snapshot(Some(&legacy), true);
+        assert!(!legacy.exists());
+        // Idempotent / absent path is fine.
+        remove_migrated_legacy_snapshot(Some(&legacy), true);
+        remove_migrated_legacy_snapshot(None, true);
+    }
+
+    #[test]
+    fn corrupt_neighbour_does_not_abort_legacy_load() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("a_b.snapshot.json");
+        std::fs::write(&path, b"not json").expect("write");
+        assert!(load_legacy_session_snapshot(&path, "a/b").is_none());
+    }
+
+    #[test]
+    fn bare_legacy_snapshot_still_resumes_for_unsafe_id() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("a_b.snapshot.json");
+        let bytes = serde_json::to_vec(&seed_snapshot()).expect("ser");
+        std::fs::write(&path, bytes).expect("write");
+        assert!(load_legacy_session_snapshot(&path, "a/b").is_some());
+    }
+
+    #[test]
+    fn corrupt_session_snapshot_is_an_error_and_missing_is_none() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let missing = tmp.path().join("missing.snapshot.json");
+        assert!(
+            load_session_snapshot(&missing, "x")
+                .expect("missing ok")
+                .is_none()
+        );
+        let corrupt = tmp.path().join("corrupt.snapshot.json");
+        std::fs::write(&corrupt, b"{not json").expect("write corrupt");
+        let err = load_session_snapshot(&corrupt, "x").expect_err("corrupt must error");
+        assert!(
+            err.to_string().contains("corrupt session snapshot"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn directory_packs_are_refused_under_strict_signing() {
+        assert!(ensure_directory_pack_allowed(SigningPolicy::DevOk).is_ok());
+        let err = ensure_directory_pack_allowed(SigningPolicy::Strict).expect_err("strict");
+        assert!(err.to_string().contains("strict signing"), "{err}");
+    }
+
+    #[test]
+    fn redaction_covers_api_keys_but_not_token_counters() {
+        let (redacted, paths) = redact_value(
+            &json!({
+                "api_key": "k1",
+                "apiKey": "k2",
+                "private_key": "k3",
+                "credentials": "k4",
+                "bearer_value": "k5",
+                "max_tokens": 256,
+                "usage": { "prompt_tokens": 3, "total_tokens": 9 }
+            }),
+            "$",
+        );
+        for key in [
+            "api_key",
+            "apiKey",
+            "private_key",
+            "credentials",
+            "bearer_value",
+        ] {
+            assert_eq!(redacted[key], "__REDACTED__", "{key}");
+        }
+        assert_eq!(redacted["max_tokens"], 256);
+        assert_eq!(redacted["usage"]["prompt_tokens"], 3);
+        assert_eq!(redacted["usage"]["total_tokens"], 9);
+        assert_eq!(paths.len(), 5);
     }
 
     #[test]

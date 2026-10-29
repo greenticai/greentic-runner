@@ -66,6 +66,13 @@ const WASM_ENTRY: &str = "extension.wasm";
 /// hostile or misconfigured store from OOM-ing the runner before the digest check.
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// TCP connect bound for the artifact download.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest gap between two body reads before the download is abandoned.
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-download ceiling (the artifact cap is 256 MiB).
+const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Maximum DECOMPRESSED size of any single ZIP entry inside a `.gtxpack`. The
 /// `MAX_ARTIFACT_BYTES` cap bounds the compressed archive, but a hostile (or
 /// MITM'd) store could ship a small archive whose entries inflate hugely (a zip
@@ -122,7 +129,24 @@ pub async fn ensure_cached(
     component_version: &str,
     component_digest: &str,
 ) -> Result<(), StorePullError> {
+    validate_component_ref(component_ref)?;
+    validate_component_version(component_version)?;
     let dest = cache_dir().join(format!("{component_ref}.wasm"));
+    if cache_is_current(&dest, component_digest) {
+        return Ok(());
+    }
+
+    // One pull per component at a time, process-wide. The cache is three files
+    // (sidecar, wasm, marker) per ref with no lock: two concurrent pulls (two
+    // tenants pinning different digests of one ref, or a warm event racing a
+    // probe) interleaved their writes, leaving a wasm paired with another
+    // pull's sidecar or marker. Serialised, the install order below holds.
+    let lock = pull_lock(component_ref);
+    let _held = lock.lock().await;
+    // Another task may have finished this exact pull while we waited.
+    if cache_is_current(&dest, component_digest) {
+        return Ok(());
+    }
     // Cache-hit ONLY when the cached wasm, its execution-digest sidecar, AND the
     // pinned-gtxpack marker are all present and the marker matches THIS request's
     // `component_digest`. Keying on file existence alone (the previous behaviour)
@@ -130,13 +154,6 @@ pub async fn ensure_cached(
     // digest — e.g. a security patch) would short-circuit on the stale cached
     // wasm and the runner would keep executing the OLD code indefinitely.
     // Comparing the marker forces a re-pull whenever the pinned digest changes.
-    if dest.exists()
-        && sidecar_path(&dest).exists()
-        && gtxpack_marker_matches(&gtxpack_marker_path(&dest), component_digest)
-    {
-        return Ok(());
-    }
-
     let base = std::env::var(STORE_URL_ENV)
         .map_err(|_| StorePullError::Config(format!("{STORE_URL_ENV} unset")))?;
     let url = format!(
@@ -184,7 +201,66 @@ pub async fn ensure_cached(
     Ok(())
 }
 
+/// Whether the cached wasm, its sidecar AND a marker equal to `digest` are all
+/// present (the marker is written last, so this means a completed pull).
+fn cache_is_current(dest: &Path, digest: &str) -> bool {
+    dest.exists()
+        && sidecar_path(dest).exists()
+        && gtxpack_marker_matches(&gtxpack_marker_path(dest), digest)
+}
+
+/// The per-`component_ref` pull lock (see [`ensure_cached`]).
+fn pull_lock(component_ref: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = OnceLock::new();
+    let map = LOCKS.get_or_init(Default::default);
+    // A poisoned map still holds valid locks: recover it rather than panic.
+    let mut guard = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.entry(component_ref.to_string()).or_default().clone()
+}
+
 /// Return the sidecar path for a cached wasm file (e.g. `router_echo.wasm.sha256`).
+/// Reject a `component_ref` that could escape the cache directory or alter the
+/// artifact URL path: it becomes a file stem (`<cache>/<ref>.wasm`) and a URL
+/// path segment, so only `[A-Za-z0-9._-]` is accepted, with no `..` and no
+/// leading dot.
+pub(crate) fn validate_component_ref(component_ref: &str) -> Result<(), StorePullError> {
+    let ok = !component_ref.is_empty()
+        && component_ref.len() <= 128
+        && !component_ref.starts_with('.')
+        && !component_ref.contains("..")
+        && component_ref
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(StorePullError::Config(format!(
+            "invalid component_ref {component_ref:?}: only [A-Za-z0-9._-] is allowed, no path traversal"
+        )))
+    }
+}
+
+/// Same constraint for the version segment of the artifact URL.
+fn validate_component_version(version: &str) -> Result<(), StorePullError> {
+    let ok = !version.is_empty()
+        && version.len() <= 128
+        && !version.contains("..")
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'));
+    if ok {
+        Ok(())
+    } else {
+        Err(StorePullError::Config(format!(
+            "invalid component_version {version:?}"
+        )))
+    }
+}
+
 pub(crate) fn sidecar_path(wasm_dest: &std::path::Path) -> std::path::PathBuf {
     let mut path = wasm_dest.to_path_buf();
     let new_extension = match path.extension() {
@@ -406,11 +482,22 @@ fn parse_trusted_signer(entry: &str) -> Option<VerifyingKey> {
 
 /// GET the `.gtxpack` bytes, sending the optional `gts_` bearer token.
 ///
-/// Rejects the response before buffering when `Content-Length` exceeds
-/// [`MAX_ARTIFACT_BYTES`], and also after buffering in case the header was absent
-/// or lied. This limits exposure to a hostile/misconfigured store.
+/// Rejects the response before reading when `Content-Length` exceeds
+/// [`MAX_ARTIFACT_BYTES`], and also while streaming (see [`collect_capped`]) in
+/// case the header was absent or lied. This limits exposure to a hostile/misconfigured store.
 async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
-    let mut request = reqwest::Client::new().get(url);
+    // Bounded: an unbounded client let a stalled store hold a pull (and, now
+    // that pulls are serialised per ref, every waiter behind it) forever.
+    let client = reqwest::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .timeout(DOWNLOAD_TOTAL_TIMEOUT)
+        .build()
+        .map_err(|e| StorePullError::Network(format!("build http client: {e}")))?;
+    // Error text names the URL without its query (presigned signature) or
+    // userinfo.
+    let shown = crate::url_redact::redact_http_url(url);
+    let mut request = client.get(url);
     if let Ok(token) = std::env::var(STORE_TOKEN_ENV)
         && !token.is_empty()
     {
@@ -419,11 +506,11 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
     let response = request
         .send()
         .await
-        .map_err(|e| StorePullError::Network(format!("GET {url}: {e}")))?;
+        .map_err(|e| StorePullError::Network(format!("GET {shown}: {}", e.without_url())))?;
     let status = response.status();
     if !status.is_success() {
         return Err(StorePullError::Network(format!(
-            "GET {url} returned HTTP {status}"
+            "GET {shown} returned HTTP {status}"
         )));
     }
     // Pre-flight: reject oversized artifacts before buffering the body.
@@ -431,20 +518,48 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
         && content_length > MAX_ARTIFACT_BYTES
     {
         return Err(StorePullError::Integrity(format!(
-            "artifact at {url} claims Content-Length {content_length} which exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
+            "artifact at {shown} claims Content-Length {content_length} which exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
         )));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| StorePullError::Network(format!("read body from {url}: {e}")))?;
-    if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
-        return Err(StorePullError::Integrity(format!(
-            "artifact at {url} is {} bytes which exceeds the {MAX_ARTIFACT_BYTES}-byte cap",
-            bytes.len()
-        )));
+    use futures::StreamExt as _;
+    // `reqwest::Error` Display appends ` for url (...)`: strip it before it
+    // reaches `collect_capped`'s message.
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|e| e.without_url().to_string()));
+    collect_capped(Box::pin(stream), MAX_ARTIFACT_BYTES, url).await
+}
+
+/// Collect a body chunk by chunk, failing as soon as the running total passes
+/// `cap`. `response.bytes()` would buffer the whole body first, so a store that
+/// omits `Content-Length` (chunked) could grow memory without bound before any
+/// size check ran.
+async fn collect_capped<S, B, E>(
+    mut stream: S,
+    cap: u64,
+    url: &str,
+) -> Result<Vec<u8>, StorePullError>
+where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt as _;
+
+    let url = crate::url_redact::redact_http_url(url);
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| StorePullError::Network(format!("read body from {url}: {e}")))?;
+        let chunk = chunk.as_ref();
+        if (body.len() as u64).saturating_add(chunk.len() as u64) > cap {
+            return Err(StorePullError::Integrity(format!(
+                "artifact at {url} exceeds the {cap}-byte cap while streaming"
+            )));
+        }
+        body.extend_from_slice(chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(body)
 }
 
 /// Hex-lowercase SHA256 of `bytes`. Matches the store's `hex::encode` output.

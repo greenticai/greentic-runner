@@ -15,9 +15,11 @@ use greentic_flow::flow_bundle::load_and_validate_bundle_with_flow;
 use greentic_runner_host::watcher;
 use greentic_runner_host::{Activity, HostBuilder, HostConfig, RunnerHost};
 use greentic_types::{
-    ComponentCapabilities, ComponentManifest, ComponentProfiles, FlowKind, HostCapabilities,
-    PackFlowEntry, PackKind, PackManifest, ResourceHints, StateCapabilities, encode_pack_manifest,
+    ComponentCapabilities, ComponentManifest, ComponentProfiles, FlowKind, PackFlowEntry, PackKind,
+    PackManifest, ResourceHints, encode_pack_manifest,
 };
+#[cfg(feature = "fault-injection")]
+use greentic_types::{HostCapabilities, StateCapabilities};
 use runner_core::env::PackConfig;
 use semver::Version;
 use serial_test::serial;
@@ -128,6 +130,7 @@ async fn trace_written_on_failure() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
 #[serial]
 async fn fault_injection_drops_state_write() -> Result<()> {
@@ -295,6 +298,7 @@ fn fixture_path(relative: &str) -> std::path::PathBuf {
         .join(relative)
 }
 
+#[cfg(feature = "fault-injection")]
 fn ensure_state_store_component() -> Result<PathBuf> {
     let crates_root = fixture_path("tests/fixtures/runner-components");
     let target_root = crates_root.join("target-test");
@@ -492,6 +496,7 @@ nodes:
     Ok(())
 }
 
+#[cfg(feature = "fault-injection")]
 fn build_state_store_fault_pack(pack_path: &std::path::Path) -> Result<()> {
     let flow_yaml = r#"
 id: demo.flow

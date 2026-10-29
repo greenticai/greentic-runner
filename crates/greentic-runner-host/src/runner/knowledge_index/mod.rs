@@ -83,8 +83,19 @@ fn shared_client() -> Result<reqwest::Client, String> {
 }
 
 fn build_client(timeout: Duration) -> Result<reqwest::Client, String> {
+    // `endpoint` / `embedding_base_url` come from the pack's binding: refuse
+    // link-local / metadata destinations, on connect and on every redirect hop.
+    let guard = crate::http_guard::HttpGuard::from_env();
     reqwest::Client::builder()
+        // The guard lives in this client's DNS resolver, which a proxy
+        // bypasses (the proxy resolves the name, and an IP literal is never
+        // resolved at all). Never honour `HTTP(S)_PROXY` / `ALL_PROXY` here.
+        .no_proxy()
         .timeout(timeout)
+        .dns_resolver(std::sync::Arc::new(crate::http_guard::GuardedResolver {
+            guard,
+        }))
+        .redirect(crate::http_guard::redirect_policy(guard))
         .build()
         .map_err(|e| e.to_string())
 }

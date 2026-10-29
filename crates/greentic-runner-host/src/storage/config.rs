@@ -39,9 +39,10 @@
 //!
 //! `RedisStateStore::del_prefix` runs an unbounded `SCAN MATCH` over the whole
 //! keyspace, which would be a real hazard on a shared Redis. It is unreachable
-//! from this crate: [`StateStoreHost::del_prefix`](crate::storage::state) is a
-//! no-op and never forwards. `del_prefix_never_reaches_the_backing_store` pins
-//! that, so a future implementation has to make the cost a deliberate decision.
+//! from this crate: [`StateStoreHost::del_prefix`](crate::storage::state)
+//! returns an "unsupported" error and never forwards.
+//! `del_prefix_is_unsupported_and_never_reaches_the_backing_store` pins that, so
+//! a future implementation has to make the cost a deliberate decision.
 //!
 //! [`SessionSnapshot`]: crate::engine::host::SessionSnapshot
 //! [`find_wait_by_scope`]: greentic_session::SessionStore::find_wait_by_scope
@@ -55,6 +56,12 @@ pub const ENV_SESSION_BACKEND: &str = "GREENTIC_RUNNER_SESSION_BACKEND";
 pub const ENV_STATE_BACKEND: &str = "GREENTIC_RUNNER_STATE_BACKEND";
 /// Environment variable holding the Redis connection URL for both stores.
 pub const ENV_REDIS_URL: &str = "GREENTIC_RUNNER_REDIS_URL";
+/// Opt-in environment variable: Redis URL for the SESSION store only.
+/// Read by [`StorageConfig::from_redis_url_env`], which `HostBuilder::build`
+/// consults when the embedder named no storage.
+pub const ENV_SESSION_REDIS_URL: &str = "GREENTIC_SESSION_REDIS_URL";
+/// Opt-in environment variable: Redis URL for the flow-STATE store only.
+pub const ENV_STATE_REDIS_URL: &str = "GREENTIC_STATE_REDIS_URL";
 /// Environment variable holding an explicit session keyspace prefix.
 pub const ENV_SESSION_NAMESPACE: &str = "GREENTIC_RUNNER_SESSION_NAMESPACE";
 /// Environment variable naming the deployment environment, used to derive a
@@ -356,6 +363,56 @@ impl StorageConfig {
         )
     }
 
+    /// Resolve from the per-store opt-in URL variables
+    /// ([`ENV_SESSION_REDIS_URL`], [`ENV_STATE_REDIS_URL`]).
+    ///
+    /// Each store is independent: a URL set for one never moves the other.
+    /// Neither set resolves to [`StorageConfig::default`] (in-memory). A session
+    /// URL still needs a keyspace ([`ENV_SESSION_NAMESPACE`] or
+    /// [`ENV_GREENTIC_ENV`]) and is refused without one. Called by
+    /// `HostBuilder::build` only when the embedder passed no `with_storage`.
+    pub fn from_redis_url_env() -> Result<Self, StorageConfigError> {
+        Self::from_redis_url_vars(
+            std::env::var(ENV_SESSION_REDIS_URL).ok().as_deref(),
+            std::env::var(ENV_STATE_REDIS_URL).ok().as_deref(),
+            std::env::var(ENV_SESSION_NAMESPACE).ok().as_deref(),
+            std::env::var(ENV_GREENTIC_ENV).ok().as_deref(),
+            std::env::var(ENV_SESSION_WAIT_TTL_SECS).ok().as_deref(),
+        )
+    }
+
+    /// The pure half of [`from_redis_url_env`](Self::from_redis_url_env).
+    pub fn from_redis_url_vars(
+        session_url: Option<&str>,
+        state_url: Option<&str>,
+        session_namespace: Option<&str>,
+        greentic_env: Option<&str>,
+        wait_ttl_secs: Option<&str>,
+    ) -> Result<Self, StorageConfigError> {
+        let wait_ttl = match named(wait_ttl_secs).and_then(|raw| raw.parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(secs) => Some(Duration::from_secs(secs)),
+            None => Some(DEFAULT_WAIT_TTL),
+        };
+        let session = match named(session_url) {
+            None => SessionBackend::InMemory,
+            Some(url) => {
+                let namespace = match named(session_namespace) {
+                    Some(explicit) => explicit.to_string(),
+                    None => SessionBackend::namespace_for_env(
+                        named(greentic_env).ok_or(StorageConfigError::MissingSessionNamespace)?,
+                    )?,
+                };
+                SessionBackend::redis_with_ttl(url, namespace, wait_ttl)?
+            }
+        };
+        let state = match named(state_url) {
+            None => StateBackend::InMemory,
+            Some(url) => StateBackend::redis(url)?,
+        };
+        Ok(Self { session, state })
+    }
+
     /// The pure half of [`from_env`](Self::from_env), so the precedence is
     /// testable without touching process-global state.
     pub fn from_vars(
@@ -426,6 +483,53 @@ fn named(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redis_url_vars_unset_is_in_memory() {
+        let c = StorageConfig::from_redis_url_vars(None, None, None, None, None).expect("ok");
+        assert_eq!(c, StorageConfig::in_memory());
+        let c = StorageConfig::from_redis_url_vars(Some("  "), Some(""), None, None, None)
+            .expect("blank is unset");
+        assert_eq!(c, StorageConfig::in_memory());
+    }
+
+    #[test]
+    fn redis_url_vars_are_independent_per_store() {
+        let c = StorageConfig::from_redis_url_vars(None, Some("redis://s"), None, None, None)
+            .expect("ok");
+        assert_eq!(c.session, SessionBackend::InMemory);
+        assert_eq!(
+            c.state,
+            StateBackend::Redis {
+                url: "redis://s".into()
+            }
+        );
+
+        let c = StorageConfig::from_redis_url_vars(
+            Some("redis://a"),
+            None,
+            None,
+            Some("prod"),
+            Some("60"),
+        )
+        .expect("ok");
+        assert_eq!(c.state, StateBackend::InMemory);
+        assert_eq!(
+            c.session,
+            SessionBackend::Redis {
+                url: "redis://a".into(),
+                namespace: "greentic:session:prod".into(),
+                wait_ttl: Some(Duration::from_secs(60)),
+            }
+        );
+    }
+
+    #[test]
+    fn redis_url_vars_session_without_namespace_is_refused() {
+        let err = StorageConfig::from_redis_url_vars(Some("redis://a"), None, None, None, None)
+            .expect_err("must refuse");
+        assert_eq!(err, StorageConfigError::MissingSessionNamespace);
+    }
 
     #[test]
     fn the_default_is_both_stores_in_memory() {

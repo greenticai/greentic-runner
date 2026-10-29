@@ -29,7 +29,6 @@ pub trait GraphNodeHandler: Send + Sync {
 #[cfg(feature = "agentic-worker")]
 mod aw {
     use std::collections::HashMap;
-    use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -60,22 +59,7 @@ mod aw {
 
     use super::GraphNodeHandler;
 
-    /// Build a [`greentic_types::TenantCtx`] for the agent-graph audit
-    /// observer from the flow node's plain `tenant_id`/`env_id` strings.
-    ///
-    /// Mirrors `agent_node::tenant_ctx_for_audit` exactly (duplicated rather
-    /// than shared: that helper is module-private to `agent_node`'s `aw`
-    /// module). An id that fails the newtype's validation (should not happen
-    /// once a graph node has been routed to a tenant) still yields a
-    /// well-formed `TenantCtx` rather than panicking — the audit event is
-    /// best-effort, never load-bearing.
-    fn tenant_ctx_for_audit(tenant_id: &str, env_id: &str) -> greentic_types::TenantCtx {
-        let env = greentic_types::EnvId::from_str(env_id)
-            .unwrap_or_else(|_| greentic_types::EnvId::new("local").expect("local env id"));
-        let tenant = greentic_types::TenantId::from_str(tenant_id)
-            .unwrap_or_else(|_| greentic_types::TenantId::new("local").expect("local tenant id"));
-        greentic_types::TenantCtx::new(env, tenant)
-    }
+    use super::super::agent_node::tenant_ctx_for_audit;
 
     /// Fixed, user-safe reply returned when a graph run fails. The detailed
     /// error is logged but never surfaced to the flow output, so internal
@@ -540,9 +524,20 @@ mod aw {
     pub(crate) struct TurnBilling {
         pub(crate) meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
         pub(crate) project_id: Option<String>,
+        /// Per-run scope (`<session>__<graph>`) prefixed onto the per-visit
+        /// agent conversation id. `None` leaves the id unscoped.
+        pub(crate) state_scope: Option<String>,
     }
 
     impl TurnBilling {
+        /// The stored-conversation id for a per-visit agent, scoped to this run.
+        fn scoped_session(&self, base: &str) -> String {
+            match &self.state_scope {
+                Some(scope) => format!("{scope}__{base}"),
+                None => base.to_string(),
+            }
+        }
+
         /// The [`TenantContext`] a graph turn runs (and bills) under: the REAL
         /// tenant/env the flow node was dispatched with, plus the unit.
         fn turn_tenant(&self, real_tenant: &greentic_types::TenantCtx) -> TenantContext {
@@ -707,7 +702,11 @@ mod aw {
             meter: Option<Arc<dyn greentic_aw_runtime::billing::BillingMeter>>,
             project_id: Option<String>,
         ) -> Self {
-            self.billing = TurnBilling { meter, project_id };
+            self.billing = TurnBilling {
+                meter,
+                project_id,
+                state_scope: None,
+            };
             self
         }
 
@@ -991,17 +990,23 @@ mod aw {
             // reach `run_one_agent_turn`/`run_one_supervisor_turn`, which feed
             // them into the shared `run_agent_step` seam that builds the
             // `AgentAuditObserver` (EPIC-B B-3b Task 2).
-            let real_tenant = tenant_ctx_for_audit(tenant_id, env_id);
+            let real_tenant = tenant_ctx_for_audit(tenant_id, env_id)
+                .map_err(crate::runner::engine::pre_effect)?;
+            // Per-run conversation scope: the per-visit agent state is stored
+            // under this tenant, so two sessions (or graphs) running the same
+            // node must not address the same stored conversation.
+            let billing = TurnBilling {
+                state_scope: Some(format!("{session_id}__{graph_id}")),
+                ..self.billing.clone()
+            };
             let agent_turn = self.turn_source.agent_turn(
                 self.audit_sink.clone(),
                 real_tenant.clone(),
-                self.billing.clone(),
+                billing.clone(),
             );
-            let supervisor = self.turn_source.supervisor(
-                self.audit_sink.clone(),
-                real_tenant,
-                self.billing.clone(),
-            );
+            let supervisor =
+                self.turn_source
+                    .supervisor(self.audit_sink.clone(), real_tenant, billing);
 
             let executor = GraphExecutor::new(
                 self.checkpoint.clone(),
@@ -1370,7 +1375,7 @@ mod aw {
         // deployed unit), not a synthetic `("graph", "run")`: it is also the
         // tenant the billing sink attributes this turn's LLM spend to.
         let tenant = billing.turn_tenant(real_tenant);
-        let session_id = format!("graph__{}", req.node_id);
+        let session_id = billing.scoped_session(&format!("graph__{}", req.node_id));
         let agent_id = format!("graph.{}", req.node_id);
 
         let seeded = seed_state_from_graph(&tenant, &session_id, &req.state);
@@ -1390,9 +1395,8 @@ mod aw {
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &step_agent_id, cfg.clone());
 
-        // TODO(guardrail): inline (agent_ref: None) graph-node AgentRuntime bypasses
-        // guardrails (v1 scope is dw.agent flow nodes only). A referenced agent
-        // (agent_ref: Some) gets full guardrail/memory/knowledge fidelity below.
+        // Guardrails are attached to every graph turn below; memory/knowledge
+        // fidelity is only for a referenced agent (agent_ref: Some).
         // MCP tool source: mirror the `dw.agent` path so a graph agent declaring an
         // `mcp:<server>/<tool>` ref resolves it against the tenant's registered MCP
         // servers (same double-authorization: tenant registers the server + the node's
@@ -1422,6 +1426,17 @@ mod aw {
         // the single-turn `dw.agent` runtime attaches.
         .with_a2a_source(a2a_source);
         runtime = billing.install(runtime);
+        // Guardrails for EVERY graph agent turn (inline ones included), through
+        // the builder the serve path and in-process `dw.agent` share, so a graph
+        // can never run an agent with fewer guardrails than a flow node would.
+        //
+        // The fallback policy is EMPTY on purpose: `cfg.guardrails` already
+        // rides in the agent config the loop evaluates as agent-level
+        // guardrails, and naming them here too made them the mandatory
+        // fallback as well, so `assemble_chain` ran every one of them twice
+        // per turn (double cost, double verdicts).
+        runtime =
+            super::super::agent_node::attach_guardrails(runtime, ext_runtime.clone(), Vec::new());
 
         // Full fidelity ONLY for a referenced agent — mirrors
         // `agent_node::build_agent_runtime`'s guardrail/short-term-memory/
@@ -1429,20 +1444,9 @@ mod aw {
         // None` inline path stays byte-unchanged (no guardrails/memory/
         // knowledge), preserving today's one-shot graph-node behaviour.
         if req.agent_ref.is_some() {
-            runtime = runtime
-                .with_guardrails(
-                    Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
-                        cfg.guardrails.clone(),
-                    )),
-                    Arc::new(
-                        greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
-                            ext_runtime: ext_runtime.clone(),
-                        },
-                    ),
-                )
-                .with_short_term_memory(Arc::new(
-                    greentic_aw_runtime::memory::InMemoryMemoryProvider::new(),
-                ));
+            runtime = runtime.with_short_term_memory(Arc::new(
+                greentic_aw_runtime::memory::InMemoryMemoryProvider::new(),
+            ));
             // Long-term memory and corpus knowledge from every registered
             // agent-runtime extension (see `runtime_ext`).
             runtime = crate::runner::runtime_ext::attach_all(runtime).await;
@@ -1606,7 +1610,7 @@ mod aw {
     ) -> Result<SupervisorResult, GraphExecError> {
         // Real tenant + unit, as for an agent turn: routing is an LLM call too.
         let tenant = billing.turn_tenant(real_tenant);
-        let session_id = format!("graph__{}_sup", req.node_id);
+        let session_id = billing.scoped_session(&format!("graph__{}_sup", req.node_id));
         let agent_id = format!("graph.{}.supervisor", req.node_id);
 
         // Build the route menu suffix.
@@ -1651,7 +1655,7 @@ mod aw {
         let runtime = billing.install(AgentRuntime::new(
             Arc::new(provider),
             state_store,
-            ext_runtime,
+            ext_runtime.clone(),
             llm,
             telemetry,
             token_meter,
@@ -1660,6 +1664,9 @@ mod aw {
             // never offered on this path.
             None,
         ));
+        // Routing is an LLM call too: same mandatory-guardrail policy as every
+        // other agent turn.
+        let runtime = super::super::agent_node::attach_guardrails(runtime, ext_runtime, Vec::new());
 
         let input = AgentInput {
             text: String::new(),
@@ -3771,7 +3778,28 @@ mod aw {
                     Arc::clone(meter) as Arc<dyn greentic_aw_runtime::billing::BillingMeter>
                 ),
                 project_id: Some("support-bot".to_string()),
+                state_scope: None,
             }
+        }
+
+        /// Per-visit agent conversations are scoped to the session AND graph, so
+        /// two sessions running the same node never share stored state.
+        #[test]
+        fn per_visit_session_ids_are_scoped_to_session_and_graph() {
+            let scoped = |session: &str, graph: &str| TurnBilling {
+                state_scope: Some(format!("{session}__{graph}")),
+                ..TurnBilling::default()
+            };
+            let a = scoped("sess-a", "triage").scoped_session("graph__n1");
+            let b = scoped("sess-b", "triage").scoped_session("graph__n1");
+            let c = scoped("sess-a", "other").scoped_session("graph__n1");
+            assert_ne!(a, b);
+            assert_ne!(a, c);
+            assert_eq!(a, "sess-a__triage__graph__n1");
+            assert_eq!(
+                TurnBilling::default().scoped_session("graph__n1"),
+                "graph__n1"
+            );
         }
 
         /// An agent-graph turn bills through the unit's installed sink, under

@@ -209,6 +209,7 @@ wasmtime-wasi-tls = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 greentic-telemetry = { workspace = true }
 hyper = "1"
+http-body-util = "0.1"
 
 [dev-dependencies]
 criterion.workspace = true
@@ -224,7 +225,6 @@ opentelemetry_sdk = "0.31"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 tower.workspace = true
-http-body-util = "0.1"
 wiremock = "0.6"
 # Signs the pack-carried extension fixture in `runner::pack_extensions` tests so
 # the real load gate (signature + ledger + TOFU anchor) is exercised end to end.

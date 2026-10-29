@@ -75,7 +75,7 @@ use greentic_types::{ReplyScope, TenantCtx};
 use serde_json::Value;
 use std::sync::Arc;
 
-use super::dispatch_listener::SessionResumer;
+use super::dispatch_listener::{ResumeOutcome, SessionResumer};
 use crate::engine::runtime::{IngressEnvelope, StateMachineRuntime};
 use crate::runner::engine::{ParkedApproval, response_authenticates};
 
@@ -100,6 +100,110 @@ const THREAD_HINT_MARKER: &str = "::thread=";
 /// Marker carrying the originating inbound `ReplyScope.reply_to`. See
 /// [`THREAD_HINT_MARKER`]; same contract for `reply_to`.
 const REPLY_HINT_MARKER: &str = "::reply=";
+
+/// Lossless (base64url, no padding) variants of the thread / reply / conversation
+/// markers. A raw value is only emitted verbatim (`::thread=<t>`) when it is a
+/// plain token; anything containing `:` or other punctuation is encoded so it
+/// cannot collide with the `::` marker delimiter or the `:`-split hint.
+const THREAD_B64_MARKER: &str = "::thr64=";
+const REPLY_B64_MARKER: &str = "::rpl64=";
+const CONVERSATION_B64_MARKER: &str = "::cnv64=";
+
+fn is_plain_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Encode one marker value: verbatim when it is a plain token (backward
+/// compatible with the original wire form), base64url otherwise.
+fn push_marker(out: &mut String, raw_marker: &str, b64_marker: &str, value: &str) {
+    use base64::Engine as _;
+    if is_plain_token(value) {
+        out.push_str(raw_marker);
+        out.push_str(value);
+    } else {
+        out.push_str(b64_marker);
+        out.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes()));
+    }
+}
+
+/// Append the conversation / thread / reply markers for `scope` to a
+/// correlation id (each omitted when empty). The conversation is carried
+/// explicitly so the resumer never has to re-derive it by splitting the hint
+/// on `:` (lossy when a segment contains `:`).
+pub(crate) fn push_scope_markers(out: &mut String, scope: &ReplyScope) {
+    // A plain-token conversation is recovered from the hint exactly; only a
+    // conversation the `:`-split would mangle needs the explicit marker.
+    if !scope.conversation.is_empty() && !is_plain_token(&scope.conversation) {
+        push_marker(out, "::cnv=", CONVERSATION_B64_MARKER, &scope.conversation);
+    }
+    if let Some(thread) = scope.thread.as_deref().filter(|v| !v.is_empty()) {
+        push_marker(out, THREAD_HINT_MARKER, THREAD_B64_MARKER, thread);
+    }
+    if let Some(reply_to) = scope.reply_to.as_deref().filter(|v| !v.is_empty()) {
+        push_marker(out, REPLY_HINT_MARKER, REPLY_B64_MARKER, reply_to);
+    }
+}
+
+/// Strip a trailing raw-or-base64 marker pair (`raw_marker` / `b64_marker`).
+/// A base64 marker whose payload does not decode as UTF-8 is left in place.
+fn split_value_marker(value: &str, raw_marker: &str, b64_marker: &str) -> (String, Option<String>) {
+    use base64::Engine as _;
+    if let Some((prefix, captured)) = value.rsplit_once(b64_marker)
+        && !captured.is_empty()
+        && let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(captured)
+        && let Ok(decoded) = String::from_utf8(bytes)
+    {
+        return (prefix.to_string(), Some(decoded));
+    }
+    split_marker(value, raw_marker)
+}
+
+/// A dispatch correlation id decomposed into its parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedCorrelation {
+    /// The store hint with every marker removed.
+    pub bare_hint: String,
+    pub pack_id: Option<String>,
+    pub flow_id: Option<String>,
+    pub conversation: Option<String>,
+    pub thread: Option<String>,
+    pub reply_to: Option<String>,
+    pub nonce: Option<String>,
+}
+
+/// Parse a correlation id by stripping markers from the END, in the reverse of
+/// the order they were appended. The bare hint may itself contain `::` (for
+/// example the `ep=<eid>::` endpoint prefix), so it is never split on `::`.
+pub(crate) fn parse_correlation(correlation_id: &str) -> ParsedCorrelation {
+    let (without_nonce, nonce) = split_dispatch_nonce(correlation_id);
+    let (rest, reply_to) = split_value_marker(without_nonce, REPLY_HINT_MARKER, REPLY_B64_MARKER);
+    let (rest, thread) = split_value_marker(&rest, THREAD_HINT_MARKER, THREAD_B64_MARKER);
+    let (rest, conversation) = split_value_marker(&rest, "::cnv=", CONVERSATION_B64_MARKER);
+    let (rest, flow_id) = split_marker(&rest, FLOW_HINT_MARKER);
+    let (bare_hint, pack_id) = split_pack_suffix(&rest);
+    ParsedCorrelation {
+        bare_hint,
+        pack_id,
+        flow_id,
+        conversation,
+        thread,
+        reply_to,
+        nonce: nonce.map(str::to_string),
+    }
+}
+
+/// Split the optional `ep=<eid>::` endpoint prefix off a canonical hint.
+fn split_endpoint_prefix(hint: &str) -> (Option<&str>, &str) {
+    if let Some(rest) = hint.strip_prefix("ep=")
+        && let Some((eid, tail)) = rest.split_once("::")
+    {
+        return (Some(eid), tail);
+    }
+    (None, hint)
+}
 
 /// Marker for the per-dispatch nonce an `approval` correlation id ends with.
 /// Always the LAST segment; see the module docs.
@@ -141,6 +245,7 @@ pub fn split_dispatch_nonce(correlation_id: &str) -> (&str, Option<&str>) {
 pub struct RuntimeSessionResumer {
     runtime: Arc<StateMachineRuntime>,
     mode: AdmissionMode,
+    watchdog_notifier: Option<crate::runner::dispatch_listener::WatchdogNotifier>,
 }
 
 /// How strictly a NONCED response must match the park before it resumes.
@@ -168,7 +273,19 @@ impl RuntimeSessionResumer {
         Self {
             runtime,
             mode: AdmissionMode::Lenient,
+            watchdog_notifier: None,
         }
+    }
+
+    /// Announce every admitted response to other replicas (so they retire
+    /// their watchdog for it) at admission, before the resumed flow runs.
+    #[must_use]
+    pub fn with_watchdog_notifier(
+        mut self,
+        notifier: crate::runner::dispatch_listener::WatchdogNotifier,
+    ) -> Self {
+        self.watchdog_notifier = Some(notifier);
+        self
     }
 
     /// A resumer for the HTTP approval inbox: a nonced response resumes only
@@ -178,6 +295,7 @@ impl RuntimeSessionResumer {
         Self {
             runtime,
             mode: AdmissionMode::Strict,
+            watchdog_notifier: None,
         }
     }
 
@@ -217,16 +335,22 @@ impl RuntimeSessionResumer {
         // absent markers leave the string unchanged (back-compat with the
         // no-thread and no-nonce cases). The nonce is NOT part of the store
         // key: dropping it here is what keeps the park keyed per conversation.
-        let (without_nonce, _nonce) = split_dispatch_nonce(correlation_id);
-        let (without_reply, reply_to) = split_marker(without_nonce, REPLY_HINT_MARKER);
-        let (without_thread, thread) = split_marker(&without_reply, THREAD_HINT_MARKER);
-        let (without_flow, flow_marker) = split_marker(&without_thread, FLOW_HINT_MARKER);
-        let (bare_hint, pack_id) = split_pack_suffix(&without_flow);
-        let parts: Vec<&str> = bare_hint.splitn(5, ':').collect();
+        let parsed = parse_correlation(correlation_id);
+        let bare_hint = parsed.bare_hint;
+        let pack_id = parsed.pack_id;
+        let (endpoint_id, hint_body) = split_endpoint_prefix(&bare_hint);
+        let endpoint_id = endpoint_id.map(str::to_string);
+        let parts: Vec<&str> = hint_body.splitn(5, ':').collect();
         let provider = parts.get(1).map(|segment| segment.to_string());
         let channel = parts.get(2).map(|segment| segment.to_string());
-        let conversation = parts.get(3).map(|segment| segment.to_string());
+        // The explicit conversation marker wins over the lossy `:`-split.
+        let conversation = parsed
+            .conversation
+            .or_else(|| parts.get(3).map(|segment| segment.to_string()));
         let user = parts.get(4).map(|segment| segment.to_string());
+        let thread = parsed.thread;
+        let reply_to = parsed.reply_to;
+        let flow_marker = parsed.flow_id;
 
         let flow_id = flow_marker
             .or_else(|| pack_id.clone())
@@ -255,7 +379,7 @@ impl RuntimeSessionResumer {
             entry_node: None,
             activity_id: None,
             timestamp: None,
-            messaging_endpoint_id: None,
+            messaging_endpoint_id: endpoint_id,
             payload: output,
             metadata: None,
             // Reproduce the EXACT reply scope used at save time so
@@ -276,6 +400,17 @@ impl RuntimeSessionResumer {
 #[async_trait]
 impl SessionResumer for RuntimeSessionResumer {
     async fn resume(&self, tenant: TenantCtx, correlation_id: &str, output: Value) -> Result<()> {
+        self.resume_checked(tenant, correlation_id, output)
+            .await
+            .map(|_| ())
+    }
+
+    async fn resume_checked(
+        &self,
+        tenant: TenantCtx,
+        correlation_id: &str,
+        output: Value,
+    ) -> Result<ResumeOutcome> {
         let nonced = split_dispatch_nonce(correlation_id).1.is_some();
         let envelope = Self::build_resume_envelope(&tenant, correlation_id, output.clone());
         // Read for EVERY response, not only nonced ones: a sender that omits
@@ -283,39 +418,62 @@ impl SessionResumer for RuntimeSessionResumer {
         // a nonced (approval) response, as before; for any other response it
         // falls through to the runtime, where the approval gate re-checks the
         // token itself before deciding anything.
-        let parked = match self.runtime.parked_approvals(&envelope).await {
-            Ok(parked) => parked,
-            Err(error) if !nonced => {
-                tracing::warn!(%error, %correlation_id, "could not read the parked flow before resuming; the gate re-checks the response itself");
-                None
+        // Check-then-resume under the session's turn lock: the park read for
+        // admission and the resume that consumes it must be one unit, or a
+        // user turn (or a duplicate response) can resume the same snapshot in
+        // between. The nested `handle` re-enters the lock on this task and
+        // skips it.
+        let runtime = &self.runtime;
+        let lock_key = runtime.turn_lock_key(&envelope);
+        runtime
+            .with_turn_lock(lock_key, async {
+            let parked = match self.runtime.parked_approvals(&envelope).await {
+                Ok(parked) => parked,
+                Err(error) if !nonced => {
+                    tracing::warn!(%error, correlation_id = %crate::log_safe::log_safe(correlation_id), "could not read the parked flow before resuming; the gate re-checks the response itself");
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            match admit_response_with(self.mode, correlation_id, &output, parked.as_deref()) {
+                Admission::Resume => {
+                    // Retire the deadline watchdog at admission, BEFORE the resumed
+                    // flow runs: `handle` runs it until it next parks, and that
+                    // park may register a new watchdog under this same
+                    // (deterministic) id which a later cancel would kill.
+                    crate::runner::dispatch_listener::retire_watchdog_on_admission(
+                        self.watchdog_notifier.as_ref(),
+                        correlation_id,
+                    );
+                }
+                Admission::WrongGate => {
+                    // Not an error: the response is real, it just no longer has a
+                    // gate to land on. Resuming would hand an earlier gate's
+                    // decision (or its watchdog's late `timeout`) to a different
+                    // gate — or to whatever the conversation is parked on now.
+                    tracing::warn!(
+                        correlation_id = %crate::log_safe::log_safe(correlation_id),
+                        "dropping approval response: it does not match the approval this conversation is parked on"
+                    );
+                    return Ok(ResumeOutcome::Dropped);
+                }
+                Admission::BadToken => {
+                    // A security event: whoever sent this does not hold the token
+                    // the gate was issued (or is replaying a spent one). The gate
+                    // stays parked. The token is never logged.
+                    tracing::warn!(
+                        correlation_id = %crate::log_safe::log_safe(correlation_id),
+                        "dropping approval response: its decision_token is missing or does not match the one the parked approval was issued"
+                    );
+                    return Ok(ResumeOutcome::Dropped);
+                }
             }
-            Err(error) => return Err(error),
-        };
-        match admit_response_with(self.mode, correlation_id, &output, parked.as_deref()) {
-            Admission::Resume => {}
-            Admission::WrongGate => {
-                // Not an error: the response is real, it just no longer has a
-                // gate to land on. Resuming would hand an earlier gate's
-                // decision (or its watchdog's late `timeout`) to a different
-                // gate — or to whatever the conversation is parked on now.
-                tracing::warn!(
-                    %correlation_id,
-                    "dropping approval response: it does not match the approval this conversation is parked on"
-                );
-                return Ok(());
-            }
-            Admission::BadToken => {
-                // A security event: whoever sent this does not hold the token
-                // the gate was issued (or is replaying a spent one). The gate
-                // stays parked. The token is never logged.
-                tracing::warn!(
-                    %correlation_id,
-                    "dropping approval response: its decision_token is missing or does not match the one the parked approval was issued"
-                );
-                return Ok(());
-            }
-        }
-        self.runtime.handle(envelope).await.map(|_| ())
+            self.runtime
+                .handle(envelope)
+                .await
+                .map(|_| ResumeOutcome::Admitted)
+            })
+            .await
     }
 }
 
@@ -436,6 +594,85 @@ mod tests {
             EnvId::from_str("local").unwrap(),
             TenantId::from_str("demo").unwrap(),
         )
+    }
+
+    fn roundtrip(hint: &str, scope: ReplyScope) -> ParsedCorrelation {
+        let mut corr = format!("{hint}::pack=p.1::flow=f.1");
+        push_scope_markers(&mut corr, &scope);
+        parse_correlation(&corr)
+    }
+
+    #[test]
+    fn correlation_roundtrips_hostile_thread_reply_and_conversation() {
+        let scope = ReplyScope {
+            conversation: "conv:with::colons".into(),
+            thread: Some("t::flow=evil:1".into()),
+            reply_to: Some("r::pack=x::n=abc".into()),
+            correlation: None,
+        };
+        let parsed = roundtrip("demo:prov:chan:conv:with::colons:user", scope.clone());
+        assert_eq!(parsed.bare_hint, "demo:prov:chan:conv:with::colons:user");
+        assert_eq!(parsed.pack_id.as_deref(), Some("p.1"));
+        assert_eq!(parsed.flow_id.as_deref(), Some("f.1"));
+        assert_eq!(parsed.conversation.as_deref(), Some("conv:with::colons"));
+        assert_eq!(parsed.thread, scope.thread);
+        assert_eq!(parsed.reply_to, scope.reply_to);
+    }
+
+    #[test]
+    fn correlation_keeps_an_endpoint_prefixed_hint_intact() {
+        let scope = ReplyScope {
+            conversation: "conv".into(),
+            thread: Some("th".into()),
+            reply_to: None,
+            correlation: None,
+        };
+        let parsed = roundtrip("ep=eid-1::demo:prov:chan:conv:user", scope);
+        assert_eq!(parsed.bare_hint, "ep=eid-1::demo:prov:chan:conv:user");
+        // Plain tokens stay in the original, readable wire form.
+        let mut corr = String::new();
+        push_scope_markers(
+            &mut corr,
+            &ReplyScope {
+                conversation: "conv".into(),
+                thread: Some("th".into()),
+                reply_to: Some("rp".into()),
+                correlation: None,
+            },
+        );
+        assert_eq!(corr, "::thread=th::reply=rp");
+    }
+
+    #[test]
+    fn legacy_raw_markers_still_parse() {
+        let parsed = parse_correlation("demo:p:c:conv:u::pack=pk::flow=fl::thread=T1::reply=R1");
+        assert_eq!(parsed.bare_hint, "demo:p:c:conv:u");
+        assert_eq!(parsed.thread.as_deref(), Some("T1"));
+        assert_eq!(parsed.reply_to.as_deref(), Some("R1"));
+        assert_eq!(parsed.pack_id.as_deref(), Some("pk"));
+    }
+
+    #[test]
+    fn resume_envelope_recovers_endpoint_prefix_and_odd_conversation() {
+        let scope = ReplyScope {
+            conversation: "a:b".into(),
+            thread: None,
+            reply_to: None,
+            correlation: None,
+        };
+        let mut corr = "ep=eid::demo:prov:chan:a:b:user::pack=p::flow=f".to_string();
+        push_scope_markers(&mut corr, &scope);
+        let envelope =
+            RuntimeSessionResumer::build_resume_envelope(&tenant_ctx(), &corr, json!(null));
+        assert_eq!(envelope.messaging_endpoint_id.as_deref(), Some("eid"));
+        assert_eq!(
+            envelope.reply_scope.map(|scope| scope.conversation),
+            Some("a:b".to_string())
+        );
+        assert_eq!(
+            envelope.session_hint.as_deref(),
+            Some("ep=eid::demo:prov:chan:a:b:user")
+        );
     }
 
     #[test]

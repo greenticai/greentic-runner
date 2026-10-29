@@ -97,7 +97,7 @@ use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
 use crate::config::HostConfig;
 use crate::fault;
 use crate::secrets::{
-    DynSecretsManager, canonicalize_secret_key, read_pack_secret_blocking,
+    DynSecretsManager, PackSecretError, canonicalize_secret_key, read_pack_secret_blocking,
     write_pack_secret_blocking,
 };
 use crate::storage::state::STATE_PREFIX;
@@ -129,6 +129,10 @@ pub struct PackRuntime {
     session_store: Option<DynSessionStore>,
     state_store: Option<DynStateStore>,
     wasi_policy: Arc<RunnerWasiPolicy>,
+    /// The policy `load` was HANDED, before `for_tenant` scoped it. A nested
+    /// load (`load_flow_engine`) must start from this: `for_tenant` is not
+    /// idempotent, so re-scoping `wasi_policy` would give `<host>/tenants/<t>/tenants/<t>`.
+    base_wasi_policy: Arc<RunnerWasiPolicy>,
     assets_tempdir: Option<TempDir>,
     provider_registry: RwLock<Option<ProviderRegistry>>,
     /// Per-revision lazy cache of `describe-identify-instance` results,
@@ -139,6 +143,10 @@ pub struct PackRuntime {
     /// has no hint". `ArcSwap`-driven revision swaps allocate a fresh
     /// `PackRuntime` so this cache is naturally invalidated.
     identify_hint_cache: RwLock<HashMap<String, Option<IdentifyInstanceHint>>>,
+    /// Components whose describe-identify probe failed recently. Failures are
+    /// remembered only for [`IDENTIFY_FAILURE_BACKOFF`] so a transient error
+    /// does not disable hinting for the lifetime of the runtime.
+    identify_hint_failures: RwLock<HashMap<String, std::time::Instant>>,
     secrets: DynSecretsManager,
     oauth_config: Option<OAuthBrokerConfig>,
     cache: CacheManager,
@@ -231,7 +239,53 @@ impl IdentifyOutcome {
     }
 }
 
-fn run_on_wasi_thread<F, T>(task_name: &'static str, task: F) -> Result<T>
+/// Describe a panic payload from a joined/caught Wasmtime thread.
+fn wasi_panic_reason(err: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = err.downcast_ref::<&str>() {
+        msg.to_string()
+    } else if let Some(msg) = err.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Run `task` on a dedicated OS thread and await its result without parking a
+/// tokio worker (the result is delivered through a oneshot channel).
+async fn run_on_wasi_thread<F, T>(task_name: &'static str, task: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel::<std::thread::Result<Result<T>>>();
+    let builder = std::thread::Builder::new().name(format!("greentic-wasmtime-{task_name}"));
+    builder
+        .spawn(move || {
+            let pid = std::process::id();
+            let thread_id = std::thread::current().id();
+            tracing::info!(
+                event = "wasmtime.thread.start",
+                task = task_name,
+                pid,
+                thread_id = ?thread_id,
+                "starting Wasmtime thread"
+            );
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+            let _ = tx.send(outcome);
+        })
+        .context("failed to spawn Wasmtime thread")?;
+    match rx.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => Err(anyhow!(
+            "Wasmtime thread panicked: {}",
+            wasi_panic_reason(panic.as_ref())
+        )),
+        Err(_) => Err(anyhow!("Wasmtime thread ended without producing a result")),
+    }
+}
+
+/// Synchronous variant for callers that are not async (blocks the caller).
+fn run_on_wasi_thread_blocking<F, T>(task_name: &'static str, task: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
@@ -268,6 +322,16 @@ where
         .and_then(|res| res)
 }
 
+/// How long a failed describe-identify probe suppresses re-probing.
+const IDENTIFY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+fn identify_failure_backoff_active(
+    failed_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    failed_at.is_some_and(|at| now.saturating_duration_since(at) < IDENTIFY_FAILURE_BACKOFF)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ComponentResolution {
     /// Root of a materialized pack directory containing `manifest.cbor` and `components/`.
@@ -282,15 +346,20 @@ pub struct ComponentResolution {
     pub allow_missing_hash: bool,
 }
 
-fn build_blocking_client() -> BlockingClient {
+fn build_blocking_client() -> Result<BlockingClient, String> {
+    // Built on a scratch thread: the blocking client must not be constructed
+    // inside an async context.
     std::thread::spawn(|| {
+        let guard = crate::http_guard::HttpGuard::from_env();
         BlockingClient::builder()
             .no_proxy()
+            .dns_resolver(Arc::new(crate::http_guard::GuardedResolver { guard }))
+            .redirect(crate::http_guard::redirect_policy(guard))
             .build()
-            .expect("blocking client")
+            .map_err(|err| format!("failed to build blocking http client: {err}"))
     })
     .join()
-    .expect("client build thread panicked")
+    .map_err(|_| "blocking http client builder thread panicked".to_string())?
 }
 
 fn normalize_pack_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -324,7 +393,16 @@ fn normalize_pack_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((root, safe))
 }
 
-static HTTP_CLIENT: Lazy<Arc<BlockingClient>> = Lazy::new(|| Arc::new(build_blocking_client()));
+static HTTP_CLIENT: Lazy<Result<Arc<BlockingClient>, String>> =
+    Lazy::new(|| build_blocking_client().map(Arc::new));
+
+/// Shared blocking HTTP client; construction failure is an error, not a panic.
+fn shared_http_client() -> Result<Arc<BlockingClient>> {
+    match &*HTTP_CLIENT {
+        Ok(client) => Ok(Arc::clone(client)),
+        Err(message) => Err(anyhow!("{message}")),
+    }
+}
 
 /// Default for [`FlowDescriptor::entry`]. A flow is treated as an entrypoint
 /// unless it is explicitly tagged `internal`, so packs (and serialized
@@ -440,7 +518,7 @@ impl HostState {
         runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
         runtime_refs: Option<RuntimeRefsInjection>,
     ) -> Result<Self> {
-        let default_env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+        let default_env = crate::config::greentic_env_or_local();
         Ok(Self {
             pack_id,
             config,
@@ -479,7 +557,11 @@ impl HostState {
     /// shared pack scope. THE single read path for every `SecretsStoreHost` /
     /// `RuntimeConfigHost` entry point on this type — four call sites used to
     /// spell the same address inline, which is how one of them would be missed.
-    fn read_pack_secret(&self, ctx: &TypesTenantCtx, canonical_key: &str) -> Result<Vec<u8>> {
+    fn read_pack_secret(
+        &self,
+        ctx: &TypesTenantCtx,
+        canonical_key: &str,
+    ) -> std::result::Result<Vec<u8>, PackSecretError> {
         read_pack_secret_blocking(
             &self.secrets,
             ctx,
@@ -611,7 +693,7 @@ impl HostState {
             let runtime = bindings.greentic_component_component_runtime();
 
             // Encode input as CBOR — the component's run() expects CBOR bytes.
-            let input_value: Value = serde_json::from_str(input_json).unwrap_or(Value::Null);
+            let input_value = parse_v06_input(input_json);
             let input_cbor =
                 serde_cbor::to_vec(&input_value).context("encode input as CBOR for v0.6")?;
             let empty_state = serde_cbor::to_vec(&Value::Object(Default::default()))
@@ -709,19 +791,35 @@ impl HostState {
     }
 
     fn tenant_ctx_from_v1(&self, ctx: Option<StateTenantCtx>) -> Result<TypesTenantCtx> {
-        let tenant_raw = ctx
+        // The tenant and env are bound by the host. Guest-supplied values are
+        // never trusted: honouring them would let a component read or write
+        // another tenant's state.
+        let tenant_raw = self
+            .exec_ctx
             .as_ref()
-            .map(|ctx| ctx.tenant.clone())
-            .or_else(|| self.exec_ctx.as_ref().map(|ctx| ctx.tenant.tenant.clone()))
+            .map(|ctx| ctx.tenant.tenant.clone())
             .unwrap_or_else(|| self.config.tenant.clone());
-        let env_raw = ctx
-            .as_ref()
-            .map(|ctx| ctx.env.clone())
-            .unwrap_or_else(|| self.default_env.clone());
+        let env_raw = self.default_env.clone();
+        if let Some(guest) = ctx.as_ref() {
+            if !guest.tenant.is_empty() && guest.tenant != tenant_raw {
+                warn!(
+                    pack_id = %self.pack_id,
+                    guest_tenant = %crate::log_safe::log_safe(&guest.tenant),
+                    "ignoring guest-supplied tenant in state ctx; using host-bound tenant"
+                );
+            }
+            if !guest.env.is_empty() && guest.env != env_raw {
+                warn!(
+                    pack_id = %self.pack_id,
+                    guest_env = %crate::log_safe::log_safe(&guest.env),
+                    "ignoring guest-supplied env in state ctx; using host-bound env"
+                );
+            }
+        }
         let tenant_id = TenantId::from_str(&tenant_raw)
             .with_context(|| format!("invalid tenant id `{tenant_raw}`"))?;
-        let env_id = EnvId::from_str(&env_raw)
-            .unwrap_or_else(|_| EnvId::from_str("local").expect("default env must be valid"));
+        let env_id =
+            EnvId::from_str(&env_raw).with_context(|| format!("invalid env id `{env_raw}`"))?;
         let mut tenant_ctx = TypesTenantCtx::new(env_id, tenant_id);
         if let Some(exec_ctx) = self.exec_ctx.as_ref() {
             if let Some(team) = exec_ctx.tenant.team.as_ref() {
@@ -785,6 +883,19 @@ impl HostState {
             });
         }
 
+        if let Some(body) = req.body.as_deref()
+            && let Err(message) = crate::wasm_limits::check_size(
+                "request body",
+                body.len(),
+                crate::wasm_limits::http_max_request_bytes(),
+            )
+        {
+            return Err(HttpClientError {
+                code: "too-large".into(),
+                message,
+            });
+        }
+
         let mut mock_state = None;
         let raw_body = req.body.clone();
         if let Some(mock) = &self.mocks
@@ -815,6 +926,16 @@ impl HostState {
             }
         }
 
+        let guard = crate::http_guard::HttpGuard::from_env();
+        if let Ok(parsed) = url::Url::parse(&req.url)
+            && let Err(reason) = guard.check_url_literal(&parsed)
+        {
+            return Err(HttpClientError {
+                code: "denied".into(),
+                message: reason,
+            });
+        }
+
         let method = req.method.parse().unwrap_or(reqwest::Method::GET);
         let mut builder = self.http_client.request(method, &req.url);
         for (key, value) in req.headers {
@@ -830,23 +951,35 @@ impl HostState {
         }
 
         if let Some(opts) = opts {
-            if let Some(timeout_ms) = opts.timeout_ms {
-                builder = builder.timeout(Duration::from_millis(timeout_ms as u64));
+            if let Some(timeout) =
+                guest_timeout(opts.timeout_ms, crate::http_timeout_hooks::ceiling())
+            {
+                builder = builder.timeout(timeout);
             }
             if opts.allow_insecure == Some(true) {
-                warn!(url = %req.url, "allow-insecure not supported; using default TLS validation");
+                warn!(origin = %crate::log_safe::log_safe_origin(&req.url), "allow-insecure not supported; using default TLS validation");
             }
             if let Some(follow_redirects) = opts.follow_redirects
                 && !follow_redirects
             {
-                warn!(url = %req.url, "follow-redirects=false not supported; using default client behaviour");
+                warn!(origin = %crate::log_safe::log_safe_origin(&req.url), "follow-redirects=false not supported; using default client behaviour");
             }
         }
 
         let response = match builder.send() {
             Ok(resp) => resp,
             Err(err) => {
-                warn!(url = %req.url, error = %err, "http client request failed");
+                // reqwest's Display appends ` for url (<full url>)`; the URL can
+                // carry a token (bot<TOKEN> path, webhook path, query).
+                let blocked = crate::http_guard::is_blocked_error(&err);
+                let err = err.without_url();
+                warn!(origin = %crate::log_safe::log_safe_origin(&req.url), error = %err, "http client request failed");
+                if blocked {
+                    return Err(HttpClientError {
+                        code: "denied".into(),
+                        message: crate::http_guard::BLOCKED_MARKER.to_string(),
+                    });
+                }
                 return Err(HttpClientError {
                     code: "unavailable".into(),
                     message: err.to_string(),
@@ -865,7 +998,22 @@ impl HostState {
                 )
             })
             .collect::<Vec<_>>();
-        let body_bytes = response.bytes().ok().map(|b| b.to_vec());
+        let body_bytes = match crate::http_guard::read_capped_body(
+            response,
+            guard.max_response_bytes,
+        ) {
+            Ok(bytes) => Some(bytes),
+            Err(err) => {
+                warn!(origin = %crate::log_safe::log_safe_origin(&req.url), error = %crate::http_guard::body_read_reason(&err), "http response body read failed");
+                return Err(HttpClientError {
+                    code: "unavailable".into(),
+                    message: format!(
+                        "failed to read response body: {}",
+                        crate::http_guard::body_read_reason(&err)
+                    ),
+                });
+            }
+        };
 
         if let Some((meta, true)) = mock_state.take()
             && let Some(mock) = &self.mocks
@@ -914,10 +1062,16 @@ mod canonicalize_tests {
     }
 }
 
+/// Parse the invocation input for a v0.6 component. Non-JSON input is passed
+/// through as a string rather than failing (or being silently nulled).
+fn parse_v06_input(input_json: &str) -> Value {
+    serde_json::from_str(input_json).unwrap_or_else(|_| Value::String(input_json.to_string()))
+}
+
 impl SecretsStoreHost for HostState {
     fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, SecretsError> {
         if provider_core_only::is_enabled() {
-            warn!(secret = %key, "provider-core only mode enabled; blocking secrets store");
+            warn!(secret = %crate::log_safe::log_safe(&key), "provider-core only mode enabled; blocking secrets store");
             return Err(SecretsError::Denied);
         }
         if !self.config.secrets_policy.is_allowed(&key) {
@@ -933,8 +1087,12 @@ impl SecretsStoreHost for HostState {
         match self.read_pack_secret(&ctx, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
-                warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
-                Err(SecretsError::NotFound)
+                warn!(secret = %crate::log_safe::log_safe(&key), canonical = %crate::log_safe::log_safe(&canonical_key), error = %err, "secret lookup failed");
+                Err(match err {
+                    PackSecretError::NotFound(_) => SecretsError::NotFound,
+                    PackSecretError::Denied(_) => SecretsError::Denied,
+                    PackSecretError::Backend(_) => SecretsError::Internal,
+                })
             }
         }
     }
@@ -943,7 +1101,7 @@ impl SecretsStoreHost for HostState {
 impl SecretsStoreHostV1_1 for HostState {
     fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, SecretsErrorV1_1> {
         if provider_core_only::is_enabled() {
-            warn!(secret = %key, "provider-core only mode enabled; blocking secrets store");
+            warn!(secret = %crate::log_safe::log_safe(&key), "provider-core only mode enabled; blocking secrets store");
             return Err(SecretsErrorV1_1::Denied);
         }
         if !self.config.secrets_policy.is_allowed(&key) {
@@ -959,36 +1117,116 @@ impl SecretsStoreHostV1_1 for HostState {
         match self.read_pack_secret(&ctx, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
-                warn!(secret = %key, canonical = %canonical_key, error = %err, "secret lookup failed");
-                Err(SecretsErrorV1_1::NotFound)
+                warn!(secret = %crate::log_safe::log_safe(&key), canonical = %crate::log_safe::log_safe(&canonical_key), error = %err, "secret lookup failed");
+                Err(match err {
+                    PackSecretError::NotFound(_) => SecretsErrorV1_1::NotFound,
+                    PackSecretError::Denied(_) => SecretsErrorV1_1::Denied,
+                    PackSecretError::Backend(_) => SecretsErrorV1_1::Internal,
+                })
             }
         }
     }
 
+    /// The WIT `put` returns nothing, so a refusal cannot be reported through
+    /// this trait method; it is logged and dropped. The linker does not route
+    /// guest calls here: [`add_secrets_store_to_linker`] calls
+    /// [`HostState::try_put_secret`] and turns a refusal into a guest trap.
     fn put(&mut self, key: String, value: Vec<u8>) {
+        if let Err(err) = self.try_put_secret(&key, &value) {
+            warn!(error = %err, "secret write refused");
+        }
+    }
+}
+
+/// Why a guest `secrets-store.put` was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum SecretPutError {
+    #[error("secret write denied for key {0}: invalid key")]
+    InvalidKey(String),
+    #[error("secret write denied for key {0}: provider-core-only mode")]
+    ProviderCoreOnly(String),
+    #[error("secret write denied for key {0}: policy")]
+    Policy(String),
+    #[error("secret write failed for key {0}")]
+    WriteFailed(String),
+}
+
+impl HostState {
+    /// Fallible secret write. Never panics; guest-reachable refusals come back
+    /// as [`SecretPutError`] (the key in the message is log-safe and bounded).
+    pub fn try_put_secret(&mut self, key: &str, value: &[u8]) -> Result<(), SecretPutError> {
+        let safe_key = crate::log_safe::log_safe(key).into_owned();
         if key.trim().is_empty() {
-            warn!(secret = %key, "secret write blocked: empty key");
-            panic!("secret write denied for key {key}: invalid key");
+            warn!(secret = %safe_key, "secret write blocked: empty key");
+            return Err(SecretPutError::InvalidKey(safe_key));
         }
         if provider_core_only::is_enabled() && !self.allows_secret_write_in_provider_core_only() {
             warn!(
-                secret = %key,
+                secret = %safe_key,
                 component = self.component_ref.as_deref().unwrap_or("<pack>"),
                 "provider-core only mode enabled; blocking secrets store write"
             );
-            panic!("secret write denied for key {key}: provider-core-only mode");
+            return Err(SecretPutError::ProviderCoreOnly(safe_key));
         }
-        if !self.config.secrets_policy.is_allowed(&key) {
-            warn!(secret = %key, "secret write denied by bindings policy");
-            panic!("secret write denied for key {key}: policy");
+        if !self.config.secrets_policy.is_allowed(key) {
+            warn!(secret = %safe_key, "secret write denied by bindings policy");
+            return Err(SecretPutError::Policy(safe_key));
         }
         let ctx = self.secrets_tenant_ctx();
-        let canonical_key = canonicalize_secret_key(&key);
-        if let Err(err) = self.write_pack_secret(&ctx, &canonical_key, &value) {
-            warn!(secret = %key, canonical = %canonical_key, error = %err, "secret write failed");
-            panic!("secret write failed for key {key}");
+        let canonical_key = canonicalize_secret_key(key);
+        if let Err(err) = self.write_pack_secret(&ctx, &canonical_key, value) {
+            warn!(
+                secret = %safe_key,
+                canonical = %crate::log_safe::log_safe(&canonical_key),
+                error = %err,
+                "secret write failed"
+            );
+            return Err(SecretPutError::WriteFailed(safe_key));
         }
+        Ok(())
     }
+}
+
+fn v1_1_error_to_v1_0(err: SecretsErrorV1_1) -> SecretsError {
+    match err {
+        SecretsErrorV1_1::NotFound => SecretsError::NotFound,
+        SecretsErrorV1_1::Denied => SecretsError::Denied,
+        SecretsErrorV1_1::InvalidKey => SecretsError::InvalidKey,
+        SecretsErrorV1_1::Internal => SecretsError::Internal,
+    }
+}
+
+/// Register `secrets-store` `@1.1.0` and `@1.0.0` on the linker. Replaces the
+/// library's `add_secrets_store_compat_to_linker` so a refused `put` surfaces
+/// as an ordinary guest trap (an invocation error) instead of a host panic;
+/// the WIT `put` has no result type to carry the error.
+fn add_secrets_store_to_linker(linker: &mut Linker<ComponentState>) -> Result<()> {
+    let mut v1_1 = linker.instance("greentic:secrets-store/secrets-store@1.1.0")?;
+    v1_1.func_wrap(
+        "get",
+        |mut caller: StoreContextMut<'_, ComponentState>, (key,): (String,)| {
+            let host = caller.data_mut().host_mut();
+            Ok((SecretsStoreHostV1_1::get(host, key),))
+        },
+    )?;
+    v1_1.func_wrap(
+        "put",
+        |mut caller: StoreContextMut<'_, ComponentState>, (key, value): (String, Vec<u8>)| {
+            let host = caller.data_mut().host_mut();
+            host.try_put_secret(&key, &value)
+                .map_err(wasmtime::Error::new)
+        },
+    )?;
+    let mut v1_0 = linker.instance("greentic:secrets-store/secrets-store@1.0.0")?;
+    v1_0.func_wrap(
+        "get",
+        |mut caller: StoreContextMut<'_, ComponentState>, (key,): (String,)| {
+            let host = caller.data_mut().host_mut();
+            let result = SecretsStoreHostV1_1::get(host, key).map_err(v1_1_error_to_v1_0);
+            Ok((result,))
+        },
+    )?;
+    Ok(())
 }
 
 /// Process-global set of `pack-config.v1` keys for which the compat shim has
@@ -1001,7 +1239,7 @@ fn warn_compat_fallback_once(key: &str) {
     let mut warned = WARNED_COMPAT_KEYS.lock();
     if warned.insert(key.to_string()) {
         warn!(
-            key = %key,
+            key = %crate::log_safe::log_safe(key),
             "runtime-config key resolved via secrets-store compat fallback; \
              move this value into pack-config.v1.non_secret"
         );
@@ -1021,7 +1259,7 @@ impl RuntimeConfigHost for HostState {
             && let Some(value) = map.get(&key)
         {
             return serde_json::to_string(value).map(Some).map_err(|err| {
-                warn!(key = %key, error = %err, "runtime-config value JSON-encode failed");
+                warn!(key = %crate::log_safe::log_safe(&key), error = %err, "runtime-config value JSON-encode failed");
                 ConfigError::Internal
             });
         }
@@ -1036,16 +1274,16 @@ impl RuntimeConfigHost for HostState {
             use crate::runtime_refs::RuntimeRefResolverError;
             return match injection.resolver.resolve(uri) {
                 Ok(Some(value)) => serde_json::to_string(&value).map(Some).map_err(|err| {
-                    warn!(key = %key, error = %err, "runtime-ref value JSON-encode failed");
+                    warn!(key = %crate::log_safe::log_safe(&key), error = %err, "runtime-ref value JSON-encode failed");
                     ConfigError::Internal
                 }),
                 Ok(None) => Ok(None),
                 Err(err @ RuntimeRefResolverError::Invalid(_)) => {
-                    warn!(key = %key, error = %err, "runtime-ref rejected");
+                    warn!(key = %crate::log_safe::log_safe(&key), error = %err, "runtime-ref rejected");
                     Err(ConfigError::InvalidKey)
                 }
                 Err(err @ RuntimeRefResolverError::Internal(_)) => {
-                    warn!(key = %key, error = %err, "runtime-ref resolution failed");
+                    warn!(key = %crate::log_safe::log_safe(&key), error = %err, "runtime-ref resolution failed");
                     Err(ConfigError::Internal)
                 }
             };
@@ -1061,7 +1299,7 @@ impl RuntimeConfigHost for HostState {
                 }
                 Err(_) => {
                     warn!(
-                        key = %key,
+                        key = %crate::log_safe::log_safe(&key),
                         "runtime-config compat fallback found non-UTF-8 secret bytes; \
                          returning not-found"
                     );
@@ -1185,7 +1423,10 @@ impl StateStoreHost for HostState {
         }
         let key = StoreStateKey::from(key);
         match store.get_json(&tenant_ctx, STATE_PREFIX, &key, None) {
-            Ok(Some(value)) => Ok(serde_json::to_vec(&value).unwrap_or_else(|_| Vec::new())),
+            Ok(Some(value)) => state_bytes_from_value(&value).map_err(|err| StateError {
+                code: "internal".into(),
+                message: format!("failed to encode stored state value: {err}"),
+            }),
             Ok(None) => Err(StateError {
                 code: "not_found".into(),
                 message: "state key not found".into(),
@@ -1203,6 +1444,16 @@ impl StateStoreHost for HostState {
         bytes: Vec<u8>,
         ctx: Option<StateTenantCtx>,
     ) -> Result<StateOpAck, StateError> {
+        if let Err(message) = crate::wasm_limits::check_size(
+            "state value",
+            bytes.len(),
+            crate::wasm_limits::state_max_value_bytes(),
+        ) {
+            return Err(StateError {
+                code: "too-large".into(),
+                message,
+            });
+        }
         let store = match self.state_store.as_ref() {
             Some(store) => store.clone(),
             None => {
@@ -1243,8 +1494,7 @@ impl StateStoreHost for HostState {
             }
         }
         let key = StoreStateKey::from(key);
-        let value = serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()));
+        let value = state_value_from_bytes(&bytes);
         match store.set_json(&tenant_ctx, STATE_PREFIX, &key, None, &value, None) {
             Ok(()) => Ok(StateOpAck::Ok),
             Err(err) => Err(StateError {
@@ -1288,6 +1538,46 @@ impl StateStoreHost for HostState {
     }
 }
 
+/// Marker key of the envelope used to store state values that are neither JSON
+/// nor valid UTF-8, so the original bytes survive a write/read round trip.
+const STATE_BYTES_ENVELOPE_KEY: &str = "$greentic_bytes_b64";
+
+/// Convert guest state bytes to the JSON value persisted by the state store.
+///
+/// JSON documents are stored as-is, other UTF-8 text as a JSON string (legacy
+/// behaviour), and arbitrary binary as a base64 envelope (never lossy).
+fn state_value_from_bytes(bytes: &[u8]) -> Value {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return value;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Value::String(text.to_string()),
+        Err(_) => {
+            use base64::Engine as _;
+            let mut envelope = serde_json::Map::new();
+            envelope.insert(
+                STATE_BYTES_ENVELOPE_KEY.to_string(),
+                Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            );
+            Value::Object(envelope)
+        }
+    }
+}
+
+/// Inverse of [`state_value_from_bytes`] for reads.
+fn state_bytes_from_value(value: &Value) -> Result<Vec<u8>, String> {
+    if let Value::Object(map) = value
+        && map.len() == 1
+        && let Some(Value::String(encoded)) = map.get(STATE_BYTES_ENVELOPE_KEY)
+    {
+        use base64::Engine as _;
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|err| format!("invalid binary state envelope: {err}"));
+    }
+    serde_json::to_vec(value).map_err(|err| err.to_string())
+}
+
 /// `StateStore::set_json_if_absent` reports a backend that has no atomic
 /// implementation as `InvalidInput` with this message; surface it as a stable
 /// `unsupported` code instead of a generic failure.
@@ -1318,6 +1608,16 @@ impl HostState {
         bytes: Vec<u8>,
         ctx: Option<StateTenantCtx>,
     ) -> Result<bool, StateError> {
+        if let Err(message) = crate::wasm_limits::check_size(
+            "state value",
+            bytes.len(),
+            crate::wasm_limits::state_max_value_bytes(),
+        ) {
+            return Err(StateError {
+                code: "too-large".into(),
+                message,
+            });
+        }
         let store = match self.state_store.as_ref() {
             Some(store) => store.clone(),
             None => {
@@ -1358,8 +1658,7 @@ impl HostState {
             }
         }
         let key = StoreStateKey::from(key);
-        let value = serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()));
+        let value = state_value_from_bytes(&bytes);
         store
             .set_json_if_absent(&tenant_ctx, STATE_PREFIX, &key, &value, None)
             .map_err(state_error_from_if_absent)
@@ -1446,6 +1745,9 @@ impl StateStoreHostV1_1 for HostState {
     }
 }
 
+/// Cap on guest telemetry fields re-emitted per log call.
+const MAX_TELEMETRY_FIELDS: usize = 64;
+
 impl TelemetryLoggerHost for HostState {
     fn log(
         &mut self,
@@ -1458,16 +1760,22 @@ impl TelemetryLoggerHost for HostState {
         {
             return Ok(TelemetryAck::Ok);
         }
+        // Everything in `span` and `fields` is guest-claimed. The tenant the
+        // host actually bound is logged beside it; guest text is sanitised
+        // and bounded so it cannot forge log lines or flood the log.
         let mut map = serde_json::Map::new();
-        for (k, v) in fields {
+        for (k, v) in fields.into_iter().take(MAX_TELEMETRY_FIELDS) {
+            let k = crate::log_safe::log_safe_max(&k, 128).into_owned();
+            let v = crate::log_safe::log_safe_max(&v, 1024).into_owned();
             map.insert(k, Value::String(v));
         }
         tracing::info!(
-            tenant = %span.tenant,
-            flow_id = %span.flow_id,
-            node = ?span.node_id,
-            provider = %span.provider,
-            fields = %serde_json::Value::Object(map.clone()),
+            host_tenant = %self.config.tenant,
+            guest_tenant = %crate::log_safe::log_safe(&span.tenant),
+            flow_id = %crate::log_safe::log_safe(&span.flow_id),
+            node = ?span.node_id.as_deref().map(crate::log_safe::log_safe),
+            provider = %crate::log_safe::log_safe(&span.provider),
+            fields = %serde_json::Value::Object(map),
             "telemetry log from pack"
         );
         Ok(TelemetryAck::Ok)
@@ -1729,8 +2037,30 @@ pub struct ComponentState {
     wasi_ctx: WasiCtx,
     wasi_tls_ctx: WasiTlsCtx,
     wasi_http_ctx: WasiHttpCtx,
-    http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks,
+    http_timeout_hooks: crate::http_guard::GuardedHooks,
     resource_table: ResourceTable,
+    wasm_limits: crate::wasm_limits::WasmLimits,
+    store_limits: crate::wasm_limits::GuestLimiter,
+}
+
+/// Resolve the guest's requested `timeout-ms` against the host ceiling.
+/// Absent or zero keeps the client default (`None`); anything else is
+/// clamped so a guest cannot extend the default into an unbounded host call.
+pub(crate) fn guest_timeout(requested_ms: Option<u32>, ceiling: Duration) -> Option<Duration> {
+    match requested_ms {
+        None | Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(u64::from(ms)).min(ceiling)),
+    }
+}
+
+/// Create the per-invocation store: memory/table/instance limiter plus a fresh
+/// epoch deadline (see [`crate::wasm_limits`]).
+fn new_limited_store(engine: &Engine, state: ComponentState) -> wasmtime::Store<ComponentState> {
+    let limits = state.wasm_limits;
+    let mut store = wasmtime::Store::new(engine, state);
+    store.limiter(|state| &mut state.store_limits);
+    crate::wasm_limits::arm_deadline(&mut store, &limits);
+    store
 }
 
 /// Install the process-default rustls [`rustls::crypto::CryptoProvider`] exactly once.
@@ -1758,13 +2088,17 @@ impl ComponentState {
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
+        let wasm_limits = crate::wasm_limits::WasmLimits::from_env();
+        let http_enabled = host.config.http_enabled;
         Ok(Self {
             host,
             wasi_ctx,
             wasi_tls_ctx: WasiTlsCtxBuilder::new().build(),
             wasi_http_ctx: WasiHttpCtx::new(),
-            http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks::from_env(),
+            http_timeout_hooks: crate::http_guard::GuardedHooks::from_env(http_enabled),
             resource_table: ResourceTable::new(),
+            wasm_limits,
+            store_limits: wasm_limits.store_limits(),
         })
     }
 
@@ -1936,11 +2270,14 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             state_store_v1_1: allow_state_store
                 .then_some(|state: &mut ComponentState| state.host_mut()),
             state_store: None,
-            secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
+            // Registered below by `add_secrets_store_to_linker` so a refused
+            // `put` traps the guest instead of panicking the host.
+            secrets_store_v1_1: None,
             secrets_store: None,
             runtime_config: Some(|state: &mut ComponentState| state.host_mut()),
         },
     )?;
+    add_secrets_store_to_linker(linker)?;
     add_http_client_client_world_aliases(linker)?;
     add_telemetry_logging_stub(linker)?;
     Ok(())
@@ -2193,14 +2530,12 @@ impl PackRuntime {
                     .map(|_| p)
             }) {
                 verify::verify_pack(verify_target).await?;
-                tracing::info!(pack_path = %verify_target.display(), "pack verification complete");
+                tracing::info!(pack_path = %verify_target.display(), "pack archive structure check passed (signature/digest checks happen at resolve time)");
             } else {
                 tracing::debug!("skipping archive verification (no archive source)");
             }
         }
-        let engine = Engine::default();
-        let engine_profile =
-            EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+        let (engine, engine_profile) = crate::runtime_cache_engine_and_profile()?;
         let cache = CacheManager::new(CacheConfig::default(), engine_profile);
         let mut metadata = PackMetadata::fallback(&safe_path);
         let mut manifest = None;
@@ -2244,7 +2579,17 @@ impl PackRuntime {
                     flows = Some(cache);
                 }
                 Err(err) => {
-                    warn!(error = %err, pack = %root.display(), "failed to parse materialized pack manifest");
+                    if archive_hint.is_none() {
+                        // No archive to fall back to: continuing would hand
+                        // back an empty pack that looks successfully loaded.
+                        return Err(err).with_context(|| {
+                            format!(
+                                "failed to load materialized pack manifest from {}",
+                                root.display()
+                            )
+                        });
+                    }
+                    warn!(error = %err, pack = %root.display(), "failed to parse materialized pack manifest; falling back to the archive");
                 }
             }
         }
@@ -2291,7 +2636,14 @@ impl PackRuntime {
         }
         let mut pack_lock = None;
         for root in find_pack_lock_roots(&safe_path, is_dir, archive_hint) {
-            pack_lock = load_pack_lock(&root)?;
+            // A lock that cannot be read or parsed is skipped, not fatal: the
+            // manifest's own component sources remain authoritative.
+            match load_pack_lock(&root) {
+                Ok(found) => pack_lock = found,
+                Err(error) => {
+                    warn!(error = %error, root = %root.display(), "ignoring unusable pack.lock");
+                }
+            }
             if pack_lock.is_some() {
                 break;
             }
@@ -2421,14 +2773,17 @@ impl PackRuntime {
                 loaded
             }
         };
-        let http_client = Arc::clone(&HTTP_CLIENT);
+        let http_client = shared_http_client()?;
         let mut component_manifests = HashMap::new();
         if let Some(manifest) = manifest.as_ref() {
             for component in &manifest.components {
                 component_manifests.insert(component.id.as_str().to_string(), component.clone());
             }
         }
-        let mut pack_policy = (*wasi_policy).clone();
+        let base_wasi_policy = Arc::clone(&wasi_policy);
+        let mut pack_policy = wasi_policy
+            .for_tenant(&config.tenant, &config.env_passthrough)
+            .with_context(|| format!("failed to build WASI policy for tenant {}", config.tenant))?;
         if let Some(dir) = pack_assets_dir {
             tracing::debug!(path = %dir.display(), "preopening pack assets directory for WASI /assets");
             pack_policy =
@@ -2451,9 +2806,11 @@ impl PackRuntime {
             session_store,
             state_store,
             wasi_policy,
+            base_wasi_policy,
             assets_tempdir,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
+            identify_hint_failures: RwLock::new(HashMap::new()),
             secrets,
             oauth_config,
             cache,
@@ -2585,27 +2942,59 @@ impl PackRuntime {
         Vec::new()
     }
 
+    /// The tenant-scoped WASI policy this pack's components run under.
+    #[doc(hidden)]
+    pub fn effective_wasi_policy(&self) -> Arc<RunnerWasiPolicy> {
+        Arc::clone(&self.wasi_policy)
+    }
+
+    /// The WASI policy of the pack a direct flow run loads. Must equal
+    /// [`Self::effective_wasi_policy`]; exposed so a test can pin that.
+    #[doc(hidden)]
+    pub async fn nested_load_wasi_policy(&self) -> Result<Arc<RunnerWasiPolicy>> {
+        let (pack, _engine) = self.load_flow_engine().await?;
+        Ok(pack.effective_wasi_policy())
+    }
+
+    /// The unit id and non-secret runtime config a direct flow run's pack
+    /// carries. Must equal this pack's; exposed so a test can pin that.
+    #[doc(hidden)]
+    pub async fn nested_load_scope(
+        &self,
+    ) -> Result<(Option<String>, Option<Arc<BTreeMap<String, Value>>>)> {
+        let (pack, _engine) = self.load_flow_engine().await?;
+        Ok((
+            pack.unit_id().map(str::to_string),
+            pack.runtime_config_non_secret().cloned(),
+        ))
+    }
+
     /// Load a fresh engine over this pack, the way every direct flow run here
     /// does. Shared by [`Self::execute_flow_inner`] and
     /// [`Self::resume_flow_for_tool`], so a resumed tool flow runs on exactly
     /// the pack and engine configuration its first leg did.
     async fn load_flow_engine(&self) -> Result<(Arc<PackRuntime>, FlowEngine)> {
-        let pack = Arc::new(
-            PackRuntime::load(
-                &self.path,
-                Arc::clone(&self.config),
-                self.mocks.clone(),
-                self.archive_path.as_deref(),
-                self.session_store.clone(),
-                self.state_store.clone(),
-                Arc::clone(&self.wasi_policy),
-                self.secrets.clone(),
-                self.oauth_config.clone(),
-                false,
-                ComponentResolution::default(),
-            )
-            .await?,
-        );
+        let mut loaded = PackRuntime::load(
+            &self.path,
+            Arc::clone(&self.config),
+            self.mocks.clone(),
+            self.archive_path.as_deref(),
+            self.session_store.clone(),
+            self.state_store.clone(),
+            Arc::clone(&self.base_wasi_policy),
+            self.secrets.clone(),
+            self.oauth_config.clone(),
+            false,
+            ComponentResolution::default(),
+        )
+        .await?;
+        // A freshly loaded pack carries none of the producer-injected scope.
+        // Without these a nested `component.exec` would read the secret scope
+        // shared by every unit and see an empty runtime config.
+        loaded.set_unit_id(self.unit_id.clone());
+        loaded.set_runtime_config_non_secret(self.runtime_config_non_secret.clone());
+        loaded.set_runtime_refs(self.runtime_refs.clone());
+        let pack = Arc::new(loaded);
         let mut engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&self.config)).await?;
         // Read from `self` (the pack the host built its agent runtime over),
         // not from the freshly loaded `pack`, whose slot is empty.
@@ -2879,7 +3268,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
 
             let invoke_result = HostState::instantiate_component_result(
                 &mut linker,
@@ -2894,6 +3283,7 @@ impl PackRuntime {
             )?;
             HostState::convert_invoke_result(invoke_result)
         })
+        .await
     }
 
     /// Fold a provider instance's configured answers into its invocation
@@ -3062,7 +3452,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
 
             // Extension-provider worlds (greentic:extension-provider@0.2.0 /
             // @0.1.0) are introspection surfaces (list-channels,
@@ -3136,6 +3526,7 @@ impl PackRuntime {
             };
             deserialize_json_bytes(result)
         })
+        .await
     }
 
     /// Call the provider component's `identify-instance` export
@@ -3215,7 +3606,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
 
             let pre_instance = linker.instantiate_pre(component.as_ref())?;
             let pre = match InstanceIdentityPre::<ComponentState>::new(pre_instance) {
@@ -3233,6 +3624,7 @@ impl PackRuntime {
                 None => IdentifyOutcome::NoMatch,
             })
         })
+        .await
     }
 
     /// Call the provider component's `describe-identify-instance` export
@@ -3298,7 +3690,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
 
             let pre_instance = linker.instantiate_pre(component.as_ref())?;
             let pre = match InstanceIdentityDescribePre::<ComponentState>::new(pre_instance) {
@@ -3335,6 +3727,7 @@ impl PackRuntime {
                 }
             }
         })
+        .await
     }
 
     /// Cached wrapper around [`invoke_describe_identify_instance`]. The
@@ -3346,9 +3739,10 @@ impl PackRuntime {
     ///
     /// Returns `None` when the component does not export the describe
     /// world, when the probe returns no hint, or when the probe fails
-    /// (trap, timeout, instantiation error). Failures are warn-logged
-    /// and cached — the same trap is logged once per revision per
-    /// component, not per request.
+    /// (trap, timeout, instantiation error). Failures are warn-logged and
+    /// remembered only for a short backoff window (not cached permanently), so
+    /// a transient error is retried while a persistent trap is not re-run on
+    /// every request.
     ///
     /// [`invoke_describe_identify_instance`]:
     ///     PackRuntime::invoke_describe_identify_instance
@@ -3359,6 +3753,14 @@ impl PackRuntime {
         if let Some(cached) = self.identify_hint_cache.read().get(&binding.component_ref) {
             return cached.clone();
         }
+        let failed_at = self
+            .identify_hint_failures
+            .read()
+            .get(&binding.component_ref)
+            .copied();
+        if identify_failure_backoff_active(failed_at, std::time::Instant::now()) {
+            return None;
+        }
         let hint = match self.invoke_describe_identify_instance(binding).await {
             Ok(hint) => hint,
             Err(err) => {
@@ -3367,11 +3769,19 @@ impl PackRuntime {
                     component_ref = %binding.component_ref,
                     error = %err,
                     "describe-identify-instance probe failed; \
-                     falling back to unhinted wrapper for this component"
+                     falling back to unhinted wrapper for this component \
+                     (the probe is retried after a short backoff)"
                 );
-                None
+                // Do not cache the failure as a permanent `None`.
+                self.identify_hint_failures
+                    .write()
+                    .insert(binding.component_ref.clone(), std::time::Instant::now());
+                return None;
             }
         };
+        self.identify_hint_failures
+            .write()
+            .remove(&binding.component_ref);
         // Tolerate a concurrent populate — `insert` is idempotent on the
         // same (component_ref, hint) shape and the probe is pure w.r.t.
         // the component, so re-probing on a write-race yields identical
@@ -3522,7 +3932,7 @@ impl PackRuntime {
             .manifest
             .as_ref()
             .context("pack manifest required for provider resolution")?;
-        let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+        let env = crate::config::greentic_env_or_local();
         let registry = ProviderRegistry::new(
             manifest,
             self.state_store.clone(),
@@ -3573,6 +3983,12 @@ impl PackRuntime {
             .filter(|name| !name.is_empty())
     }
 
+    /// Archive this runtime was loaded from, when it came from one. The pack
+    /// watcher uses it to keep the cached copy of a runtime it retains alive.
+    pub fn archive_path(&self) -> Option<&Path> {
+        self.archive_path.as_deref()
+    }
+
     /// Read an asset file from the pack's assets directory.
     ///
     /// Accepts paths like `assets/cards/card-a.json` or `cards/card-a.json`
@@ -3582,16 +3998,13 @@ impl PackRuntime {
             .trim_start_matches("assets/")
             .trim_start_matches("/assets/");
         // Try assets tempdir first (extracted from archive).
-        if let Some(tempdir) = &self.assets_tempdir {
-            let full = tempdir.path().join("assets").join(normalized);
-            if full.exists() {
-                return std::fs::read(&full)
-                    .with_context(|| format!("read asset {}", full.display()));
-            }
+        if let Some(tempdir) = &self.assets_tempdir
+            && let Some(full) = confined_asset_path(&tempdir.path().join("assets"), normalized)?
+        {
+            return std::fs::read(&full).with_context(|| format!("read asset {}", full.display()));
         }
         // Try materialized directory.
-        let full = self.path.join("assets").join(normalized);
-        if full.exists() {
+        if let Some(full) = confined_asset_path(&self.path.join("assets"), normalized)? {
             return std::fs::read(&full).with_context(|| format!("read asset {}", full.display()));
         }
         bail!("asset not found: {}", asset_path)
@@ -3923,11 +4336,33 @@ impl PackRuntime {
     /// which is logged). Used for sidecar files (`agent-graph.json`) and bundled
     /// assets (`knowledge_corpus.json`, `assets/knowledge/*.txt`).
     pub fn read_pack_file(&self, name: &str) -> Option<Vec<u8>> {
+        self.read_pack_file_capped(name, MAX_ARCHIVE_ENTRY_READ_BYTES)
+    }
+
+    /// [`read_pack_file`](Self::read_pack_file) with a caller-chosen ceiling
+    /// (never above [`MAX_ARCHIVE_ENTRY_READ_BYTES`]). An entry larger than
+    /// `limit` yields `None` after at most `limit + 1` bytes were read, so a
+    /// caller with a budget never holds an over-budget entry in memory.
+    pub fn read_pack_file_capped(&self, name: &str, limit: u64) -> Option<Vec<u8>> {
+        let limit = limit.min(MAX_ARCHIVE_ENTRY_READ_BYTES);
         // Materialized pack directory (root holds manifest.cbor + sidecars/assets).
         if self.path.is_dir() {
-            let candidate = self.path.join(name);
-            if candidate.exists() {
-                match std::fs::read(&candidate) {
+            // `name` can come from pack-authored content (a corpus sidecar's
+            // asset paths), so it must not leave the pack directory.
+            let confined = match confined_asset_path(&self.path, name) {
+                Ok(found) => found,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "refusing to read {name} from pack directory"
+                    );
+                    return None;
+                }
+            };
+            if let Some(candidate) = confined {
+                match File::open(&candidate)
+                    .and_then(|mut file| read_to_end_bounded(&mut file, limit))
+                {
                     Ok(bytes) => return Some(bytes),
                     Err(error) => {
                         tracing::warn!(
@@ -3969,18 +4404,17 @@ impl PackRuntime {
             }
         };
         match archive.by_name(name) {
-            Ok(mut entry) => {
-                let mut bytes = Vec::new();
-                if let Err(error) = entry.read_to_end(&mut bytes) {
+            Ok(mut entry) => match read_to_end_bounded(&mut entry, limit) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
                     tracing::warn!(
                         path = %archive_path.display(),
                         error = %error,
                         "failed to extract {name} from pack archive"
                     );
-                    return None;
+                    None
                 }
-                Some(bytes)
-            }
+            },
             Err(zip::result::ZipError::FileNotFound) => None,
             Err(error) => {
                 tracing::warn!(
@@ -4017,7 +4451,7 @@ impl PackRuntime {
         let runtime_config_non_secret = self.runtime_config_non_secret.clone();
         let runtime_refs = self.runtime_refs.clone();
 
-        run_on_wasi_thread("component.describe", move || {
+        run_on_wasi_thread_blocking("component.describe", move || {
             let mut linker = Linker::new(&engine);
             register_all(&mut linker, allow_state_store)?;
             add_component_control_to_linker(&mut linker)?;
@@ -4039,7 +4473,7 @@ impl PackRuntime {
             )?
             .with_unit(unit_id.clone());
             let store_state = ComponentState::new(host_state, wasi_policy)?;
-            let mut store = wasmtime::Store::new(&engine, store_state);
+            let mut store = new_limited_store(&engine, store_state);
             let pre_instance = linker.instantiate_pre(&component)?;
             let pre = match component_api::v0_6_descriptor::ComponentV0V6V0Pre::new(pre_instance) {
                 Ok(pre) => pre,
@@ -4095,8 +4529,7 @@ impl PackRuntime {
                 .with_context(|| format!("failed to read pack {}", archive_path.display()))?;
             match archive.by_name(&rel) {
                 Ok(mut entry) => {
-                    let mut bytes = Vec::new();
-                    entry.read_to_end(&mut bytes)?;
+                    let bytes = read_to_end_bounded(&mut entry, MAX_ARCHIVE_ENTRY_READ_BYTES)?;
                     let value = serde_json::from_slice::<Value>(&bytes).with_context(|| {
                         format!("invalid schema JSON in {}:{}", archive_path.display(), rel)
                     })?;
@@ -4232,13 +4665,15 @@ impl PackRuntime {
             mocks: None,
             flows: Some(flows_cache),
             components: component_map,
-            http_client: Arc::clone(&HTTP_CLIENT),
+            http_client: shared_http_client()?,
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(RunnerWasiPolicy::new()),
+            base_wasi_policy: Arc::new(RunnerWasiPolicy::new()),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
+            identify_hint_failures: RwLock::new(HashMap::new()),
             secrets: crate::secrets::default_manager()?,
             oauth_config: None,
             cache,
@@ -4802,8 +5237,8 @@ fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     let mut file = archive
         .by_name(name)
         .with_context(|| format!("entry {name} missing from archive"))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    let buf = read_to_end_bounded(&mut file, MAX_ARCHIVE_ENTRY_READ_BYTES)
+        .with_context(|| format!("failed to read entry {name} from archive"))?;
     Ok(buf)
 }
 
@@ -5082,21 +5517,14 @@ fn find_pack_lock_roots(
     if is_dir {
         return vec![pack_path.to_path_buf()];
     }
-    let mut roots = Vec::new();
-    if let Some(archive_path) = archive_hint {
-        if let Some(parent) = archive_path.parent() {
-            roots.push(parent.to_path_buf());
-            if let Some(grandparent) = parent.parent() {
-                roots.push(grandparent.to_path_buf());
-            }
-        }
-    } else if let Some(parent) = pack_path.parent() {
-        roots.push(parent.to_path_buf());
-        if let Some(grandparent) = parent.parent() {
-            roots.push(grandparent.to_path_buf());
-        }
-    }
-    roots
+    // Only the archive's own directory: a `pack.lock` further up the tree
+    // belongs to whatever else happens to live there (another pack, a shared
+    // cache dir) and would silently replace this pack's component table.
+    let archive = archive_hint.unwrap_or(pack_path);
+    archive
+        .parent()
+        .map(|parent| vec![parent.to_path_buf()])
+        .unwrap_or_default()
 }
 
 fn normalize_sha256(digest: &str) -> Result<String> {
@@ -5261,11 +5689,16 @@ fn component_sources_table_from_pack_lock(
     Ok(table)
 }
 
-fn component_path_for_spec(root: &Path, spec: &ComponentSpec) -> PathBuf {
-    if let Some(path) = &spec.legacy_path {
-        return root.join(path);
-    }
-    root.join("components").join(format!("{}.wasm", spec.id))
+/// Where a materialized component lives under `root`, or `Ok(None)` when it is
+/// not there. The relative path comes from pack-authored content (a legacy
+/// manifest's `legacy_path`, or the component id), so it is confined to `root`
+/// the same way asset paths are: normal components only, symlinks resolved.
+fn component_path_for_spec(root: &Path, spec: &ComponentSpec) -> Result<Option<PathBuf>> {
+    let relative = match &spec.legacy_path {
+        Some(path) => path.clone(),
+        None => format!("components/{}.wasm", spec.id),
+    };
+    confined_asset_path(root, &relative)
 }
 
 fn normalize_digest(digest: &str) -> String {
@@ -5292,20 +5725,25 @@ fn compute_sha256_digest_for(bytes: &[u8]) -> String {
     format!("sha256:{}", to_hex(&hasher.finalize()))
 }
 
-fn build_artifact_key(cache: &CacheManager, digest: Option<&str>, bytes: &[u8]) -> ArtifactKey {
-    let wasm_digest = digest
-        .map(normalize_digest)
-        .unwrap_or_else(|| compute_sha256_digest_for(bytes));
-    ArtifactKey::new(cache.engine_profile_id().to_string(), wasm_digest)
+/// Cache key derived from the sha256 of the actual wasm bytes. A manifest- or
+/// lock-declared digest is deliberately not used here: it may not have been
+/// verified against `bytes`, and keying the compiled-artifact cache by an
+/// unverified claim would let one component's compiled code be served for
+/// another.
+fn build_artifact_key(cache: &CacheManager, bytes: &[u8]) -> ArtifactKey {
+    ArtifactKey::new(
+        cache.engine_profile_id().to_string(),
+        compute_sha256_digest_for(bytes),
+    )
 }
 
 async fn compile_component_with_cache(
     cache: &CacheManager,
     engine: &Engine,
-    digest: Option<&str>,
+    _declared_digest: Option<&str>,
     bytes: Vec<u8>,
 ) -> Result<Arc<Component>> {
-    let key = build_artifact_key(cache, digest, &bytes);
+    let key = build_artifact_key(cache, &bytes);
     cache.get_component(engine, &key, || Ok(bytes)).await
 }
 
@@ -5836,30 +6274,137 @@ fn locate_pack_assets(
     Ok((None, None))
 }
 
+/// Per-entry cap for extracted pack assets (decompressed).
+const MAX_ASSET_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+/// Total cap for all extracted pack assets (decompressed).
+const MAX_ASSETS_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap on the number of entries (files and directories) under `assets/` in one pack.
+const MAX_ASSET_ENTRIES: usize = 20_000;
+/// Cap for archive entries read fully into memory (manifests, schemas, ...).
+const MAX_ARCHIVE_ENTRY_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read at most `limit` bytes from `reader`; exceeding it is an error rather
+/// than silent truncation (guards against zip bombs).
+fn read_to_end_bounded<R: Read>(reader: R, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive entry exceeds the {limit} byte read limit"),
+        ));
+    }
+    Ok(buf)
+}
+
+/// Resolve `relative` under `root`, refusing anything that could leave it
+/// (`..`, absolute paths, symlinks pointing outside). `Ok(None)` when the file
+/// does not exist.
+fn confined_asset_path(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
+    use std::path::Component;
+    let mut clean = PathBuf::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            _ => bail!("invalid asset path: {relative}"),
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        bail!("invalid asset path: {relative}");
+    }
+    let candidate = root.join(&clean);
+    if !candidate.exists() {
+        return Ok(None);
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", root.display()))?;
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", candidate.display()))?;
+    if !canonical.starts_with(&canonical_root) {
+        bail!("asset path escapes the assets root: {relative}");
+    }
+    Ok(Some(canonical))
+}
+
 fn extract_assets_from_archive(path: &Path) -> Result<Option<(TempDir, PathBuf)>> {
+    extract_assets_with_entry_cap(path, MAX_ASSET_ENTRIES)
+}
+
+/// [`extract_assets_from_archive`] refusing a pack with more than `max_entries`
+/// entries under `assets/` (files and directories alike). The byte caps alone do
+/// not bound inode use: a million empty files cost no bytes.
+fn extract_assets_with_entry_cap(
+    path: &Path,
+    max_entries: usize,
+) -> Result<Option<(TempDir, PathBuf)>> {
     let file =
         File::open(path).with_context(|| format!("failed to open pack {}", path.display()))?;
     let mut archive =
         ZipArchive::new(file).with_context(|| format!("failed to read pack {}", path.display()))?;
     let temp = TempDir::new().context("failed to create temporary assets directory")?;
     let mut found = false;
+    let mut total_bytes = 0u64;
+    let mut asset_entries = 0usize;
     for idx in 0..archive.len() {
         let mut entry = archive.by_index(idx)?;
-        let name = entry.name();
-        if !name.starts_with("assets/") {
+        let raw_name = entry.name().to_string();
+        if !raw_name.starts_with("assets/") {
             continue;
         }
-        let dest = temp.path().join(name);
-        if name.ends_with('/') {
+        asset_entries += 1;
+        if asset_entries > max_entries {
+            bail!(
+                "pack {} has too many asset entries (limit {max_entries})",
+                path.display()
+            );
+        }
+        // `enclosed_name` rejects absolute paths and `..` escapes (zip-slip).
+        let Some(safe_name) = entry.enclosed_name() else {
+            bail!(
+                "pack {} contains an unsafe asset path `{raw_name}`",
+                path.display()
+            );
+        };
+        if entry.is_symlink() {
+            warn!(entry = %raw_name, "skipping symlink entry in pack assets");
+            continue;
+        }
+        let dest = temp.path().join(&safe_name);
+        if raw_name.ends_with('/') {
             std::fs::create_dir_all(&dest)?;
             found = true;
             continue;
+        }
+        if entry.size() > MAX_ASSET_ENTRY_BYTES {
+            bail!(
+                "asset `{raw_name}` in {} is too large ({} bytes, limit {MAX_ASSET_ENTRY_BYTES})",
+                path.display(),
+                entry.size()
+            );
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut outfile = std::fs::File::create(&dest)?;
-        std::io::copy(&mut entry, &mut outfile)?;
+        // Bound the real decompressed size, not just the declared one.
+        let mut limited = (&mut entry).take(MAX_ASSET_ENTRY_BYTES + 1);
+        let copied = std::io::copy(&mut limited, &mut outfile)?;
+        if copied > MAX_ASSET_ENTRY_BYTES {
+            bail!(
+                "asset `{raw_name}` in {} exceeds the size limit",
+                path.display()
+            );
+        }
+        total_bytes = total_bytes.saturating_add(copied);
+        if total_bytes > MAX_ASSETS_TOTAL_BYTES {
+            bail!(
+                "assets in {} exceed the total size limit ({MAX_ASSETS_TOTAL_BYTES} bytes)",
+                path.display()
+            );
+        }
         found = true;
     }
     if found {
@@ -5917,8 +6462,12 @@ async fn load_components_from_sources(
         let bytes = match &source.artifact {
             ComponentArtifactLocation::Inline { wasm_path } => {
                 if let Some(root) = materialized_root {
-                    let path = root.join(wasm_path);
-                    if path.exists() {
+                    // `wasm_path` is pack-authored: confine it to the pack root.
+                    let confined = confined_asset_path(root, wasm_path).with_context(|| {
+                        format!("inline component {} has an unusable path", spec.id)
+                    })?;
+                    let path = confined.clone().unwrap_or_else(|| root.join(wasm_path));
+                    if confined.is_some() {
                         std::fs::read(&path).with_context(|| {
                             format!(
                                 "failed to read inline component {} from {}",
@@ -6138,11 +6687,12 @@ async fn load_components_from_dir(
         if !missing.contains(&spec.id) {
             continue;
         }
-        let path = component_path_for_spec(root, spec);
-        if !path.exists() {
-            tracing::debug!(component = %spec.id, path = %path.display(), "materialized component missing; will try other sources");
+        let Some(path) = component_path_for_spec(root, spec)
+            .with_context(|| format!("component {} has an unusable path", spec.id))?
+        else {
+            tracing::debug!(component = %spec.id, root = %root.display(), "materialized component missing; will try other sources");
             continue;
-        }
+        };
         let bytes = std::fs::read(&path)
             .with_context(|| format!("failed to read component {}", path.display()))?;
         let component = compile_component_with_cache(cache, engine, None, bytes)
@@ -6342,13 +6892,15 @@ pub(crate) mod tests {
             mocks: None,
             flows: None,
             components: HashMap::new(),
-            http_client: Arc::clone(&HTTP_CLIENT),
+            http_client: shared_http_client().expect("http client"),
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
+            base_wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
+            identify_hint_failures: RwLock::new(HashMap::new()),
             secrets: crate::secrets::default_manager().expect("default secrets manager"),
             oauth_config: None,
             runtime_config_non_secret: None,
@@ -7034,5 +7586,271 @@ impl PackMetadata {
             entry_flows,
             secret_requirements: manifest.secret_requirements.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_hardening_tests {
+    use super::tests::pack_runtime_for_dir;
+    use super::*;
+    use std::io::Write;
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).expect("create zip");
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, body) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .expect("start file");
+            writer.write_all(body).expect("write entry");
+        }
+        writer.finish().expect("finish zip");
+    }
+
+    #[test]
+    fn extract_assets_rejects_zip_slip_entry() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("evil.gtpack");
+        write_zip(&archive, &[("assets/../../evil.txt", b"pwned")]);
+        let err =
+            extract_assets_from_archive(&archive).expect_err("zip-slip entry must be rejected");
+        assert!(err.to_string().contains("unsafe asset path"));
+        assert!(!dir.path().join("evil.txt").exists());
+    }
+
+    #[test]
+    fn extract_assets_caps_the_entry_count() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("many.gtpack");
+        let names: Vec<String> = (0..6).map(|i| format!("assets/f{i}.txt")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b""[..])).collect();
+        write_zip(&archive, &entries);
+        let err = extract_assets_with_entry_cap(&archive, 5)
+            .expect_err("more entries than the cap must be refused");
+        assert!(err.to_string().contains("too many asset entries"), "{err}");
+        assert!(extract_assets_with_entry_cap(&archive, 6).is_ok());
+        // Entries outside `assets/` do not count.
+        let other = dir.path().join("other.gtpack");
+        let mut entries: Vec<(&str, &[u8])> = vec![("assets/a.txt", &b"x"[..])];
+        let outside: Vec<String> = (0..10).map(|i| format!("flows/f{i}.ygtc")).collect();
+        entries.extend(outside.iter().map(|n| (n.as_str(), &b""[..])));
+        write_zip(&other, &entries);
+        assert!(extract_assets_with_entry_cap(&other, 1).is_ok());
+    }
+
+    #[test]
+    fn extract_assets_extracts_regular_entries() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("ok.gtpack");
+        write_zip(
+            &archive,
+            &[("assets/cards/a.json", b"{}"), ("other.txt", b"x")],
+        );
+        let (temp, assets) = extract_assets_from_archive(&archive)
+            .expect("extract")
+            .expect("assets present");
+        assert_eq!(
+            std::fs::read(assets.join("cards/a.json")).expect("read"),
+            b"{}"
+        );
+        drop(temp);
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_entries() {
+        let data = [7u8; 100];
+        assert_eq!(
+            read_to_end_bounded(&data[..], 100).expect("fits").len(),
+            100
+        );
+        assert!(read_to_end_bounded(&data[..], 99).is_err());
+    }
+
+    #[test]
+    fn confined_asset_path_blocks_traversal_and_symlink_escape() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("assets");
+        std::fs::create_dir_all(root.join("cards")).expect("mkdir");
+        std::fs::write(root.join("cards/a.json"), b"{}").expect("write");
+        std::fs::write(dir.path().join("secret.txt"), b"top-secret").expect("write secret");
+
+        assert!(
+            confined_asset_path(&root, "cards/a.json")
+                .expect("ok")
+                .is_some()
+        );
+        assert!(
+            confined_asset_path(&root, "cards/missing.json")
+                .expect("ok")
+                .is_none()
+        );
+        assert!(confined_asset_path(&root, "../secret.txt").is_err());
+        assert!(confined_asset_path(&root, "/etc/passwd").is_err());
+        assert!(confined_asset_path(&root, "cards/../../secret.txt").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("secret.txt"), root.join("link.txt"))
+                .expect("symlink");
+            assert!(confined_asset_path(&root, "link.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn pack_lock_is_searched_only_beside_the_archive() {
+        let archive = Path::new("/a/b/c.gtpack");
+        assert_eq!(
+            find_pack_lock_roots(archive, false, None),
+            vec![PathBuf::from("/a/b")]
+        );
+        assert_eq!(
+            find_pack_lock_roots(Path::new("/x/y.gtpack"), false, Some(archive)),
+            vec![PathBuf::from("/a/b")]
+        );
+    }
+
+    #[test]
+    fn a_corrupt_pack_lock_is_an_error_for_the_loader_to_skip() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(dir.path().join("pack.lock"), b"not json").expect("write");
+        assert!(load_pack_lock(dir.path()).is_err());
+    }
+
+    #[test]
+    fn component_paths_are_confined_to_the_pack_root() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("pack");
+        std::fs::create_dir_all(root.join("components")).expect("mkdir");
+        std::fs::write(root.join("components/ok.wasm"), b"\0asm").expect("write");
+        std::fs::write(dir.path().join("outside.wasm"), b"\0asm").expect("write");
+        let spec = |id: &str, legacy: Option<&str>| ComponentSpec {
+            id: id.to_string(),
+            version: "0.0.0".to_string(),
+            legacy_path: legacy.map(str::to_string),
+        };
+        assert!(
+            component_path_for_spec(&root, &spec("ok", None))
+                .expect("ok")
+                .is_some()
+        );
+        assert!(
+            component_path_for_spec(&root, &spec("gone", None))
+                .expect("ok")
+                .is_none()
+        );
+        assert!(component_path_for_spec(&root, &spec("x", Some("../outside.wasm"))).is_err());
+        let absolute = dir.path().join("outside.wasm").display().to_string();
+        assert!(component_path_for_spec(&root, &spec("x", Some(&absolute))).is_err());
+        assert!(component_path_for_spec(&root, &spec("../outside", None)).is_err());
+    }
+
+    #[test]
+    fn read_pack_file_is_confined_to_the_pack_directory() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("pack");
+        std::fs::create_dir_all(root.join("assets")).expect("mkdir");
+        std::fs::write(root.join("assets/ok.txt"), b"fine").expect("write");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"top-secret").expect("write secret");
+        let pack = pack_runtime_for_dir(&root);
+
+        assert_eq!(pack.read_pack_file("assets/ok.txt"), Some(b"fine".to_vec()));
+        assert_eq!(pack.read_pack_file("../secret.txt"), None);
+        assert_eq!(pack.read_pack_file("assets/../../secret.txt"), None);
+        assert_eq!(pack.read_pack_file(&secret.display().to_string()), None);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, root.join("assets/link.txt")).expect("symlink");
+            assert_eq!(pack.read_pack_file("assets/link.txt"), None);
+        }
+    }
+
+    #[test]
+    fn state_values_preserve_json_text_and_binary() {
+        assert_eq!(
+            state_value_from_bytes(b"{\"a\":1}"),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            state_value_from_bytes(b"plain text"),
+            Value::String("plain text".into())
+        );
+        let binary = vec![0xff, 0x00, 0xfe];
+        let stored = state_value_from_bytes(&binary);
+        assert_eq!(state_bytes_from_value(&stored).expect("decode"), binary);
+        assert_eq!(
+            state_bytes_from_value(&serde_json::json!({"a": 1})).expect("json"),
+            b"{\"a\":1}".to_vec()
+        );
+    }
+
+    #[test]
+    fn v06_input_falls_back_to_a_string_for_non_json() {
+        assert_eq!(parse_v06_input("{\"a\":1}"), serde_json::json!({"a": 1}));
+        assert_eq!(
+            parse_v06_input("hello there"),
+            Value::String("hello there".into())
+        );
+    }
+
+    #[test]
+    fn identify_failure_backoff_expires() {
+        let now = std::time::Instant::now();
+        assert!(!identify_failure_backoff_active(None, now));
+        assert!(identify_failure_backoff_active(Some(now), now));
+        let later = now + IDENTIFY_FAILURE_BACKOFF + Duration::from_secs(1);
+        assert!(!identify_failure_backoff_active(Some(now), later));
+    }
+
+    #[test]
+    fn artifact_key_is_derived_from_actual_bytes() {
+        let engine = Engine::default();
+        let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".into());
+        let cache = CacheManager::new(CacheConfig::default(), profile);
+        let key_a = build_artifact_key(&cache, b"one");
+        let key_b = build_artifact_key(&cache, b"two");
+        assert_ne!(key_a.wasm_digest, key_b.wasm_digest);
+        assert_eq!(key_a.wasm_digest, compute_sha256_digest_for(b"one"));
+    }
+
+    #[tokio::test]
+    async fn wasi_thread_reports_panics_as_errors_without_blocking() {
+        let err = run_on_wasi_thread::<_, ()>("test.panic", || panic!("boom"))
+            .await
+            .expect_err("panic is surfaced");
+        assert!(err.to_string().contains("boom"));
+        let ok = run_on_wasi_thread("test.ok", || Ok(41 + 1))
+            .await
+            .expect("ok");
+        assert_eq!(ok, 42);
+    }
+}
+
+#[cfg(test)]
+mod guest_http_timeout_tests {
+    use super::guest_timeout;
+    use std::time::Duration;
+
+    const CEILING: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn absent_or_zero_keeps_the_default() {
+        assert_eq!(guest_timeout(None, CEILING), None);
+        assert_eq!(guest_timeout(Some(0), CEILING), None);
+    }
+
+    #[test]
+    fn value_under_the_ceiling_is_honoured() {
+        assert_eq!(
+            guest_timeout(Some(5_000), CEILING),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn value_over_the_ceiling_is_clamped() {
+        assert_eq!(guest_timeout(Some(u32::MAX), CEILING), Some(CEILING));
+        assert_eq!(guest_timeout(Some(30_001), CEILING), Some(CEILING));
     }
 }

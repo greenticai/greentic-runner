@@ -114,16 +114,17 @@ fn engine_str(engine: Engine) -> &'static str {
 fn group_columns(rows: impl Iterator<Item = (String, String, String)>) -> Vec<Table> {
     let mut tables: Vec<Table> = Vec::new();
     for (table, column, type_) in rows {
-        if tables.last().map(|t| &t.name) != Some(&table) {
-            tables.push(Table {
-                name: table.clone(),
-                columns: Vec::new(),
-            });
-        }
-        tables.last_mut().unwrap().columns.push(Column {
+        let column = Column {
             name: column,
             type_,
-        });
+        };
+        match tables.last_mut() {
+            Some(current) if current.name == table => current.columns.push(column),
+            _ => tables.push(Table {
+                name: table,
+                columns: vec![column],
+            }),
+        }
     }
     tables
 }

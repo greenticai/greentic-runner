@@ -76,14 +76,16 @@ impl ConversationState {
     /// Truncate the oldest messages until the count of non-system messages is
     /// at or below `max_turns`.
     ///
-    /// System messages are always kept. The unit of removal is a GROUP: an
-    /// assistant turn carrying `tool_calls` goes together with the `Tool`
-    /// results that answer it (a provider refuses a `tool` message with no
-    /// preceding `tool_calls`, and an assistant `tool_calls` turn with no
-    /// answer), and a stray `Tool` is removed alone. The group holding the
-    /// parked flow tool's call is never removed, so the result stays
-    /// answerable; if only protected groups remain, truncation stops short of
-    /// `max_turns`.
+    /// System messages are always kept. The unit of removal is a whole TURN:
+    /// a `User` message together with everything up to the next `User`
+    /// (assistant replies, assistant `tool_calls` and the `Tool` results that
+    /// answer them). Removing a turn at a time keeps every `tool_calls` /
+    /// `Tool` pair together and leaves the history starting at a `User`
+    /// message, which providers require. The turn holding the parked flow
+    /// tool's call is never removed (its result must stay answerable), and
+    /// neither is the newest turn, so truncating mid-step cannot discard the
+    /// message being answered; if only protected turns remain, truncation
+    /// stops short of `max_turns`.
     pub fn truncate_history(&mut self, max_turns: u32) {
         let max = max_turns as usize;
         let pending_id = self.pending_tool.as_ref().map(|p| p.call_id.clone());
@@ -96,29 +98,40 @@ impl ConversationState {
             if non_system <= max {
                 return;
             }
-            let Some((start, end)) = self.oldest_removable_group(pending_id.as_deref()) else {
+            let Some((start, end)) = self.oldest_removable_turn(pending_id.as_deref()) else {
                 return;
             };
-            self.messages.drain(start..end);
+            // System messages inside the span (a mid-turn note, such as an
+            // attachment notice) outlive the turn they sit in: only the
+            // conversational messages are dropped.
+            let kept: Vec<ChatMessage> = self
+                .messages
+                .drain(start..end)
+                .filter(|m| matches!(m, ChatMessage::System { .. }))
+                .collect();
+            self.messages.splice(start..start, kept);
         }
     }
 
-    /// `[start, end)` of the oldest non-system group that does not hold
-    /// `protected_call_id`.
-    fn oldest_removable_group(&self, protected_call_id: Option<&str>) -> Option<(usize, usize)> {
+    /// `[start, end)` of the oldest non-system turn that is neither the newest
+    /// turn nor the one holding `protected_call_id`.
+    fn oldest_removable_turn(&self, protected_call_id: Option<&str>) -> Option<(usize, usize)> {
         let mut i = 0;
         while i < self.messages.len() {
             if matches!(self.messages[i], ChatMessage::System { .. }) {
                 i += 1;
                 continue;
             }
+            // A turn runs from its `User` message to the next `User`.
             let mut end = i + 1;
-            if matches!(&self.messages[i],
-                ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+            while end < self.messages.len()
+                && !matches!(self.messages[end], ChatMessage::User { .. })
             {
-                while matches!(self.messages.get(end), Some(ChatMessage::Tool { .. })) {
-                    end += 1;
-                }
+                end += 1;
+            }
+            if end >= self.messages.len() {
+                // The newest turn is never removed.
+                return None;
             }
             let holds_protected = protected_call_id.is_some_and(|id| {
                 self.messages[i..end].iter().any(|m| match m {
@@ -136,6 +149,125 @@ impl ConversationState {
         }
         None
     }
+}
+
+/// Largest serialised size of one tool result kept in the conversation
+/// history. A single unbounded result (a big MCP or HTTP response) would
+/// otherwise be re-sent on every later turn until it overflowed the model's
+/// context window and bricked the session.
+pub const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+
+/// Bound a tool result before it is stored in history. A result within
+/// [`MAX_TOOL_RESULT_BYTES`] is returned unchanged; a larger one is replaced
+/// by a small JSON object the model can read, carrying a prefix of the
+/// original text.
+pub fn cap_tool_result(result: serde_json::Value) -> serde_json::Value {
+    cap_tool_result_for(result, "")
+}
+
+/// [`cap_tool_result`] that names the tool in the warning it logs when it
+/// replaces a result with a preview. The model sees only the preview, so
+/// without a log line an operator debugging "the agent ignored my big
+/// response" has no trace of the cut.
+pub fn cap_tool_result_for(result: serde_json::Value, tool_name: &str) -> serde_json::Value {
+    let text = result.to_string();
+    if text.len() <= MAX_TOOL_RESULT_BYTES {
+        return result;
+    }
+    // A chatty tool would otherwise log at warn on every oversize call. Warn at
+    // most once per `OVERSIZE_WARN_INTERVAL_SECS` per process; the rest are debug.
+    let tool = log_safe_tool_name(tool_name);
+    if OVERSIZE_WARN.due(now_epoch_secs()) {
+        tracing::warn!(
+            tool = %tool,
+            original_bytes = text.len(),
+            limit_bytes = MAX_TOOL_RESULT_BYTES,
+            "tool result exceeds the history cap; the model receives a truncated preview \
+             (warned at most once a minute; further occurrences are logged at debug)"
+        );
+    } else {
+        tracing::debug!(
+            tool = %tool,
+            original_bytes = text.len(),
+            limit_bytes = MAX_TOOL_RESULT_BYTES,
+            "tool result exceeds the history cap; truncated"
+        );
+    }
+    let mut cut = MAX_TOOL_RESULT_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    serde_json::json!({
+        "truncated": true,
+        "original_bytes": text.len(),
+        "preview": &text[..cut],
+    })
+}
+
+/// Minimum spacing of the oversize-tool-result `warn` (per process).
+const OVERSIZE_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Process-wide limiter for the oversize warning. The limiter is a value (not
+/// bare statics + functions) so a test can own an instance instead of racing
+/// every other test that goes through [`cap_tool_result_for`].
+static OVERSIZE_WARN: WarnLimiter = WarnLimiter::new(OVERSIZE_WARN_INTERVAL_SECS);
+
+/// Lets one event through per `interval_secs`.
+struct WarnLimiter {
+    interval_secs: u64,
+    /// Epoch second of the last permitted event; `0` = never.
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl WarnLimiter {
+    const fn new(interval_secs: u64) -> Self {
+        Self {
+            interval_secs,
+            last: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Whether the event may be emitted at `now`; claims the slot when so.
+    fn due(&self, now: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.last.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < self.interval_secs {
+            return false;
+        }
+        self.last
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// A tool name (model- or pack-chosen) made safe for a log line: control and
+/// bidi characters become spaces, at most 128 characters.
+fn log_safe_tool_name(raw: &str) -> String {
+    raw.chars()
+        .take(128)
+        .map(|c| {
+            if c.is_control()
+                || matches!(
+                    c,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{FEFF}'
+                )
+            {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// How long a parked flow tool waits for the user before the next turn
@@ -329,6 +461,25 @@ pub trait SessionLockInner: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oversize_warning_is_rate_limited() {
+        // A private limiter: no shared static, so other tests that call
+        // `cap_tool_result_for` in parallel cannot disturb it.
+        let limiter = super::WarnLimiter::new(super::OVERSIZE_WARN_INTERVAL_SECS);
+        let base = 1_000_000;
+        assert!(limiter.due(base), "first is due");
+        assert!(!limiter.due(base + 1), "inside the interval");
+        assert!(!limiter.due(base + 59));
+        assert!(limiter.due(base + 60), "interval elapsed");
+    }
+
+    #[test]
+    fn tool_name_is_made_log_safe() {
+        assert_eq!(super::log_safe_tool_name("ext/tool"), "ext/tool");
+        assert_eq!(super::log_safe_tool_name("a\nb\u{202E}c"), "a b c");
+        assert_eq!(super::log_safe_tool_name(&"x".repeat(500)).len(), 128);
+    }
+
     use super::*;
 
     #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -584,6 +735,65 @@ mod tests {
         );
         assert!(pairing_is_valid(&s.messages), "{:?}", s.messages);
     }
+    #[test]
+    fn truncate_removes_whole_turns_and_starts_at_a_user_message() {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = vec![
+            user("a"),
+            asst_calls(&["c1"]),
+            tool("c1"),
+            asst_text("done a"),
+            user("b"),
+            asst_text("r"),
+        ];
+        // Dropping 2 messages would split turn one; the whole turn goes.
+        s.truncate_history(4);
+        assert!(matches!(s.messages.first(), Some(ChatMessage::User { .. })));
+        assert_eq!(s.messages.len(), 2, "{:?}", s.messages);
+        assert!(pairing_is_valid(&s.messages));
+    }
+
+    #[test]
+    fn truncate_keeps_system_messages_inside_a_removed_turn() {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = vec![
+            user("a"),
+            ChatMessage::System {
+                content: "note".into(),
+            },
+            asst_text("done a"),
+            user("b"),
+            asst_text("r"),
+        ];
+        s.truncate_history(2);
+        let systems = s
+            .messages
+            .iter()
+            .filter(|m| matches!(m, ChatMessage::System { .. }))
+            .count();
+        assert_eq!(systems, 1, "{:?}", s.messages);
+        let non_system = s.messages.len() - systems;
+        assert_eq!(non_system, 2, "{:?}", s.messages);
+    }
+
+    #[test]
+    fn truncate_never_removes_the_newest_turn() {
+        let mut s = ConversationState::empty(&TenantContext::new("a", "b"), "x");
+        s.messages = vec![user("q"), asst_calls(&["c1"]), tool("c1"), asst_text("r")];
+        s.truncate_history(1);
+        assert_eq!(s.messages.len(), 4);
+    }
+
+    #[test]
+    fn cap_tool_result_passes_small_and_bounds_large() {
+        let small = serde_json::json!({ "ok": true });
+        assert_eq!(cap_tool_result(small.clone()), small);
+        let big = serde_json::json!({ "blob": "é".repeat(MAX_TOOL_RESULT_BYTES) });
+        let capped = cap_tool_result(big);
+        assert_eq!(capped["truncated"], true);
+        assert!(capped.to_string().len() < MAX_TOOL_RESULT_BYTES + 200);
+    }
+
     #[test]
     #[allow(clippy::unwrap_used)]
     fn user_message_without_attachments_serializes_exactly_as_before() {

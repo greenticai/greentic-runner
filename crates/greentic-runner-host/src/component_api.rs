@@ -448,7 +448,7 @@ pub fn exec_ctx_v0_5_for(
     caller: Option<&crate::caller_identity::ComponentCaller>,
     provider_id: Option<&str>,
 ) -> v0_5::exports::greentic::component::node::ExecCtx {
-    let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+    let env = crate::config::greentic_env_or_local();
     let team_id = presented_team(ctx, caller);
     let user_id = presented_user(ctx, caller, provider_id);
     let deadline_ms = ctx
@@ -485,6 +485,7 @@ pub fn exec_ctx_v0_5_for(
     }
 }
 
+#[cfg(test)]
 pub fn envelope_v0_6(
     ctx: &node::ExecCtx,
     component_id: &str,
@@ -515,7 +516,7 @@ pub fn envelope_v0_6_for(
     component_id: &str,
     payload_json: &str,
 ) -> Result<v0_6::exports::greentic::component::node::InvocationEnvelope> {
-    let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+    let env = crate::config::greentic_env_or_local();
     let step_id = ctx
         .node_id
         .clone()

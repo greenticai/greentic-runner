@@ -42,10 +42,18 @@ pub fn render_template_value(
 
 fn render_template_string(raw: &str, ctx: &Value, options: TemplateOptions) -> Result<Value> {
     if options.allow_pointer && raw.starts_with('/') && !raw.contains("{{") {
-        return ctx
-            .pointer(raw)
-            .cloned()
-            .ok_or_else(|| anyhow!("mapping path `{raw}` not found"));
+        // A literal string that merely starts with `/` (a URL path, a route)
+        // is not an error: fall back to the literal when no such pointer exists
+        // AND its first segment is not a context root. A missing path under a
+        // known root (`/node/x/output/typo`) is a mistake, not a literal, and
+        // must fail rather than send that text on to a provider.
+        return match ctx.pointer(raw) {
+            Some(value) => Ok(value.clone()),
+            None if pointer_root_is_known(raw, ctx) => Err(anyhow!(
+                "template pointer `{raw}` not found in the render context"
+            )),
+            None => Ok(Value::String(raw.to_string())),
+        };
     }
 
     if let Some(expr) = extract_exact_expression(raw)
@@ -73,11 +81,35 @@ fn render_template_string(raw: &str, ctx: &Value, options: TemplateOptions) -> R
     Ok(Value::String(raw.to_string()))
 }
 
+/// Context roots a pointer may address even when the context does not carry
+/// them (flow templates and the provider `in_map`/`out_map` contexts).
+const KNOWN_POINTER_ROOTS: [&str; 10] = [
+    "entry", "in", "prev", "node", "state", "vars", "now", "input", "result", "response",
+];
+
+/// Is the first segment of JSON pointer `raw` a context root: a top-level key
+/// of `ctx`, or one of [`KNOWN_POINTER_ROOTS`]?
+fn pointer_root_is_known(raw: &str, ctx: &Value) -> bool {
+    let first = raw.trim_start_matches('/').split('/').next().unwrap_or("");
+    if first.is_empty() {
+        return false;
+    }
+    let first = first.replace("~1", "/").replace("~0", "~");
+    KNOWN_POINTER_ROOTS.contains(&first.as_str())
+        || ctx
+            .as_object()
+            .is_some_and(|map| map.contains_key(first.as_str()))
+}
+
 fn extract_exact_expression(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.starts_with("{{") && trimmed.ends_with("}}") {
         let inner = trimmed.trim_start_matches('{').trim_end_matches('}').trim();
-        if !inner.is_empty() {
+        // Only a SINGLE plain expression is an exact-path candidate. Anything
+        // with more mustaches (`{{a}} {{b}}`), a block/partial/comment sigil
+        // (`{{#if}}`, `{{> p}}`, `{{! c}}`) is left to Handlebars.
+        let is_sigil = inner.starts_with(['#', '/', '>', '!', '^', '&', '@']);
+        if !inner.is_empty() && !inner.contains("{{") && !inner.contains("}}") && !is_sigil {
             return Some(inner);
         }
     }
@@ -186,7 +218,9 @@ where
         chars.next();
     }
     let ident = buf.trim();
-    if ident.is_empty() {
+    // Whitespace inside an identifier means this is a helper call
+    // (`{{upper name}}`), not a path: let Handlebars evaluate it.
+    if ident.is_empty() || ident.contains(char::is_whitespace) {
         return None;
     }
     Some(ident.to_string())
@@ -212,6 +246,71 @@ fn resolve_path<'a>(root: &'a Value, path: &[PathSegment]) -> Option<&'a Value> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn multiple_expressions_fall_through_to_handlebars() {
+        let ctx = json!({ "a": "x", "b": "y" });
+        let rendered = render_template_value(
+            &Value::String("{{a}} {{b}}".to_string()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rendered, json!("x y"));
+    }
+
+    #[test]
+    fn blocks_and_helpers_are_not_treated_as_paths() {
+        let ctx = json!({ "flag": true, "name": "bob" });
+        let block = render_template_value(
+            &Value::String("{{#if flag}}yes{{else}}no{{/if}}".to_string()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(block, json!("yes"));
+        let helper = render_template_value(
+            &Value::String("{{lookup this \"name\"}}".to_string()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(helper, json!("bob"));
+    }
+
+    #[test]
+    fn pointer_mode_falls_back_to_the_literal_when_missing() {
+        let ctx = json!({ "a": { "b": 1 } });
+        let options = TemplateOptions {
+            allow_pointer: true,
+        };
+        let found =
+            render_template_value(&Value::String("/a/b".to_string()), &ctx, options).unwrap();
+        assert_eq!(found, json!(1));
+        let literal =
+            render_template_value(&Value::String("/api/v1/items".to_string()), &ctx, options)
+                .unwrap();
+        assert_eq!(literal, json!("/api/v1/items"));
+    }
+
+    #[test]
+    fn pointer_mode_errors_on_a_missing_path_under_a_known_root() {
+        let ctx = json!({ "node": { "x": { "output": { "ok": 1 } } }, "vars": {} });
+        let options = TemplateOptions {
+            allow_pointer: true,
+        };
+        for typo in ["/node/x/output/typo", "/vars/missing", "/entry/anything"] {
+            let result = render_template_value(&Value::String(typo.to_string()), &ctx, options);
+            assert!(result.is_err(), "`{typo}` must fail, not render literally");
+        }
+        let found = render_template_value(
+            &Value::String("/node/x/output/ok".to_string()),
+            &ctx,
+            options,
+        )
+        .unwrap();
+        assert_eq!(found, json!(1));
+    }
 
     #[test]
     fn renders_prev_and_node_outputs() {

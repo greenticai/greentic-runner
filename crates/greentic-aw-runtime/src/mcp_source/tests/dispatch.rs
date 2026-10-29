@@ -532,3 +532,27 @@ fn an_unusable_call_timeout_override_falls_back_to_the_default() {
         );
     }
 }
+
+/// A pack-supplied `transport_url` naming a cloud-metadata address must be
+/// refused before any connection is made (outbound guard), while a loopback
+/// server (every wiremock test above) keeps working.
+#[tokio::test]
+async fn dispatch_refuses_a_metadata_transport_url() {
+    let route = McpRoute::from_parts(
+        "s1",
+        "http://169.254.169.254/latest/meta-data",
+        None,
+        None,
+        "http",
+        None,
+        None,
+        None,
+    );
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let out = dispatch_route(&route, "{}", &scope).await;
+    assert!(
+        out.to_string().contains("blocked by outbound http policy"),
+        "metadata destination must be refused; got: {out}"
+    );
+}

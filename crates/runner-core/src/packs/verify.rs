@@ -43,6 +43,20 @@ impl PackVerifier {
     }
 }
 
+/// Parse a (possibly multi-key) `PACK_PUBLIC_KEY` value into verifiers.
+///
+/// Keys are separated by commas, semicolons or whitespace, which allows
+/// key rotation (old + new key configured at the same time).
+pub fn parse_verifiers(value: &str) -> Result<Vec<PackVerifier>> {
+    let verifiers = value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(PackVerifier::from_env_value)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(verifiers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,6 +72,22 @@ mod tests {
         let signature = secret.sign(message);
         let signature_b64 = STANDARD.encode(signature.to_bytes());
         verifier.verify(message, &signature_b64).unwrap();
+    }
+
+    #[test]
+    fn parse_verifiers_accepts_multiple_keys_for_rotation() {
+        let old = SigningKey::from_bytes(&[3u8; 32]);
+        let new = SigningKey::from_bytes(&[4u8; 32]);
+        let value = format!(
+            "ed25519:{}, ed25519:{}",
+            STANDARD.encode(old.verifying_key().as_bytes()),
+            STANDARD.encode(new.verifying_key().as_bytes())
+        );
+        let verifiers = parse_verifiers(&value).unwrap();
+        assert_eq!(verifiers.len(), 2);
+        let sig = STANDARD.encode(new.sign(b"msg").to_bytes());
+        assert!(verifiers[0].verify(b"msg", &sig).is_err());
+        assert!(verifiers[1].verify(b"msg", &sig).is_ok());
     }
 
     #[test]

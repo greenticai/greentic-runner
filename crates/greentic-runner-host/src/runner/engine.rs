@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::error::Error as StdError;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -444,6 +443,84 @@ enum NodeKind {
     MediaCreate,
 }
 
+impl NodeKind {
+    /// Whether a SUCCESSFUL run of this node may already have changed something
+    /// outside the turn (a dispatched request, a tool call, an uploaded file, a
+    /// nested flow's own effects), so re-running the turn from the start would
+    /// repeat it.
+    ///
+    /// Deliberately NOT included:
+    /// - `emit.*`: it only appends to the turn's egress, which is dropped when
+    ///   the turn fails, so a re-run re-appends into a fresh state;
+    /// - `var.set`, `state.get`, `session.wait`, `flow.goto`: no external write
+    ///   or idempotent;
+    /// - `state.set`: a plain overwrite is idempotent (a read-modify-write
+    ///   counter is not; that gap is documented in CLAUDE.md);
+    /// - generic component nodes (`Exec` / `PackComponent`): opaque to the host,
+    ///   so the host cannot tell a pure formatter from an HTTP writer. Treating
+    ///   them all as effectful would turn the whole-turn retry into a no-op for
+    ///   almost every flow. Known limitation, documented in CLAUDE.md.
+    ///
+    /// Over-conservative cases, accepted: a `flow.call` to a pure sub-flow and a
+    /// read-only `dw.agent` count as effectful on SUCCESS, because the host
+    /// cannot cheaply tell (the nested run's own flag is not surfaced, and an
+    /// agent's tools are chosen by the model at run time). The cost is that a
+    /// later transient failure in that turn is not re-run.
+    fn performs_external_effect(&self) -> bool {
+        matches!(
+            self,
+            NodeKind::ProviderInvoke
+                | NodeKind::FlowCall
+                | NodeKind::DwAgent { .. }
+                | NodeKind::DwAgentGraph { .. }
+                | NodeKind::SorlaCall { .. }
+                | NodeKind::OperalaCall { .. }
+                | NodeKind::AgenticCall { .. }
+                | NodeKind::TelcoXCall { .. }
+                | NodeKind::ApprovalCall { .. }
+                | NodeKind::Mcp { .. }
+                | NodeKind::A2a { .. }
+                | NodeKind::MediaCreate
+        )
+    }
+
+    /// Whether a FAILED run of this node may already have changed something
+    /// outside the turn. Same set as [`Self::performs_external_effect`] except
+    /// `flow.call`, whose nested `drive_flow` classifies its own failure.
+    ///
+    /// This is only the default: a failure marked [`pre_effect`] (proven to
+    /// precede every effect of the node) does not count, see the failure site in
+    /// `drive_flow_tracked`.
+    fn may_have_partial_effect_on_failure(&self) -> bool {
+        !matches!(self, NodeKind::FlowCall) && self.performs_external_effect()
+    }
+}
+
+/// Make a failure terminal when an earlier node of the turn already performed
+/// an external effect: re-running the turn would repeat it (a second SoR write,
+/// a second approval request, a second upload). Failures before any effect keep
+/// their classification, so a transient failure there still retries.
+///
+/// The rebuilt error's `Display` is only the OUTERMOST message
+/// (`err.to_string()`), the same text the error had before, because that string
+/// reaches the user-facing failure envelope (`metadata.error_message`) and a
+/// cause chain can name a host or URL. The original causes are kept as its
+/// `source()`, so `{err:#}` and `anyhow_chain_text` (operator log, redacted run
+/// error) still see the root cause.
+fn terminal_after_effects(err: anyhow::Error, effects_performed: bool) -> anyhow::Error {
+    if !effects_performed || is_after_effects_failure(&err) {
+        return err;
+    }
+    tracing::warn!(
+        error = %format!("{err:#}"),
+        "flow failed after an earlier node performed an external effect; the turn is not re-run"
+    );
+    // An error that is ALREADY terminal (a step budget, an unknown node) is
+    // rebuilt too: it still has to carry the "effects ran" marker, which a
+    // resume reads to decide whether the park may be cleared.
+    terminal_flow_error_from_after_effects(err)
+}
+
 #[derive(Clone, Debug)]
 enum EmitKind {
     Log,
@@ -594,6 +671,30 @@ fn user_facing_flow_failure_text(entry: &Value) -> String {
     user_facing_flow_failure_text_for(&locale)
 }
 
+/// The metadata-only envelope a session flow's terminal failure is rendered as
+/// (see `USER_FACING_FLOW_FAILURE_KEY`), shared by a fresh run and by a resumed
+/// run that failed after an effect so both answer the user identically.
+fn surfaced_failure_execution(
+    input: &Value,
+    flow_id: &str,
+    err: &anyhow::Error,
+    node_outputs: JsonMap<String, Value>,
+) -> FlowExecution {
+    FlowExecution::completed(
+        json!({
+            "text": user_facing_flow_failure_text(input),
+            // Generic, user-safe, and REQUIRED for the failure to reach
+            // anyone. See `USER_FACING_FLOW_FAILURE_KEY`.
+            "metadata": {
+                "error_kind": "flow_execution_failed",
+                "error_message": err.to_string(),
+                "flow_id": flow_id,
+            }
+        }),
+        node_outputs,
+    )
+}
+
 impl FlowEngine {
     pub async fn new(packs: Vec<Arc<PackRuntime>>, config: Arc<HostConfig>) -> Result<Self> {
         let mut flow_sources: HashMap<FlowKey, usize> = HashMap::new();
@@ -719,7 +820,7 @@ impl FlowEngine {
             flow_sources,
             messaging_provider_pack_ids,
             flow_cache: RwLock::new(flow_map),
-            default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
+            default_env: crate::config::greentic_env_or_local(),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
             approval_dispatch_handler: None,
@@ -876,6 +977,7 @@ impl FlowEngine {
     /// dispatch or fail outright with `sorla_route_missing`.
     ///
     /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    #[cfg(feature = "agentic-worker")]
     fn remote_dispatch_configured(&self) -> bool {
         self.remote_dispatch_handler.is_some()
     }
@@ -954,7 +1056,11 @@ impl FlowEngine {
         let pack_idx = *self
             .flow_sources
             .get(&key)
-            .with_context(|| format!("flow {pack_id}:{flow_id} not registered"))?;
+            // Deterministic: re-running cannot register the flow. (A
+            // `load_flow` I/O failure below stays retryable.)
+            .ok_or_else(|| {
+                terminal_flow_error(format!("flow {pack_id}:{flow_id} not registered"))
+            })?;
         let pack = Arc::clone(&self.packs[pack_idx]);
         let flow_id_owned = flow_id.to_string();
         let task_flow_id = flow_id_owned.clone();
@@ -1015,6 +1121,18 @@ impl FlowEngine {
         self.execute_with_entry(ctx, input, None).await
     }
 
+    /// [`Self::execute`] without the user-facing failure envelope: a terminal
+    /// error is returned as `Err` even for a session flow. Used by nested
+    /// executions (`flow.call`) whose caller must SEE the failure rather than
+    /// receive a "something went wrong" card as if the sub-flow had succeeded.
+    async fn execute_propagating_failure(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+    ) -> Result<FlowExecution> {
+        self.execute_with_options(ctx, input, None, false).await
+    }
+
     /// Execute a flow whose cursor starts at `entry_node` instead of the flow's
     /// declared entrypoint.
     ///
@@ -1047,6 +1165,20 @@ impl FlowEngine {
         input: Value,
         entry_node: Option<String>,
     ) -> Result<FlowExecution> {
+        self.execute_with_options(ctx, input, entry_node, true)
+            .await
+    }
+
+    /// `surface_failures`: convert a terminal error of a session flow into a
+    /// metadata-only completed envelope (top-level behaviour) instead of
+    /// returning it.
+    async fn execute_with_options(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+        entry_node: Option<String>,
+        surface_failures: bool,
+    ) -> Result<FlowExecution> {
         // Validate the caller's entry node BEFORE the retry loop below, whose
         // session-flow arm converts a terminal error into an Ok envelope. A
         // node id the flow does not have is a caller/pack defect, not a
@@ -1057,7 +1189,10 @@ impl FlowEngine {
             let node_id = NodeId::from_str(node)
                 .with_context(|| format!("invalid entry node id `{node}`"))?;
             if !flow_ir.nodes.contains_key(&node_id) {
-                bail!("flow {} has no node `{}`", ctx.flow_id, node);
+                return Err(terminal_flow_error(format!(
+                    "flow {} has no node `{}`",
+                    ctx.flow_id, node
+                )));
             }
         }
         let span = self.flow_execute_span(&ctx);
@@ -1068,6 +1203,10 @@ impl FlowEngine {
         let metric_flow_id = ctx.flow_id.to_string();
         let started = std::time::Instant::now();
         let observer = ctx.observer;
+        // Set when a session flow's terminal failure was rendered as a
+        // completed envelope: metrics must still report it as a failure.
+        let mut surfaced_failure = false;
+        let surfaced_ref = &mut surfaced_failure;
         let result = async move {
             let mut attempt = 0u32;
             loop {
@@ -1084,8 +1223,7 @@ impl FlowEngine {
                         node_id: ctx.node_id,
                         attempt: ctx.attempt,
                     };
-                    maybe_fail(FaultPoint::Timeout, fault_ctx)
-                        .map_err(|err| anyhow!(err.to_string()))?;
+                    maybe_fail(FaultPoint::Timeout, fault_ctx).map_err(injected_error)?;
                 }
                 match self
                     .execute_once(&ctx, original_input.clone(), entry_node.clone())
@@ -1101,19 +1239,12 @@ impl FlowEngine {
                             // error as a metadata-only Ok envelope so the
                             // messaging provider renders it instead of leaking
                             // raw engine text to the chat.
-                            if ctx.session_id.is_some() {
-                                return Ok(FlowExecution::completed(
-                                    json!({
-                                        "text": user_facing_flow_failure_text(&original_input),
-                                        // Generic, user-safe, and REQUIRED for the
-                                        // failure to reach anyone. See
-                                        // `USER_FACING_FLOW_FAILURE_KEY`.
-                                        "metadata": {
-                                            "error_kind": "flow_execution_failed",
-                                            "error_message": err.to_string(),
-                                            "flow_id": ctx.flow_id,
-                                        }
-                                    }),
+                            if surface_failures && ctx.session_id.is_some() {
+                                *surfaced_ref = true;
+                                return Ok(surfaced_failure_execution(
+                                    &original_input,
+                                    ctx.flow_id,
+                                    &err,
                                     node_outputs,
                                 ));
                             }
@@ -1139,7 +1270,11 @@ impl FlowEngine {
         if let Some(observer) = observer {
             observer.on_flow_exit(&metric_flow_id);
         }
-        let status = if result.is_ok() { "ok" } else { "err" };
+        let status = if result.is_ok() && !surfaced_failure {
+            "ok"
+        } else {
+            "err"
+        };
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         crate::metrics::record_flow_execution(&metric_tenant, &metric_flow_id, status, duration_ms);
         result
@@ -1151,12 +1286,38 @@ impl FlowEngine {
         snapshot: FlowSnapshot,
         input: Value,
     ) -> Result<FlowExecution> {
+        self.resume_with_options(ctx, snapshot, input, false).await
+    }
+
+    /// [`Self::resume`] for the top-level turn path. A resumed run whose failure
+    /// FOLLOWED an external effect of that same run (`is_after_effects_failure`)
+    /// is rendered as the same metadata-only envelope a fresh run gets, as an
+    /// `Ok` completed execution, so the caller clears the park exactly as it
+    /// does for any completed turn; returning `Err` would leave the snapshot in
+    /// place and the next message would resume it and repeat the effect. Every
+    /// other failure (deterministic pre-effect, transient pre-effect) is still
+    /// an `Err` and the park is kept, so a transient one can be retried.
+    pub async fn resume_surfacing_failures(
+        &self,
+        ctx: FlowContext<'_>,
+        snapshot: FlowSnapshot,
+        input: Value,
+    ) -> Result<FlowExecution> {
+        self.resume_with_options(ctx, snapshot, input, true).await
+    }
+
+    async fn resume_with_options(
+        &self,
+        ctx: FlowContext<'_>,
+        snapshot: FlowSnapshot,
+        input: Value,
+        surface_after_effects: bool,
+    ) -> Result<FlowExecution> {
         if snapshot.pack_id != ctx.pack_id {
-            bail!(
+            return Err(terminal_flow_error(format!(
                 "snapshot pack {} does not match requested {}",
-                snapshot.pack_id,
-                ctx.pack_id
-            );
+                snapshot.pack_id, ctx.pack_id
+            )));
         }
         let resume_flow = snapshot
             .next_flow
@@ -1169,6 +1330,10 @@ impl FlowEngine {
         let resumed_at = resumed_card_node(&snapshot);
         let mut state = snapshot.state;
         state.resumed_at = resumed_at;
+        // `redirect_limit` guards a loop inside ONE inbound turn. A new inbound
+        // message is a new turn, so gotos from earlier parked turns must not
+        // count against it (the 4th goto across turns used to fail).
+        state.reset_redirect_count();
         // Replace BOTH `input` AND `entry` with the new activity. The
         // routing context (built by `build_routing_context`) reads
         // `entry.input.metadata.*` for the synthesised `response.*` fields
@@ -1179,16 +1344,38 @@ impl FlowEngine {
         // to refresh `entry` ourselves; `ensure_entry` is a no-op once
         // entry is non-null.
         state.replace_input(input.clone());
+        let surfaced_input = surface_after_effects.then(|| input.clone());
         // Park the submitted fields for the node that was awaiting them. Only a
         // snapshot flagged `awaiting_submit` names the waiting node in
         // `next_node`; `session.wait` names its SUCCESSOR, which has not run.
         state.pending_card_answers = pending_card_answers;
         state.entry = input;
         let span = self.flow_execute_span(&ctx);
-        self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
+        let result = self
+            .drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
             .instrument(span)
-            .await
-            .map_err(|failure| failure.error)
+            .await;
+        match result {
+            Ok(execution) => Ok(execution),
+            Err(failure) => match surfaced_input {
+                Some(input)
+                    if ctx.session_id.is_some() && is_after_effects_failure(&failure.error) =>
+                {
+                    tracing::warn!(
+                        error = %format!("{:#}", failure.error),
+                        flow_id = ctx.flow_id,
+                        "resumed flow failed after an effect; surfacing the failure and clearing the park"
+                    );
+                    Ok(surfaced_failure_execution(
+                        &input,
+                        ctx.flow_id,
+                        &failure.error,
+                        failure.node_outputs,
+                    ))
+                }
+                _ => Err(failure.error),
+            },
+        }
     }
 
     async fn execute_once(
@@ -1212,19 +1399,48 @@ impl FlowEngine {
                 "required flow variable not provided",
                 "en",
             );
-            return Err(anyhow!("{label}: {}", missing.join(", ")).into());
+            return Err(terminal_flow_error(format!("{label}: {}", missing.join(", "))).into());
         }
         self.drive_flow(ctx, flow_ir, state, entry_node, ctx.flow_id.to_string())
             .await
     }
 
+    /// Drive the flow, making any failure terminal once a node of THIS run has
+    /// performed an external effect (see [`terminal_after_effects`]). Both retry
+    /// layers (the engine's own and the state machine's whole-turn retry) read
+    /// that classification, so neither re-runs the effects.
     async fn drive_flow(
+        &self,
+        ctx: &FlowContext<'_>,
+        flow_ir: HostFlow,
+        state: ExecutionState,
+        resume_from: Option<String>,
+        current_flow_id: String,
+    ) -> Result<FlowExecution, FlowFailure> {
+        let mut effects_performed = false;
+        self.drive_flow_tracked(
+            ctx,
+            flow_ir,
+            state,
+            resume_from,
+            current_flow_id,
+            &mut effects_performed,
+        )
+        .await
+        .map_err(|failure| FlowFailure {
+            error: terminal_after_effects(failure.error, effects_performed),
+            node_outputs: failure.node_outputs,
+        })
+    }
+
+    async fn drive_flow_tracked(
         &self,
         ctx: &FlowContext<'_>,
         mut flow_ir: HostFlow,
         mut state: ExecutionState,
         resume_from: Option<String>,
         mut current_flow_id: String,
+        effects_performed: &mut bool,
     ) -> Result<FlowExecution, FlowFailure> {
         let mut current = match resume_from {
             Some(node) => NodeId::from_str(&node)
@@ -1233,10 +1449,15 @@ impl FlowEngine {
                 .start
                 .clone()
                 .or_else(|| flow_ir.nodes.keys().next().cloned())
-                .with_context(|| format!("flow {} has no start node", flow_ir.id))?,
+                .ok_or_else(|| {
+                    terminal_flow_error(format!("flow {} has no start node", flow_ir.id))
+                })?,
         };
 
+        let mut steps_run: usize = 0;
         loop {
+            steps_run += 1;
+            check_step_budget(steps_run, flow_ir.id.as_str())?;
             let step_ctx = FlowContext {
                 tenant: ctx.tenant,
                 pack_id: ctx.pack_id,
@@ -1275,8 +1496,7 @@ impl FlowEngine {
                     node_id: Some(current.as_str()),
                     attempt: ctx.attempt,
                 };
-                maybe_fail(FaultPoint::TemplateRender, fault_ctx)
-                    .map_err(|err| anyhow!(err.to_string()))?;
+                maybe_fail(FaultPoint::TemplateRender, fault_ctx).map_err(injected_error)?;
             }
             let mut payload =
                 render_template_value(&payload_template, &ctx_value, TemplateOptions::default())
@@ -1329,6 +1549,24 @@ impl FlowEngine {
                     // failures, then convert to a metadata-only Ok envelope at
                     // the top level once retries are exhausted (session flows).
                     // The envelope keeps what the earlier nodes produced.
+                    //
+                    // An effectful node that fails may already have done part
+                    // of its work (a published request, a tool call that ran
+                    // before the next one failed), so a TRANSIENT failure here
+                    // must not re-run the turn either. `FlowCall` is exempt: the
+                    // nested `drive_flow` tracks its own effects and has already
+                    // made the failure terminal when it had any. Errors that are
+                    // not retryable anyway (validation, config) are unaffected.
+                    //
+                    // A failure PROVEN to precede every effect (marked with
+                    // `pre_effect`: no handler configured, a payload that did not
+                    // validate, a request that was never published) leaves the
+                    // flag alone, so a transient one of those still retries. The
+                    // default stays conservative: an unmarked error sets it.
+                    if node.kind.may_have_partial_effect_on_failure() && !is_pre_effect_error(&err)
+                    {
+                        *effects_performed = true;
+                    }
                     return Err(FlowFailure {
                         error: err,
                         node_outputs: state.outputs_map(),
@@ -1336,10 +1574,13 @@ impl FlowEngine {
                 }
             };
 
+            if node.kind.performs_external_effect() {
+                *effects_performed = true;
+            }
             let owned_the_submit =
                 attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.note_created_artifacts(std::mem::take(&mut output.created));
-            state.nodes.insert(node_id.clone().into(), output.clone());
+            state.record_node_output(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
             // context where `prev` is this node's own output payload (already
@@ -1372,10 +1613,12 @@ impl FlowEngine {
                     let decision = match &node.routing {
                         Routing::Next { node_id } => NextDecision::Next(node_id.clone()),
                         Routing::End | Routing::Reply => NextDecision::End,
-                        Routing::Branch { default, .. } => match default {
-                            Some(target) => NextDecision::Next(target.clone()),
-                            None => NextDecision::End,
-                        },
+                        Routing::Branch { on_status, default } => {
+                            match branch_target(on_status, default.as_ref(), &output) {
+                                Some(target) => NextDecision::Next(target),
+                                None => NextDecision::End,
+                            }
+                        }
                         Routing::Custom(raw) => {
                             match evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
                             {
@@ -1404,10 +1647,10 @@ impl FlowEngine {
                         NextDecision::Next(n) => current = n,
                         NextDecision::End => {
                             let node_outputs = state.outputs_map();
-                            let nodes_snapshot = state.nodes.clone();
+                            let failure = state.first_unhandled_failure(&flow_ir);
                             let final_output = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::completed(
-                                lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
+                                lift_node_error(final_output, failure.as_ref()),
                                 node_outputs,
                             ));
                         }
@@ -1447,7 +1690,9 @@ impl FlowEngine {
                     let next: Option<NodeId> = match &node.routing {
                         Routing::Next { node_id } => Some(node_id.clone()),
                         Routing::End | Routing::Reply => None,
-                        Routing::Branch { default, .. } => default.clone(),
+                        Routing::Branch { on_status, default } => {
+                            branch_target(on_status, default.as_ref(), &output)
+                        }
                         Routing::Custom(raw) => {
                             match evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
                             {
@@ -1574,10 +1819,10 @@ impl FlowEngine {
                     });
                     state.push_egress(response);
                     let node_outputs = state.outputs_map();
-                    let nodes_snapshot = state.nodes.clone();
+                    let failure = state.first_unhandled_failure(&flow_ir);
                     let final_output = state.finalize_with(None);
                     return Ok(FlowExecution::completed(
-                        lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
+                        lift_node_error(final_output, failure.as_ref()),
                         node_outputs,
                     ));
                 }
@@ -1722,19 +1967,20 @@ impl FlowEngine {
                                     // fresh-dispatch branch below), but this also
                                     // handles a `{ok:false}` envelope from any other
                                     // source (e.g. a flow-authored deadline) the same way.
-                                    let message = state
-                                        .entry
-                                        .get("error")
-                                        .and_then(|e| e.get("message"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("the agent could not respond");
+                                    let (_reply, payload) =
+                                        agent_error_envelope_reply(&state.entry);
+                                    // Log the MACHINE error (code + message), not the
+                                    // localized user-safe reply, so operators keep
+                                    // their diagnostics.
+                                    let (error_code, error_message) =
+                                        agent_error_log_fields(&state.entry);
                                     tracing::warn!(
                                         agent_id = %agent_id,
-                                        error = %message,
+                                        error_code = %error_code,
+                                        error = %error_message,
                                         "conversational dw.agent (nats) response was an error/timeout envelope; surfacing and re-parking without bumping the park-loop cap"
                                     );
-                                    let output =
-                                        NodeOutput::new(serde_json::json!({ "reply": message }));
+                                    let output = NodeOutput::new(payload);
                                     Ok(DispatchOutcome::with_control(
                                         output,
                                         NodeControl::LoopHere {
@@ -2002,13 +2248,15 @@ impl FlowEngine {
         let handler = self
             .agent_node_handler
             .as_ref()
-            .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")?;
+            .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")
+            .map_err(pre_effect)?;
         // Inside a `flow:` tool the flow context has no session; the nested
         // agent then runs under the session the tool call derived
         // (`nested_flow`), never `""` (one conversation shared by every user
         // of the tenant) and never the caller's (whose lock it holds).
         let session_owned = crate::runner::nested_flow::agent_session_for(ctx.session_id)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::msg)
+            .map_err(pre_effect)?;
         let session_id = session_owned.as_str();
         let started = std::time::Instant::now();
         let mut result = handler
@@ -2487,7 +2735,7 @@ impl FlowEngine {
         let payload_agent = crate::runner::a2a_node::agent_from_payload(&payload);
         let agent_id = payload_agent.as_deref().unwrap_or(agent_id);
 
-        let pack = self.pack_for_flow(ctx)?;
+        let pack = self.pack_for_flow(ctx).map_err(pre_effect)?;
         let pack_id = pack.metadata().pack_id.to_string();
 
         // `message` must be configured. Refused as a value rather than as a
@@ -2626,9 +2874,12 @@ impl FlowEngine {
         resume_at_self: bool,
         decision_token: Option<String>,
     ) -> Result<DispatchOutcome> {
-        let handler = self.dispatch_handler_for(runtime).with_context(|| {
-            format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
-        })?;
+        let handler = self
+            .dispatch_handler_for(runtime)
+            .with_context(|| {
+                format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
+            })
+            .map_err(pre_effect)?;
 
         let await_mode = payload
             .get("await")
@@ -2652,7 +2903,10 @@ impl FlowEngine {
         // robust whether `ctx.session_id` is already bare (the production case)
         // or has accreted a marker.
         let raw_hint = ctx.session_id.unwrap_or_default();
-        let bare_hint = raw_hint.split("::").next().unwrap_or_default();
+        // Strip only the trailing dispatch markers: the hint itself may contain
+        // `::` (e.g. the `ep=<eid>::` endpoint prefix) and must survive intact.
+        let bare_hint =
+            crate::runner::runtime_session_resumer::parse_correlation(raw_hint).bare_hint;
         // The store key (`FlowResumeStore::save`) hashes the inbound reply
         // scope's `conversation`/`thread`/`reply_to`. The bare canonical hint
         // only encodes `conversation`, so a wait saved against a non-empty
@@ -2665,14 +2919,7 @@ impl FlowEngine {
         let mut correlation_id =
             format!("{}::pack={}::flow={}", bare_hint, ctx.pack_id, ctx.flow_id);
         if let Some(scope) = ctx.reply_scope {
-            if let Some(thread) = scope.thread.as_deref().filter(|value| !value.is_empty()) {
-                correlation_id.push_str("::thread=");
-                correlation_id.push_str(thread);
-            }
-            if let Some(reply_to) = scope.reply_to.as_deref().filter(|value| !value.is_empty()) {
-                correlation_id.push_str("::reply=");
-                correlation_id.push_str(reply_to);
-            }
+            crate::runner::runtime_session_resumer::push_scope_markers(&mut correlation_id, scope);
         }
         // An approval's correlation id is its responder's idempotency key:
         // greentic-designer-admin UNIQUE-indexes it and upserts only while the
@@ -2752,9 +2999,13 @@ impl FlowEngine {
         graph_id: &str,
         payload: Value,
     ) -> Result<NodeOutput> {
-        let handler = self.graph_node_handler.as_ref().context(
-            "DwAgentGraph node dispatched but no GraphNodeHandler configured on FlowEngine",
-        )?;
+        let handler = self
+            .graph_node_handler
+            .as_ref()
+            .context(
+                "DwAgentGraph node dispatched but no GraphNodeHandler configured on FlowEngine",
+            )
+            .map_err(pre_effect)?;
         let session_id = ctx.session_id.unwrap_or("");
         let result = handler
             .execute(
@@ -2864,7 +3115,7 @@ impl FlowEngine {
     ) -> Result<JumpTarget> {
         let target_flow = jump.flow.trim();
         if target_flow.is_empty() {
-            bail!("missing_flow");
+            return Err(terminal_flow_error("missing_flow"));
         }
 
         let flow = self
@@ -2873,21 +3124,26 @@ impl FlowEngine {
             .with_context(|| format!("unknown_flow:{target_flow}"))?;
 
         let target_node = if let Some(node) = jump.node.as_deref() {
-            let parsed = NodeId::from_str(node).with_context(|| format!("unknown_node:{node}"))?;
+            let parsed = NodeId::from_str(node)
+                .map_err(|err| terminal_flow_error(format!("unknown_node:{node}: {err}")))?;
             if !flow.nodes.contains_key(&parsed) {
-                bail!("unknown_node:{node}");
+                return Err(terminal_flow_error(format!("unknown_node:{node}")));
             }
             parsed
         } else {
             flow.start
                 .clone()
                 .or_else(|| flow.nodes.keys().next().cloned())
-                .ok_or_else(|| anyhow!("jump_failed: flow {target_flow} has no start node"))?
+                .ok_or_else(|| {
+                    terminal_flow_error(format!(
+                        "jump_failed: flow {target_flow} has no start node"
+                    ))
+                })?
         };
 
         let max_redirects = jump.max_redirects.unwrap_or(3);
         if state.redirect_count() >= max_redirects {
-            bail!("redirect_limit");
+            return Err(terminal_flow_error("redirect_limit"));
         }
         state.increment_redirect_count();
         state.replace_input(jump.payload.clone());
@@ -2920,7 +3176,9 @@ impl FlowEngine {
         let call: FlowCallPayload =
             serde_json::from_value(payload).context("invalid payload for flow.call node")?;
         if call.flow_id.trim().is_empty() {
-            bail!("flow.call requires a non-empty flow_id");
+            return Err(terminal_flow_error(
+                "flow.call requires a non-empty flow_id",
+            ));
         }
 
         let sub_input = if call.input.is_null() {
@@ -2950,18 +3208,91 @@ impl FlowEngine {
             caller: ctx.caller,
         };
 
-        let execution = Box::pin(self.execute(sub_ctx, sub_input))
+        let depth = FLOW_CALL_DEPTH.try_with(|depth| *depth).unwrap_or(0);
+        if depth >= MAX_FLOW_CALL_DEPTH {
+            return Err(terminal_flow_error(format!(
+                "flow.call nesting exceeds {MAX_FLOW_CALL_DEPTH} levels (calling {})",
+                flow_id_owned
+            )));
+        }
+        // The caller's own retry loop owns retries; a nested loop would multiply
+        // attempts. The failure is propagated, never rendered as an envelope.
+        let sub_ctx = FlowContext {
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                ..sub_ctx.retry_config
+            },
+            ..sub_ctx
+        };
+        let execution = FLOW_CALL_DEPTH
+            .scope(
+                depth + 1,
+                Box::pin(self.execute_propagating_failure(sub_ctx, sub_input)),
+            )
             .await
             .with_context(|| format!("flow.call failed for {}", flow_id_owned))?;
         match execution.status {
             FlowStatus::Completed => Ok(NodeOutput::new(execution.output)),
-            FlowStatus::Waiting(wait) => bail!(
+            // The nested flow's effects already ran: never re-run the turn.
+            FlowStatus::Waiting(wait) => Err(terminal_flow_error(format!(
                 "flow.call cannot pause (flow {} waiting {:?})",
-                flow_id_owned,
-                wait.reason
-            ),
+                flow_id_owned, wait.reason
+            ))),
         }
     }
+}
+
+/// Resolve a `Routing::Branch`: the node's reported `status` selects an
+/// `on_status` entry, otherwise the `default` target applies.
+///
+/// The status is read from the node output payload's `status` field (string,
+/// number or bool), falling back to `meta.status`.
+fn branch_target(
+    on_status: &std::collections::BTreeMap<String, NodeId>,
+    default: Option<&NodeId>,
+    output: &NodeOutput,
+) -> Option<NodeId> {
+    let status_of = |value: &Value| match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    };
+    let status = output
+        .payload
+        .get("status")
+        .and_then(status_of)
+        .or_else(|| output.meta.get("status").and_then(status_of));
+    status
+        .and_then(|status| on_status.get(&status).cloned())
+        .or_else(|| default.cloned())
+}
+
+#[cfg(feature = "agentic-worker")]
+use crate::runner::media_node::MAX_CREATED_PER_TURN;
+
+/// Mirrors `media_node::MAX_CREATED_PER_TURN`; no node creates files without
+/// the `agentic-worker` feature, so the list stays empty there.
+#[cfg(not(feature = "agentic-worker"))]
+const MAX_CREATED_PER_TURN: usize = 20;
+
+#[cfg(feature = "agentic-worker")]
+fn attach_created_files(reply: Value, created: Vec<Value>) -> Value {
+    crate::runner::media_node::attach_created(reply, created)
+}
+
+/// Without `media.create` nothing is ever created; the reply is unchanged.
+#[cfg(not(feature = "agentic-worker"))]
+fn attach_created_files(reply: Value, _created: Vec<Value>) -> Value {
+    reply
+}
+
+/// Deepest `flow.call` nesting allowed before the call is refused.
+const MAX_FLOW_CALL_DEPTH: u32 = 16;
+
+tokio::task_local! {
+    /// How many `flow.call` frames enclose the node currently executing.
+    static FLOW_CALL_DEPTH: u32;
 }
 
 /// Build the jump that hands this turn over to another flow.
@@ -3001,7 +3332,9 @@ fn execute_flow_goto(payload: Value) -> Result<DispatchOutcome> {
         serde_json::from_value(payload).context("invalid payload for flow.goto node")?;
     let flow = goto.flow_id.trim().to_string();
     if flow.is_empty() {
-        bail!("flow.goto requires a non-empty flow_id");
+        return Err(terminal_flow_error(
+            "flow.goto requires a non-empty flow_id",
+        ));
     }
     let node = goto
         .node
@@ -3179,8 +3512,7 @@ impl FlowEngine {
                 node_id: Some(node_id),
                 attempt: ctx.attempt,
             };
-            maybe_fail(FaultPoint::BeforeComponentCall, fault_ctx)
-                .map_err(|err| anyhow!(err.to_string()))?;
+            maybe_fail(FaultPoint::BeforeComponentCall, fault_ctx).map_err(injected_error)?;
         }
         let value = pack
             .invoke_component_for(
@@ -3201,8 +3533,7 @@ impl FlowEngine {
                 node_id: Some(node_id),
                 attempt: ctx.attempt,
             };
-            maybe_fail(FaultPoint::AfterComponentCall, fault_ctx)
-                .map_err(|err| anyhow!(err.to_string()))?;
+            maybe_fail(FaultPoint::AfterComponentCall, fault_ctx).map_err(injected_error)?;
         }
 
         if let Some((code, message)) = component_error(&value) {
@@ -3279,17 +3610,19 @@ impl FlowEngine {
             in_map: Value,
             #[serde(default)]
             out_map: Value,
-            #[serde(default)]
-            err_map: Value,
         }
 
-        let payload: ProviderPayload =
-            serde_json::from_value(payload).context("invalid payload for provider.invoke")?;
+        // Every `?` below up to `invoke_provider` precedes the provider call, so
+        // each failure is marked `pre_effect`: nothing has left the host yet.
+        let payload: ProviderPayload = serde_json::from_value(payload)
+            .context("invalid payload for provider.invoke")
+            .map_err(pre_effect)?;
         let op = payload
             .op
             .as_deref()
             .filter(|v| !v.trim().is_empty())
-            .with_context(|| "provider.invoke requires an op")?
+            .with_context(|| "provider.invoke requires an op")
+            .map_err(pre_effect)?
             .to_string();
 
         let prev = state
@@ -3312,13 +3645,14 @@ impl FlowEngine {
                     allow_pointer: true,
                 },
             )
-            .context("failed to render provider.invoke in_map")?
+            .context("failed to render provider.invoke in_map")
+            .map_err(pre_effect)?
         } else if !payload.input.is_null() {
             payload.input
         } else {
             Value::Null
         };
-        let input_json = serde_json::to_vec(&input_value)?;
+        let input_json = serde_json::to_vec(&input_value).map_err(pre_effect)?;
 
         self.validate_tool(
             ctx,
@@ -3327,15 +3661,18 @@ impl FlowEngine {
             payload.provider_type.as_deref(),
             &op,
             &input_value,
-        )?;
+        )
+        .map_err(pre_effect)?;
 
         let key = FlowKey {
             pack_id: ctx.pack_id.to_string(),
             flow_id: ctx.flow_id.to_string(),
         };
-        let pack_idx = *self.flow_sources.get(&key).with_context(|| {
-            format!("flow {} (pack {}) not registered", ctx.flow_id, ctx.pack_id)
-        })?;
+        let pack_idx = *self
+            .flow_sources
+            .get(&key)
+            .with_context(|| format!("flow {} (pack {}) not registered", ctx.flow_id, ctx.pack_id))
+            .map_err(pre_effect)?;
         let pack = Arc::clone(&self.packs[pack_idx]);
         let binding = pack.resolve_provider(
             payload.provider_id.as_deref(),
@@ -3355,7 +3692,7 @@ impl FlowEngine {
             return Ok(output);
         }
 
-        let binding = binding?;
+        let binding = binding.map_err(pre_effect)?;
         let exec_ctx = component_exec_ctx(ctx, node_id);
         #[cfg(feature = "fault-injection")]
         {
@@ -3366,7 +3703,8 @@ impl FlowEngine {
                 attempt: ctx.attempt,
             };
             maybe_fail(FaultPoint::BeforeToolCall, fault_ctx)
-                .map_err(|err| anyhow!(err.to_string()))?;
+                .map_err(injected_error)
+                .map_err(pre_effect)?;
         }
         let provider_metric_id = payload
             .provider_id
@@ -3394,8 +3732,7 @@ impl FlowEngine {
                 node_id: Some(node_id),
                 attempt: ctx.attempt,
             };
-            maybe_fail(FaultPoint::AfterToolCall, fault_ctx)
-                .map_err(|err| anyhow!(err.to_string()))?;
+            maybe_fail(FaultPoint::AfterToolCall, fault_ctx).map_err(injected_error)?;
         }
 
         let output = if payload.out_map.is_null() {
@@ -3415,7 +3752,6 @@ impl FlowEngine {
             )
             .context("failed to render provider.invoke out_map")?
         };
-        let _ = payload.err_map;
         Ok(NodeOutput::new(output))
     }
 
@@ -3427,9 +3763,9 @@ impl FlowEngine {
         input_json: &[u8],
         tenant: &str,
     ) -> Result<Option<NodeOutput>> {
-        eprintln!(
-            "[DEBUG] provider.invoke: pack-local failed, has_resolver={}",
-            self.cross_pack_resolver.is_some()
+        tracing::debug!(
+            has_resolver = self.cross_pack_resolver.is_some(),
+            "provider.invoke: pack-local failed"
         );
         let Some(resolver) = self.cross_pack_resolver.as_ref() else {
             return Ok(None);
@@ -3711,6 +4047,11 @@ pub struct ExecutionState {
     input: Value,
     #[serde(default)]
     nodes: HashMap<String, NodeOutput>,
+    /// Node ids in the order their (latest) output was recorded. `nodes` is a
+    /// `HashMap`, so without this "the first failed node" was whichever the
+    /// hasher happened to yield.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    node_order: Vec<String>,
     #[serde(default)]
     egress: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3787,6 +4128,7 @@ impl ExecutionState {
             entry: input.clone(),
             input,
             nodes: HashMap::new(),
+            node_order: Vec::new(),
             egress: Vec::new(),
             last_output: None,
             redirect_count: 0,
@@ -3834,6 +4176,43 @@ impl ExecutionState {
         })
     }
 
+    /// Record `output` as the latest result of `node_id`, tracking execution order.
+    fn record_node_output(&mut self, node_id: String, output: NodeOutput) {
+        self.node_order.retain(|id| id != &node_id);
+        self.node_order.push(node_id.clone());
+        self.nodes.insert(node_id, output);
+    }
+
+    /// The first node, in execution order, that finished `ok == false` and is
+    /// NOT handled by an error edge (a handled failure was routed, not
+    /// unhandled, and must not be lifted into the reply as if it escaped).
+    fn first_unhandled_failure(&self, flow: &HostFlow) -> Option<(String, NodeOutput)> {
+        let handled = |id: &str| {
+            NodeId::from_str(id)
+                .ok()
+                .and_then(|node_id| flow.nodes.get(&node_id))
+                .is_some_and(|node| node_has_error_route(&node.routing))
+        };
+        let ordered = self
+            .node_order
+            .iter()
+            .filter_map(|id| self.nodes.get(id).map(|out| (id, out)));
+        // Nodes restored from a snapshot written before `node_order` existed
+        // have no recorded order: fall back to sorted ids so the pick is at
+        // least deterministic.
+        let mut unordered: Vec<(&String, &NodeOutput)> = self
+            .nodes
+            .iter()
+            .filter(|(id, _)| !self.node_order.contains(id))
+            .collect();
+        unordered.sort_by(|a, b| a.0.cmp(b.0));
+        unordered
+            .into_iter()
+            .chain(ordered)
+            .find(|(id, out)| !out.ok && !handled(id))
+            .map(|(id, out)| (id.clone(), out.clone()))
+    }
+
     fn outputs_map(&self) -> JsonMap<String, Value> {
         let mut outputs = JsonMap::new();
         for (id, output) in &self.nodes {
@@ -3860,9 +4239,13 @@ impl ExecutionState {
     /// Record files a node created for the user this turn. Deduplicated by id
     /// and bounded, so a looping flow cannot grow the list without limit.
     fn note_created_artifacts(&mut self, created: Vec<Value>) {
+        let mut dropped = 0usize;
         for file in created {
-            if self.created_artifacts.len() >= crate::runner::media_node::MAX_CREATED_PER_TURN {
-                break;
+            if self.created_artifacts.len() >= MAX_CREATED_PER_TURN {
+                // The file exists in the artifact store but will NOT be listed
+                // in the turn's reply, so the user never receives it.
+                dropped += 1;
+                continue;
             }
             let id = file.get("id").and_then(Value::as_str);
             let known = self
@@ -3873,10 +4256,21 @@ impl ExecutionState {
                 self.created_artifacts.push(file);
             }
         }
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                cap = MAX_CREATED_PER_TURN,
+                "a turn created more files than the per-turn delivery cap; the extra files are stored but not listed in the reply"
+            );
+        }
     }
 
     fn redirect_count(&self) -> u32 {
         self.redirect_count
+    }
+
+    fn reset_redirect_count(&mut self) {
+        self.redirect_count = 0;
     }
 
     fn increment_redirect_count(&mut self) {
@@ -3973,7 +4367,7 @@ impl ExecutionState {
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
         let created = std::mem::take(&mut self.created_artifacts);
         let reply = self.finalize_reply(final_payload);
-        crate::runner::media_node::attach_created(reply, created)
+        attach_created_files(reply, created)
     }
 
     fn finalize_reply(mut self, final_payload: Option<Value>) -> Value {
@@ -4689,6 +5083,61 @@ fn component_error(value: &Value) -> Option<(String, String)> {
     Some((code.to_string(), message.to_string()))
 }
 
+#[cfg(feature = "agentic-worker")]
+/// `(code, message)` of an `{ok:false, error}` envelope for operator logs.
+/// The error may be an object `{code, message}` or a bare string; anything
+/// missing degrades to `unknown` / the empty string rather than failing.
+fn agent_error_log_fields(entry: &Value) -> (String, String) {
+    match entry.get("error") {
+        Some(Value::Object(obj)) => (
+            obj.get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            obj.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        Some(Value::String(message)) => ("unknown".to_string(), message.clone()),
+        _ => ("unknown".to_string(), String::new()),
+    }
+}
+
+/// Reply and node payload for an `{ok:false}` agent response envelope.
+///
+/// The agentic bridge reports a turn that ended without a final reply
+/// (timeout, max iterations) as `ok:false` with `error.message` set to a
+/// machine string while keeping the partial reply in `output.reply`. A
+/// non-empty `output.reply` is what the user should see; the error (and the
+/// trail, when present) stay on the payload for operators and routing. Without
+/// one, the reply is the localized user-safe failure line
+/// ([`user_facing_flow_failure_text`]), never the machine string; the error
+/// (code and message) stays on the payload for operators either way.
+#[cfg(feature = "agentic-worker")]
+fn agent_error_envelope_reply(entry: &Value) -> (String, Value) {
+    let error = entry.get("error").filter(|e| !e.is_null());
+    let output = entry.get("output");
+    let partial = output
+        .and_then(|o| o.get("reply"))
+        .and_then(Value::as_str)
+        .filter(|reply| !reply.trim().is_empty());
+    let message = partial
+        .map(str::to_string)
+        .unwrap_or_else(|| user_facing_flow_failure_text(entry));
+    let mut payload = serde_json::Map::new();
+    payload.insert("reply".to_string(), Value::String(message.clone()));
+    if let Some(error) = error {
+        payload.insert("error".to_string(), error.clone());
+    }
+    if partial.is_some()
+        && let Some(trail) = output.and_then(|o| o.get("trail"))
+    {
+        payload.insert("trail".to_string(), trail.clone());
+    }
+    (message, Value::Object(payload))
+}
+
 /// MCP tool-error wire shape from greentic-mcp-generator's `tool_error_with_status`:
 /// `{ "error": { "code", "message", "status" } }`. The component returned ok=true at
 /// the WIT level (the HTTP failure was caught and serialized), so the regular
@@ -4952,7 +5401,14 @@ fn component_dispatch_outcome(output: NodeOutput) -> Result<DispatchOutcome> {
     Ok(DispatchOutcome::complete(output))
 }
 
+/// Parse a component's `greentic_control` block. A malformed block is a
+/// deterministic output of the component, so the failure is terminal: re-running
+/// the turn would produce the same block.
 fn parse_component_control(payload: &Value) -> Result<Option<NodeControl>> {
+    parse_component_control_inner(payload).map_err(|err| terminal_flow_error(format!("{err:#}")))
+}
+
+fn parse_component_control_inner(payload: &Value) -> Result<Option<NodeControl>> {
     let Value::Object(map) = payload else {
         return Ok(None);
     };
@@ -6190,40 +6646,54 @@ fn evaluate_custom_routing(
 ///   `f64`, and a non-numeric operand makes the condition false (never a panic).
 /// - `contains` — case-insensitive substring of the resolved string.
 fn evaluate_simple_condition(condition: &str, ctx: &Value) -> bool {
-    if let Some((path, expected)) = split_condition(condition, "==") {
-        return string_eq(ctx, path, expected, false);
+    let Some((op, path, expected)) = split_at_first_operator(condition) else {
+        return false;
+    };
+    match op {
+        "==" => string_eq(ctx, path, expected, false),
+        "!=" => string_eq(ctx, path, expected, true),
+        ">=" => numeric_cmp(ctx, path, expected, |a, b| a >= b),
+        "<=" => numeric_cmp(ctx, path, expected, |a, b| a <= b),
+        ">" => numeric_cmp(ctx, path, expected, |a, b| a > b),
+        "<" => numeric_cmp(ctx, path, expected, |a, b| a < b),
+        " contains " => {
+            let needle = expected.to_lowercase();
+            resolve_dotted_path(ctx, path)
+                .is_some_and(|actual| actual.to_lowercase().contains(&needle))
+        }
+        _ => false,
     }
-    if let Some((path, expected)) = split_condition(condition, "!=") {
-        return string_eq(ctx, path, expected, true);
-    }
-    if let Some((path, expected)) = split_condition(condition, ">=") {
-        return numeric_cmp(ctx, path, expected, |a, b| a >= b);
-    }
-    if let Some((path, expected)) = split_condition(condition, "<=") {
-        return numeric_cmp(ctx, path, expected, |a, b| a <= b);
-    }
-    if let Some((path, expected)) = split_condition(condition, ">") {
-        return numeric_cmp(ctx, path, expected, |a, b| a > b);
-    }
-    if let Some((path, expected)) = split_condition(condition, "<") {
-        return numeric_cmp(ctx, path, expected, |a, b| a < b);
-    }
-    if let Some((path, expected)) = split_condition(condition, " contains ") {
-        let needle = expected.to_lowercase();
-        return resolve_dotted_path(ctx, path)
-            .is_some_and(|actual| actual.to_lowercase().contains(&needle));
-    }
-    false
 }
 
-/// Split a condition on the first occurrence of `op` into a trimmed
-/// `(path, value)`, with surrounding quotes stripped from the value.
-/// `None` when `op` is absent.
-fn split_condition<'a>(condition: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
-    let idx = condition.find(op)?;
-    let path = condition[..idx].trim();
-    let value = condition[idx + op.len()..].trim().trim_matches('"');
-    Some((path, value))
+/// Operators in the order they are tried at one position: longer tokens first
+/// so `>=`/`<=` win over `>`/`<`.
+const CONDITION_OPERATORS: [&str; 7] = ["==", "!=", ">=", "<=", ">", "<", " contains "];
+
+/// Split a condition at its FIRST operator that is not inside double quotes,
+/// into `(operator, trimmed path, trimmed value)` with the value's surrounding
+/// quotes stripped.
+///
+/// "First" is by position, not by operator priority: a value that itself
+/// contains another operator (`x > "a==b"`) must split at the real operator,
+/// not at the one inside the literal. `None` when there is no operator.
+fn split_at_first_operator(condition: &str) -> Option<(&'static str, &str, &str)> {
+    let mut in_quotes = false;
+    for (idx, ch) in condition.char_indices() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if in_quotes {
+            continue;
+        }
+        let rest = &condition[idx..];
+        if let Some(op) = CONDITION_OPERATORS.iter().find(|op| rest.starts_with(**op)) {
+            let path = condition[..idx].trim();
+            let value = condition[idx + op.len()..].trim().trim_matches('"');
+            return Some((op, path, value));
+        }
+    }
+    None
 }
 
 /// Case-insensitive string equality of the resolved path against `expected`,
@@ -6261,6 +6731,27 @@ fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
         Value::Number(n) => Some(n.to_string()),
         _ => Some(current.to_string()),
     }
+}
+
+/// Upper bound on nodes executed by ONE `drive_flow` call (one inbound turn).
+/// Pausing nodes end the call, so only a flow that loops without ever waiting
+/// (a routing cycle, a self-`flow.goto` chain) can reach it; generous enough
+/// that no legitimate graph does.
+const MAX_STEPS_PER_TURN: usize = 10_000;
+
+/// Fail a runaway turn with a clear error instead of spinning forever. The
+/// message deliberately avoids `should_retry`'s trigger words: re-running a
+/// cycle just burns another full budget.
+fn check_step_budget(steps_run: usize, flow_id: &str) -> Result<()> {
+    if steps_run > MAX_STEPS_PER_TURN {
+        // Terminal: the first 10 000 nodes already ran their effects, and a
+        // routing cycle is deterministic, so re-running the turn only repeats
+        // both (see `TerminalFlowError`).
+        return Err(terminal_flow_error(format!(
+            "flow_step_limit_exceeded: flow `{flow_id}` ran more than {MAX_STEPS_PER_TURN} nodes in one turn (routing cycle?)"
+        )));
+    }
+    Ok(())
 }
 
 /// Success-family outcome ports, in the priority order used to pick the default
@@ -6530,28 +7021,33 @@ fn approval_requires_human(input: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("always");
     match mode {
-        "above_risk" => {
-            let risk = input.get("risk").and_then(Value::as_f64).unwrap_or(0.0);
-            let threshold = input
-                .get("risk_threshold")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            risk >= threshold
-        }
-        "above_confidence" => {
-            let confidence = input
-                .get("confidence")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let threshold = input
-                .get("confidence_threshold")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            confidence < threshold
-        }
+        // Fail closed: a missing, null, string or non-finite value (or
+        // threshold) can never auto-approve; it goes to a human.
+        "above_risk" => match (
+            finite_number(input, "risk"),
+            finite_number(input, "risk_threshold"),
+        ) {
+            (Some(risk), Some(threshold)) => risk >= threshold,
+            _ => true,
+        },
+        "above_confidence" => match (
+            finite_number(input, "confidence"),
+            finite_number(input, "confidence_threshold"),
+        ) {
+            (Some(confidence), Some(threshold)) => confidence < threshold,
+            _ => true,
+        },
         // "always" and any unknown mode fail safe: require a human.
         _ => true,
     }
+}
+
+/// A JSON number under `key`, or `None` when absent, non-numeric or non-finite.
+fn finite_number(input: &Value, key: &str) -> Option<f64> {
+    input
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite())
 }
 
 /// True when `entry` is a runtime-dispatch response envelope rather than a user
@@ -6637,6 +7133,35 @@ mod approval_gate_tests {
         let input =
             json!({ "confidence": 0.4, "mode": "above_confidence", "confidence_threshold": 0.8 });
         assert!(approval_requires_human(&input));
+    }
+
+    #[test]
+    fn above_risk_fails_closed_on_missing_or_non_numeric_values() {
+        for input in [
+            json!({ "mode": "above_risk", "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": null, "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": "0.1", "risk_threshold": 0.7 }),
+            json!({ "mode": "above_risk", "risk": 0.1 }),
+            json!({ "mode": "above_risk", "risk": 0.1, "risk_threshold": "high" }),
+            json!({ "mode": "above_risk" }),
+        ] {
+            assert!(approval_requires_human(&input), "{input}");
+        }
+    }
+
+    #[test]
+    fn above_confidence_fails_closed_on_missing_or_non_numeric_values() {
+        for input in [
+            json!({ "mode": "above_confidence", "confidence_threshold": 0.5 }),
+            json!({ "mode": "above_confidence", "confidence": "0.99", "confidence_threshold": 0.5 }),
+            json!({ "mode": "above_confidence", "confidence": 0.99 }),
+            json!({ "mode": "above_confidence", "confidence": null, "confidence_threshold": null }),
+        ] {
+            assert!(approval_requires_human(&input), "{input}");
+        }
+        let ok =
+            json!({ "mode": "above_confidence", "confidence": 0.9, "confidence_threshold": 0.5 });
+        assert!(!approval_requires_human(&ok));
     }
 
     #[test]
@@ -6735,6 +7260,78 @@ mod approval_gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn should_retry_typed_and_message_transient_errors() {
+        assert!(should_retry(&anyhow!("internal server error")));
+        assert!(should_retry(&anyhow!("service unavailable: timeout")));
+        assert!(!should_retry(&anyhow!("bad request")));
+        assert!(should_retry(&anyhow::Error::new(TransientFlowError(
+            "upstream hiccup".into()
+        ))));
+        let wrapped = anyhow::Error::new(TransientFlowError("x".into())).context("node failed");
+        assert!(should_retry(&wrapped));
+        let io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(should_retry(&io));
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!should_retry(&denied));
+    }
+
+    #[test]
+    fn branch_target_routes_on_status_then_default() {
+        let a = NodeId::from_str("a").unwrap();
+        let b = NodeId::from_str("b").unwrap();
+        let d = NodeId::from_str("d").unwrap();
+        let mut on_status = std::collections::BTreeMap::new();
+        on_status.insert("approved".to_string(), a.clone());
+        on_status.insert("true".to_string(), b.clone());
+        let out = NodeOutput::new(json!({ "status": "approved" }));
+        assert_eq!(branch_target(&on_status, Some(&d), &out), Some(a));
+        let flag = NodeOutput::new(json!({ "status": true }));
+        assert_eq!(branch_target(&on_status, Some(&d), &flag), Some(b));
+        let unknown = NodeOutput::new(json!({ "status": "other" }));
+        assert_eq!(
+            branch_target(&on_status, Some(&d), &unknown),
+            Some(d.clone())
+        );
+        let none = NodeOutput::new(json!({}));
+        assert_eq!(branch_target(&on_status, None, &none), None);
+    }
+
+    #[test]
+    fn first_unhandled_failure_uses_execution_order_and_skips_handled_nodes() {
+        let failed = |msg: &str| {
+            let mut out = NodeOutput::new(json!({}));
+            out.ok = false;
+            out.meta = json!({ "error": { "message": msg } });
+            out
+        };
+        let mut state = ExecutionState::new(json!({}));
+        // Recorded z-then-a: execution order, not key order, decides.
+        state.record_node_output("z_first".to_string(), failed("first"));
+        state.record_node_output("a_second".to_string(), failed("second"));
+
+        let mut flow = HostFlow {
+            id: "f".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        };
+        let (id, _) = state.first_unhandled_failure(&flow).expect("a failure");
+        assert_eq!(id, "z_first");
+
+        // Give `z_first` an error edge: its failure was routed, so the next
+        // unhandled failure is the one lifted.
+        let mut handled = HostNode::for_test("comp", Some("op"));
+        handled.routing = Routing::Custom(json!([
+            { "condition": "event == \"on_error\"", "to": "recover" }
+        ]));
+        flow.nodes
+            .insert(NodeId::from_str("z_first").unwrap(), handled);
+        let (id, _) = state.first_unhandled_failure(&flow).expect("a failure");
+        assert_eq!(id, "a_second");
+    }
 
     /// The loader and the engine must agree on which op-keys are runner-native.
     ///
@@ -8725,6 +9322,7 @@ mod tests {
         assert_ne!(got["sub"], "forged@evil");
     }
 
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn dw_agent_node_routes_to_handler_and_returns_reply() {
         use crate::runner::agent_node::{AgentNodeHandler, RuntimeAgentNodeHandler};
@@ -9564,6 +10162,448 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_jump_failures_are_terminal_not_retried() {
+        let rt = Runtime::new().unwrap();
+        let jump = |flow: &str, node: Option<&str>| JumpControl {
+            flow: flow.into(),
+            node: node.map(str::to_string),
+            payload: json!({ "ok": true }),
+            hints: Value::Null,
+            max_redirects: None,
+            reason: None,
+        };
+
+        // unknown_flow: the flow is not registered at all.
+        let engine = minimal_engine();
+        let mut state = ExecutionState::new(Value::Null);
+        let err = rt
+            .block_on(engine.apply_jump(
+                &jump_ctx("flow.source"),
+                &mut state,
+                jump("flow.missing", None),
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown_flow"), "{err}");
+        assert!(
+            is_terminal_flow_error(&err),
+            "unknown_flow must be terminal"
+        );
+        assert!(!should_retry(&err));
+
+        // unknown_node: a node that does not exist, and one that is not even a
+        // valid node id.
+        let engine = jump_test_engine();
+        for node in ["node-missing", "not a valid id!"] {
+            let mut state = ExecutionState::new(Value::Null);
+            let err = rt
+                .block_on(engine.apply_jump(
+                    &jump_ctx("flow.source"),
+                    &mut state,
+                    jump("flow.target", Some(node)),
+                ))
+                .unwrap_err();
+            assert!(err.to_string().contains("unknown_node"), "{err}");
+            assert!(is_terminal_flow_error(&err), "unknown_node {node:?}");
+        }
+
+        // A flow with no start node and no nodes.
+        let empty = host_flow_for_test("flow.empty", &[], None);
+        engine.flow_cache.write().insert(
+            FlowKey {
+                pack_id: "test-pack".to_string(),
+                flow_id: "flow.empty".to_string(),
+            },
+            empty,
+        );
+        let mut state = ExecutionState::new(Value::Null);
+        let err = rt
+            .block_on(engine.apply_jump(
+                &jump_ctx("flow.source"),
+                &mut state,
+                jump("flow.empty", None),
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("no start node"), "{err}");
+        assert!(is_terminal_flow_error(&err));
+    }
+
+    #[test]
+    fn external_effect_classification_is_narrow_and_explicit() {
+        assert!(NodeKind::SorlaCall { target: "t".into() }.performs_external_effect());
+        assert!(NodeKind::AgenticCall { target: "t".into() }.performs_external_effect());
+        assert!(NodeKind::ApprovalCall { target: "t".into() }.performs_external_effect());
+        assert!(NodeKind::MediaCreate.performs_external_effect());
+        assert!(NodeKind::FlowCall.performs_external_effect());
+        assert!(
+            !NodeKind::BuiltinEmit {
+                kind: EmitKind::Response
+            }
+            .performs_external_effect()
+        );
+        assert!(!NodeKind::BuiltinStateGet.performs_external_effect());
+        assert!(!NodeKind::Wait.performs_external_effect());
+    }
+
+    #[test]
+    fn terminal_after_effects_only_changes_failures_that_follow_an_effect() {
+        let transient = || anyhow!("internal timeout: unavailable");
+        // Before any effect: untouched, a transient failure still retries.
+        let before = terminal_after_effects(transient(), false);
+        assert!(!is_terminal_flow_error(&before));
+        assert!(should_retry(&before));
+        // After an effect: terminal, message preserved.
+        let after = terminal_after_effects(transient(), true);
+        assert!(is_terminal_flow_error(&after));
+        assert!(!should_retry(&after));
+        assert_eq!(after.to_string(), "internal timeout: unavailable");
+        // Only the outermost message survives the rebuild: the cause chain
+        // (which can name a host or URL) goes to the operator log, never into
+        // the text that reaches the user-facing failure envelope.
+        let chained = anyhow::Error::new(TransientFlowError(
+            "connect to https://internal.example:8443/x refused".into(),
+        ))
+        .context("sorla.call failed");
+        let rebuilt = terminal_after_effects(chained, true);
+        assert!(is_terminal_flow_error(&rebuilt));
+        // User-facing text: outermost only.
+        assert_eq!(rebuilt.to_string(), "sorla.call failed");
+        // Operator/redaction paths: the root cause is kept, not duplicated.
+        assert_eq!(
+            format!("{rebuilt:#}"),
+            "sorla.call failed: connect to https://internal.example:8443/x refused"
+        );
+        assert_eq!(
+            crate::run_outcome::error::anyhow_chain_text(&rebuilt),
+            "sorla.call failed\ncaused by: connect to https://internal.example:8443/x refused"
+        );
+        // The retry classifiers still see the typed cause but the terminal
+        // marker wins.
+        assert!(!should_retry(&rebuilt));
+        fn assert_send_sync<T: Send + Sync + 'static>(_: &T) {}
+        assert_send_sync(&TerminalFlowError {
+            message: String::new(),
+            original: None,
+            after_effects: false,
+        });
+    }
+
+    #[test]
+    fn only_a_failure_that_followed_an_effect_carries_the_after_effects_marker() {
+        // Deterministic pre-effect terminal: terminal, but not "after effects".
+        let deterministic = terminal_flow_error("flow x has no node `y`");
+        assert!(is_terminal_flow_error(&deterministic));
+        assert!(!is_after_effects_failure(&deterministic));
+        // No effect yet: untouched.
+        let untouched = terminal_after_effects(deterministic, false);
+        assert!(!is_after_effects_failure(&untouched));
+        // Transient failure after an effect: marked, message preserved.
+        let marked = terminal_after_effects(anyhow!("internal timeout"), true);
+        assert!(is_after_effects_failure(&marked));
+        assert_eq!(marked.to_string(), "internal timeout");
+        // An already-terminal error after an effect picks the marker up too.
+        let upgraded = terminal_after_effects(terminal_flow_error("step limit"), true);
+        assert!(is_after_effects_failure(&upgraded));
+        assert_eq!(upgraded.to_string(), "step limit");
+        // The marker survives added context and a pre_effect wrapper.
+        assert!(is_after_effects_failure(&upgraded.context("outer")));
+        assert!(is_after_effects_failure(&pre_effect(marked)));
+        assert!(!is_after_effects_failure(&anyhow!("plain")));
+    }
+
+    #[test]
+    fn pre_effect_marker_keeps_message_and_inner_classification() {
+        let marked = pre_effect(
+            anyhow::Error::new(TransientFlowError("429 slow down".into())).context("llm call"),
+        );
+        assert!(is_pre_effect_error(&marked));
+        assert_eq!(marked.to_string(), "llm call");
+        // The wrapped error's own type is still visible to the classifiers.
+        assert!(should_retry(&marked));
+        let with_ctx = marked.context("outer");
+        assert!(is_pre_effect_error(&with_ctx));
+        assert!(should_retry(&with_ctx));
+        // A terminal error stays terminal when marked.
+        assert!(is_terminal_flow_error(&pre_effect(terminal_flow_error(
+            "x"
+        ))));
+        // Unmarked errors are not pre-effect.
+        assert!(!is_pre_effect_error(&anyhow!("plain")));
+    }
+
+    type DispatchStep = fn() -> Result<crate::runner::remote_dispatch::RemoteDispatchAction>;
+
+    /// Scripted dispatcher: call N returns `script[N]` (the last repeats).
+    struct ScriptedDispatch {
+        calls: std::sync::atomic::AtomicUsize,
+        script: Vec<DispatchStep>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runner::remote_dispatch::RemoteDispatchHandler for ScriptedDispatch {
+        async fn dispatch(
+            &self,
+            _request: crate::runner::remote_dispatch::RemoteDispatch,
+        ) -> Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.script[n.min(self.script.len() - 1)])()
+        }
+    }
+
+    fn dispatched() -> Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+        Ok(crate::runner::remote_dispatch::RemoteDispatchAction::Dispatched)
+    }
+    fn transient_pre_effect() -> Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+        Err(pre_effect(
+            anyhow::Error::new(TransientFlowError("broker 503".into())).context("publish"),
+        ))
+    }
+    fn transient_unproven() -> Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+        Err(anyhow::Error::new(TransientFlowError("broker 503".into())).context("publish"))
+    }
+
+    /// Drive a chain of `agentic.call` nodes (fire-and-forget) against a
+    /// scripted dispatcher; return the failure and the number of dispatches.
+    fn drive_dispatch_chain(
+        handler: Option<Vec<DispatchStep>>,
+        nodes: usize,
+    ) -> (anyhow::Error, usize) {
+        let mut engine = jump_test_engine();
+        let scripted = handler.map(|script| {
+            Arc::new(ScriptedDispatch {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                script,
+            })
+        });
+        engine.remote_dispatch_handler = scripted
+            .clone()
+            .map(|h| h as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>);
+        let ids: Vec<String> = (0..nodes).map(|i| format!("n{i}")).collect();
+        let specs: Vec<(&str, &str, Value)> = ids
+            .iter()
+            .map(|id| (id.as_str(), "agentic.call", json!({ "await": false })))
+            .collect();
+        let flow = chain_flow("chain.flow", &specs);
+        let rt = Runtime::new().unwrap();
+        let ctx = jump_ctx("chain.flow");
+        let failure = match rt.block_on(engine.drive_flow(
+            &ctx,
+            flow,
+            ExecutionState::new(Value::Null),
+            None,
+            "chain.flow".to_string(),
+        )) {
+            Ok(_) => panic!("the chain must fail"),
+            Err(failure) => failure,
+        };
+        let count = scripted
+            .map(|h| h.calls.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0);
+        (failure.error, count)
+    }
+
+    #[test]
+    fn effect_node_failing_before_any_effect_is_retried() {
+        let (err, calls) = drive_dispatch_chain(Some(vec![transient_pre_effect]), 1);
+        assert_eq!(calls, 1);
+        assert!(!is_terminal_flow_error(&err), "{err:#}");
+        assert!(should_retry(&err), "{err:#}");
+    }
+
+    #[test]
+    fn effect_node_with_no_handler_is_a_pre_effect_config_error_that_is_not_retried() {
+        // A missing handler is deterministic configuration: re-running the turn
+        // cannot help, so it must not retry (its text names none of the
+        // transient words `should_retry` looks for). It is also provably before
+        // any effect, so it is marked `pre_effect` and does not become a
+        // "terminal after effects" failure.
+        let (err, _) = drive_dispatch_chain(None, 1);
+        assert!(
+            err.to_string().contains("no RemoteDispatchHandler"),
+            "{err}"
+        );
+        assert!(is_pre_effect_error(&err), "{err:#}");
+        assert!(!is_terminal_flow_error(&err), "{err:#}");
+        assert!(!should_retry(&err), "{err:#}");
+    }
+
+    /// Drive one node of `component` on an engine with nothing registered and
+    /// return its failure.
+    fn drive_single_failing_node(component: &str, input: Value) -> anyhow::Error {
+        let engine = jump_test_engine();
+        let flow = chain_flow("chain.flow", &[("n0", component, input)]);
+        let rt = Runtime::new().unwrap();
+        let ctx = jump_ctx("chain.flow");
+        match rt.block_on(engine.drive_flow(
+            &ctx,
+            flow,
+            ExecutionState::new(Value::Null),
+            None,
+            "chain.flow".to_string(),
+        )) {
+            Ok(_) => panic!("the node must fail"),
+            Err(failure) => failure.error,
+        }
+    }
+
+    #[test]
+    fn provider_invoke_failures_before_the_call_are_pre_effect() {
+        // Payload that does not parse, missing op, and an unregistered flow
+        // (the binding lookup) all precede the provider call.
+        for input in [
+            json!({"op": 5}),
+            json!({}),
+            json!({"op": "send", "input": {"a": 1}}),
+        ] {
+            let err = drive_single_failing_node("provider.invoke", input.clone());
+            assert!(is_pre_effect_error(&err), "{input}: {err:#}");
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a2a_without_a_registered_pack_fails_pre_effect() {
+        let err = drive_single_failing_node("a2a", json!({"agent": "x", "message": "hi"}));
+        assert!(is_pre_effect_error(&err), "{err:#}");
+    }
+
+    #[test]
+    fn effect_node_failure_that_is_not_proven_pre_effect_is_terminal() {
+        let (err, calls) = drive_dispatch_chain(Some(vec![transient_unproven]), 1);
+        assert_eq!(calls, 1);
+        assert!(is_terminal_flow_error(&err), "{err:#}");
+        assert!(!should_retry(&err));
+    }
+
+    #[test]
+    fn failure_after_a_completed_effect_is_terminal_even_if_pre_effect_for_its_node() {
+        // n0 dispatches (an effect); n1 then fails with a transient error its
+        // own node can prove precedes ITS effects. n0's effect still counts, so
+        // the turn must not be re-run (which would dispatch n0 again).
+        let (err, calls) = drive_dispatch_chain(Some(vec![dispatched, transient_pre_effect]), 2);
+        assert_eq!(calls, 2);
+        assert!(is_terminal_flow_error(&err), "{err:#}");
+        assert!(!should_retry(&err));
+    }
+
+    #[test]
+    fn failed_effect_nodes_may_have_partial_effects_except_flow_call() {
+        assert!(NodeKind::MediaCreate.may_have_partial_effect_on_failure());
+        assert!(NodeKind::SorlaCall { target: "t".into() }.may_have_partial_effect_on_failure());
+        assert!(!NodeKind::FlowCall.may_have_partial_effect_on_failure());
+        assert!(!NodeKind::BuiltinStateGet.may_have_partial_effect_on_failure());
+        assert!(!NodeKind::Wait.may_have_partial_effect_on_failure());
+    }
+
+    fn chain_flow(flow_id: &str, nodes: &[(&str, &str, Value)]) -> HostFlow {
+        let mut map = indexmap::IndexMap::default();
+        for (index, (node_id, component, input)) in nodes.iter().enumerate() {
+            let id = NodeId::from_str(node_id).unwrap();
+            let routing = match nodes.get(index + 1) {
+                Some((next, _, _)) => Routing::Next {
+                    node_id: NodeId::from_str(next).unwrap(),
+                },
+                None => Routing::End,
+            };
+            map.insert(
+                id.clone(),
+                Node {
+                    id,
+                    component: FlowComponentRef {
+                        id: component.parse().unwrap(),
+                        pack_alias: None,
+                        operation: None,
+                    },
+                    input: InputMapping {
+                        mapping: input.clone(),
+                    },
+                    output: OutputMapping {
+                        mapping: Value::Null,
+                    },
+                    err_map: None,
+                    routing,
+                    telemetry: TelemetryHints::default(),
+                    conversational: false,
+                },
+            );
+        }
+        HostFlow::from(Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str(flow_id).unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(nodes[0].0.to_string()),
+            )]),
+            nodes: map,
+            metadata: Default::default(),
+        })
+    }
+
+    /// Drive `chain.flow` (first node, then a `flow.call` that fails because it
+    /// names no flow) and return the failure.
+    fn drive_chain_failure(first_component: &str, first_input: Value) -> anyhow::Error {
+        let engine = jump_test_engine();
+        let flow = chain_flow(
+            "chain.flow",
+            &[
+                ("first", first_component, first_input),
+                ("boom", "flow.call", json!({})),
+            ],
+        );
+        let rt = Runtime::new().unwrap();
+        let ctx = jump_ctx("chain.flow");
+        let failure = match rt.block_on(engine.drive_flow(
+            &ctx,
+            flow,
+            ExecutionState::new(Value::Null),
+            None,
+            "chain.flow".to_string(),
+        )) {
+            Ok(_) => panic!("the flow.call node must fail"),
+            Err(failure) => failure,
+        };
+        failure.error
+    }
+
+    #[test]
+    fn a_failure_after_an_effectful_node_is_terminal() {
+        // `flow.call` into a registered flow succeeds and counts as an effect.
+        let err = drive_chain_failure("flow.call", json!({ "flow": "flow.target" }));
+        assert!(
+            err.to_string().contains("flow.call"),
+            "original message kept: {err}"
+        );
+        assert!(is_terminal_flow_error(&err), "must not be re-run: {err:#}");
+    }
+
+    #[test]
+    fn a_failure_after_a_pure_node_stays_retryable() {
+        let err = drive_chain_failure("emit.log", json!({ "message": "hi" }));
+        assert!(
+            !is_terminal_flow_error(&err),
+            "no effect happened, the turn may be re-run: {err:#}"
+        );
+    }
+
+    #[test]
+    fn invalid_greentic_control_is_terminal() {
+        for payload in [
+            json!({ "greentic_control": "bad-shape" }),
+            json!({ "greentic_control": { "v": 1 } }),
+            json!({ "greentic_control": { "action": "jump", "v": 2 } }),
+            json!({ "greentic_control": { "action": "jump", "v": 1 } }),
+        ] {
+            let err = parse_component_control(&payload).expect_err("invalid control");
+            assert!(
+                err.to_string().contains("jump_failed")
+                    || err.to_string().contains("greentic_control")
+            );
+            assert!(is_terminal_flow_error(&err), "{payload}");
+            assert!(!should_retry(&err));
+        }
+    }
+
+    #[test]
     fn apply_jump_unknown_node_errors() {
         let engine = jump_test_engine();
         let mut state = ExecutionState::new(Value::Null);
@@ -9609,6 +10649,46 @@ mod tests {
             .expect("jump target");
         assert_eq!(target.flow_id, "flow.target");
         assert_eq!(target.node_id.as_str(), "node-a");
+    }
+
+    #[test]
+    fn condition_values_containing_another_operator_split_at_the_real_one() {
+        let ctx = json!({ "x": "5", "msg": { "text": "a>=b" }, "n": 7 });
+        assert!(evaluate_simple_condition(r#"msg.text == "a>=b""#, &ctx));
+        assert!(!evaluate_simple_condition(r#"msg.text != "a>=b""#, &ctx));
+        // `>` is the operator; the `==` lives inside the quoted literal.
+        assert!(evaluate_simple_condition(r#"n > "3""#, &ctx));
+        assert!(!evaluate_simple_condition(r#"n > "a==b""#, &ctx));
+        assert!(evaluate_simple_condition(r#"x >= 5"#, &ctx));
+        assert!(evaluate_simple_condition(r#"msg.text contains "=b""#, &ctx));
+        assert!(!evaluate_simple_condition("no operator here", &ctx));
+    }
+
+    #[test]
+    fn step_budget_trips_only_past_the_cap() {
+        assert!(check_step_budget(MAX_STEPS_PER_TURN, "f").is_ok());
+        let err = check_step_budget(MAX_STEPS_PER_TURN + 1, "f").unwrap_err();
+        assert!(err.to_string().contains("flow_step_limit_exceeded"));
+        assert!(!should_retry(&err));
+        assert!(is_terminal_flow_error(&err));
+    }
+
+    #[test]
+    fn terminal_marker_overrides_transient_sounding_text() {
+        let err = terminal_flow_error("internal timeout: unavailable");
+        assert!(!should_retry(&err));
+        assert!(!should_retry(&err.context("node failed")));
+        assert!(should_retry(&anyhow!("internal server error")));
+    }
+
+    #[test]
+    fn redirect_count_resets_for_a_resumed_turn() {
+        let mut state = ExecutionState::new(Value::Null);
+        state.increment_redirect_count();
+        state.increment_redirect_count();
+        assert_eq!(state.redirect_count(), 2);
+        state.reset_redirect_count();
+        assert_eq!(state.redirect_count(), 0);
     }
 
     #[test]
@@ -10433,6 +11513,7 @@ mod tests {
     /// `bound` here has no `output:` binding key, so it degrades to the bare
     /// tool result (`{"error": "..."}`); `mcp_node_output_preserves_the_output_binding_key`
     /// below covers the wrapped case.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_reports_failure_when_the_node_has_an_error_route() {
         let result = json!({ "error": "MCP is not configured on this runner" });
@@ -10479,6 +11560,7 @@ mod tests {
     /// Compared against calling `mcp_tool_error` directly on the same value —
     /// not a hand-typed string — so this test cannot drift from the detector
     /// it is supposed to match.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_uses_mcp_tool_error_for_the_object_shaped_error() {
         let result = json!({
@@ -10524,6 +11606,7 @@ mod tests {
     /// field survives verbatim alongside the new top-level `ok`/`error`
     /// fields the errors envelope needs. `node.<id>.quote_result_data` and
     /// `node.<id>.errors[0].message` must both resolve from the same output.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_preserves_the_output_binding_key_alongside_the_error_envelope() {
         let result = json!({ "error": "connection refused" });
@@ -10561,6 +11644,7 @@ mod tests {
     /// failure is surfaced only when `has_error_route` is true; a node
     /// without one keeps reporting `ok: true`, byte-for-byte the pre-R3
     /// behaviour.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_ignores_failure_when_the_node_has_no_error_route() {
         let result = json!({ "error": "MCP is not configured on this runner" });
@@ -10582,6 +11666,7 @@ mod tests {
     /// The success path must stay exactly as it was, regardless of
     /// `has_error_route`: a node that opted into error routing but whose
     /// call succeeded must not be affected.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_node_output_stays_ok_on_success_regardless_of_error_route() {
         let result = json!({ "annual_premium": 1234 });
@@ -10597,6 +11682,7 @@ mod tests {
 
     /// Case 2 of the third-routing-shape analysis: a node WITH an `on_error`
     /// route takes it — this is the point of R3.
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_failure_with_on_error_route_routes_to_the_error_branch() {
         let raw_routing = json!([
@@ -10630,6 +11716,7 @@ mod tests {
     /// `evaluate_custom_routing`: a node whose `Routing::Custom` array has
     /// only success-family routes never flips to `ok: false`, so it stays on
     /// the success path — never `CustomRoutingDecision::Wait` (parked).
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn mcp_failure_with_success_only_routing_never_parks() {
         let raw_routing = json!([
@@ -14120,6 +15207,75 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn error_envelope_prefers_the_partial_reply_over_the_machine_string() {
+        let entry = json!({
+            "ok": false,
+            "output": { "reply": "Here is what I found so far", "trail": [1] },
+            "error": { "code": "timeout", "message": "agent step ended without a reply: timeout" },
+        });
+        let (message, payload) = agent_error_envelope_reply(&entry);
+        assert_eq!(message, "Here is what I found so far");
+        assert_eq!(payload["reply"], "Here is what I found so far");
+        assert_eq!(payload["error"]["code"], "timeout", "error info is kept");
+        assert_eq!(payload["trail"], json!([1]));
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn error_envelope_without_a_usable_reply_shows_a_user_safe_line() {
+        for output in [
+            Value::Null,
+            json!({ "reply": "" }),
+            json!({ "reply": "  " }),
+        ] {
+            let entry = json!({
+                "ok": false, "output": output,
+                "error": { "code": "timeout", "message": "agent step ended without a reply: timeout" },
+                "metadata": { "locale": "id" },
+            });
+            let (message, payload) = agent_error_envelope_reply(&entry);
+            assert!(
+                !message.contains("agent step ended") && !message.trim().is_empty(),
+                "machine string must not reach the user: {message}"
+            );
+            assert!(message.starts_with("Maaf"), "localized via i18n: {message}");
+            assert_eq!(payload["reply"], message.as_str());
+            assert_eq!(
+                payload["error"]["code"], "timeout",
+                "operators keep the code"
+            );
+            assert_eq!(
+                payload["error"]["message"],
+                "agent step ended without a reply: timeout"
+            );
+        }
+        let (message, payload) = agent_error_envelope_reply(&json!({ "ok": false }));
+        assert!(!message.trim().is_empty());
+        assert_eq!(payload["reply"], message.as_str());
+    }
+
+    /// The operator log carries the machine error, never the localized reply.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn agent_error_log_fields_are_the_machine_error() {
+        let entry =
+            json!({"ok": false, "error": {"code": "timeout", "message": "no reply in 30s"}});
+        assert_eq!(
+            agent_error_log_fields(&entry),
+            ("timeout".to_string(), "no reply in 30s".to_string())
+        );
+        assert_eq!(
+            agent_error_log_fields(&json!({"ok": false, "error": "boom"})),
+            ("unknown".to_string(), "boom".to_string())
+        );
+        assert_eq!(
+            agent_error_log_fields(&json!({"ok": false})),
+            ("unknown".to_string(), String::new())
+        );
+    }
+
     /// Fix A (interleave guard): a user message arriving before the agent's
     /// NATS response must NOT be misread as that response. With the
     /// pending-await marker set (turn 1's fresh dispatch), a resume whose
@@ -15328,8 +16484,23 @@ pub struct RetryConfig {
 /// `ExecutionState` because the callers have already consumed `state` via
 /// `state.finalize_with(...)`; we capture a cheap clone of `state.nodes` up
 /// front and pass it in here.
+#[cfg(test)]
 fn lift_first_node_error_from_nodes(output: Value, nodes: &HashMap<String, NodeOutput>) -> Value {
-    let Some((node_id, failed)) = nodes.iter().find(|(_, out)| !out.ok) else {
+    // No execution order is available here, so pick deterministically by id.
+    let failure = nodes
+        .iter()
+        .filter(|(_, out)| !out.ok)
+        .min_by(|a, b| a.0.cmp(b.0))
+        .map(|(id, out)| (id.clone(), out.clone()));
+    lift_node_error(output, failure.as_ref())
+}
+
+/// Lift `failure` (a node id and its failed output) into `output.metadata`;
+/// see [`lift_first_node_error_from_nodes`]. Production callers choose the
+/// failure with [`ExecutionState::first_unhandled_failure`]: execution order,
+/// skipping nodes whose failure an error edge already routed.
+fn lift_node_error(output: Value, failure: Option<&(String, NodeOutput)>) -> Value {
+    let Some((node_id, failed)) = failure else {
         return output;
     };
     let err_meta = failed.meta.get("error");
@@ -15373,12 +16544,191 @@ fn lift_first_node_error_from_nodes(output: Value, nodes: &HashMap<String, NodeO
     Value::Object(output)
 }
 
+/// Marks a failure as transient, i.e. worth re-running the flow for. Wrap a
+/// source error in this (via `anyhow::Error::new`) where a failure is known to
+/// be retryable; nothing is retried on the strength of its message text.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct TransientFlowError(pub String);
+
+/// Wraps an error that is PROVEN to have happened before the failing node did
+/// anything outside the turn (nothing was published, no tool or provider call
+/// was made). The engine reads the marker to leave `effects_performed` unset
+/// for that failure, so a transient pre-effect error still retries the turn.
+/// Display is the wrapped error's, unchanged; its cause chain stays reachable
+/// to [`should_retry`] / [`is_terminal_flow_error`] (see `error_causes`).
+#[derive(Debug)]
+pub struct PreEffectError(anyhow::Error);
+
+impl std::fmt::Display for PreEffectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for PreEffectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The wrapped error itself is NOT repeated as a source (its message is
+        // this error's Display); `error_causes` looks inside instead.
+        self.0.source()
+    }
+}
+
+/// Mark `err` as having occurred before any external effect of the node. Use it
+/// only where that is provable; when in doubt, do not (the default is to assume
+/// the node may have done part of its work).
+pub fn pre_effect(err: impl Into<anyhow::Error>) -> anyhow::Error {
+    anyhow::Error::new(PreEffectError(err.into()))
+}
+
+/// Whether `err` was marked with [`pre_effect`] (at any depth of its chain).
+pub fn is_pre_effect_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<PreEffectError>())
+}
+
+/// Every cause in `err`, looking through [`PreEffectError`] wrappers into the
+/// error they wrap (which `source()` deliberately skips).
+fn error_causes(err: &anyhow::Error) -> Vec<&(dyn std::error::Error + 'static)> {
+    fn walk<'a>(err: &'a anyhow::Error, out: &mut Vec<&'a (dyn std::error::Error + 'static)>) {
+        for cause in err.chain() {
+            out.push(cause);
+            if let Some(wrapped) = cause.downcast_ref::<PreEffectError>() {
+                walk(&wrapped.0, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(err, &mut out);
+    out
+}
+
+/// Marks a failure as terminal: deterministic (a routing cycle, an unknown
+/// node, a missing required variable) or raised after side effects already ran
+/// (a step budget spent). Re-running the turn cannot help and would repeat the
+/// effects, so neither the engine's own retry loop nor the state machine's
+/// whole-turn `retry_with_jitter` re-runs it; the state machine sees it as
+/// [`RunnerError::FlowTerminal`](crate::engine::error::RunnerError::FlowTerminal).
+/// The `Display` text is the bare message, so existing message assertions hold.
+///
+/// It may carry the error it replaced ([`terminal_flow_error_from_after_effects`]). `Display`
+/// stays the OUTERMOST message only, because `to_string()` is what reaches the
+/// user-facing failure envelope and a cause chain can name a host or URL;
+/// `source()` exposes the original causes so `{err:#}` and
+/// `anyhow_chain_text` (operator logs, the redacted run error) still see the
+/// root cause.
+#[derive(Debug)]
+pub struct TerminalFlowError {
+    message: String,
+    original: Option<anyhow::Error>,
+    /// An earlier node of the SAME run had already performed an external
+    /// effect when this failure happened (see [`terminal_after_effects`]).
+    /// A deterministic pre-effect failure (unknown node) is terminal too but
+    /// leaves this `false`: nothing ran that a re-delivery would repeat.
+    after_effects: bool,
+}
+
+impl std::fmt::Display for TerminalFlowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TerminalFlowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The original's own message is this error's Display, so skip it and
+        // continue with ITS causes (same trick as `PreEffectError`).
+        self.original.as_ref().and_then(|err| {
+            let top: &(dyn std::error::Error + 'static) = err.as_ref();
+            top.source()
+        })
+    }
+}
+
+/// Build an `anyhow::Error` carrying a [`TerminalFlowError`].
+pub(crate) fn terminal_flow_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TerminalFlowError {
+        message: message.into(),
+        original: None,
+        after_effects: false,
+    })
+}
+
+/// Make `err` terminal while keeping its cause chain reachable through
+/// `source()` (see [`TerminalFlowError`]; `Display` is `err`'s outermost message,
+/// unchanged), recording that an earlier node of the run had performed an
+/// external effect.
+fn terminal_flow_error_from_after_effects(err: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(TerminalFlowError {
+        message: err.to_string(),
+        original: Some(err),
+        after_effects: true,
+    })
+}
+
+/// Whether the failure is terminal AND followed an external effect of the same
+/// run. A resumed run that fails this way has already spent the effect, so the
+/// park it was resumed from must not outlive the turn (the next message would
+/// resume the same wait and repeat the effect).
+pub fn is_after_effects_failure(err: &anyhow::Error) -> bool {
+    error_causes(err).into_iter().any(|cause| {
+        cause
+            .downcast_ref::<TerminalFlowError>()
+            .is_some_and(|terminal| terminal.after_effects)
+    })
+}
+
+/// Whether any cause in the chain is a [`TerminalFlowError`].
+pub fn is_terminal_flow_error(err: &anyhow::Error) -> bool {
+    error_causes(err)
+        .into_iter()
+        .any(|cause| cause.is::<TerminalFlowError>())
+}
+
+/// Retry transient failures: anything typed as transient (an explicit
+/// [`TransientFlowError`], a timeout, a transient I/O kind) or whose message
+/// names a transient condition ("transient", "unavailable", "internal",
+/// "timeout"). The message check is the long-standing behaviour that
+/// `FlowRetryConfig` callers (fault injection, state-store flakiness) rely on.
 fn should_retry(err: &anyhow::Error) -> bool {
+    // A terminal marker wins over any transient-sounding message text.
+    if is_terminal_flow_error(err) {
+        return false;
+    }
+    let typed = error_causes(err).into_iter().any(|cause| {
+        if cause.is::<TransientFlowError>() || cause.is::<tokio::time::error::Elapsed>() {
+            return true;
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+            )
+        })
+    });
+    if typed {
+        return true;
+    }
     let lower = err.to_string().to_lowercase();
     lower.contains("transient")
         || lower.contains("unavailable")
         || lower.contains("internal")
         || lower.contains("timeout")
+}
+
+#[cfg(feature = "fault-injection")]
+fn injected_error(err: crate::testing::fault_injection::InjectedError) -> anyhow::Error {
+    use crate::testing::fault_injection::FaultErrorKind;
+    match err.kind {
+        FaultErrorKind::Transient | FaultErrorKind::Timeout => {
+            anyhow::Error::new(TransientFlowError(err.to_string()))
+        }
+        _ => anyhow!(err.to_string()),
+    }
 }
 
 impl From<FlowRetryConfig> for RetryConfig {

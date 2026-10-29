@@ -10,13 +10,19 @@
 //! Gated behind the `serve` feature so the core library has no NATS dependency.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use aw_event_bridge::{AgentDispatchInvoker, InvokeOutcome, run_bridge, run_bridge_jetstream};
+use aw_event_bridge::{
+    AgentDispatchInvoker, DispatchIdentity, InvokeOutcome, run_bridge, run_bridge_jetstream,
+    valid_dispatch_id,
+};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::dispatch_ledger::{DispatchLedger, NoopDispatchLedger};
+use crate::error::TerminationReason;
 use crate::tenant::TenantContext;
 use crate::{AgentInput, AgentRuntime};
 
@@ -93,19 +99,91 @@ fn extract_user_text(input: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Whether a step that ended for `reason` produced a usable result.
+///
+/// A step cut short by the wall-clock timeout, the iteration cap or an error
+/// ends with an empty reply; reporting that as `ok: true` made the caller's
+/// flow carry on as if the agent had answered. The output keeps its
+/// `{reply, trail, terminated_by}` shape either way, so a consumer can read
+/// `terminated_by` to tell which limit was hit.
+fn step_succeeded(reason: &TerminationReason) -> bool {
+    !matches!(
+        reason,
+        TerminationReason::Timeout
+            | TerminationReason::MaxIterations
+            | TerminationReason::Error
+            | TerminationReason::TokenBudgetExceeded
+    )
+}
+
+/// The structured error for a step that ended without a usable reply: code is
+/// the `terminated_by` reason (`timeout`, `max_iterations`, ...), so the engine
+/// can say why instead of a generic fallback. The partial reply stays in
+/// `output`. `None` when the step succeeded.
+fn step_failure(ok: bool, output: &Value) -> Option<aw_event_bridge::DispatchError> {
+    if ok {
+        return None;
+    }
+    let code = output
+        .get("terminated_by")
+        .and_then(Value::as_str)
+        .unwrap_or("error")
+        .to_string();
+    Some(aw_event_bridge::DispatchError {
+        message: format!("agent step ended without a reply: {code}"),
+        code,
+    })
+}
+
 /// Resolve the session id for the step.
 ///
 /// Prefers an explicit `session_id` field in the input; otherwise falls back to
 /// the dispatch correlation/idempotency hint (which the runner derives from the
 /// flow session). A final synthetic default keeps the function total.
 fn resolve_session_id(input: &Value, idempotency_key: Option<&str>) -> String {
-    input
+    let raw = input
         .get("session_id")
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| idempotency_key.map(str::to_string))
         .filter(|hint| !hint.is_empty())
-        .unwrap_or_else(|| "agentic-dispatch".to_string())
+        .unwrap_or_else(|| "agentic-dispatch".to_string());
+    shorten_session_id(raw)
+}
+
+/// Replace an over-long session id with a stable digest (`h:` + sha256 hex).
+///
+/// The runner's resume markers (`::cnv64=`, `::thr64=`, `::rpl64=`) base64 the
+/// provider conversation / thread / reply ids onto the correlation id, so a
+/// long Teams or email conversation exceeds `MAX_SESSION_ID_LEN` and used to be
+/// rejected on every turn. The digest is deterministic, so one conversation
+/// still maps to one agent memory. An id with a forbidden character is passed
+/// through unchanged so `validate_session_id` still rejects it.
+fn shorten_session_id(id: String) -> String {
+    if id.len() <= crate::tenant::MAX_SESSION_ID_LEN || id.chars().any(char::is_control) {
+        return id;
+    }
+    let digest = Sha256::digest(id.as_bytes());
+    let mut out = String::with_capacity(2 + digest.len() * 2);
+    out.push_str("h:");
+    for byte in digest.iter() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// The ledger key for one dispatch: tenant + env + the publisher's per-dispatch
+/// id. `None` when there is no well-formed dispatch id, in which case the
+/// ledger is not used at all.
+///
+/// The key is NOT the correlation/idempotency hint: that is the conversation's
+/// session hint, identical for every turn, so keying on it replayed turn 1's
+/// reply as turn 2's. The dispatch id is minted once per publish, so a broker
+/// redelivery of the same message hits the entry while the next turn misses.
+/// `tenant` and `env` cannot contain `:` (validated), so the join is unambiguous.
+fn ledger_key(tenant: &str, env: &str, dispatch_id: Option<&str>) -> Option<String> {
+    let id = dispatch_id.filter(|id| valid_dispatch_id(id))?;
+    Some(format!("{tenant}:{env}:{id}"))
 }
 
 #[async_trait]
@@ -115,15 +193,49 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
         tenant: &str,
         env: &str,
         target: &str,
-        _operation: &str,
+        operation: &str,
         input: Value,
         idempotency_key: Option<&str>,
     ) -> Result<InvokeOutcome> {
+        // No dispatch id: nothing safely identifies a redelivery, so no dedup.
+        self.invoke_identified(
+            tenant,
+            env,
+            target,
+            operation,
+            input,
+            DispatchIdentity {
+                idempotency_key,
+                dispatch_id: None,
+            },
+        )
+        .await
+    }
+
+    async fn invoke_identified(
+        &self,
+        tenant: &str,
+        env: &str,
+        target: &str,
+        _operation: &str,
+        input: Value,
+        ident: DispatchIdentity<'_>,
+    ) -> Result<InvokeOutcome> {
+        let idempotency_key = ident.idempotency_key;
+        // Tenant, env and session ids arrive from the wire and become Redis key
+        // segments: refuse the ones that could alias another tenant's keys.
+        crate::tenant::validate_scope_id("tenant", tenant).map_err(anyhow::Error::msg)?;
+        crate::tenant::validate_scope_id("env", env).map_err(anyhow::Error::msg)?;
+        // The target becomes an admin-registry URL path segment: refuse one
+        // that could steer it (a deterministic, non-retryable rejection).
+        crate::tenant::validate_target_id(target).map_err(anyhow::Error::msg)?;
+
         // --- dispatch-level idempotency (Task 2.3) ---
-        // If we have a key, check the ledger first. A hit means this is a
-        // JetStream redelivery: return the cached output without re-running
-        // the (expensive + side-effectful) LLM step.
-        if let Some(key) = idempotency_key {
+        // A hit means this is a redelivery of the SAME published message:
+        // return the cached output without re-running the (expensive +
+        // side-effectful) LLM step.
+        let ledger_key = ledger_key(tenant, env, ident.dispatch_id);
+        if let Some(key) = ledger_key.as_deref() {
             match self.ledger.get(key).await {
                 Ok(Some(cached)) => {
                     tracing::debug!(key, "dispatch ledger hit; returning cached output");
@@ -131,6 +243,7 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
                         ok: true,
                         output: cached,
                         events: vec![],
+                        error: None,
                     });
                 }
                 Ok(None) => {}
@@ -143,6 +256,7 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
 
         let user_text = extract_user_text(&input);
         let session_id = resolve_session_id(&input, idempotency_key);
+        crate::tenant::validate_session_id(&session_id).map_err(anyhow::Error::msg)?;
         let tenant_ctx = TenantContext::new(tenant, env);
         // Forward-compatible: honour a `conversational` flag on the dispatch
         // input if the caller (engine remote-dispatch) supplies it, so the
@@ -175,19 +289,41 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
             "terminated_by": output.terminated_by,
         });
 
-        // Record the result for future redeliveries (best-effort: a ledger
-        // write error is logged but does NOT fail the dispatch).
-        if let Some(key) = idempotency_key
+        let ok = step_succeeded(&output.terminated_by);
+
+        // Record a successful result for future redeliveries (best-effort: a
+        // ledger write error is logged but does NOT fail the dispatch). A
+        // timed-out / exhausted step is not cached, so a retry can succeed.
+        if ok
+            && let Some(key) = ledger_key.as_deref()
             && let Err(e) = self.ledger.record(key, outcome_output.clone()).await
         {
             tracing::warn!(key, error = %e, "dispatch ledger record failed; redelivery will re-run step");
         }
 
+        let error = step_failure(ok, &outcome_output);
         Ok(InvokeOutcome {
-            ok: true,
+            ok,
             output: outcome_output,
             events: vec![],
+            error,
         })
+    }
+
+    async fn step_timeout(&self, tenant: &str, env: &str, target: &str) -> Option<Duration> {
+        if crate::tenant::validate_target_id(target).is_err() {
+            return None;
+        }
+        let tenant_ctx = TenantContext::new(tenant, env);
+        match self
+            .runtime
+            .config_provider
+            .agent_config(&tenant_ctx, target)
+            .await
+        {
+            Ok(config) => Some(config.limits.timeout),
+            Err(_) => None,
+        }
     }
 }
 
@@ -256,20 +392,23 @@ pub async fn serve_with_ledger(
     ledger: Arc<dyn DispatchLedger>,
 ) -> Result<()> {
     warm_on_start(|k| std::env::var(k).ok());
+    // The URL may carry `user:pass@`; only the redacted form is ever logged
+    // or put in an error context.
+    let nats_url_display = crate::url_redact::redact_url(nats_url);
     let client = async_nats::connect(nats_url)
         .await
-        .with_context(|| format!("connecting to NATS at {nats_url}"))?;
+        .with_context(|| format!("connecting to NATS at {nats_url_display}"))?;
     tracing::info!(
-        nats_url,
+        nats_url = %nats_url_display,
         subject = aw_event_bridge::request_topic(aw_event_bridge::RUNTIME_NAME),
         "aw event bridge connected; serving agentic dispatch"
     );
     let invoker = Arc::new(RuntimeAgentDispatchInvoker::with_ledger(runtime, ledger));
     if use_jetstream(|k| std::env::var(k).ok()) {
-        tracing::info!(nats_url, "aw serve: JetStream durable consumer");
+        tracing::info!(nats_url = %nats_url_display, "aw serve: JetStream durable consumer");
         run_bridge_jetstream(client, invoker).await
     } else {
-        tracing::info!(nats_url, "aw serve: core-NATS consumer (legacy)");
+        tracing::info!(nats_url = %nats_url_display, "aw serve: core-NATS consumer (legacy)");
         run_bridge(client, invoker).await
     }
 }
@@ -427,11 +566,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn limit_terminations_are_not_reported_as_success() {
+        assert!(step_succeeded(&TerminationReason::FinalReply));
+        assert!(step_succeeded(&TerminationReason::ConversationEnded));
+        assert!(step_succeeded(&TerminationReason::AwaitingToolInput));
+        assert!(!step_succeeded(&TerminationReason::Timeout));
+        assert!(!step_succeeded(&TerminationReason::MaxIterations));
+        assert!(!step_succeeded(&TerminationReason::Error));
+    }
+
+    #[test]
+    fn failed_step_carries_terminated_by_as_error_code_and_keeps_partial_reply() {
+        let output = json!({"reply": "partial", "trail": [], "terminated_by": "timeout"});
+        let error = step_failure(false, &output);
+        assert_eq!(error.as_ref().map(|e| e.code.as_str()), Some("timeout"));
+        assert!(error.is_some_and(|e| e.message.contains("timeout")));
+        assert_eq!(output["reply"], json!("partial"));
+        assert!(step_failure(true, &output).is_none());
+    }
+
+    #[test]
     fn extract_user_text_accepts_node_and_raw_shapes() {
         assert_eq!(extract_user_text(&json!({"user_text": "hi"})), "hi");
         assert_eq!(extract_user_text(&json!({"text": "yo"})), "yo");
         assert_eq!(extract_user_text(&json!("bare")), "bare");
         assert_eq!(extract_user_text(&json!({"other": 1})), "");
+    }
+
+    #[test]
+    fn long_session_id_becomes_stable_valid_digest() {
+        let long_a = format!("conv::cnv64={}", "A".repeat(600));
+        let long_b = format!("conv::cnv64={}", "B".repeat(600));
+        let a1 = resolve_session_id(&json!({}), Some(&long_a));
+        let a2 = resolve_session_id(&json!({}), Some(&long_a));
+        let b = resolve_session_id(&json!({}), Some(&long_b));
+        assert_eq!(a1, a2, "digest must be deterministic");
+        assert_ne!(a1, b, "distinct inputs must stay distinct");
+        assert!(a1.starts_with("h:"));
+        assert_eq!(a1.len(), 66);
+        assert!(crate::tenant::validate_session_id(&a1).is_ok());
+        // Short ids are untouched; control characters are still rejected.
+        assert_eq!(resolve_session_id(&json!({}), Some("short")), "short");
+        let bad = format!("{}\n", "x".repeat(600));
+        let kept = resolve_session_id(&json!({}), Some(&bad));
+        assert!(crate::tenant::validate_session_id(&kept).is_err());
     }
 
     #[test]
@@ -480,7 +658,7 @@ mod tests {
         use crate::dispatch_ledger::InMemoryDispatchLedger;
 
         let ledger = Arc::new(InMemoryDispatchLedger::with(
-            "k1",
+            "acme:prod:d1",
             json!({"reply": "CACHED", "trail": [], "terminated_by": "final_reply"}),
         ));
         let invoker = RuntimeAgentDispatchInvoker::with_ledger(
@@ -489,13 +667,16 @@ mod tests {
         );
 
         let out = invoker
-            .invoke(
+            .invoke_identified(
                 "acme",
                 "prod",
                 "greeter",
                 "",
                 json!({"user_text": "hi"}),
-                Some("k1"),
+                DispatchIdentity {
+                    idempotency_key: Some("sess-k1"),
+                    dispatch_id: Some("d1"),
+                },
             )
             .await
             .expect("cached invoke succeeds");
@@ -522,26 +703,126 @@ mod tests {
         );
 
         let out = invoker
-            .invoke(
+            .invoke_identified(
                 "acme",
                 "prod",
                 "greeter",
                 "",
                 json!({"user_text": "hi"}),
-                Some("k2"),
+                DispatchIdentity {
+                    idempotency_key: Some("sess-k2"),
+                    dispatch_id: Some("d2"),
+                },
             )
             .await
             .expect("fresh invoke succeeds");
 
         assert!(out.ok);
         assert_eq!(out.output["reply"], json!("pong"), "step ran and replied");
-        let stored = ledger.stored("k2");
+        let stored = ledger.stored("acme:prod:d2");
         assert!(stored.is_some(), "result was recorded in the ledger");
         assert_eq!(
             stored.expect("stored entry present")["reply"],
             json!("pong"),
             "recorded value matches step output"
         );
+    }
+
+    /// The regression: two TURNS of one conversation share the correlation /
+    /// idempotency hint but carry different dispatch ids. Both must run; turn 2
+    /// must not replay turn 1's cached reply.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn two_turns_with_one_correlation_id_both_run() {
+        use crate::dispatch_ledger::InMemoryDispatchLedger;
+
+        let ledger = Arc::new(InMemoryDispatchLedger::with(
+            "acme:prod:turn-1",
+            json!({"reply": "TURN1", "trail": [], "terminated_by": "final_reply"}),
+        ));
+        let invoker = RuntimeAgentDispatchInvoker::with_ledger(
+            build_test_mock_runtime("greeter", "pong"),
+            ledger.clone(),
+        );
+        let turn = |dispatch_id: &'static str| DispatchIdentity {
+            idempotency_key: Some("sess-1::pack=p::flow=f"),
+            dispatch_id: Some(dispatch_id),
+        };
+
+        let second = invoker
+            .invoke_identified(
+                "acme",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "again"}),
+                turn("turn-2"),
+            )
+            .await
+            .expect("turn 2 runs");
+        assert_eq!(second.output["reply"], json!("pong"), "turn 2 ran the step");
+        assert!(ledger.stored("acme:prod:turn-2").is_some());
+
+        // Redelivery of turn 1 still dedups, and of turn 2 returns turn 2's.
+        let redelivered = invoker
+            .invoke_identified(
+                "acme",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "hi"}),
+                turn("turn-1"),
+            )
+            .await
+            .expect("redelivery");
+        assert_eq!(redelivered.output["reply"], json!("TURN1"));
+    }
+
+    /// The ledger is scoped by tenant and env: the same dispatch id under
+    /// another tenant is a miss.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn ledger_is_scoped_by_tenant_and_env() {
+        use crate::dispatch_ledger::InMemoryDispatchLedger;
+
+        let ledger = Arc::new(InMemoryDispatchLedger::with(
+            "acme:prod:d1",
+            json!({"reply": "ACME", "trail": [], "terminated_by": "final_reply"}),
+        ));
+        let invoker = RuntimeAgentDispatchInvoker::with_ledger(
+            build_test_mock_runtime("greeter", "pong"),
+            ledger,
+        );
+        let out = invoker
+            .invoke_identified(
+                "globex",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "hi"}),
+                DispatchIdentity {
+                    idempotency_key: Some("sess"),
+                    dispatch_id: Some("d1"),
+                },
+            )
+            .await
+            .err()
+            .expect("a miss reaches the step; the mock only knows tenant acme");
+        assert!(
+            format!("{out:#}").contains("agentic step failed"),
+            "{out:#}"
+        );
+    }
+
+    #[test]
+    fn ledger_key_requires_a_well_formed_dispatch_id() {
+        assert_eq!(
+            ledger_key("acme", "prod", Some("abc-1_X")).as_deref(),
+            Some("acme:prod:abc-1_X")
+        );
+        assert_eq!(ledger_key("acme", "prod", None), None);
+        assert_eq!(ledger_key("acme", "prod", Some("")), None);
+        assert_eq!(ledger_key("acme", "prod", Some("a:b")), None);
     }
 
     /// No key → no ledger interaction; step runs normally.
@@ -572,5 +853,33 @@ mod tests {
         assert_eq!(out.output["reply"], json!("pong"));
         // No key → nothing recorded.
         assert!(ledger.stored("k-absent").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_path_steering_target_is_refused_before_any_config_lookup() {
+        let runtime = build_test_mock_runtime("greeter", "pong");
+        let invoker = RuntimeAgentDispatchInvoker::new(runtime);
+        let refused = invoker
+            .invoke(
+                "acme",
+                "prod",
+                "../tenant/me/mcp-servers",
+                "",
+                json!({"user_text": "ping"}),
+                Some("sess-1"),
+            )
+            .await
+            .err();
+        assert!(refused.is_some(), "a path-steering target must be refused");
+        let message = refused.map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("target"), "{message}");
+        // Non-retryable: not classified as a busy / unavailable session.
+        assert!(!message.contains("temporarily unavailable"));
+        assert!(
+            invoker
+                .step_timeout("acme", "prod", "../tenant/me/mcp-servers")
+                .await
+                .is_none()
+        );
     }
 }

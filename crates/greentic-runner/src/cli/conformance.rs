@@ -216,6 +216,21 @@ fn emit_report(args: &ConformanceArgs, reports: Vec<PackReport>) -> Result<()> {
     } else {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     }
+    ensure_report_passed(&payload.summary)
+}
+
+/// A conformance run only succeeds when at least one pack ran and none failed.
+fn ensure_report_passed(summary: &SummaryReport) -> Result<()> {
+    if summary.total == 0 {
+        bail!("conformance ran no packs (is the --provider filter correct?)");
+    }
+    if summary.failed > 0 {
+        bail!(
+            "conformance failed: {} of {} packs failed",
+            summary.failed,
+            summary.total
+        );
+    }
     Ok(())
 }
 
@@ -240,21 +255,36 @@ fn discover_packs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(packs)
 }
 
+/// Run one pack against a fresh host. The host is always stopped, even when
+/// the inner run bails out early with `?`.
 async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<PackReport>> {
+    let host = build_host(args.trace)?;
+    host.start().await?;
+    let outcome = run_pack_on_host(args, pack_path, &host).await;
+    let stopped = host.stop().await;
+    match (outcome, stopped) {
+        (Err(err), _) => Err(err),
+        (Ok(report), Ok(())) => Ok(report),
+        (Ok(_), Err(stop_err)) => Err(stop_err),
+    }
+}
+
+async fn run_pack_on_host(
+    args: &ConformanceArgs,
+    pack_path: &Path,
+    host: &RunnerHost,
+) -> Result<Option<PackReport>> {
     let timeout_limit = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     let mut timing = TimingReport::default();
     let mut diagnostics = Vec::new();
 
     let resolve_start = Instant::now();
-    let host = build_host(args.trace)?;
-    host.start().await?;
     let load_result = timeout(timeout_limit, host.load_pack("conformance", pack_path)).await;
     timing.resolve = resolve_start.elapsed().as_millis() as u64;
 
     let load_result = match load_result {
         Ok(result) => result,
         Err(_) => {
-            host.stop().await?;
             return Ok(Some(PackReport {
                 pack: pack_path.display().to_string(),
                 version: "unknown".to_string(),
@@ -271,7 +301,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
         }
     };
     if let Err(err) = load_result {
-        host.stop().await?;
         return Ok(Some(PackReport {
             pack: pack_path.display().to_string(),
             version: "unknown".to_string(),
@@ -288,7 +317,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
     }
 
     let Some(tenant) = host.tenant("conformance").await else {
-        host.stop().await?;
         bail!(
             "tenant runtime not available for pack {}",
             pack_path.display()
@@ -299,7 +327,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
     let pack_version = pack.metadata().version.clone();
 
     if !matches_provider(&pack_id, args.provider.as_deref()) {
-        host.stop().await?;
         return Ok(None);
     }
 
@@ -310,7 +337,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
 
     let flow_descriptors = pack.list_flows().await?;
     if flow_descriptors.is_empty() {
-        host.stop().await?;
         return Ok(Some(PackReport {
             pack: pack_id,
             version: pack_version,
@@ -347,7 +373,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
         for flow in &flow_descriptors {
             pack.load_flow(flow.id.as_str())?;
         }
-        host.stop().await?;
         return Ok(Some(PackReport {
             pack: pack_id,
             version: pack_version,
@@ -373,7 +398,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
     let run_result = match run_result {
         Ok(result) => result,
         Err(_) => {
-            host.stop().await?;
             diagnostics.push(Diagnostic {
                 code: "timeout".to_string(),
                 message: "execution timed out".to_string(),
@@ -391,26 +415,44 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
         }
     };
 
-    if let Err(err) = run_result {
-        host.stop().await?;
-        diagnostics.push(Diagnostic {
-            code: "execute_error".to_string(),
-            message: err.to_string(),
-        });
-        return Ok(Some(PackReport {
-            pack: pack_id,
-            version: pack_version,
-            level: level_label(args.level),
-            status: "fail".to_string(),
-            stage: "execute".to_string(),
-            case: None,
-            diagnostics,
-            timing_ms: timing,
-        }));
+    match run_result {
+        Err(err) => {
+            diagnostics.push(Diagnostic {
+                code: "execute_error".to_string(),
+                message: err.to_string(),
+            });
+            return Ok(Some(PackReport {
+                pack: pack_id,
+                version: pack_version,
+                level: level_label(args.level),
+                status: "fail".to_string(),
+                stage: "execute".to_string(),
+                case: None,
+                diagnostics,
+                timing_ms: timing,
+            }));
+        }
+        Ok(replies) => {
+            if let Some((kind, message)) = replies_error_envelope(&replies) {
+                diagnostics.push(Diagnostic {
+                    code: "flow_error_envelope".to_string(),
+                    message: format!("{kind}: {message}"),
+                });
+                return Ok(Some(PackReport {
+                    pack: pack_id,
+                    version: pack_version,
+                    level: level_label(args.level),
+                    status: "fail".to_string(),
+                    stage: "execute".to_string(),
+                    case: None,
+                    diagnostics,
+                    timing_ms: timing,
+                }));
+            }
+        }
     }
 
     if matches!(args.level, ConformanceLevel::L1) {
-        host.stop().await?;
         return Ok(Some(PackReport {
             pack: pack_id,
             version: pack_version,
@@ -436,7 +478,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
     let second = match second {
         Ok(result) => result,
         Err(_) => {
-            host.stop().await?;
             diagnostics.push(Diagnostic {
                 code: "timeout".to_string(),
                 message: "state execution timed out".to_string(),
@@ -456,12 +497,27 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
 
     match second {
         Ok(replies) => {
+            if let Some((kind, message)) = replies_error_envelope(&replies) {
+                diagnostics.push(Diagnostic {
+                    code: "flow_error_envelope".to_string(),
+                    message: format!("{kind}: {message}"),
+                });
+                return Ok(Some(PackReport {
+                    pack: pack_id,
+                    version: pack_version,
+                    level: level_label(args.level),
+                    status: "fail".to_string(),
+                    stage: "state".to_string(),
+                    case: None,
+                    diagnostics,
+                    timing_ms: timing,
+                }));
+            }
             if !is_structured(&replies) {
                 diagnostics.push(Diagnostic {
                     code: "invalid_output".to_string(),
                     message: "runner returned unstructured output".to_string(),
                 });
-                host.stop().await?;
                 return Ok(Some(PackReport {
                     pack: pack_id,
                     version: pack_version,
@@ -479,7 +535,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
                 code: "execute_error".to_string(),
                 message: err.to_string(),
             });
-            host.stop().await?;
             return Ok(Some(PackReport {
                 pack: pack_id,
                 version: pack_version,
@@ -493,7 +548,6 @@ async fn run_pack(args: &ConformanceArgs, pack_path: &Path) -> Result<Option<Pac
         }
     }
 
-    host.stop().await?;
     Ok(Some(PackReport {
         pack: pack_id,
         version: pack_version,
@@ -781,11 +835,22 @@ fn write_fault_artifacts(
     result: &Value,
     trace_path: Option<PathBuf>,
 ) -> Result<()> {
+    write_fault_artifacts_under(Path::new("target"), case, inputs, result, trace_path)
+}
+
+#[cfg(feature = "fault-injection")]
+fn write_fault_artifacts_under(
+    base: &Path,
+    case: &FaultCase,
+    inputs: &Value,
+    result: &Value,
+    trace_path: Option<PathBuf>,
+) -> Result<()> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let root = PathBuf::from("target")
+    let root = base
         .join("fault-artifacts")
         .join(case.name.replace(' ', "_"))
         .join(timestamp.to_string());
@@ -824,7 +889,6 @@ fn build_activity(
 
 /// Look for `error_kind` + `error_message` at any of the carrier paths an
 /// Activity reply may nest them under (`payload.metadata`, `metadata`, root).
-#[cfg(feature = "fault-injection")]
 fn extract_error_envelope(value: &Value) -> Option<(String, String)> {
     let candidates = [
         value.get("payload").and_then(|p| p.get("metadata")),
@@ -847,6 +911,16 @@ fn extract_error_envelope(value: &Value) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// Find the `error_kind`/`error_message` envelope a session flow returns as an
+/// `Ok` reply when a node fails.
+fn replies_error_envelope(replies: &[Activity]) -> Option<(String, String)> {
+    let payload = serde_json::to_value(replies).ok()?;
+    payload
+        .as_array()
+        .and_then(|arr| arr.iter().find_map(extract_error_envelope))
+        .or_else(|| extract_error_envelope(&payload))
 }
 
 fn is_structured(replies: &[Activity]) -> bool {
@@ -1037,6 +1111,21 @@ mod tests {
     }
 
     #[test]
+    fn error_envelope_is_found_in_replies_and_ignored_when_absent() {
+        let failing = vec![Activity::custom(
+            "reply",
+            serde_json::json!({"metadata": {"error_kind": "node_failed", "error_message": "boom"}}),
+        )];
+        assert_eq!(
+            replies_error_envelope(&failing),
+            Some(("node_failed".to_string(), "boom".to_string()))
+        );
+        let ok = vec![Activity::custom("reply", serde_json::json!({"ok": true}))];
+        assert_eq!(replies_error_envelope(&ok), None);
+        assert_eq!(replies_error_envelope(&[]), None);
+    }
+
+    #[test]
     fn structured_check_and_build_host_work() {
         let replies = vec![Activity::custom("one", serde_json::json!({"ok": true}))];
         assert!(is_structured(&replies));
@@ -1053,7 +1142,9 @@ mod tests {
         let report_path = nested.join("report.json");
         let args = args_for_report(Some(report_path.clone()));
         let reports = vec![sample_report("pass"), sample_report("fail")];
-        emit_report(&args, reports)?;
+        // The report is still written, but a failing pack makes the run fail.
+        let err = emit_report(&args, reports).expect_err("failed pack must error");
+        assert!(err.to_string().contains("1 of 2"), "got: {err}");
         assert!(report_path.exists(), "parent directory should be created");
         let contents = fs::read_to_string(&report_path)?;
         let parsed: Value = serde_json::from_str(&contents)?;
@@ -1068,8 +1159,15 @@ mod tests {
     #[test]
     fn emit_report_prints_to_stdout_when_no_path() -> Result<()> {
         let args = args_for_report(None);
-        // Should not panic or error when path is None (output goes to stdout).
+        // Output goes to stdout; an all-pass run succeeds.
         emit_report(&args, vec![sample_report("pass")])
+    }
+
+    #[test]
+    fn emit_report_errors_when_no_packs_ran() {
+        let args = args_for_report(None);
+        let err = emit_report(&args, Vec::new()).expect_err("empty run must error");
+        assert!(err.to_string().contains("no packs"), "got: {err}");
     }
 
     #[cfg(feature = "fault-injection")]
@@ -1092,11 +1190,10 @@ mod tests {
     #[test]
     fn write_fault_artifacts_creates_expected_files() -> Result<()> {
         let temp = TempDir::new()?;
-        // write_fault_artifacts writes under target/fault-artifacts/<case_name>/<ts>/.
-        // Switch CWD to the tempdir so we don't pollute the real target dir.
-        let prev_cwd = std::env::current_dir()?;
-        std::env::set_current_dir(temp.path())?;
-        let result = (|| {
+        // Write under <tmp>/target/fault-artifacts/<case_name>/<ts>/ without
+        // touching the process-global cwd (other tests run in parallel).
+        let target = temp.path().join("target");
+        {
             let case = FaultCase {
                 name: "case under test".to_string(),
                 pack: "messaging-conformance".to_string(),
@@ -1113,7 +1210,7 @@ mod tests {
             let result = serde_json::json!({"status": "fail"});
             let trace_src = temp.path().join("trace.txt");
             fs::write(&trace_src, b"trace-bytes")?;
-            write_fault_artifacts(&case, &inputs, &result, Some(trace_src))?;
+            write_fault_artifacts_under(&target, &case, &inputs, &result, Some(trace_src))?;
 
             let root = temp.path().join("target").join("fault-artifacts");
             let case_dir = root.join("case_under_test");
@@ -1129,10 +1226,8 @@ mod tests {
             assert!(run_dir.join("result.json").exists());
             assert!(run_dir.join("trace.txt").exists());
             // No trace path: should still write the three JSON files.
-            write_fault_artifacts(&case, &inputs, &result, None)?;
-            Ok::<(), anyhow::Error>(())
-        })();
-        std::env::set_current_dir(prev_cwd)?;
-        result
+            write_fault_artifacts_under(&target, &case, &inputs, &result, None)?;
+            Ok(())
+        }
     }
 }

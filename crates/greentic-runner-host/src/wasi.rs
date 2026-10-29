@@ -1,9 +1,33 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder};
+
+/// Guest paths that are backed by per-tenant host directories.
+const TENANT_SCOPED_GUEST_PATHS: [&str; 3] = ["/state", "/cache", "/logs"];
+
+/// Validate a tenant id for use as a single host directory name.
+///
+/// Accepts `[A-Za-z0-9._-]{1,128}` and rejects `.`/`..`, so the result can
+/// never contain a path separator or climb out of its parent.
+pub(crate) fn tenant_dir_segment(tenant: &str) -> Result<&str> {
+    let ok = !tenant.is_empty()
+        && tenant.len() <= 128
+        && tenant != "."
+        && tenant != ".."
+        && tenant
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(tenant)
+    } else {
+        Err(anyhow!(
+            "tenant id {tenant:?} is not safe to use as a directory name"
+        ))
+    }
+}
 
 /// Specification for exposing a host directory to the guest.
 #[derive(Clone, Debug)]
@@ -107,7 +131,9 @@ impl RunnerWasiPolicy {
             // visibility.
             builder.stdout(crate::telemetry_scan::TelemetryStream::stdout());
             builder.stderr(crate::telemetry_scan::TelemetryStream::stderr());
-            builder.inherit_stdin();
+            // stdin is deliberately NOT inherited: a guest has no business
+            // reading the host process's stdin (the builder default is an
+            // empty, closed stream).
         }
         let env_pairs = self.collect_env();
         if !env_pairs.is_empty() {
@@ -121,6 +147,48 @@ impl RunnerWasiPolicy {
             self.install_preopen(&mut builder, spec)?;
         }
         Ok(builder.build())
+    }
+
+    /// Derive the policy a single tenant's packs run under.
+    ///
+    /// * The guest-visible `/state`, `/cache` and `/logs` preopens keep their
+    ///   guest paths but are re-backed by `<host_path>/tenants/<tenant>`
+    ///   (created on demand), so two tenants never share a host directory and
+    ///   a guest never sees the sibling pack-artifact cache (`<cache>/packs`).
+    ///   Data written under the previous host-wide directories is NOT migrated.
+    /// * `GREENTIC_{STATE,CACHE,LOGS}_DIR` that point at a rewritten host path
+    ///   follow it.
+    /// * `env_allow` gains only this tenant's `env_passthrough` (the policy's
+    ///   own entries, e.g. from an embedder, are kept).
+    ///
+    /// A tenant id is only validated when there is a tenant-scoped preopen to
+    /// rewrite, so policies without such preopens are returned unchanged
+    /// (apart from the env allowlist).
+    pub fn for_tenant(&self, tenant: &str, env_passthrough: &[String]) -> Result<Self> {
+        let mut out = self.clone();
+        for key in env_passthrough {
+            if !out.env_allow.contains(key) {
+                out.env_allow.push(key.clone());
+            }
+        }
+        for spec in &mut out.preopens {
+            if !TENANT_SCOPED_GUEST_PATHS.contains(&spec.guest_path.as_str()) {
+                continue;
+            }
+            let segment = tenant_dir_segment(tenant)?;
+            let original = spec.host_path.clone();
+            let scoped = original.join("tenants").join(segment);
+            fs::create_dir_all(&scoped).with_context(|| {
+                format!("failed to create tenant directory {}", scoped.display())
+            })?;
+            for value in out.env_set.values_mut() {
+                if Path::new(value.as_str()) == original {
+                    *value = scoped.display().to_string();
+                }
+            }
+            spec.host_path = scoped;
+        }
+        Ok(out)
     }
 
     fn collect_env(&self) -> Vec<(String, String)> {
@@ -157,5 +225,93 @@ impl RunnerWasiPolicy {
                 )
             })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `WasiCtx` cannot be introspected for its stdin, so pin the source:
+    /// a guest must never be handed the host's stdin.
+    #[test]
+    fn guest_stdin_is_never_inherited() {
+        let src = include_str!("wasi.rs");
+        let needle = ["inherit", "_stdin("].concat();
+        let calls = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && l.contains(&needle))
+            .count();
+        // The only mention left is this test's own `needle` construction.
+        assert_eq!(
+            calls, 0,
+            "wasi.rs must not call the stdin-inheriting builder method"
+        );
+    }
+
+    fn base(root: &Path) -> RunnerWasiPolicy {
+        let state = root.join("state");
+        let cache = root.join("cache");
+        let logs = root.join("logs");
+        for d in [&state, &cache, &logs, &cache.join("packs")] {
+            fs::create_dir_all(d).expect("mkdir");
+        }
+        RunnerWasiPolicy::default()
+            .with_env("GREENTIC_STATE_DIR", state.display().to_string())
+            .with_preopen(PreopenSpec::new(&state, "/state"))
+            .with_preopen(PreopenSpec::new(&cache, "/cache"))
+            .with_preopen(PreopenSpec::new(&logs, "/logs"))
+    }
+
+    #[test]
+    fn tenants_get_disjoint_host_dirs_with_same_guest_paths() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let policy = base(tmp.path());
+        let a = policy.for_tenant("acme", &[]).expect("a");
+        let b = policy.for_tenant("globex", &[]).expect("b");
+        for (pa, pb) in a.preopens.iter().zip(b.preopens.iter()) {
+            assert_eq!(pa.guest_path, pb.guest_path);
+            assert_ne!(pa.host_path, pb.host_path);
+            assert!(pa.host_path.is_dir() && pb.host_path.is_dir());
+            assert!(!pa.host_path.starts_with(&pb.host_path));
+        }
+        let cache = a
+            .preopens
+            .iter()
+            .find(|p| p.guest_path == "/cache")
+            .expect("cache");
+        assert!(!cache.host_path.ends_with("packs"));
+        assert!(cache.host_path.ends_with("tenants/acme"));
+        assert_eq!(
+            a.env_set.get("GREENTIC_STATE_DIR").map(String::as_str),
+            Some(a.preopens[0].host_path.display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn env_allowlist_is_per_tenant() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let policy = base(tmp.path());
+        let a = policy.for_tenant("a", &["KEY_A".to_string()]).expect("a");
+        let b = policy.for_tenant("b", &["KEY_B".to_string()]).expect("b");
+        assert_eq!(a.env_allow, vec!["KEY_A"]);
+        assert_eq!(b.env_allow, vec!["KEY_B"]);
+        assert!(policy.env_allow.is_empty());
+    }
+
+    #[test]
+    fn traversal_tenant_names_are_rejected() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let policy = base(tmp.path());
+        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "a b", "x\0y"] {
+            assert!(policy.for_tenant(bad, &[]).is_err(), "{bad:?}");
+        }
+        assert!(policy.for_tenant("ok.tenant-1_x", &[]).is_ok());
+    }
+
+    #[test]
+    fn policy_without_scoped_preopens_ignores_tenant_name() {
+        let policy = RunnerWasiPolicy::new();
+        assert!(policy.for_tenant("../x", &[]).is_ok());
     }
 }

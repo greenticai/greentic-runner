@@ -19,6 +19,7 @@ pub mod artifact_reader;
 pub mod attachment_guard;
 pub mod attachments;
 pub mod attachments_materialize;
+mod background;
 pub mod billing;
 pub mod component_source;
 pub mod config;
@@ -55,6 +56,7 @@ pub mod mcp_source;
 pub mod mcp_store_pull;
 pub mod memory;
 pub mod oauth;
+pub mod outbound_guard;
 pub mod playbook_source;
 pub mod run_trace;
 pub mod scoped_secrets;
@@ -70,6 +72,7 @@ pub mod tool_call_frame;
 pub mod tool_session;
 pub mod tool_wire_name;
 pub mod tools;
+pub mod url_redact;
 pub mod user_ledger;
 
 #[cfg(feature = "test-mock")]

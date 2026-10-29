@@ -4,8 +4,22 @@
 //! covered without spawning one.
 
 use super::*;
+use greentic_runner_host::cache::{CpuPolicy, EngineProfile};
 use serde_json::json;
 use tempfile::TempDir;
+
+#[test]
+fn warmup_key_is_the_sha256_of_the_bytes_not_a_lock_claim() {
+    let bytes = b"\0asm\x01\0\0\0";
+    let key = warmup_artifact_key("profile", bytes);
+    assert_eq!(key.engine_profile_id, "profile");
+    assert_eq!(key.wasm_digest, sha256_prefixed(bytes));
+    // Different bytes can never share a key, whatever a lock says about them.
+    assert_ne!(
+        key.wasm_digest,
+        warmup_artifact_key("profile", b"other").wasm_digest
+    );
+}
 
 fn parse(args: &[&str]) -> Cli {
     let mut argv = vec!["greentic-runner"];
@@ -56,11 +70,14 @@ fn cli_parses_run_flags_and_subcommands() {
         "--config-explain",
     ]);
     assert!(cli.command.is_none());
-    assert_eq!(cli.run.port, 9001);
+    assert_eq!(cli.run.port, Some(9001));
     assert!(cli.run.no_cache && cli.run.json && cli.run.allow_dev && cli.run.config_explain);
     assert_eq!(cli.run.locale.as_deref(), Some("id"));
-    assert!(matches!(cli.run.trace, TraceArg::Always));
-    assert!(matches!(cli.run.trace_capture_inputs, TraceCaptureArg::On));
+    assert!(matches!(cli.run.trace, Some(TraceArg::Always)));
+    assert!(matches!(
+        cli.run.trace_capture_inputs,
+        Some(TraceCaptureArg::On)
+    ));
     assert!(matches!(cli.run.validation, Some(ValidationArg::Warn)));
 
     assert!(matches!(
@@ -115,7 +132,11 @@ async fn running_without_bindings_is_refused() {
 }
 
 #[tokio::test]
-async fn config_explain_prints_and_returns_before_loading_bindings() {
+async fn config_explain_needs_no_bindings() {
+    run_with_cli(parse(&["--config-explain"]))
+        .await
+        .expect("config explain without bindings");
+    // Bindings that are given are still never read in explain mode.
     run_with_cli(parse(&[
         "--bindings",
         "never-read.gtbind",
@@ -173,23 +194,29 @@ fn lock_component_prefers_agreeing_names_and_rejects_conflicts() {
         "name": "c", "source_ref": "oci://x/y:1", "bundled_path": "a.wasm", "wasm_sha256": "aa"
     }));
     assert_eq!(primary.source_ref().expect("ref"), "oci://x/y:1");
-    assert_eq!(primary.bundled_path(), Some("a.wasm"));
-    assert_eq!(primary.wasm_digest().as_deref(), Some("aa"));
+    assert_eq!(primary.bundled_path().expect("path"), Some("a.wasm"));
+    assert_eq!(
+        primary.wasm_digest().expect("digest").as_deref(),
+        Some("aa")
+    );
 
     let legacy = component(json!({
         "name": "c", "ref": "oci://x/y:2", "path": "b.wasm", "sha256": "bb"
     }));
     assert_eq!(legacy.source_ref().expect("ref"), "oci://x/y:2");
-    assert_eq!(legacy.bundled_path(), Some("b.wasm"));
-    assert_eq!(legacy.wasm_digest().as_deref(), Some("bb"));
+    assert_eq!(legacy.bundled_path().expect("path"), Some("b.wasm"));
+    assert_eq!(legacy.wasm_digest().expect("digest").as_deref(), Some("bb"));
 
     let agreeing = component(json!({
         "name": "c", "source_ref": "r", "ref": "r", "bundled_path": "p", "path": "p",
         "wasm_sha256": "d", "sha256": "d"
     }));
     assert_eq!(agreeing.source_ref().expect("ref"), "r");
-    assert_eq!(agreeing.bundled_path(), Some("p"));
-    assert_eq!(agreeing.wasm_digest().as_deref(), Some("d"));
+    assert_eq!(agreeing.bundled_path().expect("path"), Some("p"));
+    assert_eq!(
+        agreeing.wasm_digest().expect("digest").as_deref(),
+        Some("d")
+    );
 
     let conflicting = component(json!({
         "name": "c", "source_ref": "r1", "ref": "r2", "bundled_path": "p1", "path": "p2",
@@ -197,8 +224,20 @@ fn lock_component_prefers_agreeing_names_and_rejects_conflicts() {
     }));
     let err = conflicting.source_ref().expect_err("conflict");
     assert!(err.to_string().contains("conflicting refs"));
-    assert_eq!(conflicting.bundled_path(), None);
-    assert_eq!(conflicting.wasm_digest(), None);
+    assert!(
+        conflicting
+            .bundled_path()
+            .expect_err("path conflict")
+            .to_string()
+            .contains("conflicting paths")
+    );
+    assert!(
+        conflicting
+            .wasm_digest()
+            .expect_err("digest conflict")
+            .to_string()
+            .contains("conflicting wasm digests")
+    );
 
     let bare = component(json!({ "name": "bare" }));
     assert!(bare.source_ref().is_err());
@@ -206,9 +245,17 @@ fn lock_component_prefers_agreeing_names_and_rejects_conflicts() {
 
 #[test]
 fn digests_and_operations_are_normalised() {
-    assert_eq!(normalize_digest("abc"), "sha256:abc");
-    assert_eq!(normalize_digest("sha256:abc"), "sha256:abc");
-    assert_eq!(normalize_digest("blake3:abc"), "blake3:abc");
+    assert_eq!(normalize_digest("abc").expect("bare"), "sha256:abc");
+    assert_eq!(
+        normalize_digest("sha256:abc").expect("sha256"),
+        "sha256:abc"
+    );
+    assert_eq!(
+        normalize_digest("blake3:abc").expect("blake3"),
+        "blake3:abc"
+    );
+    assert!(normalize_digest("sha512:xyz").is_err());
+    assert!(normalize_digest("md5:xyz").is_err());
     assert_eq!(normalize_operation_id("  "), "run");
     assert_eq!(normalize_operation_id(" go "), "go");
     assert_eq!(to_hex(&[0, 255, 16]), "00ff10");
@@ -321,6 +368,67 @@ async fn warmup_reports_a_lock_entry_without_a_source() {
 }
 
 #[tokio::test]
+async fn warmup_rejects_conflicting_wasm_digests() {
+    let dir = TempDir::new().expect("tmp");
+    let lock = write(
+        dir.path(),
+        "pack.lock",
+        r#"{"schema_version":1,"components":[{"name":"c","source_ref":"oci://a/b:1","wasm_sha256":"aa","sha256":"bb"}]}"#,
+    );
+    let err = warmup_cache(CacheWarmupArgs {
+        pack: lock,
+        mode: CacheWarmupMode::Disk,
+    })
+    .await
+    .expect_err("conflicting digests");
+    assert!(
+        err.to_string().contains("conflicting wasm digests"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn warmup_rejects_unsupported_digest_algorithm() {
+    let dir = TempDir::new().expect("tmp");
+    let lock = write(
+        dir.path(),
+        "pack.lock",
+        r#"{"schema_version":1,"components":[{"name":"c","source_ref":"oci://a/b:1","resolved_digest":"sha512:xyz"}]}"#,
+    );
+    let err = warmup_cache(CacheWarmupArgs {
+        pack: lock,
+        mode: CacheWarmupMode::Disk,
+    })
+    .await
+    .expect_err("unsupported algorithm");
+    assert!(
+        format!("{err:#}").contains("unsupported digest algorithm"),
+        "got: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn warmup_verifies_local_bundled_bytes_against_a_sha256_resolved_digest() {
+    let dir = TempDir::new().expect("tmp");
+    std::fs::write(dir.path().join("c.wasm"), b"wasm-bytes").expect("write");
+    let lock = write(
+        dir.path(),
+        "pack.lock",
+        &format!(
+            r#"{{"schema_version":1,"components":[{{"name":"c","source_ref":"oci://a/b:1","bundled_path":"c.wasm","resolved_digest":"sha256:{}"}}]}}"#,
+            "0".repeat(64)
+        ),
+    );
+    let err = warmup_cache(CacheWarmupArgs {
+        pack: lock,
+        mode: CacheWarmupMode::Disk,
+    })
+    .await
+    .expect_err("local bytes must match a sha256 digest");
+    assert!(err.to_string().contains("digest mismatch"), "got: {err:#}");
+}
+
+#[tokio::test]
 async fn bundled_component_bytes_are_read_from_the_pack_root() {
     let dir = TempDir::new().expect("tmp");
     std::fs::write(dir.path().join("c.wasm"), b"wasm-bytes").expect("write");
@@ -328,10 +436,11 @@ async fn bundled_component_bytes_are_read_from_the_pack_root() {
         "name": "c", "source_ref": "oci://a/b:1", "bundled_path": "c.wasm"
     }));
     let client = DistClient::new(DistOptions::default());
-    let bytes = resolve_component_bytes(dir.path(), &entry, "oci://a/b:1", &client)
+    let (bytes, from_local) = resolve_component_bytes(dir.path(), &entry, "oci://a/b:1", &client)
         .await
         .expect("bundled bytes");
     assert_eq!(bytes, b"wasm-bytes");
+    assert!(from_local);
 }
 
 #[tokio::test]
@@ -441,9 +550,13 @@ fn contract_report_carries_schemas_and_stable_hashes() {
     assert_eq!(report.describe_hash, again.describe_hash);
     assert_eq!(report.schema_hash, again.schema_hash);
 
-    // The legacy `input_schema` field is honoured when `input.schema` is null.
+    // A requested operation that is not first is selected, and the legacy
+    // `input_schema` field is honoured when `input.schema` is null.
     let other = contract_from_describe("other", &typed, "unit".into()).expect("report");
-    assert_eq!(other.selected_operation, "run");
+    assert_eq!(other.selected_operation, "other");
+    assert_eq!(other.input_schema, json!({ "type": "null" }));
+    let unknown = contract_from_describe("missing", &typed, "unit".into()).expect("report");
+    assert_eq!(unknown.selected_operation, "run");
 
     let empty = parse_typed_describe_from_value(json!({}), "t").expect("typed");
     let err = contract_from_describe("run", &empty, "unit".into()).expect_err("no ops");
@@ -530,4 +643,121 @@ async fn contract_with_an_unreadable_pack_fails_to_load() {
     args.pack = Some(dir.path().join("missing.gtpack"));
     args.component = Some("c".into());
     assert!(run_contract(args).await.is_err());
+}
+
+#[test]
+fn operation_selection_finds_a_non_first_requested_operation() {
+    let typed = parse_typed_describe_from_value(
+        json!({ "operations": [ { "id": "first" }, { "id": "second" } ] }),
+        "t",
+    )
+    .expect("typed");
+    assert_eq!(
+        select_operation_from_describe(&typed, "second").as_deref(),
+        Some("second")
+    );
+    // `run` fallback is also found when it is not the first operation.
+    let with_run = parse_typed_describe_from_value(
+        json!({ "operations": [ { "id": "first" }, { "id": "run" } ] }),
+        "t",
+    )
+    .expect("typed");
+    assert_eq!(
+        select_operation_from_describe(&with_run, "missing").as_deref(),
+        Some("run")
+    );
+}
+
+#[test]
+fn port_flag_is_optional_so_env_is_not_always_overridden() {
+    assert_eq!(parse(&["--bindings", "a.gtbind"]).run.port, None);
+}
+
+#[test]
+fn trace_flags_only_override_env_when_given() {
+    let base = TraceConfig {
+        mode: TraceMode::Always,
+        out_path: PathBuf::from("env-trace.json"),
+        buffer_size: 8,
+        capture_inputs: true,
+    };
+    let untouched = build_trace_config(base.clone(), None, None, None);
+    assert_eq!(untouched.mode, TraceMode::Always);
+    assert_eq!(untouched.out_path, PathBuf::from("env-trace.json"));
+    assert!(untouched.capture_inputs);
+
+    let overridden = build_trace_config(
+        base,
+        Some(TraceArg::Off),
+        Some(PathBuf::from("cli-trace.json")),
+        Some(TraceCaptureArg::Off),
+    );
+    assert_eq!(overridden.mode, TraceMode::Off);
+    assert_eq!(overridden.out_path, PathBuf::from("cli-trace.json"));
+    assert!(!overridden.capture_inputs);
+}
+
+#[test]
+fn trace_out_alone_enables_tracing_but_explicit_off_wins() {
+    let base = TraceConfig {
+        mode: TraceMode::Off,
+        out_path: PathBuf::from("trace.json"),
+        buffer_size: 8,
+        capture_inputs: false,
+    };
+    let enabled = build_trace_config(base.clone(), None, Some(PathBuf::from("foo.json")), None);
+    assert_eq!(enabled.mode, TraceMode::On);
+    assert_eq!(enabled.out_path, PathBuf::from("foo.json"));
+
+    let off = build_trace_config(
+        base.clone(),
+        Some(TraceArg::Off),
+        Some(PathBuf::from("foo.json")),
+        None,
+    );
+    assert_eq!(off.mode, TraceMode::Off);
+
+    let neither = build_trace_config(base, None, None, None);
+    assert_eq!(neither.mode, TraceMode::Off);
+}
+
+#[test]
+fn component_digest_is_verified_before_caching() {
+    let bytes = b"component-bytes";
+    let good = sha256_prefixed(bytes);
+    assert!(verify_component_digest("c", &good, bytes).is_ok());
+    let blake = format!("blake3:{}", blake3::hash(bytes).to_hex());
+    assert!(verify_component_digest("c", &blake, bytes).is_ok());
+    let err = verify_component_digest("c", &good, b"tampered").expect_err("mismatch");
+    assert!(err.to_string().contains("digest mismatch"), "got: {err}");
+    assert!(verify_component_digest("c", "md5:abc", bytes).is_err());
+}
+
+#[test]
+fn non_authoritative_lock_digest_mismatch_is_skipped_not_fatal() {
+    let bytes = b"component-bytes";
+    // An OCI manifest digest does not hash the wasm bytes.
+    let manifest_digest = sha256_prefixed(b"some oci manifest json");
+    assert!(check_lock_digest("c", &manifest_digest, bytes, false).is_ok());
+    assert!(check_lock_digest("c", "md5:abc", bytes, false).is_ok());
+    // wasm_sha256 is authoritative: a mismatch still rejects.
+    assert!(check_lock_digest("c", &manifest_digest, bytes, true).is_err());
+    assert!(check_lock_digest("c", &sha256_prefixed(bytes), bytes, true).is_ok());
+}
+
+#[test]
+fn cache_cli_profile_matches_the_runtime_profile_not_a_default_engine() -> anyhow::Result<()> {
+    let (_engine, profile) = greentic_runner_host::runtime_cache_engine_and_profile()?;
+    let (_engine2, again) = greentic_runner_host::runtime_cache_engine_and_profile()?;
+    assert_eq!(profile.id(), again.id(), "profile id is deterministic");
+
+    // The old CLI behaviour: a default engine under the "default" fingerprint.
+    let default_engine = wasmtime::Engine::default();
+    let legacy = EngineProfile::from_engine(&default_engine, CpuPolicy::Native, "default".into());
+    assert_ne!(
+        profile.id(),
+        legacy.id(),
+        "cache tools must not act on the default-engine cache dir"
+    );
+    Ok(())
 }

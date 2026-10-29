@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -76,7 +76,8 @@ pub fn introspect_component_contract(
         output_schema: &output_schema,
     };
     let describe_hash = sha256_prefixed(
-        &serde_cbor::to_vec(&describe_material).expect("describe hash material serialization"),
+        &serde_cbor::to_vec(&describe_material)
+            .context("failed to serialise describe hash material")?,
     );
 
     let schema_material = SchemaHashMaterial {
@@ -87,7 +88,8 @@ pub fn introspect_component_contract(
         config_schema: &config_schema,
     };
     let schema_hash = sha256_prefixed(
-        &serde_cbor::to_vec(&schema_material).expect("schema hash material serialization"),
+        &serde_cbor::to_vec(&schema_material)
+            .context("failed to serialise schema hash material")?,
     );
 
     Ok(Some(IntrospectedContract {
@@ -102,18 +104,17 @@ pub fn introspect_component_contract(
 
 fn select_operation_from_describe(payload: &Value, requested_operation: &str) -> Option<String> {
     let ops = payload.get("operations")?.as_array()?;
-    let requested = ops
-        .iter()
-        .find_map(|entry| operation_name(entry))
-        .filter(|name| *name == requested_operation)
-        .map(ToString::to_string);
-    if requested.is_some() {
-        return requested;
-    }
-    ops.iter()
-        .find_map(|entry| operation_name(entry))
-        .filter(|name| *name == "run")
-        .map(ToString::to_string)
+    // Search EVERY operation for the requested name, then for `run`, then fall
+    // back to the first one. (`find_map(..).filter(..)` would only ever have
+    // inspected the first operation.)
+    let named = |wanted: &str| {
+        ops.iter()
+            .filter_map(operation_name)
+            .find(|name| *name == wanted)
+            .map(ToString::to_string)
+    };
+    named(requested_operation)
+        .or_else(|| named("run"))
         .or_else(|| {
             ops.first()
                 .and_then(operation_name)
@@ -144,7 +145,7 @@ fn extract_config_schema(payload: &Value) -> Option<Value> {
     payload.get("config_schema").cloned()
 }
 
-fn sha256_prefixed(bytes: &[u8]) -> String {
+pub(crate) fn sha256_prefixed(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
@@ -155,7 +156,7 @@ fn to_hex(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn canonicalize_json(value: Value) -> Value {
+pub(crate) fn canonicalize_json(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut ordered = serde_json::Map::new();
@@ -173,5 +174,35 @@ fn canonicalize_json(value: Value) -> Value {
         }
         Value::Array(items) => Value::Array(items.into_iter().map(canonicalize_json).collect()),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn selects_the_requested_operation_even_when_it_is_not_first() {
+        let payload =
+            json!({ "operations": [{ "id": "alpha" }, { "id": "beta" }, { "id": "run" }] });
+        assert_eq!(
+            select_operation_from_describe(&payload, "beta").as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_run_then_to_the_first_operation() {
+        let with_run = json!({ "operations": [{ "id": "alpha" }, { "name": "run" }] });
+        assert_eq!(
+            select_operation_from_describe(&with_run, "missing").as_deref(),
+            Some("run")
+        );
+        let without_run = json!({ "operations": [{ "id": "alpha" }, { "id": "beta" }] });
+        assert_eq!(
+            select_operation_from_describe(&without_run, "missing").as_deref(),
+            Some("alpha")
+        );
     }
 }

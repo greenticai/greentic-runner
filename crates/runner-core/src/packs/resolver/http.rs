@@ -1,12 +1,13 @@
-use std::io::copy;
-
 use anyhow::{Context, Result, bail};
 use greentic_config_types::{NetworkConfig, TlsMode};
 use reqwest::blocking::Client;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
-use super::{FetchResponse, PackResolver};
+use super::{
+    DEFAULT_DOWNLOAD_TIMEOUT_SECS, DEFAULT_MAX_PACK_DOWNLOAD_MB, FetchResponse, PackResolver,
+    copy_capped, env_cap_bytes, redact_locator,
+};
 
 pub struct HttpResolver {
     scheme: &'static str,
@@ -23,12 +24,21 @@ impl HttpResolver {
             if let Some(timeout) = cfg.connect_timeout_ms {
                 builder = builder.connect_timeout(Duration::from_millis(timeout));
             }
-            if let Some(timeout) = cfg.read_timeout_ms {
-                builder = builder.timeout(Duration::from_millis(timeout));
-            }
             if matches!(cfg.tls_mode, TlsMode::Disabled) {
                 bail!("TLS certificate validation cannot be disabled");
             }
+        }
+        // `reqwest::blocking` offers only a whole-request deadline, no
+        // per-read (idle) one. `read_timeout_ms` is a per-read notion, so
+        // applying it as the total deadline made any large pack fail on a
+        // healthy connection. The total deadline is therefore generous and
+        // separate; `connect_timeout_ms` still bounds a dead host.
+        let total = std::env::var("GREENTIC_PACK_DOWNLOAD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT_SECS);
+        if total != 0 {
+            builder = builder.timeout(Duration::from_secs(total));
         }
         Ok(Self {
             scheme,
@@ -43,18 +53,34 @@ impl PackResolver for HttpResolver {
     }
 
     fn fetch(&self, locator: &str) -> Result<FetchResponse> {
+        // The locator may be a presigned S3 / Azure SAS URL: neither it nor
+        // reqwest's own " for url (...)" Display suffix may reach an error chain.
+        let shown = redact_locator(locator);
         let mut response = self
             .client
             .get(locator)
             .send()
-            .with_context(|| format!("failed to download {}", locator))?
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("failed to download {shown}"))?
             .error_for_status()
-            .with_context(|| format!("download failed {}", locator))?;
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("download failed {shown}"))?;
+
+        let cap = env_cap_bytes(
+            "GREENTIC_PACK_MAX_DOWNLOAD_MB",
+            DEFAULT_MAX_PACK_DOWNLOAD_MB,
+        );
+        if let (Some(cap), Some(len)) = (cap, response.content_length())
+            && len > cap
+        {
+            bail!("{shown} is {len} bytes, over the {cap} byte download limit");
+        }
 
         let mut temp = NamedTempFile::new().context("failed to allocate temp file for download")?;
         {
             let mut writer = temp.as_file_mut();
-            copy(&mut response, &mut writer).context("failed to stream HTTP content")?;
+            copy_capped(&mut response, &mut writer, cap, &shown)
+                .context("failed to stream HTTP content")?;
         }
         Ok(FetchResponse::from_temp(temp.into_temp_path()))
     }
@@ -99,5 +125,21 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("failed to download"));
+    }
+
+    #[test]
+    fn failed_download_error_chain_carries_no_query_or_userinfo() {
+        let resolver = HttpResolver::new("http", None).expect("resolver");
+        // Port 1 refuses the connection, so the send itself fails.
+        let err =
+            match resolver.fetch("http://user:pw@127.0.0.1:1/a.gtpack?X-Amz-Signature=SECRETSIG") {
+                Ok(_) => panic!("unreachable host must fail"),
+                Err(err) => err,
+            };
+        let chain = format!("{err:#}");
+        assert!(chain.contains("failed to download"), "{chain}");
+        assert!(!chain.contains("SECRETSIG"), "{chain}");
+        assert!(!chain.contains("user:pw"), "{chain}");
+        assert!(!chain.contains("pw@"), "{chain}");
     }
 }

@@ -1,26 +1,71 @@
 use axum::{
-    body::{Body, to_bytes},
+    body::Body,
     http::{HeaderMap, Response, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use serde_cbor;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tracing::{Level, span};
+use tracing::{Instrument, Level, span};
 
 use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx};
 use crate::operator_registry::{OperatorBinding, OperatorResolveError};
 use crate::provider::ProviderBinding;
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::contract_cache::ContractSnapshot;
-use crate::runner::contract_introspection::introspect_component_contract;
+use crate::runner::contract_introspection::{
+    canonicalize_json, introspect_component_contract, sha256_prefixed,
+};
 use crate::runner::i18n::{I18nText, resolve_text, select_locale};
 use crate::runner::schema_validator::validate_json_instance;
 use crate::runtime::TenantRuntime;
+
+/// Introspected contracts, keyed by `digest::component::operation`.
+///
+/// `describe()` instantiates the component, and it used to run on EVERY
+/// operator invoke before the (hash-only) contract cache was consulted. The
+/// digest in the key pins the exact component bytes, so a hot-reloaded
+/// component with different code misses, and the same bytes always describe
+/// the same contract. Bounded: cleared wholesale at the cap rather than
+/// tracking recency, since the working set is tiny.
+static INTROSPECTION_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<
+        std::collections::HashMap<
+            String,
+            Option<crate::runner::contract_introspection::IntrospectedContract>,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+const INTROSPECTION_CACHE_MAX_ENTRIES: usize = 1024;
+
+fn cached_introspection(
+    digest: &str,
+    component_ref: &str,
+    op_id: &str,
+    compute: impl FnOnce() -> anyhow::Result<
+        Option<crate::runner::contract_introspection::IntrospectedContract>,
+    >,
+) -> anyhow::Result<Option<crate::runner::contract_introspection::IntrospectedContract>> {
+    // Without a real digest nothing pins the bytes: always re-describe.
+    if digest == "unknown" || digest.is_empty() {
+        return compute();
+    }
+    let key = format!("{digest}::{component_ref}::{op_id}");
+    if let Some(hit) = INTROSPECTION_CACHE.lock().get(&key) {
+        return Ok(hit.clone());
+    }
+    let computed = compute()?;
+    let mut cache = INTROSPECTION_CACHE.lock();
+    if cache.len() >= INTROSPECTION_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, computed.clone());
+    Ok(computed)
+}
 
 const CONTENT_TYPE_CBOR: &str = "application/cbor";
 const FLAG_SKIP_OUTPUT_VALIDATE: &str = "skip-output-validate";
@@ -231,17 +276,6 @@ fn normalize_sha256_hash(value: &str) -> String {
     }
 }
 
-fn sha256_prefixed(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    format!("sha256:{}", to_hex(&digest))
-}
-
-fn to_hex(digest: &[u8]) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[derive(Serialize)]
 struct SchemaHashMaterial<'a> {
     resolved_digest: &'a str,
@@ -278,10 +312,10 @@ fn compute_contract_hashes(
     config_schema: &Value,
     state_schema_ref: Option<&str>,
     pack_ref: &str,
-) -> (String, String) {
-    let input_schema = canonicalize_json_value(input_schema.clone());
-    let output_schema = canonicalize_json_value(output_schema.clone());
-    let config_schema = canonicalize_json_value(config_schema.clone());
+) -> Result<(String, String), serde_cbor::Error> {
+    let input_schema = canonicalize_json(input_schema.clone());
+    let output_schema = canonicalize_json(output_schema.clone());
+    let config_schema = canonicalize_json(config_schema.clone());
     let describe_material = DescribeHashMaterial {
         resolved_digest,
         component_ref,
@@ -291,8 +325,7 @@ fn compute_contract_hashes(
         input_schema: &input_schema,
         output_schema: &output_schema,
     };
-    let describe_bytes =
-        serde_cbor::to_vec(&describe_material).expect("describe hash material serialization");
+    let describe_bytes = serde_cbor::to_vec(&describe_material)?;
     let describe_hash = sha256_prefixed(&describe_bytes);
 
     let schema_material = SchemaHashMaterial {
@@ -306,33 +339,9 @@ fn compute_contract_hashes(
         config_schema: &config_schema,
         state_schema_ref,
     };
-    let schema_bytes =
-        serde_cbor::to_vec(&schema_material).expect("schema hash material serialization");
+    let schema_bytes = serde_cbor::to_vec(&schema_material)?;
     let schema_hash = sha256_prefixed(&schema_bytes);
-    (describe_hash, schema_hash)
-}
-
-fn canonicalize_json_value(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut ordered = serde_json::Map::new();
-            let mut keys = map.keys().cloned().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                let normalized = map
-                    .get(&key)
-                    .cloned()
-                    .map(canonicalize_json_value)
-                    .unwrap_or(Value::Null);
-                ordered.insert(key, normalized);
-            }
-            Value::Object(ordered)
-        }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(canonicalize_json_value).collect())
-        }
-        other => other,
-    }
+    Ok((describe_hash, schema_hash))
 }
 
 fn derive_output_schema_ref(config_schema_ref: Option<&str>) -> Option<String> {
@@ -483,313 +492,320 @@ pub async fn invoke_operator(
         provider_id = ?request.provider_id,
         provider_type = ?request.provider_type
     );
-    let _root_guard = root_span.enter();
 
-    let provider_id = request.provider_id.as_deref();
-    let provider_type = request.provider_type.as_deref();
-    runtime
-        .operator_metrics()
-        .resolve_attempts
-        .fetch_add(1, Ordering::Relaxed);
-    let resolve_span = span!(Level::DEBUG, "resolve_op");
-    let _resolve_guard = resolve_span.enter();
-
-    let emit_resolve_error = |err: OperatorResolveError| {
-        let (code, message) = match err {
-            OperatorResolveError::ProviderNotFound => {
-                let label = provider_id.or(provider_type).unwrap_or("unknown");
-                (
-                    OperatorErrorCode::ProviderNotFound,
-                    format!("provider `{label}` not registered"),
-                )
-            }
-            OperatorResolveError::OpNotFound => {
-                let label = provider_id.or(provider_type).unwrap_or("unknown provider");
-                (
-                    OperatorErrorCode::OpNotFound,
-                    format!("op `{}` not found for provider `{label}`", &op_id),
-                )
-            }
-        };
+    // The rest of the invocation runs inside an async block instrumented with
+    // the root span: holding `span.enter()` across an `.await` would attach the
+    // span to whatever task the executor polls next on this thread.
+    async move {
+        let provider_id = request.provider_id.as_deref();
+        let provider_type = request.provider_type.as_deref();
         runtime
             .operator_metrics()
-            .resolve_errors
+            .resolve_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let response = OperatorResponse::error(code, message);
-        let diagnostic = diagnostic_error(
-            match code {
-                OperatorErrorCode::ProviderNotFound => "provider_not_found",
-                OperatorErrorCode::OpNotFound => "op_not_found",
-                _ => "resolve_error",
-            },
-            "/op_id",
-            match code {
-                OperatorErrorCode::ProviderNotFound => "runner.operator.provider_not_found",
-                OperatorErrorCode::OpNotFound => "runner.operator.op_not_found",
-                _ => "runner.operator.resolve_error",
-            },
-            response
-                .error
-                .as_ref()
-                .map(|e| e.message.clone())
-                .unwrap_or_else(|| "operator resolve failed".to_string()),
-            Some(op_id.as_str()),
-            binding_component_ref_hint(provider_id, provider_type),
-            runtime.digest(),
-            &locale,
-        );
-        OperatorResponse::error_with_diagnostics(
-            code,
-            response
-                .error
-                .as_ref()
-                .map(|e| e.message.clone())
-                .unwrap_or_else(|| "operator resolve failed".to_string()),
-            vec![diagnostic],
-        )
-    };
+        let resolve_span = span!(Level::DEBUG, "resolve_op");
+        let _resolve_guard = resolve_span.enter();
 
-    // M1.1b: state-store-backed provider instances are not in
-    // OperatorRegistry's per_provider_id index (the registry is built from
-    // inline pack decls at load time, instances live in the tenant state
-    // store at providers/instances/{id}.json). For id-only dispatch, probe
-    // the state store via main_pack to derive the provider_type, then re-key
-    // the operator lookup by type. The probe's ProviderBinding is carried
-    // forward so the second-stage pack.resolve_provider can be skipped — one
-    // state-store read covers both the type-derivation and the runtime
-    // binding. This also makes the snapshot atomic (no probe-vs-dispatch
-    // TOCTOU on the instance file).
-    let initial = runtime
-        .operator_registry()
-        .resolve(provider_id, provider_type, &op_id);
-    let (binding, probe_binding): (OperatorBinding, Option<ProviderBinding>) = match initial {
-        Ok(b) => (b.clone(), None),
-        Err(OperatorResolveError::ProviderNotFound)
-            if let Some(id) = provider_id
-                && provider_type.is_none() =>
-        {
-            match runtime.main_pack().resolve_provider(Some(id), None) {
-                Ok(pb) => {
-                    let derived = pb.provider_type.clone();
-                    // Retry by type only: the probe proved this id maps to
-                    // that type. The strict OperatorRegistry contract would
-                    // reject (Some(id), _) again because the id is not in
-                    // per_provider_id.
-                    match runtime
-                        .operator_registry()
-                        .resolve(None, Some(derived.as_str()), &op_id)
-                    {
-                        Ok(b) => (b.clone(), Some(pb)),
-                        Err(err) => return emit_resolve_error(err),
+        let emit_resolve_error = |err: OperatorResolveError| {
+            let (code, message) = match err {
+                OperatorResolveError::ProviderNotFound => {
+                    let label = provider_id.or(provider_type).unwrap_or("unknown");
+                    (
+                        OperatorErrorCode::ProviderNotFound,
+                        format!("provider `{label}` not registered"),
+                    )
+                }
+                OperatorResolveError::OpNotFound => {
+                    let label = provider_id.or(provider_type).unwrap_or("unknown provider");
+                    (
+                        OperatorErrorCode::OpNotFound,
+                        format!("op `{}` not found for provider `{label}`", &op_id),
+                    )
+                }
+            };
+            runtime
+                .operator_metrics()
+                .resolve_errors
+                .fetch_add(1, Ordering::Relaxed);
+            let response = OperatorResponse::error(code, message);
+            let diagnostic = diagnostic_error(
+                match code {
+                    OperatorErrorCode::ProviderNotFound => "provider_not_found",
+                    OperatorErrorCode::OpNotFound => "op_not_found",
+                    _ => "resolve_error",
+                },
+                "/op_id",
+                match code {
+                    OperatorErrorCode::ProviderNotFound => "runner.operator.provider_not_found",
+                    OperatorErrorCode::OpNotFound => "runner.operator.op_not_found",
+                    _ => "runner.operator.resolve_error",
+                },
+                response
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "operator resolve failed".to_string()),
+                Some(op_id.as_str()),
+                binding_component_ref_hint(provider_id, provider_type),
+                runtime.digest(),
+                &locale,
+            );
+            OperatorResponse::error_with_diagnostics(
+                code,
+                response
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "operator resolve failed".to_string()),
+                vec![diagnostic],
+            )
+        };
+
+        // M1.1b: state-store-backed provider instances are not in
+        // OperatorRegistry's per_provider_id index (the registry is built from
+        // inline pack decls at load time, instances live in the tenant state
+        // store at providers/instances/{id}.json). For id-only dispatch, probe
+        // the state store via main_pack to derive the provider_type, then re-key
+        // the operator lookup by type. The probe's ProviderBinding is carried
+        // forward so the second-stage pack.resolve_provider can be skipped — one
+        // state-store read covers both the type-derivation and the runtime
+        // binding. This also makes the snapshot atomic (no probe-vs-dispatch
+        // TOCTOU on the instance file).
+        let initial = runtime
+            .operator_registry()
+            .resolve(provider_id, provider_type, &op_id);
+        let (binding, probe_binding): (OperatorBinding, Option<ProviderBinding>) = match initial {
+            Ok(b) => (b.clone(), None),
+            Err(OperatorResolveError::ProviderNotFound)
+                if let Some(id) = provider_id
+                    && provider_type.is_none() =>
+            {
+                match runtime.main_pack().resolve_provider(Some(id), None) {
+                    Ok(pb) => {
+                        let derived = pb.provider_type.clone();
+                        // Retry by type only: the probe proved this id maps to
+                        // that type. The strict OperatorRegistry contract would
+                        // reject (Some(id), _) again because the id is not in
+                        // per_provider_id.
+                        match runtime.operator_registry().resolve(
+                            None,
+                            Some(derived.as_str()),
+                            &op_id,
+                        ) {
+                            Ok(b) => (b.clone(), Some(pb)),
+                            Err(err) => return emit_resolve_error(err),
+                        }
+                    }
+                    Err(probe_err) => {
+                        // Don't swallow — disabled instance, malformed JSON, or
+                        // state-store I/O errors are all actionable diagnostics
+                        // that get rolled up as a generic ProviderNotFound to
+                        // the caller but surface in logs for operators.
+                        tracing::warn!(
+                            provider_id = %id,
+                            error = %probe_err,
+                            "state-store probe failed for id-only operator dispatch"
+                        );
+                        return emit_resolve_error(OperatorResolveError::ProviderNotFound);
                     }
                 }
-                Err(probe_err) => {
-                    // Don't swallow — disabled instance, malformed JSON, or
-                    // state-store I/O errors are all actionable diagnostics
-                    // that get rolled up as a generic ProviderNotFound to
-                    // the caller but surface in logs for operators.
-                    tracing::warn!(
-                        provider_id = %id,
-                        error = %probe_err,
-                        "state-store probe failed for id-only operator dispatch"
-                    );
-                    return emit_resolve_error(OperatorResolveError::ProviderNotFound);
-                }
             }
-        }
-        Err(err) => return emit_resolve_error(err),
-    };
-    drop(_resolve_guard);
+            Err(err) => return emit_resolve_error(err),
+        };
+        drop(_resolve_guard);
 
-    let policy = &runtime.config().operator_policy;
-    if !policy.allows_provider(provider_id, binding.provider_type.as_str()) {
-        return OperatorResponse::error(
-            OperatorErrorCode::PolicyDenied,
-            format!(
-                "provider `{}` not allowed for tenant {}",
-                binding
-                    .provider_id
-                    .as_deref()
-                    .unwrap_or(&binding.provider_type),
-                runtime.config().tenant
-            ),
-        );
-    }
-    if !policy.allows_op(provider_id, binding.provider_type.as_str(), &binding.op_id) {
-        return OperatorResponse::error(
-            OperatorErrorCode::PolicyDenied,
-            format!(
-                "op `{}` is not permitted for provider `{}` on tenant {}",
-                binding.op_id,
-                binding
-                    .provider_id
-                    .as_deref()
-                    .unwrap_or(&binding.provider_type),
-                runtime.config().tenant
-            ),
-        );
-    }
-
-    if let Some(req_pack) = request.pack_id.as_deref() {
-        let binding_pack = binding
-            .pack_ref
-            .split('@')
-            .next()
-            .unwrap_or(&binding.pack_ref);
-        if binding_pack != req_pack {
+        let policy = &runtime.config().operator_policy;
+        if !policy.allows_provider(provider_id, binding.provider_type.as_str()) {
             return OperatorResponse::error(
                 OperatorErrorCode::PolicyDenied,
                 format!(
-                    "request bound to pack `{req_pack}`, but op lives in `{}`",
-                    binding.pack_ref
+                    "provider `{}` not allowed for tenant {}",
+                    binding
+                        .provider_id
+                        .as_deref()
+                        .unwrap_or(&binding.provider_type),
+                    runtime.config().tenant
                 ),
             );
         }
-    }
-
-    let attachments = match resolve_attachments(&request.payload, runtime) {
-        Ok(map) => map,
-        Err(response) => return response,
-    };
-
-    let decode_span = span!(Level::DEBUG, "decode_cbor");
-    let _decode_guard = decode_span.enter();
-    let input_value = match decode_request_payload(&request.payload.cbor_input) {
-        Ok(value) => value,
-        Err(err) => {
-            runtime
-                .operator_metrics()
-                .cbor_decode_errors
-                .fetch_add(1, Ordering::Relaxed);
-            return OperatorResponse::error(OperatorErrorCode::CborDecode, format!("{err}"));
-        }
-    };
-    drop(_decode_guard);
-
-    let input_value = merge_input_with_attachments(input_value, attachments);
-
-    let registry_component_ref = &binding.runtime.component_ref;
-    let resolved = match runtime.resolve_component(registry_component_ref) {
-        Some(resolved) => resolved,
-        None => {
+        if !policy.allows_op(provider_id, binding.provider_type.as_str(), &binding.op_id) {
             return OperatorResponse::error(
-                OperatorErrorCode::ComponentLoad,
+                OperatorErrorCode::PolicyDenied,
                 format!(
-                    "component `{}` not found in tenant packs",
-                    registry_component_ref
+                    "op `{}` is not permitted for provider `{}` on tenant {}",
+                    binding.op_id,
+                    binding
+                        .provider_id
+                        .as_deref()
+                        .unwrap_or(&binding.provider_type),
+                    runtime.config().tenant
                 ),
             );
         }
-    };
-    let pack = resolved.pack;
-    // When the probe above produced a ProviderBinding (id-only dispatch
-    // against a state-store instance), reuse it — it's already a coherent
-    // snapshot from the same load_instance call that derived the type, so
-    // there's nothing to drift against and no second state-store read is
-    // needed. For all other paths the second-stage resolve runs as before
-    // and ProviderRegistry's defense-in-depth check (binding.provider_type
-    // == requested) fires on the (Some(id), Some(type)) shape.
-    let provider_binding = match probe_binding {
-        Some(pb) => pb,
-        None => match pack.resolve_provider(provider_id, provider_type) {
-            Ok(binding) => binding,
-            Err(err) => {
+
+        if let Some(req_pack) = request.pack_id.as_deref() {
+            let binding_pack = binding
+                .pack_ref
+                .split('@')
+                .next()
+                .unwrap_or(&binding.pack_ref);
+            if binding_pack != req_pack {
                 return OperatorResponse::error(
-                    OperatorErrorCode::HostFailure,
-                    format!("failed to resolve provider runtime: {err}"),
+                    OperatorErrorCode::PolicyDenied,
+                    format!(
+                        "request bound to pack `{req_pack}`, but op lives in `{}`",
+                        binding.pack_ref
+                    ),
                 );
             }
-        },
-    };
-
-    let component_ref = &provider_binding.component_ref;
-    let resolved = match runtime.resolve_component(component_ref) {
-        Some(resolved) => resolved,
-        None => {
-            return OperatorResponse::error(
-                OperatorErrorCode::ComponentLoad,
-                format!("component `{}` not found in tenant packs", component_ref),
-            );
         }
-    };
-    let pack = resolved.pack;
-    let resolved_digest = if resolved.digest == "unknown" {
-        binding
-            .pack_digest
-            .clone()
-            .unwrap_or_else(|| resolved.digest.clone())
-    } else {
-        resolved.digest.clone()
-    };
-    let introspected_contract =
-        match introspect_component_contract(pack.as_ref(), component_ref.as_str(), &op_id) {
+
+        let attachments = match resolve_attachments(&request.payload, runtime) {
+            Ok(map) => map,
+            Err(response) => return response,
+        };
+
+        let decode_span = span!(Level::DEBUG, "decode_cbor");
+        let _decode_guard = decode_span.enter();
+        let input_value = match decode_request_payload(&request.payload.cbor_input) {
             Ok(value) => value,
             Err(err) => {
-                let message = format!("failed to introspect component contract: {err}");
-                return OperatorResponse::error_with_diagnostics(
-                    OperatorErrorCode::TypeMismatch,
-                    message.clone(),
-                    vec![diagnostic_error(
-                        "contract_introspection_failed",
-                        "/operation",
-                        "runner.operator.contract_introspection_failed",
-                        message,
-                        Some(op_id.as_str()),
-                        Some(component_ref.as_str()),
-                        Some(resolved_digest.as_str()),
-                        &locale,
-                    )],
+                runtime
+                    .operator_metrics()
+                    .cbor_decode_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return OperatorResponse::error(OperatorErrorCode::CborDecode, format!("{err}"));
+            }
+        };
+        drop(_decode_guard);
+
+        let input_value = merge_input_with_attachments(input_value, attachments);
+
+        let registry_component_ref = &binding.runtime.component_ref;
+        let resolved = match runtime.resolve_component(registry_component_ref) {
+            Some(resolved) => resolved,
+            None => {
+                return OperatorResponse::error(
+                    OperatorErrorCode::ComponentLoad,
+                    format!(
+                        "component `{}` not found in tenant packs",
+                        registry_component_ref
+                    ),
                 );
             }
         };
-    let invoke_op_id = introspected_contract
-        .as_ref()
-        .map(|contract| contract.selected_operation.clone())
-        .unwrap_or_else(|| op_id.clone());
-    let loaded_config_schema = introspected_contract
-        .as_ref()
-        .map(|contract| contract.config_schema.clone())
-        .filter(|value| !value.is_null())
-        .or_else(|| {
+        let pack = resolved.pack;
+        // When the probe above produced a ProviderBinding (id-only dispatch
+        // against a state-store instance), reuse it — it's already a coherent
+        // snapshot from the same load_instance call that derived the type, so
+        // there's nothing to drift against and no second state-store read is
+        // needed. For all other paths the second-stage resolve runs as before
+        // and ProviderRegistry's defense-in-depth check (binding.provider_type
+        // == requested) fires on the (Some(id), Some(type)) shape.
+        let provider_binding = match probe_binding {
+            Some(pb) => pb,
+            None => match pack.resolve_provider(provider_id, provider_type) {
+                Ok(binding) => binding,
+                Err(err) => {
+                    return OperatorResponse::error(
+                        OperatorErrorCode::HostFailure,
+                        format!("failed to resolve provider runtime: {err}"),
+                    );
+                }
+            },
+        };
+
+        let component_ref = &provider_binding.component_ref;
+        let resolved = match runtime.resolve_component(component_ref) {
+            Some(resolved) => resolved,
+            None => {
+                return OperatorResponse::error(
+                    OperatorErrorCode::ComponentLoad,
+                    format!("component `{}` not found in tenant packs", component_ref),
+                );
+            }
+        };
+        let pack = resolved.pack;
+        let resolved_digest = if resolved.digest == "unknown" {
             binding
-                .config_schema_ref
-                .as_deref()
-                .and_then(|schema_ref| pack.load_schema_json(schema_ref).ok().flatten())
-        })
-        .unwrap_or(Value::Null);
-    let loaded_output_schema = introspected_contract
-        .as_ref()
-        .map(|contract| contract.output_schema.clone())
-        .filter(|value| !value.is_null())
-        .or_else(|| {
-            derive_output_schema_ref(binding.config_schema_ref.as_deref())
-                .and_then(|schema_ref| pack.load_schema_json(&schema_ref).ok().flatten())
-        })
-        .unwrap_or(Value::Null);
-    let loaded_input_schema = introspected_contract
-        .as_ref()
-        .map(|contract| contract.input_schema.clone())
-        .filter(|value| !value.is_null())
-        .or_else(|| loaded_config_schema.is_null().then_some(Value::Null))
-        .or_else(|| Some(loaded_config_schema.clone()))
-        .unwrap_or(Value::Null);
-    let loaded_config_schema = binding
-        .config_schema_ref
-        .as_deref()
-        .and_then(|schema_ref| pack.load_schema_json(schema_ref).ok().flatten())
-        .unwrap_or_else(|| loaded_config_schema.clone());
-    let contract_key = format!(
-        "{}::{component_ref}::{op_id}::validate_output={}::strict={}",
-        resolved_digest, validation_options.validate_output, validation_options.strict
-    );
-    let _contract_snapshot = if let Some(snapshot) = runtime.contract_cache().get(&contract_key) {
-        snapshot
-    } else {
-        let (describe_hash, schema_hash) = introspected_contract
+                .pack_digest
+                .clone()
+                .unwrap_or_else(|| resolved.digest.clone())
+        } else {
+            resolved.digest.clone()
+        };
+        let introspected_contract =
+            match cached_introspection(&resolved_digest, component_ref.as_str(), &op_id, || {
+                introspect_component_contract(pack.as_ref(), component_ref.as_str(), &op_id)
+            }) {
+                Ok(value) => value,
+                Err(err) => {
+                    let message = format!("failed to introspect component contract: {err}");
+                    return OperatorResponse::error_with_diagnostics(
+                        OperatorErrorCode::TypeMismatch,
+                        message.clone(),
+                        vec![diagnostic_error(
+                            "contract_introspection_failed",
+                            "/operation",
+                            "runner.operator.contract_introspection_failed",
+                            message,
+                            Some(op_id.as_str()),
+                            Some(component_ref.as_str()),
+                            Some(resolved_digest.as_str()),
+                            &locale,
+                        )],
+                    );
+                }
+            };
+        let invoke_op_id = introspected_contract
             .as_ref()
-            .map(|contract| (contract.describe_hash.clone(), contract.schema_hash.clone()))
-            .unwrap_or_else(|| {
-                compute_contract_hashes(
+            .map(|contract| contract.selected_operation.clone())
+            .unwrap_or_else(|| op_id.clone());
+        let loaded_config_schema = introspected_contract
+            .as_ref()
+            .map(|contract| contract.config_schema.clone())
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                binding
+                    .config_schema_ref
+                    .as_deref()
+                    .and_then(|schema_ref| pack.load_schema_json(schema_ref).ok().flatten())
+            })
+            .unwrap_or(Value::Null);
+        let loaded_output_schema = introspected_contract
+            .as_ref()
+            .map(|contract| contract.output_schema.clone())
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                derive_output_schema_ref(binding.config_schema_ref.as_deref())
+                    .and_then(|schema_ref| pack.load_schema_json(&schema_ref).ok().flatten())
+            })
+            .unwrap_or(Value::Null);
+        let loaded_input_schema = introspected_contract
+            .as_ref()
+            .map(|contract| contract.input_schema.clone())
+            .filter(|value| !value.is_null())
+            .or_else(|| loaded_config_schema.is_null().then_some(Value::Null))
+            .or_else(|| Some(loaded_config_schema.clone()))
+            .unwrap_or(Value::Null);
+        let loaded_config_schema = binding
+            .config_schema_ref
+            .as_deref()
+            .and_then(|schema_ref| pack.load_schema_json(schema_ref).ok().flatten())
+            .unwrap_or_else(|| loaded_config_schema.clone());
+        let contract_key = format!(
+            "{}::{component_ref}::{op_id}::validate_output={}::strict={}",
+            resolved_digest, validation_options.validate_output, validation_options.strict
+        );
+        let _contract_snapshot = if let Some(snapshot) = runtime.contract_cache().get(&contract_key)
+        {
+            snapshot
+        } else {
+            let hashes = match introspected_contract.as_ref() {
+                Some(contract) => {
+                    Ok((contract.describe_hash.clone(), contract.schema_hash.clone()))
+                }
+                None => compute_contract_hashes(
                     &resolved_digest,
                     component_ref,
                     &invoke_op_id,
@@ -800,232 +816,42 @@ pub async fn invoke_operator(
                     &loaded_config_schema,
                     binding.state_schema_ref.as_deref(),
                     &binding.pack_ref,
-                )
-            });
-        let mut snapshot = ContractSnapshot::new(
-            resolved_digest.clone(),
-            component_ref.clone(),
-            invoke_op_id.clone(),
-            validation_options.validate_output,
-            validation_options.strict,
-        );
-        snapshot.describe_hash = Some(describe_hash);
-        snapshot.schema_hash = Some(schema_hash);
-        let snapshot = Arc::new(snapshot);
-        runtime
-            .contract_cache()
-            .insert(contract_key, Arc::clone(&snapshot));
-        snapshot
-    };
-    if !loaded_input_schema.is_null() {
-        let issues = validate_json_instance(
-            &loaded_input_schema,
-            &input_value,
-            validation_options.strict,
-        );
-        if !issues.is_empty() {
-            let diagnostics = schema_issues_to_diagnostics(
-                issues,
-                "/input",
-                component_ref,
-                &resolved_digest,
-                &op_id,
-                &locale,
-            );
-            return OperatorResponse::error_with_diagnostics(
-                OperatorErrorCode::TypeMismatch,
-                "input failed schema validation".to_string(),
-                diagnostics,
-            );
-        }
-    } else if validation_options.strict && binding.config_schema_ref.is_some() {
-        let message = format!(
-            "schema `{}` referenced by op `{}` was not found in pack",
-            binding.config_schema_ref.as_deref().unwrap_or("unknown"),
-            op_id
-        );
-        return OperatorResponse::error_with_diagnostics(
-            OperatorErrorCode::TypeMismatch,
-            message.clone(),
-            vec![diagnostic_error(
-                "schema_ref_not_found",
-                "/schema_hash",
-                "runner.operator.schema_ref_not_found",
-                message,
-                Some(op_id.as_str()),
-                Some(component_ref.as_str()),
-                Some(resolved_digest.as_str()),
-                &locale,
-            )],
-        );
-    }
-
-    if let Some(request_schema_hash) = request.schema_hash.as_deref()
-        && let Some(expected_schema_hash) = _contract_snapshot.schema_hash.as_deref()
-    {
-        let expected = normalize_sha256_hash(expected_schema_hash);
-        let provided = normalize_sha256_hash(request_schema_hash);
-        if expected != provided {
-            let message = format!(
-                "schema_hash mismatch for op `{}`: expected `{}`, got `{}`",
-                op_id, expected, provided
-            );
-            return OperatorResponse::error_with_diagnostics(
-                OperatorErrorCode::TypeMismatch,
-                message.clone(),
-                vec![diagnostic_error(
-                    "schema_hash_mismatch",
-                    "/schema_hash",
-                    "runner.operator.schema_hash_mismatch",
-                    message,
-                    Some(op_id.as_str()),
-                    Some(component_ref.as_str()),
-                    Some(resolved_digest.as_str()),
-                    &locale,
-                )],
-            );
-        }
-    }
-
-    let input_json = match serde_json::to_string(&input_value) {
-        Ok(json) => json,
-        Err(err) => {
-            return OperatorResponse::error(
-                OperatorErrorCode::TypeMismatch,
-                format!("failed to serialise input JSON: {err}"),
-            );
-        }
-    };
-
-    let exec_ctx = build_exec_ctx(&request, runtime, &op_id);
-    runtime
-        .operator_metrics()
-        .invoke_attempts
-        .fetch_add(1, Ordering::Relaxed);
-    let invoke_span = span!(Level::INFO, "invoke_component", component = %component_ref);
-    let _invoke_guard = invoke_span.enter();
-    let result = if provider_binding.world.starts_with("greentic:provider-core") {
-        let input_bytes = input_json.clone().into_bytes();
-        match pack
-            .invoke_provider(&provider_binding, exec_ctx, &invoke_op_id, input_bytes)
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                runtime
-                    .operator_metrics()
-                    .invoke_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                return OperatorResponse::error(
-                    OperatorErrorCode::HostFailure,
-                    format!("provider invoke failed: {err}"),
-                );
-            }
-        }
-    } else {
-        match pack
-            .invoke_component(
-                component_ref,
-                exec_ctx,
-                &invoke_op_id,
-                provider_binding.config_json.clone(),
-                input_json.clone(),
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                runtime
-                    .operator_metrics()
-                    .invoke_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                return OperatorResponse::error(
-                    OperatorErrorCode::HostFailure,
-                    format!("component invoke failed: {err}"),
-                );
-            }
-        }
-    };
-    drop(_invoke_guard);
-
-    if validation_options.validate_output
-        && let Some(output_ref) = derive_output_schema_ref(binding.config_schema_ref.as_deref())
-        && let Ok(Some(output_schema)) = pack.load_schema_json(&output_ref)
-    {
-        let output_value = result
-            .as_object()
-            .and_then(|obj| obj.get("output"))
-            .unwrap_or(&result);
-        let issues =
-            validate_json_instance(&output_schema, output_value, validation_options.strict);
-        if !issues.is_empty() {
-            let diagnostics = schema_issues_to_diagnostics(
-                issues,
-                "/output",
-                component_ref,
-                &resolved_digest,
-                &op_id,
-                &locale,
-            );
-            return OperatorResponse::error_with_diagnostics(
-                OperatorErrorCode::TypeMismatch,
-                "output failed schema validation".to_string(),
-                diagnostics,
-            );
-        }
-    }
-
-    if let Some(new_state) = result.as_object().and_then(|obj| obj.get("new_state")) {
-        if let Some(config_ref) = binding.config_schema_ref.as_deref() {
-            let config_schema = match pack.load_schema_json(config_ref) {
-                Ok(Some(schema)) => schema,
-                Ok(None) => {
-                    let message = format!(
-                        "config schema `{}` required for new_state validation was not found",
-                        config_ref
-                    );
-                    return OperatorResponse::error_with_diagnostics(
-                        OperatorErrorCode::TypeMismatch,
-                        message.clone(),
-                        vec![diagnostic_error(
-                            "new_state_schema_missing",
-                            "/new_state",
-                            "runner.operator.new_state_schema_missing",
-                            message,
-                            Some(op_id.as_str()),
-                            Some(component_ref.as_str()),
-                            Some(resolved_digest.as_str()),
-                            &locale,
-                        )],
-                    );
-                }
+                ),
+            };
+            let (describe_hash, schema_hash) = match hashes {
+                Ok(hashes) => hashes,
                 Err(err) => {
-                    let message = format!(
-                        "failed to load config schema `{}` for new_state validation: {}",
-                        config_ref, err
-                    );
-                    return OperatorResponse::error_with_diagnostics(
-                        OperatorErrorCode::TypeMismatch,
-                        message.clone(),
-                        vec![diagnostic_error(
-                            "new_state_schema_load_failed",
-                            "/new_state",
-                            "runner.operator.new_state_schema_load_failed",
-                            message,
-                            Some(op_id.as_str()),
-                            Some(component_ref.as_str()),
-                            Some(resolved_digest.as_str()),
-                            &locale,
-                        )],
+                    return OperatorResponse::error(
+                        OperatorErrorCode::HostFailure,
+                        format!("failed to compute contract hashes: {err}"),
                     );
                 }
             };
-            let issues =
-                validate_json_instance(&config_schema, new_state, validation_options.strict);
+            let mut snapshot = ContractSnapshot::new(
+                resolved_digest.clone(),
+                component_ref.clone(),
+                invoke_op_id.clone(),
+                validation_options.validate_output,
+                validation_options.strict,
+            );
+            snapshot.describe_hash = Some(describe_hash);
+            snapshot.schema_hash = Some(schema_hash);
+            let snapshot = Arc::new(snapshot);
+            runtime
+                .contract_cache()
+                .insert(contract_key, Arc::clone(&snapshot));
+            snapshot
+        };
+        if !loaded_input_schema.is_null() {
+            let issues = validate_json_instance(
+                &loaded_input_schema,
+                &input_value,
+                validation_options.strict,
+            );
             if !issues.is_empty() {
                 let diagnostics = schema_issues_to_diagnostics(
                     issues,
-                    "/new_state",
+                    "/input",
                     component_ref,
                     &resolved_digest,
                     &op_id,
@@ -1033,19 +859,23 @@ pub async fn invoke_operator(
                 );
                 return OperatorResponse::error_with_diagnostics(
                     OperatorErrorCode::TypeMismatch,
-                    "new_state failed schema validation".to_string(),
+                    "input failed schema validation".to_string(),
                     diagnostics,
                 );
             }
-        } else if validation_options.strict {
-            let message = "new_state returned but no config_schema_ref is available".to_string();
+        } else if validation_options.strict && binding.config_schema_ref.is_some() {
+            let message = format!(
+                "schema `{}` referenced by op `{}` was not found in pack",
+                binding.config_schema_ref.as_deref().unwrap_or("unknown"),
+                op_id
+            );
             return OperatorResponse::error_with_diagnostics(
                 OperatorErrorCode::TypeMismatch,
                 message.clone(),
                 vec![diagnostic_error(
-                    "new_state_schema_unavailable",
-                    "/new_state",
-                    "runner.operator.new_state_schema_unavailable",
+                    "schema_ref_not_found",
+                    "/schema_hash",
+                    "runner.operator.schema_ref_not_found",
                     message,
                     Some(op_id.as_str()),
                     Some(component_ref.as_str()),
@@ -1054,22 +884,221 @@ pub async fn invoke_operator(
                 )],
             );
         }
-    }
 
-    let encode_span = span!(Level::DEBUG, "encode_cbor");
-    let _encode_guard = encode_span.enter();
-    let output_bytes = match serde_cbor::to_vec(&result) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return OperatorResponse::error(
-                OperatorErrorCode::HostFailure,
-                format!("failed to encode CBOR output: {err}"),
-            );
+        if let Some(request_schema_hash) = request.schema_hash.as_deref()
+            && let Some(expected_schema_hash) = _contract_snapshot.schema_hash.as_deref()
+        {
+            let expected = normalize_sha256_hash(expected_schema_hash);
+            let provided = normalize_sha256_hash(request_schema_hash);
+            if expected != provided {
+                let message = format!(
+                    "schema_hash mismatch for op `{}`: expected `{}`, got `{}`",
+                    op_id, expected, provided
+                );
+                return OperatorResponse::error_with_diagnostics(
+                    OperatorErrorCode::TypeMismatch,
+                    message.clone(),
+                    vec![diagnostic_error(
+                        "schema_hash_mismatch",
+                        "/schema_hash",
+                        "runner.operator.schema_hash_mismatch",
+                        message,
+                        Some(op_id.as_str()),
+                        Some(component_ref.as_str()),
+                        Some(resolved_digest.as_str()),
+                        &locale,
+                    )],
+                );
+            }
         }
-    };
-    drop(_encode_guard);
 
-    OperatorResponse::ok(output_bytes)
+        let input_json = match serde_json::to_string(&input_value) {
+            Ok(json) => json,
+            Err(err) => {
+                return OperatorResponse::error(
+                    OperatorErrorCode::TypeMismatch,
+                    format!("failed to serialise input JSON: {err}"),
+                );
+            }
+        };
+
+        let exec_ctx = build_exec_ctx(&request, runtime, &op_id);
+        runtime
+            .operator_metrics()
+            .invoke_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let invoke_span = span!(Level::INFO, "invoke_component", component = %component_ref);
+        let result = if provider_binding.world.starts_with("greentic:provider-core") {
+            let input_bytes = input_json.clone().into_bytes();
+            match pack
+                .invoke_provider(&provider_binding, exec_ctx, &invoke_op_id, input_bytes)
+                .instrument(invoke_span.clone())
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    runtime
+                        .operator_metrics()
+                        .invoke_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    return OperatorResponse::error(
+                        OperatorErrorCode::HostFailure,
+                        format!("provider invoke failed: {err}"),
+                    );
+                }
+            }
+        } else {
+            match pack
+                .invoke_component(
+                    component_ref,
+                    exec_ctx,
+                    &invoke_op_id,
+                    provider_binding.config_json.clone(),
+                    input_json.clone(),
+                )
+                .instrument(invoke_span.clone())
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    runtime
+                        .operator_metrics()
+                        .invoke_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    return OperatorResponse::error(
+                        OperatorErrorCode::HostFailure,
+                        format!("component invoke failed: {err}"),
+                    );
+                }
+            }
+        };
+
+        if validation_options.validate_output
+            && let Some(output_ref) = derive_output_schema_ref(binding.config_schema_ref.as_deref())
+            && let Ok(Some(output_schema)) = pack.load_schema_json(&output_ref)
+        {
+            let output_value = result
+                .as_object()
+                .and_then(|obj| obj.get("output"))
+                .unwrap_or(&result);
+            let issues =
+                validate_json_instance(&output_schema, output_value, validation_options.strict);
+            if !issues.is_empty() {
+                let diagnostics = schema_issues_to_diagnostics(
+                    issues,
+                    "/output",
+                    component_ref,
+                    &resolved_digest,
+                    &op_id,
+                    &locale,
+                );
+                return OperatorResponse::error_with_diagnostics(
+                    OperatorErrorCode::TypeMismatch,
+                    "output failed schema validation".to_string(),
+                    diagnostics,
+                );
+            }
+        }
+
+        if let Some(new_state) = result.as_object().and_then(|obj| obj.get("new_state")) {
+            if let Some(config_ref) = binding.config_schema_ref.as_deref() {
+                let config_schema = match pack.load_schema_json(config_ref) {
+                    Ok(Some(schema)) => schema,
+                    Ok(None) => {
+                        let message = format!(
+                            "config schema `{}` required for new_state validation was not found",
+                            config_ref
+                        );
+                        return OperatorResponse::error_with_diagnostics(
+                            OperatorErrorCode::TypeMismatch,
+                            message.clone(),
+                            vec![diagnostic_error(
+                                "new_state_schema_missing",
+                                "/new_state",
+                                "runner.operator.new_state_schema_missing",
+                                message,
+                                Some(op_id.as_str()),
+                                Some(component_ref.as_str()),
+                                Some(resolved_digest.as_str()),
+                                &locale,
+                            )],
+                        );
+                    }
+                    Err(err) => {
+                        let message = format!(
+                            "failed to load config schema `{}` for new_state validation: {}",
+                            config_ref, err
+                        );
+                        return OperatorResponse::error_with_diagnostics(
+                            OperatorErrorCode::TypeMismatch,
+                            message.clone(),
+                            vec![diagnostic_error(
+                                "new_state_schema_load_failed",
+                                "/new_state",
+                                "runner.operator.new_state_schema_load_failed",
+                                message,
+                                Some(op_id.as_str()),
+                                Some(component_ref.as_str()),
+                                Some(resolved_digest.as_str()),
+                                &locale,
+                            )],
+                        );
+                    }
+                };
+                let issues =
+                    validate_json_instance(&config_schema, new_state, validation_options.strict);
+                if !issues.is_empty() {
+                    let diagnostics = schema_issues_to_diagnostics(
+                        issues,
+                        "/new_state",
+                        component_ref,
+                        &resolved_digest,
+                        &op_id,
+                        &locale,
+                    );
+                    return OperatorResponse::error_with_diagnostics(
+                        OperatorErrorCode::TypeMismatch,
+                        "new_state failed schema validation".to_string(),
+                        diagnostics,
+                    );
+                }
+            } else if validation_options.strict {
+                let message =
+                    "new_state returned but no config_schema_ref is available".to_string();
+                return OperatorResponse::error_with_diagnostics(
+                    OperatorErrorCode::TypeMismatch,
+                    message.clone(),
+                    vec![diagnostic_error(
+                        "new_state_schema_unavailable",
+                        "/new_state",
+                        "runner.operator.new_state_schema_unavailable",
+                        message,
+                        Some(op_id.as_str()),
+                        Some(component_ref.as_str()),
+                        Some(resolved_digest.as_str()),
+                        &locale,
+                    )],
+                );
+            }
+        }
+
+        let encode_span = span!(Level::DEBUG, "encode_cbor");
+        let _encode_guard = encode_span.enter();
+        let output_bytes = match serde_cbor::to_vec(&result) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return OperatorResponse::error(
+                    OperatorErrorCode::HostFailure,
+                    format!("failed to encode CBOR output: {err}"),
+                );
+            }
+        };
+        drop(_encode_guard);
+
+        OperatorResponse::ok(output_bytes)
+    }
+    .instrument(root_span)
+    .await
 }
 
 fn binding_component_ref_hint<'a>(
@@ -1095,9 +1124,15 @@ pub async fn invoke(
     _headers: HeaderMap,
     body: Body,
 ) -> Result<Response<Body>, Response<Body>> {
-    let bytes = match to_bytes(body, usize::MAX).await {
+    let bytes = match read_body_limited(body, MAX_OPERATOR_BODY_BYTES).await {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(BodyReadError::TooLarge) => {
+            return Err(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body exceeds {MAX_OPERATOR_BODY_BYTES} bytes"),
+            ));
+        }
+        Err(BodyReadError::Read(err)) => {
             return Err(bad_request(format!("failed to read body: {err}")));
         }
     };
@@ -1109,27 +1144,74 @@ pub async fn invoke(
         }
     };
 
-    let response = invoke_operator(&runtime, request).await;
+    // Detached so a client disconnect cannot cancel the invocation midway.
+    let response = match crate::http::agent_chat::run_detached(async move {
+        invoke_operator(&runtime, request).await
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::error!(error = %err, "operator invoke task panicked or was cancelled");
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal host failure".to_string(),
+            ));
+        }
+    };
     build_cbor_response(response)
 }
 
-fn bad_request(message: String) -> Response<Body> {
+/// Largest operator request body accepted (8 MiB).
+const MAX_OPERATOR_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+enum BodyReadError {
+    TooLarge,
+    Read(String),
+}
+
+/// Collect `body`, refusing to buffer more than `limit` bytes.
+async fn read_body_limited(body: Body, limit: usize) -> Result<Vec<u8>, BodyReadError> {
+    use futures::StreamExt as _;
+    let mut stream = body.into_data_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| BodyReadError::Read(err.to_string()))?;
+        if buf.len().saturating_add(chunk.len()) > limit {
+            return Err(BodyReadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+fn error_response(status: StatusCode, message: String) -> Response<Body> {
     let payload = json!({ "error": message });
-    Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .header("content-type", "application/json")
-        .body(Body::from(payload.to_string()))
-        .expect("building JSON error response must succeed")
+    let mut response = Response::new(Body::from(payload.to_string()));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+fn bad_request(message: String) -> Response<Body> {
+    error_response(StatusCode::BAD_REQUEST, message)
 }
 
 #[allow(clippy::result_large_err)]
 fn build_cbor_response(response: OperatorResponse) -> Result<Response<Body>, Response<Body>> {
     match response.to_cbor() {
-        Ok(bytes) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", CONTENT_TYPE_CBOR)
-            .body(Body::from(bytes))
-            .expect("building CBOR response must succeed")),
+        Ok(bytes) => {
+            let mut http = Response::new(Body::from(bytes));
+            http.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(CONTENT_TYPE_CBOR),
+            );
+            Ok(http)
+        }
         Err(err) => Err(bad_request(format!(
             "failed to serialize response CBOR: {err}"
         ))),
@@ -1337,6 +1419,24 @@ mod tests {
         assert!(options.strict);
     }
 
+    #[tokio::test]
+    async fn body_reader_enforces_the_limit() {
+        let small = read_body_limited(Body::from(vec![1u8; 10]), 16).await;
+        assert_eq!(small.map(|b| b.len()).ok(), Some(10));
+        let big = read_body_limited(Body::from(vec![1u8; 17]), 16).await;
+        assert!(matches!(big, Err(BodyReadError::TooLarge)));
+    }
+
+    #[test]
+    fn error_responses_carry_status_and_json_content_type() {
+        let response = error_response(StatusCode::PAYLOAD_TOO_LARGE, "x".into());
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.headers().get("content-type").map(|v| v.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+    }
+
     #[test]
     fn validation_options_apply_known_flags() {
         let options = validation_options_from_flags(&[
@@ -1379,7 +1479,8 @@ mod tests {
             &input_schema,
             Some("schemas/state.schema.json"),
             "operator.provider@0.1.0",
-        );
+        )
+        .unwrap();
         let two = compute_contract_hashes(
             "sha256:abc",
             "provider.dummy",
@@ -1391,7 +1492,35 @@ mod tests {
             &input_schema,
             Some("schemas/state.schema.json"),
             "operator.provider@0.1.0",
-        );
+        )
+        .unwrap();
         assert_eq!(one, two);
+    }
+}
+
+#[cfg(test)]
+mod introspection_cache_tests {
+    use super::cached_introspection;
+    use std::cell::Cell;
+
+    #[test]
+    fn describe_runs_once_per_digest_component_operation() {
+        let calls = Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        };
+        assert!(cached_introspection("sha256:abc-test", "comp", "op", compute).is_ok());
+        assert!(cached_introspection("sha256:abc-test", "comp", "op", compute).is_ok());
+        assert_eq!(calls.get(), 1, "second lookup must be served from cache");
+        assert!(cached_introspection("sha256:other-test", "comp", "op", compute).is_ok());
+        assert_eq!(
+            calls.get(),
+            2,
+            "a different digest is a different component"
+        );
+        assert!(cached_introspection("unknown", "comp", "op", compute).is_ok());
+        assert!(cached_introspection("unknown", "comp", "op", compute).is_ok());
+        assert_eq!(calls.get(), 4, "an unknown digest is never cached");
     }
 }

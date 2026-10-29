@@ -38,10 +38,36 @@ pub fn secret_uri(
     if key.trim().is_empty() {
         return Err("secret key must not be empty".to_string());
     }
+    // Every segment is looked up verbatim by the secrets backend; a `..`,
+    // `/`, `?`, `#` or `%2e%2e` could otherwise step into another tenant's
+    // path. Pack-controlled values (MCP server id / auth team, SoR name)
+    // reach this function.
+    for (label, value) in [
+        ("category", category),
+        ("tenant", tenant),
+        ("team", team.unwrap_or(TENANT_DEFAULT_TEAM)),
+        ("key", key),
+    ] {
+        if !is_safe_segment(value) {
+            return Err(format!(
+                "secret {label} is not a safe secret-path segment; refusing to build a secrets uri"
+            ));
+        }
+    }
     Ok(format!(
         "secrets://{ENV_SEGMENT}/{tenant}/{}/{category}/{key}",
         team.unwrap_or(TENANT_DEFAULT_TEAM)
     ))
+}
+
+/// Whether `value` is safe to use as ONE segment of a `secrets://` URI:
+/// only `[A-Za-z0-9._-]`, non-empty, no leading dot and no `..`. This excludes
+/// `/`, backslash, `?`, `#`, `%` (so `%2e%2e`) and control characters.
+pub fn is_safe_segment(value: &str) -> bool {
+    let charset_ok = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    !value.is_empty() && charset_ok && !value.starts_with('.') && !value.contains("..")
 }
 
 /// Every URI [`read_secret_for_unit`] tries, in order:
@@ -69,15 +95,45 @@ pub fn secret_uri_candidates(
 ) -> Result<Vec<String>, String> {
     let team = team.filter(|t| !t.is_empty() && *t != TENANT_DEFAULT_TEAM);
     let mut uris = Vec::with_capacity(3);
-    if let Some(unit_key) = unit.and_then(|unit| crate::mcp_secrets::mcp_unit_secret_key(key, unit))
-    {
-        uris.push(secret_uri(category, tenant, team, &unit_key)?);
+    let unit_key = unit.and_then(|unit| crate::mcp_secrets::mcp_unit_secret_key(key, unit));
+    match unit_key {
+        Some(unit_key) => {
+            // A key that cannot form a safe unit name (e.g. one ending in `.`)
+            // only loses the unit scope; team / tenant candidates still apply.
+            match secret_uri(category, tenant, team, &unit_key) {
+                Ok(uri) => uris.push(uri),
+                Err(reason) => note_unit_scope_skipped(category, unit, &reason),
+            }
+        }
+        None if unit.is_some() => {
+            note_unit_scope_skipped(category, unit, "no safe unit-scoped secret name");
+        }
+        None => {}
     }
     if let Some(team) = team {
         uris.push(secret_uri(category, tenant, Some(team), key)?);
     }
     uris.push(secret_uri(category, tenant, None, key)?);
     Ok(uris)
+}
+
+/// A known unit's own secret scope was skipped, so the lookup silently falls
+/// back to the broader team / tenant scope. That can serve another unit's
+/// credential, which an operator must be able to see. Warns once per process
+/// (the lookup runs per call), then stays at debug.
+fn note_unit_scope_skipped(category: &str, unit: Option<&str>, reason: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(category, unit = ?unit, reason, "unit-scoped secret candidate skipped; using the team / tenant scope");
+    } else {
+        tracing::warn!(
+            category,
+            unit = ?unit,
+            reason,
+            "unit-scoped secret candidate skipped; falling back to the team / tenant scope (logged once; later skips at debug)"
+        );
+    }
 }
 
 /// No credential was readable at any scope [`read_secret_for_unit`] tried.
@@ -191,6 +247,58 @@ mod tests {
     fn an_empty_category_or_key_is_a_caller_error() {
         assert!(secret_uri("", "acme", None, "k").is_err());
         assert!(secret_uri("a2a", "acme", None, "  ").is_err());
+    }
+
+    #[test]
+    fn unsafe_segments_are_refused_in_every_position() {
+        for bad in [
+            "..", "a/b", "a?b", "a#b", "%2e%2e", "a%2fb", "a\\b", ".hidden", "a\nb",
+        ] {
+            assert!(secret_uri("mcp", "acme", None, bad).is_err(), "key {bad}");
+            assert!(
+                secret_uri("mcp", "acme", Some(bad), "k").is_err(),
+                "team {bad}"
+            );
+            assert!(secret_uri("mcp", bad, None, "k").is_err(), "tenant {bad}");
+            assert!(
+                secret_uri(bad, "acme", None, "k").is_err(),
+                "category {bad}"
+            );
+            assert!(
+                secret_uri_candidates("mcp", "acme", Some(bad), None, "k").is_err(),
+                "candidates team {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_ending_in_a_dot_loses_only_the_unit_candidate() {
+        // `key.` + `.unit-x` contains `..`, so the unit name is unsafe.
+        let uris = secret_uri_candidates("mcp", "acme", Some("sales"), Some("u1"), "key.")
+            .expect("team and tenant candidates survive");
+        assert_eq!(
+            uris,
+            vec![
+                "secrets://default/acme/sales/mcp/key.".to_string(),
+                "secrets://default/acme/_/mcp/key.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn hostile_segments_are_refused() {
+        for bad in ["..", "../x", "a/b", "%2e%2e", "a?b", "a#b", ".x"] {
+            assert!(secret_uri("llm", "acme", None, bad).is_err(), "key {bad}");
+            assert!(secret_uri("llm", bad, None, "k").is_err(), "tenant {bad}");
+            assert!(
+                secret_uri("llm", "acme", Some(bad), "k").is_err(),
+                "team {bad}"
+            );
+            assert!(
+                secret_uri(bad, "acme", None, "k").is_err(),
+                "category {bad}"
+            );
+        }
     }
 
     #[test]

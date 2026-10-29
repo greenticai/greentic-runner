@@ -29,6 +29,31 @@ pub enum RunnerError {
 
     #[error("serialization error: {reason}")]
     Serialization { reason: String },
+
+    /// Persisting the session/resume record failed AFTER the flow's side
+    /// effects had run (approval dispatch, SoR writes, artifact uploads,
+    /// emits). It is never retried by `retry_with_jitter`: re-running the
+    /// adapter call would repeat those effects. The persistence call itself is
+    /// retried in place before this is raised.
+    #[error("persisting flow state after execution failed: {reason}")]
+    PostEffectPersistence { reason: String },
+
+    /// The flow failed for a reason re-running cannot fix (a routing cycle past
+    /// the step budget, `redirect_limit`, an unknown node, a missing required
+    /// variable) or after its effects ran. Never retried by
+    /// `retry_with_jitter`.
+    #[error("adapter call failed: {reason}")]
+    FlowTerminal { reason: String },
+}
+
+impl RunnerError {
+    /// Whether re-running the same adapter call is pointless or unsafe.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            RunnerError::PostEffectPersistence { .. } | RunnerError::FlowTerminal { .. }
+        )
+    }
 }
 
 /// Result alias for runner operations.

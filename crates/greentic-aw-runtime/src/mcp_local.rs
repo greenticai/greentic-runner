@@ -58,21 +58,32 @@ pub fn cache_dir() -> PathBuf {
 /// instantiated, and `local_call_tool` will return `{"error": ...}` without
 /// running the tampered code.
 pub(crate) fn exec_config_for(component_ref: &str, scope: Option<&McpCallScope>) -> ExecConfig {
-    let pinned_digest = read_pinned_digest(component_ref);
-    let security = if let Some(wasm_digest) = pinned_digest {
-        let mut required_digests = HashMap::new();
-        required_digests.insert(component_ref.to_string(), wasm_digest);
-        VerifyPolicy {
-            allow_unverified: false,
-            required_digests,
-            trusted_signers: Vec::new(),
+    let security = match read_pinned_digest(component_ref) {
+        PinnedDigest::Pinned(wasm_digest) => {
+            let mut required_digests = HashMap::new();
+            required_digests.insert(component_ref.to_string(), wasm_digest);
+            VerifyPolicy {
+                allow_unverified: false,
+                required_digests,
+                trusted_signers: Vec::new(),
+            }
         }
-    } else {
         // No sidecar: operator-seeded cache; maintain Phase-1 trust posture.
-        VerifyPolicy {
+        PinnedDigest::Absent => VerifyPolicy {
             allow_unverified: true,
             required_digests: HashMap::new(),
             trusted_signers: Vec::new(),
+        },
+        // The sidecar exists but cannot be trusted: fail closed with a digest
+        // no wasm can hash to, so mcp-exec refuses to run the component.
+        PinnedDigest::Unusable => {
+            let mut required_digests = HashMap::new();
+            required_digests.insert(component_ref.to_string(), UNUSABLE_DIGEST.to_string());
+            VerifyPolicy {
+                allow_unverified: false,
+                required_digests,
+                trusted_signers: Vec::new(),
+            }
         }
     };
     ExecConfig {
@@ -87,35 +98,52 @@ pub(crate) fn exec_config_for(component_ref: &str, scope: Option<&McpCallScope>)
     }
 }
 
+/// Outcome of reading the pinned-digest sidecar.
+#[derive(Debug, PartialEq, Eq)]
+enum PinnedDigest {
+    Pinned(String),
+    /// No sidecar: operator-seeded cache (Phase-1 behaviour).
+    Absent,
+    /// Sidecar present but unreadable/empty, or the ref is invalid: refuse to run.
+    Unusable,
+}
+
+/// A required digest no wasm can hash to (not valid hex), used to fail closed.
+const UNUSABLE_DIGEST: &str = "unusable-sidecar";
+
 /// Read the pinned wasm digest from the sidecar file `<cache>/<ref>.wasm.sha256`.
 ///
-/// Returns `Some(hex_digest)` when the sidecar exists and is readable UTF-8;
-/// `None` when the sidecar is absent (operator-seeded cache, no prior
-/// store-pull). A missing sidecar (`ErrorKind::NotFound`) is treated silently as
-/// the Phase-1 / operator-seeded case; any other read error (permission denied,
-/// corrupt filesystem) is unexpected and is reported with a `warn` so the
-/// operator can investigate without needing to trace back through silent fallbacks.
-fn read_pinned_digest(component_ref: &str) -> Option<String> {
+/// A missing sidecar (`ErrorKind::NotFound`) is the Phase-1 / operator-seeded
+/// case ([`PinnedDigest::Absent`]). Any other read error (permission denied,
+/// corrupt filesystem), an empty sidecar, or an invalid `component_ref` is
+/// [`PinnedDigest::Unusable`]: it is logged and the caller fails closed rather
+/// than downgrading to `allow_unverified`.
+fn read_pinned_digest(component_ref: &str) -> PinnedDigest {
+    if let Err(e) = crate::mcp_store_pull::validate_component_ref(component_ref) {
+        tracing::warn!(component = %component_ref, error = %e, "invalid component_ref; refusing to run");
+        return PinnedDigest::Unusable;
+    }
     let wasm_dest = cache_dir().join(format!("{component_ref}.wasm"));
     let sidecar = crate::mcp_store_pull::sidecar_path(&wasm_dest);
     match std::fs::read_to_string(&sidecar) {
         Ok(content) => {
             let trimmed = content.trim().to_string();
             if trimmed.is_empty() {
-                None
+                tracing::warn!(component = %component_ref, "wasm digest sidecar is empty; refusing to run");
+                PinnedDigest::Unusable
             } else {
-                Some(trimmed)
+                PinnedDigest::Pinned(trimmed)
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PinnedDigest::Absent,
         Err(e) => {
             tracing::warn!(
                 component = %component_ref,
                 sidecar = %sidecar.display(),
                 error = %e,
-                "unexpected error reading wasm digest sidecar; falling back to allow_unverified"
+                "unexpected error reading wasm digest sidecar; failing closed"
             );
-            None
+            PinnedDigest::Unusable
         }
     }
 }
@@ -290,6 +318,30 @@ mod tests {
         );
         assert!(config.security.required_digests.is_empty());
         unsafe { std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR") };
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn exec_config_fails_closed_on_unreadable_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", dir.path()) };
+        // A directory where the sidecar file should be: read_to_string errors
+        // with something other than NotFound.
+        std::fs::create_dir(dir.path().join("broken.wasm.sha256")).unwrap();
+        let config = exec_config_for("broken", None);
+        unsafe { std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR") };
+        assert!(!config.security.allow_unverified);
+        assert_eq!(
+            config.security.required_digests.get("broken"),
+            Some(&UNUSABLE_DIGEST.to_string())
+        );
+    }
+
+    #[test]
+    fn exec_config_fails_closed_on_traversal_ref() {
+        let config = exec_config_for("../evil", None);
+        assert!(!config.security.allow_unverified);
+        assert!(!config.security.required_digests.is_empty());
     }
 
     #[test]

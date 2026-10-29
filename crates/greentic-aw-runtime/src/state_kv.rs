@@ -29,12 +29,24 @@ fn lock_key(tenant: &TenantContext, session_id: &str) -> String {
 /// `AgentStateStore` backed by an [`AwKv`]. Cheap to clone the `Arc`.
 pub struct KvAgentStateStore {
     kv: Arc<dyn AwKv>,
+    lock_ttl: Duration,
 }
 
 impl KvAgentStateStore {
     /// Wrap a shared key-value backend.
     pub fn new(kv: Arc<dyn AwKv>) -> Self {
-        Self { kv }
+        Self {
+            kv,
+            lock_ttl: LOCK_TTL,
+        }
+    }
+
+    /// Override the session-lock TTL (default 90 s). Lets a test make a lock
+    /// lapse quickly; production keeps the default.
+    #[must_use]
+    pub fn with_lock_ttl(mut self, ttl: Duration) -> Self {
+        self.lock_ttl = ttl;
+        self
     }
 }
 
@@ -88,13 +100,14 @@ impl AgentStateStore for KvAgentStateStore {
             loop {
                 if self
                     .kv
-                    .set_nx(&key, token.clone().into_bytes(), LOCK_TTL)
+                    .set_nx(&key, token.clone().into_bytes(), self.lock_ttl)
                     .await?
                 {
                     let inner = KvSessionLock {
                         kv: self.kv.clone(),
                         key,
                         token,
+                        ttl: self.lock_ttl,
                     };
                     return Ok(SessionLock::new(Box::new(inner)));
                 }
@@ -111,6 +124,7 @@ struct KvSessionLock {
     kv: Arc<dyn AwKv>,
     key: String,
     token: String,
+    ttl: Duration,
 }
 
 impl SessionLockInner for KvSessionLock {
@@ -118,15 +132,16 @@ impl SessionLockInner for KvSessionLock {
         Box::pin(async move {
             let ok = self
                 .kv
-                .compare_refresh(&self.key, self.token.as_bytes(), LOCK_TTL)
+                .compare_refresh(&self.key, self.token.as_bytes(), self.ttl)
                 .await?;
             if ok {
-                Ok(())
-            } else {
-                Err(StateError::Redis(
-                    "lock no longer owned by this holder".into(),
-                ))
+                return Ok(());
             }
+            // Absent (the TTL lapsed) or held by another owner. An absent key
+            // does NOT mean nobody ran in the gap (another turn may have
+            // taken it, saved and released), so it is never re-acquired here:
+            // the step aborts without saving its stale state.
+            Err(StateError::LockLost)
         })
     }
 
@@ -189,6 +204,70 @@ mod tests {
             .unwrap();
         let err = s.acquire_lock(&t, "sess", Duration::from_millis(20)).await;
         assert!(matches!(err, Err(StateError::LockTimeout(_))));
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_lock_lost_when_the_lock_lapsed() {
+        let kv: Arc<dyn AwKv> = Arc::new(MemoryKv::new());
+        let s = KvAgentStateStore::new(kv.clone());
+        let t = TenantContext::new("acme", "prod");
+        let held = s
+            .acquire_lock(&t, "sess", Duration::from_millis(10))
+            .await
+            .unwrap();
+        // Simulate the TTL lapsing with nobody else having taken it.
+        kv.del(&lock_key(&t, "sess")).await.unwrap();
+        assert!(matches!(held.refresh().await, Err(StateError::LockLost)));
+        // The lock was not silently re-created.
+        assert!(kv.get(&lock_key(&t, "sess")).await.unwrap().is_none());
+    }
+
+    /// Stale-holder interleaving: A's lock lapses, B takes it, saves newer
+    /// state and releases; A's refresh must report the loss (so the loop
+    /// aborts before its stale save) instead of re-taking the free key.
+    #[tokio::test]
+    async fn lapsed_holder_cannot_retake_after_another_turn_ran() {
+        let kv: Arc<dyn AwKv> = Arc::new(MemoryKv::new());
+        let s = KvAgentStateStore::new(kv.clone());
+        let t = TenantContext::new("acme", "prod");
+        let a = s
+            .acquire_lock(&t, "sess", Duration::from_millis(10))
+            .await
+            .unwrap();
+        kv.del(&lock_key(&t, "sess")).await.unwrap();
+        {
+            let b = s
+                .acquire_lock(&t, "sess", Duration::from_millis(10))
+                .await
+                .unwrap();
+            let mut newer = ConversationState::empty(&t, "sess");
+            newer.messages.push(ChatMessage::User {
+                content: "newer".into(),
+                attachments: Vec::new(),
+            });
+            s.save(&t, "sess", &newer).await.unwrap();
+            drop(b);
+        }
+        // Let B's detached release run.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(a.refresh().await, Err(StateError::LockLost)));
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_lock_lost_when_another_owner_holds_it() {
+        let kv: Arc<dyn AwKv> = Arc::new(MemoryKv::new());
+        let s = KvAgentStateStore::new(kv.clone());
+        let t = TenantContext::new("acme", "prod");
+        let held = s
+            .acquire_lock(&t, "sess", Duration::from_millis(10))
+            .await
+            .unwrap();
+        kv.del(&lock_key(&t, "sess")).await.unwrap();
+        let _other = s
+            .acquire_lock(&t, "sess", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(matches!(held.refresh().await, Err(StateError::LockLost)));
     }
 
     #[tokio::test]
