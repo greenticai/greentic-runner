@@ -73,23 +73,10 @@ fn uri_candidates_pin_env_default_team_underscore_and_try_the_served_tenant_firs
 }
 
 #[test]
-#[serial_test::serial]
-#[allow(unsafe_code)]
-fn uri_candidates_ignore_the_flow_env() {
-    // SAFETY: `serial` keeps env mutation single-threaded within this suite.
-    unsafe {
-        std::env::set_var("GREENTIC_ENV", "prod");
-    }
-    let got = uri_candidates("acme", KIND).unwrap();
-    unsafe {
-        std::env::remove_var("GREENTIC_ENV");
-    }
+fn uri_candidates_canonicalise_a_non_canonical_kind() {
     assert_eq!(
-        got,
-        vec![
-            "secrets://default/acme/_/infra/vector_store_qdrant".to_string(),
-            "secrets://default/default/_/infra/vector_store_qdrant".to_string(),
-        ]
+        uri_candidates("acme", "Vector-Store.Qdrant").unwrap(),
+        uri_candidates("acme", KIND).unwrap()
     );
 }
 
@@ -306,6 +293,50 @@ async fn missing_entry_names_the_kind_and_both_uris_and_no_value() {
     assert!(msg.contains("secrets://default/acme/_/infra/vector_store_qdrant"));
     assert!(msg.contains("secrets://default/default/_/infra/vector_store_qdrant"));
     assert!(msg.contains("deploy again"));
+    // Matched verbatim by the Qdrant extension's `classify_host_error`
+    // (component-rag-qdrant-ext-infra). Changing it breaks that consumer.
+    assert!(msg.contains("is not connected to this deployment"), "{msg}");
+}
+
+struct BrokenSecrets;
+
+#[async_trait]
+impl SecretsManager for BrokenSecrets {
+    async fn read(&self, _: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+        Err(SecretError::Backend("S3CRET store down".into()))
+    }
+    async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+    async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_store_error_is_unreadable_not_missing_and_leaks_nothing() {
+    let err = read(&BrokenSecrets, "acme", KIND).await.unwrap_err();
+    assert!(
+        matches!(err, InfraConnectionError::Unreadable { .. }),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains("S3CRET"));
+}
+
+#[test]
+fn malformed_uri_message_is_bounded_and_quoted() {
+    let long = format!("secret://infra/a/{}", "x".repeat(5000));
+    let msg = malformed_uri_message(&long);
+    assert!(msg.len() < 600, "{}", msg.len());
+    assert!(msg.contains("\"secret://infra/a/"), "{msg}");
+}
+
+#[test]
+fn the_guest_receives_the_canonical_kind() {
+    let c = InfraConnection::parse(KIND, DOC.as_bytes()).unwrap();
+    let v: Value =
+        serde_json::from_str(c.to_guest_document("Vector-Store.Qdrant").expose_secret()).unwrap();
+    assert_eq!(v["kind"], "vector_store_qdrant");
 }
 
 #[tokio::test]

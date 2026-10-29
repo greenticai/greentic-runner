@@ -47,6 +47,14 @@ pub(crate) fn resolve_blocking(
     .flatten();
     match result {
         Some(Ok(doc)) => Ok(doc),
+        // A routine "not connected" read is not an error: the extension falls
+        // back to its legacy config, and `Backend` would be logged at ERROR by
+        // the ext-runtime on every call. `NotFound` carries the full remedy
+        // sentence (and the phrase the Qdrant extension's `classify_host_error`
+        // matches). Genuine faults stay `Backend`.
+        Some(Err(err @ infra_connection::InfraConnectionError::Missing { .. })) => {
+            Err(SecretsError::NotFound(err.to_string()))
+        }
         Some(Err(err)) => Err(SecretsError::Backend(err.to_string())),
         None => Err(bridge_down()),
     }
@@ -103,13 +111,15 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_entry_is_a_named_backend_error() {
+    fn a_missing_entry_is_a_named_not_found_with_the_remedy() {
         let s = secrets(&[]);
         let err = resolve_blocking(s, "acme", "vector_store_qdrant").unwrap_err();
-        let SecretsError::Backend(msg) = err else {
-            panic!("expected Backend, got {err:?}");
+        let SecretsError::NotFound(msg) = err else {
+            panic!("expected NotFound, got {err:?}");
         };
         assert!(msg.contains("vector_store_qdrant") && msg.contains("deploy again"));
+        // Matched verbatim by the Qdrant extension's `classify_host_error`.
+        assert!(msg.contains("is not connected to this deployment"), "{msg}");
     }
 
     #[test]

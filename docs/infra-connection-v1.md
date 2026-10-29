@@ -61,9 +61,15 @@ IPv6.
 
 ## 3. Errors
 
-All surface as `SecretsError::Backend(msg)` (never `NotFound`, whose rendering
-names no remedy). Messages never contain a value; serde errors are mapped to a
-field name.
+A routine "not connected" read (and the well-formed serve-path refusal)
+surfaces as `SecretsError::NotFound(msg)` where `msg` is the full remedy
+sentence, so the ext-runtime does not log an ERROR per call for a legal
+absence. Every other condition is `SecretsError::Backend(msg)`. Messages never
+contain a value; serde errors are mapped to a field name.
+
+**Stable phrases.** `is not connected to this deployment` and `not available on
+the out-of-process serve path` are matched verbatim by the Qdrant extension's
+`classify_host_error`; do not reword them (tests pin both).
 
 | Condition | Message shape |
 |---|---|

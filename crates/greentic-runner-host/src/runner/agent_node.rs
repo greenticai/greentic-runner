@@ -980,9 +980,23 @@ mod aw {
     impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
             if greentic_aw_runtime::infra_connection::is_infra_uri(uri) {
-                return Err(greentic_ext_runtime::SecretsError::Backend(format!(
-                    "infra resource request '{uri}' is not available on the out-of-process serve path (it resolves one credential for every tenant); deploy the worker as a unit"
-                )));
+                // The extension reads this as "resource absent" (legacy config),
+                // a routine read, so `NotFound` (no ERROR log) for a well-formed
+                // request; a malformed one is a real fault. The phrase is matched
+                // by the Qdrant extension's `classify_host_error`.
+                let shown: String = uri.chars().take(200).collect();
+                let message = format!(
+                    "infra resource request {shown:?} is not available on the out-of-process serve path (it resolves one credential for every tenant); deploy the worker as a unit"
+                );
+                return Err(
+                    if greentic_aw_runtime::infra_connection::kind_from_guest_uri(uri).is_some() {
+                        greentic_ext_runtime::SecretsError::NotFound(message)
+                    } else {
+                        greentic_ext_runtime::SecretsError::Backend(
+                            greentic_aw_runtime::infra_connection::malformed_uri_message(uri),
+                        )
+                    },
+                );
             }
             let name = env_var_name_for_secret(uri);
             std::env::var(&name)
@@ -5058,15 +5072,18 @@ mod aw {
         }
 
         #[test]
-        fn a_missing_infra_entry_is_a_named_backend_error_not_not_found() {
+        fn a_missing_infra_entry_is_a_named_not_found_with_the_remedy() {
             use greentic_ext_runtime::SecretsBackend as _;
             let backend = backend_for(None, &[]);
             match backend.get("secret://infra/vector_store_qdrant") {
-                Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
+                Err(greentic_ext_runtime::SecretsError::NotFound(msg)) => {
                     assert!(msg.contains("vector_store_qdrant"), "{msg}");
                     assert!(msg.contains("deploy again"), "{msg}");
+                    // Matched verbatim by the Qdrant extension's
+                    // `classify_host_error`.
+                    assert!(msg.contains("is not connected to this deployment"), "{msg}");
                 }
-                other => panic!("expected Backend error, got {other:?}"),
+                other => panic!("expected NotFound, got {other:?}"),
             }
         }
 
@@ -5085,11 +5102,11 @@ mod aw {
                 std::env::remove_var("INFRA_VECTOR_STORE_QDRANT");
             }
             match got {
-                Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
+                Err(greentic_ext_runtime::SecretsError::NotFound(msg)) => {
                     assert!(msg.contains("deploy again"), "{msg}");
                     assert!(!msg.contains("localhost"), "{msg}");
                 }
-                other => panic!("expected Backend error, got {other:?}"),
+                other => panic!("expected NotFound, got {other:?}"),
             }
         }
 
@@ -5187,13 +5204,24 @@ mod aw {
                     std::env::remove_var(var);
                 }
             }
-            for got in results {
-                match got {
-                    Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
-                        assert!(msg.contains("serve path"), "{msg}");
+            for (i, got) in results.into_iter().enumerate() {
+                match (i, got) {
+                    // Well-formed request: routine "absent" read. The phrase is
+                    // matched verbatim by the Qdrant extension's
+                    // `classify_host_error`.
+                    (0, Err(greentic_ext_runtime::SecretsError::NotFound(msg))) => {
+                        assert!(
+                            msg.contains("not available on the out-of-process serve path"),
+                            "{msg}"
+                        );
                         assert!(!msg.contains("localhost"), "{msg}");
                     }
-                    other => panic!("expected Backend error, got {other:?}"),
+                    // Malformed requests stay a real fault.
+                    (_, Err(greentic_ext_runtime::SecretsError::Backend(msg))) if i > 0 => {
+                        assert!(msg.contains("malformed"), "{msg}");
+                        assert!(!msg.contains("localhost"), "{msg}");
+                    }
+                    (_, other) => panic!("unexpected result {other:?}"),
                 }
             }
         }

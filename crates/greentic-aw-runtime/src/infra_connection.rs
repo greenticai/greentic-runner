@@ -36,10 +36,14 @@ const SCHEME_MAX: usize = 16;
 const CREDENTIAL_MAX: usize = 4096;
 const EXTRAS_MAX: usize = 16;
 const EXTRA_ITEM_MAX: usize = 256;
+const MALFORMED_URI_ECHO_MAX: usize = 200;
 
 /// Why a connection could not be produced. Messages never contain a value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InfraConnectionError {
+    // Cross-repo string contract: the Qdrant extension's `classify_host_error`
+    // matches "is not connected to this deployment" to tell "resource absent,
+    // use legacy config" from a hard failure. Do not reword.
     #[error(
         "infra resource '{kind}' is not connected to this deployment (looked at {tried}); add it in workspace settings and deploy again"
     )]
@@ -68,15 +72,6 @@ pub enum InfraConnectionError {
 /// Idempotent.
 pub fn canonical_name(kind: &str) -> String {
     greentic_secrets_lib::spec::canonical_secret_name(kind)
-}
-
-/// Friendly label for error text only; the runtime has no kind allow-list.
-pub fn kind_label(name_or_kind: &str) -> String {
-    match canonical_name(name_or_kind).as_str() {
-        "vector_store_qdrant" => "Qdrant".to_string(),
-        "cache_redis" => "Redis".to_string(),
-        _ => name_or_kind.to_string(),
-    }
 }
 
 /// Store URIs tried for a kind: the served tenant first, then `default`.
@@ -117,8 +112,12 @@ pub fn is_infra_uri(uri: &str) -> bool {
 
 /// Error text for an infra-category URI that is not `secret://infra/<name>`.
 pub fn malformed_uri_message(uri: &str) -> String {
+    // The URI is guest-controlled and unbounded (a `/`-boundary prefix test
+    // admits `secret://infra/<declared>/<megabytes>`), and this text is logged.
+    let shown: String = uri.chars().take(MALFORMED_URI_ECHO_MAX).collect();
+    let shown = format!("{shown}{}", if shown.len() < uri.len() { "…" } else { "" });
     format!(
-        "infra resource request '{uri}' is malformed; expected {URI_PREFIX}<name>. Fix the extension's secret declaration and deploy again"
+        "infra resource request {shown:?} is malformed; expected {URI_PREFIX}<name>. Fix the extension's secret declaration and deploy again"
     )
 }
 
@@ -306,7 +305,7 @@ impl InfraConnection {
     pub fn to_guest_document(&self, kind: &str) -> SecretString {
         let doc = serde_json::json!({
             "v": SCHEMA_VERSION,
-            "kind": kind,
+            "kind": canonical_name(kind),
             "host": self.host,
             "port": self.port,
             "scheme": self.scheme,
