@@ -979,9 +979,9 @@ mod aw {
 
     impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
-            if let Some(name) = greentic_aw_runtime::infra_connection::kind_from_guest_uri(uri) {
+            if greentic_aw_runtime::infra_connection::is_infra_uri(uri) {
                 return Err(greentic_ext_runtime::SecretsError::Backend(format!(
-                    "infra resource '{name}' is not available on the out-of-process serve path (it resolves one credential for every tenant); deploy the worker as a unit"
+                    "infra resource request '{uri}' is not available on the out-of-process serve path (it resolves one credential for every tenant); deploy the worker as a unit"
                 )));
             }
             let name = env_var_name_for_secret(uri);
@@ -1080,12 +1080,19 @@ mod aw {
 
     impl greentic_ext_runtime::SecretsBackend for StoreToolSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
-            if let Some(name) = greentic_aw_runtime::infra_connection::kind_from_guest_uri(uri) {
-                return crate::runner::infra_secret::resolve_blocking(
-                    self.secrets.clone(),
-                    &self.tenant,
-                    name,
-                );
+            if greentic_aw_runtime::infra_connection::is_infra_uri(uri) {
+                // Any infra-category URI is served here or refused by name;
+                // none may reach the store scope or the env-var fallback.
+                return match greentic_aw_runtime::infra_connection::kind_from_guest_uri(uri) {
+                    Some(name) => crate::runner::infra_secret::resolve_blocking(
+                        self.secrets.clone(),
+                        &self.tenant,
+                        name,
+                    ),
+                    None => Err(greentic_ext_runtime::SecretsError::Backend(
+                        greentic_aw_runtime::infra_connection::malformed_uri_message(uri),
+                    )),
+                };
             }
             let candidates = self.store_uri_candidates(uri);
             if !candidates.is_empty() {
@@ -5043,7 +5050,11 @@ mod aw {
                     INFRA_DOC,
                 )],
             );
-            assert!(backend.get("secret://infra/vector_store_qdrant").is_ok());
+            let got = backend
+                .get("secret://infra/vector_store_qdrant")
+                .expect("default tenant doc");
+            let v: serde_json::Value = serde_json::from_str(&got).expect("json");
+            assert_eq!(v["host"], "q.example.com");
         }
 
         #[test]
@@ -5073,10 +5084,50 @@ mod aw {
             unsafe {
                 std::env::remove_var("INFRA_VECTOR_STORE_QDRANT");
             }
-            assert!(
-                got.is_err(),
-                "env var must not satisfy an infra read: {got:?}"
-            );
+            match got {
+                Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
+                    assert!(msg.contains("deploy again"), "{msg}");
+                    assert!(!msg.contains("localhost"), "{msg}");
+                }
+                other => panic!("expected Backend error, got {other:?}"),
+            }
+        }
+
+        /// Every infra-category URI, malformed or not, is refused by name and
+        /// never reaches the store scope or the env-var fallback.
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn malformed_infra_uris_never_fall_through_to_the_env_var() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let cases = [
+                (
+                    "secret://infra/vector_store_qdrant/x",
+                    "INFRA_VECTOR_STORE_QDRANT_X",
+                ),
+                ("secret://infra", "INFRA"),
+                ("secret://infra/", "INFRA"),
+                ("secret://Infra/x", "INFRA_X"),
+            ];
+            for (uri, var) in cases {
+                let backend = backend_for(None, &[]);
+                // SAFETY: `serial` keeps env mutation single-threaded within this suite.
+                unsafe {
+                    std::env::set_var(var, "http://localhost:6333");
+                }
+                let got = backend.get(uri);
+                unsafe {
+                    std::env::remove_var(var);
+                }
+                match got {
+                    Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
+                        assert!(msg.contains("deploy again"), "{uri}: {msg}");
+                        assert!(msg.contains(uri), "{uri}: {msg}");
+                        assert!(!msg.contains("localhost"), "{uri}: {msg}");
+                    }
+                    other => panic!("{uri}: expected Backend error, got {other:?}"),
+                }
+            }
         }
 
         #[test]
@@ -5111,15 +5162,39 @@ mod aw {
             unsafe {
                 std::env::set_var("INFRA_VECTOR_STORE_QDRANT", "http://localhost:6333");
             }
-            let got = super::EnvSecretsBackend.get("secret://infra/vector_store_qdrant");
+            let vars = [
+                (
+                    "INFRA_VECTOR_STORE_QDRANT_X",
+                    "secret://infra/vector_store_qdrant/x",
+                ),
+                ("INFRA", "secret://infra"),
+                ("INFRA", "secret://infra/"),
+                ("INFRA_X", "secret://Infra/x"),
+            ];
+            unsafe {
+                for (var, _) in vars {
+                    std::env::set_var(var, "http://localhost:6333");
+                }
+            }
+            let mut results =
+                vec![super::EnvSecretsBackend.get("secret://infra/vector_store_qdrant")];
+            for (_, uri) in vars {
+                results.push(super::EnvSecretsBackend.get(uri));
+            }
             unsafe {
                 std::env::remove_var("INFRA_VECTOR_STORE_QDRANT");
-            }
-            match got {
-                Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
-                    assert!(msg.contains("serve path"), "{msg}");
+                for (var, _) in vars {
+                    std::env::remove_var(var);
                 }
-                other => panic!("expected Backend error, got {other:?}"),
+            }
+            for got in results {
+                match got {
+                    Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
+                        assert!(msg.contains("serve path"), "{msg}");
+                        assert!(!msg.contains("localhost"), "{msg}");
+                    }
+                    other => panic!("expected Backend error, got {other:?}"),
+                }
             }
         }
 

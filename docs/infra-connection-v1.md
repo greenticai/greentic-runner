@@ -26,7 +26,7 @@ Value (JSON):
 {"host":"q.example.com","port":6333,"scheme":"https","credential":"...","extras":{"collection_prefix":"acme__"}}
 ```
 
-`v` is optional; absent is read as 1; `v > 1` is refused by name. Unknown
+`v` is optional; absent is read as 1; `v = 0` is malformed; `v > 1` is refused by name. Unknown
 top-level fields are tolerated and not echoed. IPv6 hosts are staged
 unbracketed.
 
@@ -45,18 +45,18 @@ The extension declares, in `describe.json`,
 gates the URI against that declaration (prefix on a `/` boundary, wildcards
 refused), then `StoreToolSecretsBackend` (runner-host `agent_node.rs`) routes
 `secret://infra/<name>` to `runner/infra_secret.rs`. A nested path
-(`secret://infra/a/b`) is not an infra URI.
+(`secret://infra/a/b`) is not a valid infra URI. Any URI whose first segment is `infra` (case-insensitive: `secret://infra`, `secret://infra/`, `secret://Infra/x`, `secret://infra/a/b`) is refused with a named `Backend` error, on both the tool backend and the serve path, and never reaches the store scope or the env-var fallback. A kind that canonicalises to the placeholder `secret` (`..`, `***`, empty) is refused.
 
 The guest receives a host-normalised document (golden fixture:
 `crates/greentic-aw-runtime/tests/fixtures/infra_connection_v1.json`):
 
 ```json
-{"v":1,"kind":"vector-store/qdrant","host":"q.example.com","port":6333,
+{"v":1,"kind":"vector_store_qdrant","host":"q.example.com","port":6333,
  "scheme":"https","base_url":"https://q.example.com:6333",
  "credential":"...","extras":{"collection_prefix":"acme__"}}
 ```
 
-`kind` is echoed as the guest asked (the canonical name). `base_url` brackets
+`kind` is the canonical name the guest asked for (nested paths such as `vector-store/qdrant` are not addressable through the URI). `base_url` brackets
 IPv6.
 
 ## 3. Errors
