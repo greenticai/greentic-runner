@@ -73,10 +73,78 @@ fn uri_candidates_pin_env_default_team_underscore_and_try_the_served_tenant_firs
 }
 
 #[test]
+#[serial_test::serial]
+#[allow(unsafe_code)]
 fn uri_candidates_ignore_the_flow_env() {
-    // The function takes no env input and never reads the process env.
-    let before = uri_candidates("acme", KIND).unwrap();
-    assert!(before.iter().all(|u| u.starts_with("secrets://default/")));
+    // SAFETY: `serial` keeps env mutation single-threaded within this suite.
+    unsafe {
+        std::env::set_var("GREENTIC_ENV", "prod");
+    }
+    let got = uri_candidates("acme", KIND).unwrap();
+    unsafe {
+        std::env::remove_var("GREENTIC_ENV");
+    }
+    assert_eq!(
+        got,
+        vec![
+            "secrets://default/acme/_/infra/vector_store_qdrant".to_string(),
+            "secrets://default/default/_/infra/vector_store_qdrant".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn kinds_that_canonicalise_to_the_placeholder_are_refused() {
+    for bad in ["", "***", "..", "  "] {
+        assert!(
+            matches!(
+                uri_candidates("acme", bad),
+                Err(InfraConnectionError::BadKind(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    // A kind that really is "secret" stays addressable.
+    assert!(uri_candidates("acme", "secret").is_ok());
+}
+
+#[test]
+fn is_infra_uri_matches_the_first_segment_case_insensitively() {
+    for yes in [
+        "secret://infra",
+        "secret://infra/",
+        "secret://Infra/x",
+        "secret://INFRA/a/b",
+        "secret://infra/x",
+    ] {
+        assert!(is_infra_uri(yes), "{yes}");
+    }
+    for no in [
+        "secret://infrastructure/x",
+        "secret://tavily/k",
+        "secrets://default/x/_/infra/y",
+        "infra/x",
+    ] {
+        assert!(!is_infra_uri(no), "{no}");
+    }
+}
+
+#[test]
+fn version_zero_is_refused() {
+    assert_eq!(
+        field(r#"{"v":0,"host":"h","port":1,"credential":"c"}"#),
+        Some("v")
+    );
+}
+
+#[test]
+fn base_url_lowercases_the_scheme() {
+    let c = InfraConnection::parse(
+        KIND,
+        br#"{"host":"h","port":1,"scheme":"HTTPS","credential":"c"}"#,
+    )
+    .unwrap();
+    assert_eq!(c.base_url(), "https://h:1");
 }
 
 #[test]
@@ -214,6 +282,9 @@ fn debug_never_shows_the_credential() {
 
 #[test]
 fn errors_never_contain_a_value() {
+    // This case exercises the typed-field path (port has the wrong JSON type);
+    // the `garbage` case below exercises the serde_json parse-error path, whose
+    // message would otherwise echo input.
     let doc = r#"{"host":"h","port":"S3CRET-IN-A-WRONG-TYPE","credential":"S3CRET"}"#;
     let err = InfraConnection::parse(KIND, doc.as_bytes()).unwrap_err();
     for s in [err.to_string(), format!("{err:?}")] {
@@ -282,8 +353,10 @@ fn require_extra_fails_closed() {
 
 #[test]
 fn guest_document_matches_the_golden_fixture() {
+    // A guest only ever receives the canonical name as `kind`.
     let c = InfraConnection::parse(KIND, DOC.as_bytes()).unwrap();
-    let got: Value = serde_json::from_str(c.to_guest_document(KIND).expose_secret()).unwrap();
+    let got: Value =
+        serde_json::from_str(c.to_guest_document(&canonical_name(KIND)).expose_secret()).unwrap();
     let want: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/infra_connection_v1.json"
     ))

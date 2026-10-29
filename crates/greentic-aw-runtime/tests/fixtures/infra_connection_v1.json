@@ -1,6 +1,6 @@
 {
   "v": 1,
-  "kind": "vector-store/qdrant",
+  "kind": "vector_store_qdrant",
   "host": "q.example.com",
   "port": 6333,
   "scheme": "https",

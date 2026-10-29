@@ -86,7 +86,10 @@ pub fn uri_candidates(tenant: &str, kind: &str) -> Result<Vec<String>, InfraConn
         return Err(InfraConnectionError::BadKind(kind.to_string()));
     }
     let name = canonical_name(kind);
-    if name.is_empty() {
+    // `canonical_secret_name` maps empty or all-dropped input (`""`, `"***"`,
+    // `".."`) to the literal "secret", which would read `infra/secret`. Accept
+    // that name only when the caller really asked for "secret".
+    if name.is_empty() || (name == "secret" && !kind.trim().eq_ignore_ascii_case("secret")) {
         return Err(InfraConnectionError::BadKind(kind.to_string()));
     }
     let mut tenants = vec![tenant];
@@ -100,6 +103,23 @@ pub fn uri_candidates(tenant: &str, kind: &str) -> Result<Vec<String>, InfraConn
                 .map_err(|_| InfraConnectionError::BadKind(kind.to_string()))
         })
         .collect()
+}
+
+/// Does this URI address the infra category at all? True for any URI whose
+/// first segment after `secret://` is `infra` (case-insensitive), well formed
+/// or not, so a malformed request is refused by name instead of falling
+/// through to the store scope or the env-var fallback.
+pub fn is_infra_uri(uri: &str) -> bool {
+    uri.strip_prefix("secret://")
+        .map(|rest| rest.split('/').next().unwrap_or(""))
+        .is_some_and(|first| first.eq_ignore_ascii_case(CATEGORY))
+}
+
+/// Error text for an infra-category URI that is not `secret://infra/<name>`.
+pub fn malformed_uri_message(uri: &str) -> String {
+    format!(
+        "infra resource request '{uri}' is malformed; expected {URI_PREFIX}<name>. Fix the extension's secret declaration and deploy again"
+    )
 }
 
 /// `secret://infra/<name>` -> `<name>`. Nested paths and empty names refused.
@@ -171,6 +191,7 @@ impl InfraConnection {
             let found = v
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n >= 1)
                 .ok_or_else(|| invalid("v"))?;
             if found > SCHEMA_VERSION {
                 return Err(InfraConnectionError::UnsupportedVersion {
@@ -201,6 +222,8 @@ impl InfraConnection {
             _ => return Err(invalid("scheme")),
         };
         let credential = match map.remove("credential") {
+            // Residual-copy risk accepted: the parsed `Value` and the input
+            // bytes briefly hold the credential un-zeroized.
             Some(Value::String(c)) if !c.is_empty() && c.len() <= CREDENTIAL_MAX => {
                 SecretString::from(c)
             }
@@ -251,10 +274,11 @@ impl InfraConnection {
 
     /// `scheme://host:port`, IPv6 bracketed.
     pub fn base_url(&self) -> String {
+        let scheme = self.scheme.to_ascii_lowercase();
         if self.host.contains(':') {
-            format!("{}://[{}]:{}", self.scheme, self.host, self.port)
+            format!("{scheme}://[{}]:{}", self.host, self.port)
         } else {
-            format!("{}://{}:{}", self.scheme, self.host, self.port)
+            format!("{scheme}://{}:{}", self.host, self.port)
         }
     }
 
