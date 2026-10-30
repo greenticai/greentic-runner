@@ -34,6 +34,7 @@ pub mod graph;
 pub mod guardrail;
 pub mod guardrail_provider;
 pub mod http_provider;
+pub mod infra_connection;
 pub mod knowledge;
 pub mod kv;
 pub mod layered_provider;

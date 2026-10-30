@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "kind": "vector_store_qdrant",
+  "host": "q.example.com",
+  "port": 6333,
+  "scheme": "https",
+  "base_url": "https://q.example.com:6333",
+  "credential": "S3CRET",
+  "extras": { "collection_prefix": "acme__" }
+}

@@ -979,6 +979,25 @@ mod aw {
 
     impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+            if greentic_aw_runtime::infra_connection::is_infra_uri(uri) {
+                // The extension reads this as "resource absent" (legacy config),
+                // a routine read, so `NotFound` (no ERROR log) for a well-formed
+                // request; a malformed one is a real fault. The phrase is matched
+                // by the Qdrant extension's `classify_host_error`.
+                let shown: String = uri.chars().take(200).collect();
+                let message = format!(
+                    "infra resource request {shown:?} is not available on the out-of-process serve path (it resolves one credential for every tenant); deploy the worker as a unit"
+                );
+                return Err(
+                    if greentic_aw_runtime::infra_connection::kind_from_guest_uri(uri).is_some() {
+                        greentic_ext_runtime::SecretsError::NotFound(message)
+                    } else {
+                        greentic_ext_runtime::SecretsError::Backend(
+                            greentic_aw_runtime::infra_connection::malformed_uri_message(uri),
+                        )
+                    },
+                );
+            }
             let name = env_var_name_for_secret(uri);
             std::env::var(&name)
                 .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
@@ -1075,6 +1094,20 @@ mod aw {
 
     impl greentic_ext_runtime::SecretsBackend for StoreToolSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+            if greentic_aw_runtime::infra_connection::is_infra_uri(uri) {
+                // Any infra-category URI is served here or refused by name;
+                // none may reach the store scope or the env-var fallback.
+                return match greentic_aw_runtime::infra_connection::kind_from_guest_uri(uri) {
+                    Some(name) => crate::runner::infra_secret::resolve_blocking(
+                        self.secrets.clone(),
+                        &self.tenant,
+                        name,
+                    ),
+                    None => Err(greentic_ext_runtime::SecretsError::Backend(
+                        greentic_aw_runtime::infra_connection::malformed_uri_message(uri),
+                    )),
+                };
+            }
             let candidates = self.store_uri_candidates(uri);
             if !candidates.is_empty() {
                 // Read off a dedicated thread with its own current-thread runtime:
@@ -4975,6 +5008,240 @@ mod aw {
                 tenant: "acme".to_string(),
                 env: "dev".to_string(),
                 unit: unit.map(str::to_string),
+            }
+        }
+
+        const INFRA_DOC: &str = r#"{"host":"q.example.com","port":6333,"scheme":"https","credential":"S3CRET","extras":{"collection_prefix":"acme__"}}"#;
+
+        /// Records every URI it is asked for.
+        struct RecSecrets {
+            entries: std::collections::HashMap<String, Vec<u8>>,
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl greentic_secrets_lib::SecretsManager for RecSecrets {
+            async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                self.seen.lock().expect("seen").push(path.to_string());
+                self.entries
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+            }
+            async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn an_infra_uri_reads_env_default_even_when_the_backend_env_is_dev() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let backend = backend_for(
+                None,
+                &[(
+                    "secrets://default/acme/_/infra/vector_store_qdrant",
+                    INFRA_DOC,
+                )],
+            );
+            let got = backend
+                .get("secret://infra/vector_store_qdrant")
+                .expect("infra doc");
+            let v: serde_json::Value = serde_json::from_str(&got).expect("json");
+            assert_eq!(v["v"], 1);
+            assert_eq!(v["host"], "q.example.com");
+        }
+
+        #[test]
+        fn an_infra_uri_falls_back_to_the_default_tenant() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let backend = backend_for(
+                None,
+                &[(
+                    "secrets://default/default/_/infra/vector_store_qdrant",
+                    INFRA_DOC,
+                )],
+            );
+            let got = backend
+                .get("secret://infra/vector_store_qdrant")
+                .expect("default tenant doc");
+            let v: serde_json::Value = serde_json::from_str(&got).expect("json");
+            assert_eq!(v["host"], "q.example.com");
+        }
+
+        #[test]
+        fn a_missing_infra_entry_is_a_named_not_found_with_the_remedy() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let backend = backend_for(None, &[]);
+            match backend.get("secret://infra/vector_store_qdrant") {
+                Err(greentic_ext_runtime::SecretsError::NotFound(msg)) => {
+                    assert!(msg.contains("vector_store_qdrant"), "{msg}");
+                    assert!(msg.contains("deploy again"), "{msg}");
+                    // Matched verbatim by the Qdrant extension's
+                    // `classify_host_error`.
+                    assert!(msg.contains("is not connected to this deployment"), "{msg}");
+                }
+                other => panic!("expected NotFound, got {other:?}"),
+            }
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn a_missing_infra_entry_never_consults_the_env_var_fallback() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let backend = backend_for(None, &[]);
+            // SAFETY: `serial` keeps env mutation single-threaded within this suite.
+            unsafe {
+                std::env::set_var("INFRA_VECTOR_STORE_QDRANT", "http://localhost:6333");
+            }
+            let got = backend.get("secret://infra/vector_store_qdrant");
+            unsafe {
+                std::env::remove_var("INFRA_VECTOR_STORE_QDRANT");
+            }
+            match got {
+                Err(greentic_ext_runtime::SecretsError::NotFound(msg)) => {
+                    assert!(msg.contains("deploy again"), "{msg}");
+                    assert!(!msg.contains("localhost"), "{msg}");
+                }
+                other => panic!("expected NotFound, got {other:?}"),
+            }
+        }
+
+        /// Every infra-category URI, malformed or not, is refused by name and
+        /// never reaches the store scope or the env-var fallback.
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn malformed_infra_uris_never_fall_through_to_the_env_var() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let cases = [
+                (
+                    "secret://infra/vector_store_qdrant/x",
+                    "INFRA_VECTOR_STORE_QDRANT_X",
+                ),
+                ("secret://infra", "INFRA"),
+                ("secret://infra/", "INFRA"),
+                ("secret://Infra/x", "INFRA_X"),
+            ];
+            for (uri, var) in cases {
+                let backend = backend_for(None, &[]);
+                // SAFETY: `serial` keeps env mutation single-threaded within this suite.
+                unsafe {
+                    std::env::set_var(var, "http://localhost:6333");
+                }
+                let got = backend.get(uri);
+                unsafe {
+                    std::env::remove_var(var);
+                }
+                match got {
+                    Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
+                        assert!(msg.contains("deploy again"), "{uri}: {msg}");
+                        assert!(msg.contains(uri), "{uri}: {msg}");
+                        assert!(!msg.contains("localhost"), "{uri}: {msg}");
+                    }
+                    other => panic!("{uri}: expected Backend error, got {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn an_infra_uri_never_reads_the_unit_scoped_or_provider_scoped_address() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let rec = Arc::new(RecSecrets {
+                entries: std::collections::HashMap::new(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            });
+            let backend = super::StoreToolSecretsBackend {
+                secrets: rec.clone(),
+                tenant: "acme".to_string(),
+                env: "dev".to_string(),
+                unit: Some("sales-bot".to_string()),
+            };
+            let _ = backend.get("secret://infra/vector_store_qdrant");
+            let seen = rec.seen.lock().expect("seen").clone();
+            assert!(!seen.is_empty());
+            for uri in &seen {
+                assert!(!uri.contains("_unit_"), "{uri}");
+                assert!(uri.starts_with("secrets://default/"), "{uri}");
+                assert!(uri.contains("/_/infra/vector_store_qdrant"), "{uri}");
+            }
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn the_serve_path_refuses_an_infra_uri_even_when_the_env_var_is_set() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            // SAFETY: `serial` keeps env mutation single-threaded within this suite.
+            unsafe {
+                std::env::set_var("INFRA_VECTOR_STORE_QDRANT", "http://localhost:6333");
+            }
+            let vars = [
+                (
+                    "INFRA_VECTOR_STORE_QDRANT_X",
+                    "secret://infra/vector_store_qdrant/x",
+                ),
+                ("INFRA", "secret://infra"),
+                ("INFRA", "secret://infra/"),
+                ("INFRA_X", "secret://Infra/x"),
+            ];
+            unsafe {
+                for (var, _) in vars {
+                    std::env::set_var(var, "http://localhost:6333");
+                }
+            }
+            let mut results =
+                vec![super::EnvSecretsBackend.get("secret://infra/vector_store_qdrant")];
+            for (_, uri) in vars {
+                results.push(super::EnvSecretsBackend.get(uri));
+            }
+            unsafe {
+                std::env::remove_var("INFRA_VECTOR_STORE_QDRANT");
+                for (var, _) in vars {
+                    std::env::remove_var(var);
+                }
+            }
+            for (i, got) in results.into_iter().enumerate() {
+                match (i, got) {
+                    // Well-formed request: routine "absent" read. The phrase is
+                    // matched verbatim by the Qdrant extension's
+                    // `classify_host_error`.
+                    (0, Err(greentic_ext_runtime::SecretsError::NotFound(msg))) => {
+                        assert!(
+                            msg.contains("not available on the out-of-process serve path"),
+                            "{msg}"
+                        );
+                        assert!(!msg.contains("localhost"), "{msg}");
+                    }
+                    // Malformed requests stay a real fault.
+                    (_, Err(greentic_ext_runtime::SecretsError::Backend(msg))) if i > 0 => {
+                        assert!(msg.contains("malformed"), "{msg}");
+                        assert!(!msg.contains("localhost"), "{msg}");
+                    }
+                    (_, other) => panic!("unexpected result {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn the_returned_infra_document_is_value_checked() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let backend = backend_for(
+                None,
+                &[(
+                    "secrets://default/acme/_/infra/vector_store_qdrant",
+                    r#"{"host":"h","port":0,"credential":"S3CRET"}"#,
+                )],
+            );
+            match backend.get("secret://infra/vector_store_qdrant") {
+                Err(greentic_ext_runtime::SecretsError::Backend(msg)) => {
+                    assert!(msg.contains("port"), "{msg}");
+                    assert!(!msg.contains("S3CRET"), "{msg}");
+                }
+                other => panic!("expected Backend error, got {other:?}"),
             }
         }
 

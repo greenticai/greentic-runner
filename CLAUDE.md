@@ -307,6 +307,15 @@ dev-store writer, greentic-start's reader) canonicalise the secret name to
 could never be written or found there — this is also why the key names use
 `_` rather than `-`.
 
+**Infrastructure connections** (`secret://infra/<name>`, contract
+`docs/infra-connection-v1.md`) reach extension TOOLS through the same
+`StoreToolSecretsBackend`. Three rules fail silently if broken: the env segment
+is pinned to `default` (never `$GREENTIC_ENV`, which is `dev` on k8s); a missing
+entry is a named `Backend` error and bypasses the env-var fallback (otherwise a
+localhost default returns); and it is tools only (`EnvSecretsBackend` and flow
+`component.exec` nodes cannot serve it). The typed reader is
+`greentic_aw_runtime::infra_connection`.
+
 **Per-call timeout** is `GREENTIC_KNOWLEDGE_INDEX_TIMEOUT_MS` (milliseconds,
 must be a positive integer or the 5000 ms default applies). It is read ONCE,
 when the process-wide HTTP client is built on the first bound search — every
