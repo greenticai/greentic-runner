@@ -108,7 +108,7 @@ fn build_fixture() -> Result<PathBuf> {
       (local.get $p)))
   (core instance $libc (instantiate $libc))
   (core func $get_env (canon lower (func $env "get-environment")
-    (memory $libc "memory") (realloc (func $libc "realloc"))))
+    (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
   (core module $m
     (import "libc" "memory" (memory 1))
     (import "host" "get-environment" (func $get (param i32)))

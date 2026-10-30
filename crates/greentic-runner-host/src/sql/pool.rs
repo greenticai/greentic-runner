@@ -146,6 +146,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // A DSN that fails to parse is rejected before any socket is opened, so the
+    // engine arms can be exercised without a live server.
+    #[tokio::test]
+    async fn postgres_rejects_unparseable_dsn_with_engine_prefix() {
+        let err = build(Engine::Postgres, "postgres://host:not-a-port/db", true)
+            .await
+            .err()
+            .expect("an unparseable DSN must not build a pool");
+        assert!(err.starts_with("postgres connect: "), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn mysql_rejects_unparseable_dsn_with_engine_prefix() {
+        let err = build(Engine::Mysql, "mysql://host:not-a-port/db", true)
+            .await
+            .err()
+            .expect("an unparseable DSN must not build a pool");
+        assert!(err.starts_with("mysql connect: "), "got: {err}");
+    }
+
     #[tokio::test]
     async fn builds_sqlite_pool_in_memory() {
         // Secondary smoke test: in-memory SQLite opened without read-only flag
