@@ -164,6 +164,7 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
                     conversational,
                     resume_payload: None,
                     attachments: Vec::new(),
+                    locale: None,
                 },
             )
             .await

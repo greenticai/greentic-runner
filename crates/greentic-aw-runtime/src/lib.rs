@@ -646,6 +646,23 @@ pub struct AgentInput {
     /// than the struct being `#[non_exhaustive]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentRef>,
+    /// Language of THIS turn (BCP 47 tag such as `id` or `pt-BR`), when the
+    /// flow's `in_map` supplies one. `Some` makes the loop add a "reply in
+    /// <locale>" instruction to the system prompt; invalid tags are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+}
+
+/// A locale tag is interpolated into the system prompt, so only a plain
+/// BCP 47-shaped value is accepted (letters, digits, `-`, `_`; at most 35).
+pub(crate) fn valid_locale(tag: &str) -> Option<&str> {
+    let tag = tag.trim();
+    let ok = !tag.is_empty()
+        && tag.len() <= 35
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    ok.then_some(tag)
 }
 
 /// Token + iteration accounting for one [`AgentRuntime::step`]. Surfaced on

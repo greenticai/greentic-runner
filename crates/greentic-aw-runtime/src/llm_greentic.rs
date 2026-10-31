@@ -21,7 +21,12 @@ use greentic_llm::{
 
 use crate::artifact_reader::ArtifactReader;
 use crate::attachment_guard::AttachmentTextGuard;
+use crate::attachments::AttachmentKind;
 use crate::attachments_materialize::{TurnAttachments, TurnKey, materialize};
+
+/// How many history positions back from the last user message an earlier
+/// message's documents are still re-read (fetch cost bound).
+const EARLIER_DOC_MESSAGES: usize = 6;
 use crate::error::LlmError;
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
 use crate::state::{ChatMessage, ToolCallRecord};
@@ -239,11 +244,37 @@ impl GreenticLlmBackend {
                     })
                     .collect();
             } else {
-                content.push_str(&format!(
-                    "\n[This message had {} attachment(s), handled in an earlier turn; they \
-                     are not repeated here.]",
-                    attachments.len()
-                ));
+                // Follow-up turns used to lose every earlier file: the state
+                // keeps references only, and this branch replaced them with a
+                // marker. Documents of the most recent earlier messages are
+                // now re-read (text only; images cannot be attached to an
+                // earlier message through the request, so they keep the
+                // marker). Bounded by EARLIER_DOC_MESSAGES and the same
+                // per-message caps/guard as the current message.
+                let docs: Vec<_> = attachments
+                    .iter()
+                    .filter(|a| a.kind == AttachmentKind::Document)
+                    .cloned()
+                    .collect();
+                let image_count = attachments.len() - docs.len();
+                let recent = idx + EARLIER_DOC_MESSAGES >= last_user.unwrap_or(0);
+                if recent && !docs.is_empty() {
+                    let nonce = (self.nonce_source)();
+                    let m =
+                        materialize(self.artifacts.as_deref(), &docs, false, &nonce, guard).await;
+                    content.push_str(&m.text);
+                    if image_count > 0 {
+                        content.push_str(&format!(
+                            "\n[{image_count} image(s) attached earlier are not repeated here.]"
+                        ));
+                    }
+                } else {
+                    content.push_str(&format!(
+                        "\n[This message had {} attachment(s), handled in an earlier turn; they \
+                         are not repeated here.]",
+                        attachments.len()
+                    ));
+                }
             }
             attachments.clear();
         }
