@@ -278,6 +278,7 @@ async fn run_step_scoped(
     // Skipped when resuming a parked flow tool: the user's answer goes to the
     // flow, not the LLM, and returns as a tool result like any other tool's.
     let attachments = message.attachments;
+    let locale = message.locale.clone();
     // The answer to a parked flow goes to the flow, which takes no files: the
     // count is kept so the agent is told after the resume, never silently.
     let resume_attachment_count = if resuming.is_some() {
@@ -444,6 +445,13 @@ async fn run_step_scoped(
         crate::end_conversation::augment_system_prompt(&system_prompt)
     } else {
         system_prompt
+    };
+
+    // Per-turn language: the node's `locale` input asks the agent to answer in
+    // that language regardless of what its prompt or the history is written in.
+    let system_prompt = match locale.as_deref().and_then(crate::valid_locale) {
+        Some(tag) => format!("{system_prompt}\n\nReply in {tag}."),
+        None => system_prompt,
     };
 
     // The turn that resumes a flow after side turns tells the model the step
@@ -1661,6 +1669,7 @@ mod tests {
                     conversational: true,
                     resume_payload: None,
                     attachments: Vec::new(),
+                    locale: None,
                 },
             )
             .await
@@ -1701,6 +1710,7 @@ mod tests {
                     conversational: false,
                     resume_payload: None,
                     attachments: Vec::new(),
+                    locale: None,
                 },
             )
             .await

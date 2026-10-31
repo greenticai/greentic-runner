@@ -421,6 +421,13 @@ mod aw {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // Optional per-turn language from the node's `in_map` (`locale`).
+            let locale = flow_input
+                .get("locale")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             // A block the provider stamped but this runtime cannot decode is
             // NOT silently treated as verified: the decode failure warns and
             // the turn proceeds anonymously, which is the restrictive
@@ -458,6 +465,7 @@ mod aw {
                 conversational,
                 resume_payload: resume_payload.cloned(),
                 attachments: parsed.refs,
+                locale,
             };
 
             // Off by default: with neither an audit sink nor a registered
