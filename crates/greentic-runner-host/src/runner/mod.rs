@@ -17,6 +17,8 @@ pub mod card_nav;
 pub mod component_invoker;
 pub mod contract_cache;
 pub mod contract_introspection;
+pub mod conversation_history;
+pub mod conversation_history_routes;
 pub mod dispatch_listener;
 pub mod engine;
 #[cfg(feature = "agentic-worker")]

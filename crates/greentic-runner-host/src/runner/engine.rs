@@ -1091,7 +1091,10 @@ impl FlowEngine {
                     .execute_once(&ctx, original_input.clone(), entry_node.clone())
                     .await
                 {
-                    Ok(value) => return Ok(value),
+                    Ok(value) => {
+                        self.record_conversation_history(&ctx, &original_input, &value);
+                        return Ok(value);
+                    }
                     Err(FlowFailure {
                         error: err,
                         node_outputs,
@@ -1194,12 +1197,19 @@ impl FlowEngine {
         // snapshot flagged `awaiting_submit` names the waiting node in
         // `next_node`; `session.wait` names its SUCCESSOR, which has not run.
         state.pending_card_answers = pending_card_answers;
+        let recorded_input = input.clone();
         state.entry = input;
+        state.history = self.load_conversation_history(&ctx);
         let span = self.flow_execute_span(&ctx);
-        self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
+        let result = self
+            .drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
             .instrument(span)
             .await
-            .map_err(|failure| failure.error)
+            .map_err(|failure| failure.error);
+        if let Ok(execution) = &result {
+            self.record_conversation_history(&ctx, &recorded_input, execution);
+        }
+        result
     }
 
     async fn execute_once(
@@ -1210,6 +1220,7 @@ impl FlowEngine {
     ) -> Result<FlowExecution, FlowFailure> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
         let mut state = ExecutionState::new(input);
+        state.history = self.load_conversation_history(ctx);
         let missing = seed_vars_and_collect_missing_required(
             &flow_ir.vars_init,
             &flow_ir.required_vars,
@@ -2873,6 +2884,64 @@ impl FlowEngine {
             .context("state node payload missing required `key` (non-empty string)")
     }
 
+    /// How many turns this flow keeps, or `None` when its pack did not opt it
+    /// in (or the run has no session to key a history by).
+    fn history_turns(&self, ctx: &FlowContext<'_>) -> Option<usize> {
+        ctx.session_id.filter(|hint| !hint.is_empty())?;
+        self.pack_for_flow(ctx)
+            .ok()?
+            .conversation_history()?
+            .turns_for(ctx.flow_id)
+    }
+
+    /// The conversation so far as the `{{history}}` value, for an opted in flow.
+    /// An empty list on the first turn, so a template reading it resolves.
+    fn load_conversation_history(&self, ctx: &FlowContext<'_>) -> Option<Value> {
+        self.history_turns(ctx)?;
+        let session = ctx.session_id.filter(|hint| !hint.is_empty())?;
+        let store = self.pack_for_flow(ctx).ok()?.state_store_handle()?;
+        let tenant = self.state_tenant_ctx(ctx).ok()?;
+        let entries =
+            crate::runner::conversation_history::load(&store, &tenant, ctx.flow_id, session);
+        Some(crate::runner::conversation_history::as_value(&entries))
+    }
+
+    /// Add this turn to an opted in flow's history. Housekeeping: it never
+    /// changes the turn's result, and any failure only costs the next turn
+    /// some context.
+    fn record_conversation_history(
+        &self,
+        ctx: &FlowContext<'_>,
+        input: &Value,
+        execution: &FlowExecution,
+    ) {
+        use crate::runner::conversation_history as history;
+        let Some(turns) = self.history_turns(ctx) else {
+            return;
+        };
+        let Some(session) = ctx.session_id.filter(|hint| !hint.is_empty()) else {
+            return;
+        };
+        let Some(store) = self
+            .pack_for_flow(ctx)
+            .ok()
+            .and_then(|p| p.state_store_handle())
+        else {
+            return;
+        };
+        let Ok(tenant) = self.state_tenant_ctx(ctx) else {
+            return;
+        };
+        let prior = history::load(&store, &tenant, ctx.flow_id, session);
+        let updated = history::with_turn(
+            prior,
+            history::user_text(input).as_deref(),
+            history::assistant_text(&execution.output).as_deref(),
+            turns,
+        );
+        history::save(&store, &tenant, ctx.flow_id, session, &updated);
+    }
+
     fn state_tenant_ctx(&self, ctx: &FlowContext<'_>) -> Result<greentic_types::TenantCtx> {
         let env = greentic_types::EnvId::from_str(&self.default_env)
             .with_context(|| format!("invalid env id `{}`", self.default_env))?;
@@ -3804,6 +3873,12 @@ pub struct ExecutionState {
     /// it never survives into a later node or a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resumed_at: Option<String>,
+    /// The conversation so far, as `[{role, text}]`, for a flow that opted in
+    /// (`assets/conversation-history.json`). Exposed to templates as
+    /// `{{history}}`. Never serialised: it is read from the state store at the
+    /// start of EVERY turn, so a parked snapshot cannot hold a stale copy.
+    #[serde(skip)]
+    history: Option<Value>,
 }
 
 impl ExecutionState {
@@ -3824,6 +3899,7 @@ impl ExecutionState {
             pending_tool_await: HashMap::new(),
             pending_card_answers: None,
             resumed_at: None,
+            history: None,
         }
     }
 
@@ -5186,6 +5262,11 @@ fn template_context(state: &ExecutionState, prev: Value) -> Value {
     ctx.insert("state".into(), state.context());
     ctx.insert("vars".into(), Value::Object(state.vars.clone()));
     ctx.insert("now".into(), now_namespace(Utc::now()));
+    // Only a flow that opted in has one; every other flow's context keeps
+    // exactly the keys it had.
+    if let Some(history) = &state.history {
+        ctx.insert("history".into(), history.clone());
+    }
     Value::Object(ctx)
 }
 
@@ -11767,6 +11848,45 @@ mod tests {
         )
         .expect("render str");
         assert_eq!(rendered_str, serde_json::json!("prefix-aws"));
+    }
+
+    #[test]
+    fn history_is_a_template_namespace_only_for_a_flow_that_opted_in() {
+        let mut st = ExecutionState::new(serde_json::json!({"text": "and free ones?"}));
+        let without = template_context(&st, serde_json::Value::Null);
+        assert!(
+            without.get("history").is_none(),
+            "a flow that did not opt in keeps exactly the keys it had"
+        );
+
+        st.history = Some(serde_json::json!([
+            {"role": "user", "text": "ports on node-101"},
+            {"role": "assistant", "text": "ACI or Gi?"},
+        ]));
+        let ctx = template_context(&st, serde_json::Value::Null);
+        // The whole list resolves typed, and one entry's field resolves too.
+        let list = render_template_value(
+            &serde_json::json!("{{history}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render list");
+        assert_eq!(list.as_array().map(Vec::len), Some(2));
+        let first = render_template_value(
+            &serde_json::json!("{{history[0].text}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render first");
+        assert_eq!(first, serde_json::json!("ports on node-101"));
+    }
+
+    #[test]
+    fn history_never_survives_a_snapshot() {
+        let mut st = ExecutionState::new(serde_json::json!({}));
+        st.history = Some(serde_json::json!([{"role": "user", "text": "x"}]));
+        let json = serde_json::to_value(&st).expect("serialise");
+        assert!(json.get("history").is_none());
     }
 
     #[test]

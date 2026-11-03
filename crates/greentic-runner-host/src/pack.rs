@@ -165,6 +165,11 @@ pub struct PackRuntime {
     /// Lazily-parsed `assets/run-context.json` sidecar — see
     /// [`PackRuntime::run_context`]. Twin of `a2a_routes`, read on first use.
     run_context: std::sync::OnceLock<Option<crate::runner::run_context_routes::PackRunContext>>,
+    /// Flows that keep a conversation history, from the optional
+    /// `assets/conversation-history.json` sidecar. Read on first use.
+    conversation_history: std::sync::OnceLock<
+        Option<crate::runner::conversation_history_routes::PackConversationHistory>,
+    >,
     /// Lazily-parsed `assets/user-ledger.json` sidecar — see
     /// [`PackRuntime::user_ledger`].
     user_ledger: std::sync::OnceLock<Option<crate::runner::user_ledger_routes::PackUserLedger>>,
@@ -2462,6 +2467,7 @@ impl PackRuntime {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            conversation_history: std::sync::OnceLock::new(),
             user_ledger: std::sync::OnceLock::new(),
             nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
@@ -3859,6 +3865,22 @@ impl PackRuntime {
             .as_ref()
     }
 
+    /// The flows that keep a conversation history, from the optional
+    /// `assets/conversation-history.json` sidecar. `None` when the pack carries
+    /// none, which means no flow keeps one.
+    pub fn conversation_history(
+        &self,
+    ) -> Option<&crate::runner::conversation_history_routes::PackConversationHistory> {
+        self.conversation_history
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::conversation_history_routes::HISTORY_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::conversation_history_routes::PackConversationHistory::from_sidecar_bytes(&bytes)
+                    })
+            })
+            .as_ref()
+    }
+
     /// Agents that use the user ledger, from the optional
     /// `assets/user-ledger.json` sidecar. `None` when the pack carries none
     /// (or it was malformed/oversized): then no agent uses the ledger.
@@ -4247,6 +4269,7 @@ impl PackRuntime {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            conversation_history: std::sync::OnceLock::new(),
             user_ledger: std::sync::OnceLock::new(),
             nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
@@ -6356,6 +6379,7 @@ pub(crate) mod tests {
             mcp_routes: std::sync::OnceLock::new(),
             a2a_routes: std::sync::OnceLock::new(),
             run_context: std::sync::OnceLock::new(),
+            conversation_history: std::sync::OnceLock::new(),
             user_ledger: std::sync::OnceLock::new(),
             nested_flow_handlers: std::sync::OnceLock::new(),
             sorla_routes: std::sync::OnceLock::new(),
