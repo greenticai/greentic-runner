@@ -85,6 +85,14 @@ impl ConversationState {
     /// answerable; if only protected groups remain, truncation stops short of
     /// `max_turns`.
     pub fn truncate_history(&mut self, max_turns: u32) {
+        drop(self.take_overflow(max_turns));
+    }
+
+    /// Same removal as [`Self::truncate_history`], returning the conversational
+    /// messages it removed (oldest first) so a caller can summarise them.
+    /// System messages are never in the result.
+    pub fn take_overflow(&mut self, max_turns: u32) -> Vec<ChatMessage> {
+        let mut removed = Vec::new();
         let max = max_turns as usize;
         let pending_id = self.pending_tool.as_ref().map(|p| p.call_id.clone());
         loop {
@@ -94,12 +102,12 @@ impl ConversationState {
                 .filter(|m| !matches!(m, ChatMessage::System { .. }))
                 .count();
             if non_system <= max {
-                return;
+                return removed;
             }
             let Some((start, end)) = self.oldest_removable_group(pending_id.as_deref()) else {
-                return;
+                return removed;
             };
-            self.messages.drain(start..end);
+            removed.extend(self.messages.drain(start..end));
         }
     }
 

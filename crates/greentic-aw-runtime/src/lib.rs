@@ -20,6 +20,7 @@ pub mod attachment_guard;
 pub mod attachments;
 pub mod attachments_materialize;
 pub mod billing;
+pub mod compaction;
 pub mod component_source;
 pub mod config;
 pub mod config_provider;
