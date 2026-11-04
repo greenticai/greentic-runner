@@ -22,6 +22,7 @@
 //! text. One index failing among several is only a warning: the others' hits
 //! are still returned.
 
+mod citation;
 mod client;
 
 use std::sync::{Arc, OnceLock};
