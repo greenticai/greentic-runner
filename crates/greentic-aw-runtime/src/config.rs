@@ -191,6 +191,12 @@ pub struct AgentLimits {
     /// preserved.
     pub max_history_turns: u32,
 
+    /// When history exceeds `max_history_turns`, summarise the messages that
+    /// would be dropped into a single system message instead of discarding
+    /// them outright. Costs one extra LLM call whenever messages overflow.
+    /// Default: false (plain truncation, as before).
+    pub compact_history: bool,
+
     /// LLM retry attempts before declaring provider unavailable.
     /// Default: 3.
     pub llm_retry_attempts: u32,
@@ -213,6 +219,7 @@ impl Default for AgentLimits {
             max_iter: 8,
             timeout: Duration::from_secs(60),
             max_history_turns: 20,
+            compact_history: false,
             llm_retry_attempts: 3,
             llm_retry_backoff: Duration::from_millis(250),
             provider_failure_message: None,

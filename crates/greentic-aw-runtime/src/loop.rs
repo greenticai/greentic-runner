@@ -1095,7 +1095,13 @@ async fn run_step_scoped(
             text: reply.clone(),
         });
 
-        state.truncate_history(config.limits.max_history_turns);
+        let compaction = crate::compaction::truncate_with_compaction(
+            runtime, &tenant, agent_id, &config, &mut state,
+        )
+        .await;
+        total_tokens += compaction.tokens_in + compaction.tokens_out;
+        tokens_in_total += compaction.tokens_in;
+        tokens_out_total += compaction.tokens_out;
         if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
             warn!(error = %e, "state save failed at end of step");
         }
@@ -1170,7 +1176,13 @@ async fn run_step_scoped(
 
     let side_turn = side_pending
         && crate::flow_suspend::finish_side_turn(&mut state, &mut terminated_by, &mut suspension);
-    state.truncate_history(config.limits.max_history_turns);
+    let compaction = crate::compaction::truncate_with_compaction(
+        runtime, &tenant, agent_id, &config, &mut state,
+    )
+    .await;
+    total_tokens += compaction.tokens_in + compaction.tokens_out;
+    tokens_in_total += compaction.tokens_in;
+    tokens_out_total += compaction.tokens_out;
     if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
         warn!(error = %e, "state save failed at end of step");
     }
