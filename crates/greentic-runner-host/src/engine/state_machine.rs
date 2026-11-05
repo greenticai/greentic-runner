@@ -5,7 +5,7 @@ use super::host::{
 };
 use super::policy::retry_with_jitter;
 use super::policy::{Policy, policy_violation};
-use super::registry::{AdapterCall, AdapterRegistry};
+use super::registry::{AdapterCall, AdapterRegistry, NodeIo};
 use greentic_types::TenantCtx;
 use parking_lot::RwLock;
 use rand::{RngExt, rng};
@@ -109,7 +109,7 @@ impl StateMachine {
         flow_id: &str,
         session_hint: Option<String>,
         input: Value,
-    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
+    ) -> GResult<(Value, NodeIo)> {
         let mut telemetry_ctx = tenant
             .clone()
             .with_provider(PROVIDER_ID.to_string())
@@ -164,6 +164,7 @@ impl StateMachine {
         // Observability only — never feeds back into `outcome` or session state;
         // callers that don't need it (`step` via `handle`) drop the map.
         let mut node_outputs = serde_json::Map::new();
+        let mut node_inputs = serde_json::Map::new();
 
         let outcome = loop {
             if session.cursor.position >= flow.steps.len() {
@@ -188,11 +189,12 @@ impl StateMachine {
                     // real node id, e.g. `insights_agent`) so mid-flow node
                     // outputs — which the outer step outcome does not expose —
                     // survive to the caller. Observability only.
-                    let (outcome, flow_nodes) = self
+                    let (outcome, flow_io) = self
                         .execute_adapter_step(&flow, &mut session, call, tenant)
                         .await?;
                     session.last_outcome = Some(outcome.clone());
-                    node_outputs.extend(flow_nodes);
+                    node_outputs.extend(flow_io.outputs);
+                    node_inputs.extend(flow_io.inputs);
                     continue;
                 }
                 FlowStep::AwaitInput { reason } => {
@@ -244,7 +246,13 @@ impl StateMachine {
             });
         }
 
-        Ok((outcome, node_outputs))
+        Ok((
+            outcome,
+            NodeIo {
+                outputs: node_outputs,
+                inputs: node_inputs,
+            },
+        ))
     }
 
     fn ensure_policy_budget(&self, flow: &FlowDefinition) -> GResult<()> {
@@ -264,7 +272,7 @@ impl StateMachine {
         session: &mut SessionSnapshot,
         call: AdapterCall,
         tenant: &TenantCtx,
-    ) -> GResult<(Value, serde_json::Map<String, Value>)> {
+    ) -> GResult<(Value, NodeIo)> {
         let adapter =
             self.adapters
                 .get(&call.adapter)
@@ -316,10 +324,7 @@ impl StateMachine {
                 "response": entry.response.clone(),
             }));
             // Dedup hit: no adapter ran, so no per-node flow map this turn.
-            return Ok((
-                session.last_outcome.clone().unwrap(),
-                serde_json::Map::new(),
-            ));
+            return Ok((session.last_outcome.clone().unwrap(), NodeIo::default()));
         }
 
         self.host
@@ -339,10 +344,10 @@ impl StateMachine {
         call_clone.payload = resolved_payload.clone();
         // `call_traced` also yields the flow's per-node output map (keyed by the
         // real node id, e.g. `insights_agent`) when the adapter drives a flow.
-        let (response, flow_nodes) = retry_with_jitter(&self.policy.retry, || {
+        let (response, flow_io) = retry_with_jitter(&self.policy.retry, || {
             let adapter = adapter_clone.clone();
             let call = call_clone.clone();
-            async move { adapter.call_traced(&call).await }
+            async move { adapter.call_with_node_io(&call).await }
         })
         .await?;
 
@@ -375,7 +380,7 @@ impl StateMachine {
             )
             .await?;
 
-        Ok((session.last_outcome.clone().unwrap(), flow_nodes))
+        Ok((session.last_outcome.clone().unwrap(), flow_io))
     }
 
     fn update_state_input(session: &mut SessionSnapshot, input: Value) {

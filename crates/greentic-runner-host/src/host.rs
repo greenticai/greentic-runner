@@ -417,6 +417,10 @@ impl Default for HostBuilder {
 pub struct TurnTrace {
     pub replies: Vec<Activity>,
     pub node_outputs: HashMap<String, Value>,
+    /// What each node in `node_outputs` was actually run with (its rendered
+    /// payload), for the nodes that ran this turn — a node restored from a
+    /// parked snapshot has none. Observability only.
+    pub node_inputs: HashMap<String, Value>,
 }
 
 /// Outcome of [`RunnerHost::build_prepared`]: either a fast2flow short-circuit
@@ -518,18 +522,26 @@ impl RunnerHost {
             Prepared::ShortCircuit(replies) => Ok(TurnTrace {
                 replies,
                 node_outputs: HashMap::new(),
+                node_inputs: HashMap::new(),
             }),
             Prepared::Run(envelope) => {
-                let (result, node_outputs) =
-                    runtime.state_machine().handle_traced(*envelope).await?;
+                let (result, node_outputs, node_inputs) = runtime
+                    .state_machine()
+                    .handle_traced_with_inputs(*envelope)
+                    .await?;
                 let replies = normalize_replies(result, tenant);
                 let node_outputs = match node_outputs {
+                    Value::Object(map) => map.into_iter().collect(),
+                    _ => HashMap::new(),
+                };
+                let node_inputs = match node_inputs {
                     Value::Object(map) => map.into_iter().collect(),
                     _ => HashMap::new(),
                 };
                 Ok(TurnTrace {
                     replies,
                     node_outputs,
+                    node_inputs,
                 })
             }
         }

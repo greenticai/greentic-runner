@@ -22,7 +22,7 @@ use super::error::{GResult, RunnerError};
 use super::glue::{FnSecretsHost, FnTelemetryHost};
 use super::host::{HostBundle, SecretsHost, SessionHost, StateHost};
 use super::policy::Policy;
-use super::registry::{Adapter, AdapterCall, AdapterRegistry};
+use super::registry::{Adapter, AdapterCall, AdapterRegistry, NodeIo};
 use super::shims::{InMemorySessionHost, InMemoryStateHost};
 use super::state_machine::{FlowDefinition, FlowStep, PAYLOAD_FROM_LAST_INPUT};
 
@@ -862,11 +862,23 @@ impl StateMachineRuntime {
     /// agent_id). Observability only — the returned response `Value` is computed
     /// byte-identically to [`Self::handle`].
     pub async fn handle_traced(&self, envelope: IngressEnvelope) -> Result<(Value, Value)> {
+        let (response, node_outputs, _) = self.handle_traced_with_inputs(envelope).await?;
+        Ok((response, node_outputs))
+    }
+
+    /// Like [`Self::handle_traced`], but also returns what each node was
+    /// actually run with (`node_id → rendered payload`, for the nodes that ran
+    /// this turn). Observability only.
+    pub async fn handle_traced_with_inputs(
+        &self,
+        envelope: IngressEnvelope,
+    ) -> Result<(Value, Value, Value)> {
         let result = self.run_flow_result(envelope).await?;
         let node_outputs = result.node_outputs;
+        let node_inputs = result.node_inputs;
         let outcome = result.outcome;
         let response = outcome.get("response").cloned().unwrap_or(outcome);
-        Ok((response, node_outputs))
+        Ok((response, node_outputs, node_inputs))
     }
 
     /// Shared body for [`Self::handle`] / [`Self::handle_traced`]: build the
@@ -1030,6 +1042,11 @@ impl Adapter for PackFlowAdapter {
         &self,
         call: &AdapterCall,
     ) -> GResult<(Value, serde_json::Map<String, Value>)> {
+        let (response, io) = self.call_with_node_io(call).await?;
+        Ok((response, io.outputs))
+    }
+
+    async fn call_with_node_io(&self, call: &AdapterCall) -> GResult<(Value, NodeIo)> {
         let envelope: IngressEnvelope =
             serde_json::from_value(call.payload.clone()).map_err(|err| {
                 RunnerError::AdapterCall {
@@ -1274,6 +1291,7 @@ impl Adapter for PackFlowAdapter {
             output,
             status,
             node_outputs,
+            node_inputs,
         } = execution;
         let observed = outcome_observer
             .as_ref()
@@ -1285,7 +1303,13 @@ impl Adapter for PackFlowAdapter {
                     reporter.record(turn.completed(&observed, &output));
                 }
                 self.resume.clear(&envelope).await?;
-                Ok((output, node_outputs))
+                Ok((
+                    output,
+                    NodeIo {
+                        outputs: node_outputs,
+                        inputs: node_inputs,
+                    },
+                ))
             }
             FlowStatus::Waiting(wait) => {
                 let marker = turn.as_ref().map(|turn| turn.marker_after(&observed));
@@ -1300,7 +1324,13 @@ impl Adapter for PackFlowAdapter {
                     "reply_scope": reply_scope,
                     "response": output,
                 });
-                Ok((outcome, node_outputs))
+                Ok((
+                    outcome,
+                    NodeIo {
+                        outputs: node_outputs,
+                        inputs: node_inputs,
+                    },
+                ))
             }
         }
     }
