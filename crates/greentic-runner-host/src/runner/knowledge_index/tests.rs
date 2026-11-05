@@ -698,3 +698,5 @@ async fn tenant_and_team_must_be_header_safe_slugs() {
     // A blank team still means "no team".
     assert_eq!(parse_error(&with("team", "  ")), None);
 }
+
+mod citations;

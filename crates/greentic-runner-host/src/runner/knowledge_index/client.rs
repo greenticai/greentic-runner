@@ -10,7 +10,7 @@ use base64::Engine as _;
 use greentic_aw_runtime::knowledge::{KnowledgeError, KnowledgeResult, RetrievedChunk};
 use serde::Deserialize;
 
-use super::{DEFAULT_TEAM, IndexBinding};
+use super::{DEFAULT_TEAM, IndexBinding, citation};
 use crate::runner::knowledge_ext::{MAX_CHUNK_CHARS, MAX_TOTAL_CHARS, truncate_chars};
 
 #[derive(Deserialize)]
@@ -35,6 +35,13 @@ struct Hit {
     score: f64,
     document_id: String,
     chunk_index: usize,
+    /// Citation fields; absent from an index server that predates them.
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    section: Option<String>,
 }
 
 /// A hit tagged with the index that returned it.
@@ -196,6 +203,12 @@ pub(super) fn merge(mut hits: Vec<IndexedHit>, limit: usize) -> Vec<RetrievedChu
 
         let mut metadata = serde_json::Map::new();
         metadata.insert("index_id".to_string(), serde_json::Value::String(index_id));
+        citation::stamp(
+            &mut metadata,
+            hit.title.as_deref(),
+            hit.source_url.as_deref(),
+            hit.section.as_deref(),
+        );
         out.push(RetrievedChunk {
             text,
             score: hit.score,
