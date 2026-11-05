@@ -623,6 +623,7 @@ mod tests {
         crate::host::TurnTrace {
             replies: vec![reply_with(json!({ "status": "pending", "response": {} }))],
             node_outputs,
+            node_inputs: std::collections::HashMap::new(),
         }
     }
 
@@ -644,6 +645,7 @@ mod tests {
         let plain = trace_to_response(crate::host::TurnTrace {
             replies: vec![reply_with(json!({ "text": "booked" }))],
             node_outputs: done,
+            node_inputs: std::collections::HashMap::new(),
         });
         let body = serde_json::to_value(&plain).unwrap();
         assert!(
@@ -668,6 +670,7 @@ mod tests {
         let response = trace_to_response(crate::host::TurnTrace {
             replies: vec![],
             node_outputs: outputs,
+            node_inputs: std::collections::HashMap::new(),
         });
         let body = serde_json::to_value(&response).unwrap();
         assert_eq!(body["replies"][0]["text"], "the signature is in Settings");
@@ -690,6 +693,7 @@ mod tests {
         let trace = || crate::host::TurnTrace {
             replies: vec![],
             node_outputs: outputs.clone(),
+            node_inputs: std::collections::HashMap::new(),
         };
         let frames = completed_turn_frames(trace(), false);
         assert!(
@@ -726,6 +730,7 @@ mod tests {
             crate::host::TurnTrace {
                 replies: vec![reply_with(json!({ "text": "booked" }))],
                 node_outputs: std::collections::HashMap::new(),
+                node_inputs: std::collections::HashMap::new(),
             },
             false,
         );

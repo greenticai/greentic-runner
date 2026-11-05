@@ -89,7 +89,7 @@ impl RunnerApi for Runner {
     }
 
     async fn run_flow(&self, req: RunFlowRequest) -> GResult<RunFlowResult> {
-        let (outcome, node_outputs) = self
+        let (outcome, node_io) = self
             .sm
             .step(
                 &req.tenant,
@@ -101,7 +101,8 @@ impl RunnerApi for Runner {
             .await?;
         Ok(RunFlowResult {
             outcome,
-            node_outputs: serde_json::Value::Object(node_outputs),
+            node_outputs: serde_json::Value::Object(node_io.outputs),
+            node_inputs: serde_json::Value::Object(node_io.inputs),
         })
     }
 }

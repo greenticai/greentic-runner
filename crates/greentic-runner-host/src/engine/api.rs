@@ -36,6 +36,11 @@ pub struct RunFlowResult {
     /// never affects `outcome`. Defaults to `Null` for back-compat.
     #[serde(default)]
     pub node_outputs: serde_json::Value,
+    /// What each node in `node_outputs` was actually run with (its rendered
+    /// payload), keyed by node id, for the nodes that ran this turn.
+    /// Observability only. Defaults to `Null` for back-compat.
+    #[serde(default)]
+    pub node_inputs: serde_json::Value,
 }
 
 #[async_trait::async_trait]

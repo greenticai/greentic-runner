@@ -185,6 +185,12 @@ pub struct FlowExecution {
     /// captured from the flow's `ExecutionState` before it is finalised.
     /// Observability only — never affects `output`/egress.
     pub node_outputs: JsonMap<String, Value>,
+    /// The input each node in `node_outputs` was actually run with (the node's
+    /// payload template after rendering, `node_id → rendered payload`), for the
+    /// nodes that ran in THIS execution. A node restored from a parked
+    /// snapshot has none. Observability only — never affects `output`/egress,
+    /// and never persisted.
+    pub node_inputs: JsonMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -478,6 +484,7 @@ struct ComponentCall {
 struct FlowFailure {
     error: anyhow::Error,
     node_outputs: JsonMap<String, Value>,
+    node_inputs: JsonMap<String, Value>,
 }
 
 impl From<anyhow::Error> for FlowFailure {
@@ -485,24 +492,36 @@ impl From<anyhow::Error> for FlowFailure {
         Self {
             error,
             node_outputs: JsonMap::new(),
+            node_inputs: JsonMap::new(),
         }
     }
 }
 
 impl FlowExecution {
-    fn completed(output: Value, node_outputs: JsonMap<String, Value>) -> Self {
+    fn completed(
+        output: Value,
+        node_outputs: JsonMap<String, Value>,
+        node_inputs: JsonMap<String, Value>,
+    ) -> Self {
         Self {
             output,
             status: FlowStatus::Completed,
             node_outputs,
+            node_inputs,
         }
     }
 
-    fn waiting(output: Value, wait: FlowWait, node_outputs: JsonMap<String, Value>) -> Self {
+    fn waiting(
+        output: Value,
+        wait: FlowWait,
+        node_outputs: JsonMap<String, Value>,
+        node_inputs: JsonMap<String, Value>,
+    ) -> Self {
         Self {
             output,
             status: FlowStatus::Waiting(Box::new(wait)),
             node_outputs,
+            node_inputs,
         }
     }
 }
@@ -1098,6 +1117,7 @@ impl FlowEngine {
                     Err(FlowFailure {
                         error: err,
                         node_outputs,
+                        node_inputs,
                     }) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
                             // The reason otherwise survives only in the reply's
@@ -1129,6 +1149,7 @@ impl FlowEngine {
                                         }
                                     }),
                                     node_outputs,
+                                    node_inputs,
                                 ));
                             }
                             return Err(err);
@@ -1354,10 +1375,12 @@ impl FlowEngine {
                     return Err(FlowFailure {
                         error: err,
                         node_outputs: state.outputs_map(),
+                        node_inputs: state.inputs_map(),
                     });
                 }
             };
 
+            output.input = Some(observed_payload.clone());
             let owned_the_submit =
                 attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.note_created_artifacts(std::mem::take(&mut output.created));
@@ -1426,11 +1449,13 @@ impl FlowEngine {
                         NextDecision::Next(n) => current = n,
                         NextDecision::End => {
                             let node_outputs = state.outputs_map();
+                            let node_inputs = state.inputs_map();
                             let nodes_snapshot = state.nodes.clone();
                             let final_output = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::completed(
                                 lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
                                 node_outputs,
+                                node_inputs,
                             ));
                         }
                         NextDecision::Wait => {
@@ -1450,6 +1475,7 @@ impl FlowEngine {
                                 state: snapshot_state,
                             };
                             let node_outputs = state.outputs_map();
+                            let node_inputs = state.inputs_map();
                             let output_value = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::waiting(
                                 output_value,
@@ -1461,6 +1487,7 @@ impl FlowEngine {
                                     snapshot,
                                 },
                                 node_outputs,
+                                node_inputs,
                             ));
                         }
                     }
@@ -1500,11 +1527,13 @@ impl FlowEngine {
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
+                    let node_inputs = state.inputs_map();
                     let output_value = state.clone().finalize_with(None);
                     return Ok(FlowExecution::waiting(
                         output_value,
                         FlowWait { reason, snapshot },
                         node_outputs,
+                        node_inputs,
                     ));
                 }
                 NodeControl::LoopHere { reason } => {
@@ -1524,6 +1553,7 @@ impl FlowEngine {
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
+                    let node_inputs = state.inputs_map();
                     // A `dw.agent` parked on a `flow:` tool renders that flow's
                     // card, not its own envelope: the card is what the user
                     // must answer, and channels render the turn output as they
@@ -1535,6 +1565,7 @@ impl FlowEngine {
                         output_value,
                         FlowWait { reason, snapshot },
                         node_outputs,
+                        node_inputs,
                     ));
                 }
                 NodeControl::AwaitHere {
@@ -1568,6 +1599,7 @@ impl FlowEngine {
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
+                    let node_inputs = state.inputs_map();
                     // Finalize with None (render nothing here — the reply, if any,
                     // was already surfaced before the dispatch): match the
                     // remote-await Wait finalize semantics confirmed in Task 1.
@@ -1576,6 +1608,7 @@ impl FlowEngine {
                         output_value,
                         FlowWait { reason, snapshot },
                         node_outputs,
+                        node_inputs,
                     ));
                 }
                 NodeControl::Jump(jump) => {
@@ -1596,11 +1629,13 @@ impl FlowEngine {
                     });
                     state.push_egress(response);
                     let node_outputs = state.outputs_map();
+                    let node_inputs = state.inputs_map();
                     let nodes_snapshot = state.nodes.clone();
                     let final_output = state.finalize_with(None);
                     return Ok(FlowExecution::completed(
                         lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
                         node_outputs,
+                        node_inputs,
                     ));
                 }
             }
@@ -3942,6 +3977,18 @@ impl ExecutionState {
         }
         outputs
     }
+    /// The rendered input each node ran with in this execution
+    /// (`node_id → payload`). Observability only: unlike [`Self::outputs_map`]
+    /// it is not part of the template context.
+    fn inputs_map(&self) -> JsonMap<String, Value> {
+        let mut inputs = JsonMap::new();
+        for (id, output) in &self.nodes {
+            if let Some(input) = &output.input {
+                inputs.insert(id.clone(), input.clone());
+            }
+        }
+        inputs
+    }
     fn push_egress(&mut self, payload: Value) {
         self.egress.push(payload);
     }
@@ -4112,6 +4159,13 @@ struct NodeOutput {
     /// neither reach a snapshot nor a later turn.
     #[serde(skip)]
     created: Vec<Value>,
+    /// What the node was run with: its payload template after rendering. Set
+    /// by the run loop right after dispatch; `None` for a node restored from a
+    /// snapshot. Never serialised (it can carry resolved secrets and would
+    /// bloat every parked snapshot) and never exposed to templates — it feeds
+    /// [`ExecutionState::inputs_map`] only.
+    #[serde(skip)]
+    input: Option<Value>,
 }
 
 impl NodeOutput {
@@ -4121,6 +4175,7 @@ impl NodeOutput {
             payload,
             meta: Value::Null,
             created: Vec::new(),
+            input: None,
         }
     }
 
@@ -4140,6 +4195,7 @@ impl NodeOutput {
                 }
             }),
             created: Vec::new(),
+            input: None,
         }
     }
 }
@@ -4248,6 +4304,7 @@ impl NodeOutput {
             payload,
             meta,
             created: Vec::new(),
+            input: None,
         }
     }
 
@@ -4282,6 +4339,7 @@ impl NodeOutput {
             payload,
             meta,
             created: Vec::new(),
+            input: None,
         }
     }
 }
@@ -10277,6 +10335,14 @@ mod tests {
             "the node that ran before the failure must keep its output, got {:?}",
             result.node_outputs
         );
+        // ...and the input it was actually run with, which is what makes the
+        // step traceable: the failing node's own input is reported too.
+        assert_eq!(
+            result.node_inputs.get("first"),
+            Some(&json!({ "message": "hello" })),
+            "the rendered input of a node that ran must be reported, got {:?}",
+            result.node_inputs
+        );
     }
 
     #[tokio::test]
@@ -11442,6 +11508,7 @@ mod tests {
             payload: json!({}),
             meta: Value::Null,
             created: Vec::new(),
+            input: None,
         };
 
         // qa shape: failure port is `on_cancel`, no `on_error` edge.

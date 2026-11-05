@@ -12,6 +12,17 @@ pub struct AdapterCall {
     pub payload: Value,
 }
 
+/// What an adapter that drives a flow reports about the nodes it ran.
+/// Observability only — never affects the adapter's response.
+#[derive(Clone, Debug, Default)]
+pub struct NodeIo {
+    /// `node_id → node_output_view(payload)`.
+    pub outputs: serde_json::Map<String, Value>,
+    /// `node_id → the node's rendered input`, for the nodes that ran in this
+    /// call (a node restored from a parked snapshot has none).
+    pub inputs: serde_json::Map<String, Value>,
+}
+
 #[async_trait]
 pub trait Adapter: Send + Sync {
     async fn call(&self, call: &AdapterCall) -> GResult<Value>;
@@ -25,6 +36,20 @@ pub trait Adapter: Send + Sync {
         call: &AdapterCall,
     ) -> GResult<(Value, serde_json::Map<String, Value>)> {
         Ok((self.call(call).await?, serde_json::Map::new()))
+    }
+
+    /// Like [`Adapter::call_traced`], but also reports what each node was
+    /// actually run with. Default: delegate to `call_traced` and contribute no
+    /// inputs. Observability only — the returned `Value` is identical to `call`.
+    async fn call_with_node_io(&self, call: &AdapterCall) -> GResult<(Value, NodeIo)> {
+        let (response, outputs) = self.call_traced(call).await?;
+        Ok((
+            response,
+            NodeIo {
+                outputs,
+                inputs: serde_json::Map::new(),
+            },
+        ))
     }
 }
 
