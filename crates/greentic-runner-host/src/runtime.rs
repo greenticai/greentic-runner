@@ -1495,32 +1495,29 @@ impl TenantRuntime {
                     .ok()
                     .filter(|value| !value.trim().is_empty());
 
-                // Same key policy the in-process dw.agent backend uses: env key
-                // wins; otherwise the first agent's `llm.credential_ref` from the
-                // per-tenant secrets store.
+                // Same key policy the in-process dw.agent backend uses: an
+                // agent's explicit `llm.credential_ref` (per-tenant secrets
+                // store) wins; the process-wide env key is only the fallback.
                 let key_secrets = &secrets_manager;
                 let key_tenant = config.tenant.as_str();
                 let key_agents = &operala_agents;
                 let resolve_key = move || async move {
-                    let env_key = std::env::var("GREENTIC_LLM_API_KEY")
-                        .ok()
-                        .filter(|value| !value.trim().is_empty())
-                        .or_else(|| {
-                            std::env::var("OPENAI_API_KEY")
-                                .ok()
-                                .filter(|value| !value.trim().is_empty())
-                        });
-                    match env_key {
-                        Some(key) => Some(key),
-                        None => {
-                            crate::runner::agent_node::resolve_in_process_llm_key(
-                                key_secrets,
-                                key_tenant,
-                                key_agents,
-                            )
-                            .await
-                        }
-                    }
+                    let store_key = crate::runner::agent_node::resolve_in_process_llm_key(
+                        key_secrets,
+                        key_tenant,
+                        key_agents,
+                    )
+                    .await;
+                    store_key.or_else(|| {
+                        std::env::var("GREENTIC_LLM_API_KEY")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| {
+                                std::env::var("OPENAI_API_KEY")
+                                    .ok()
+                                    .filter(|value| !value.trim().is_empty())
+                            })
+                    })
                 };
 
                 let dispatch_env = std::env::var(OPERALA_DISPATCH_ENV).ok();

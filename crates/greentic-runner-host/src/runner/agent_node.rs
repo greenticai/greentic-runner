@@ -1967,7 +1967,7 @@ mod aw {
     /// `secrets://default/{tenant}/_/llm/{credential_ref}` that
     /// [`greentic_aw_runtime::llm_credential::SecretsBackedCredentialResolver`]
     /// reads. This lets the in-process LLM backend be zero-env (key from store)
-    /// when no `GREENTIC_LLM_API_KEY` env is set.
+    /// and takes precedence over any `GREENTIC_LLM_API_KEY` env key.
     ///
     /// Returns `None` when no agent declares a credential_ref or the read misses.
     /// The in-process backend carries a single key, so when agents declare
@@ -1983,13 +1983,51 @@ mod aw {
         tenant: &str,
         merged_agents: &HashMap<String, AgentConfig>,
     ) -> Option<String> {
-        let credential_ref = merged_agents
-            .values()
-            .find_map(|agent| agent.llm.credential_ref.clone())?;
+        let credential_ref = declared_credential_ref(merged_agents)?;
         let uri = format!("secrets://default/{tenant}/_/llm/{credential_ref}");
         let bytes = secrets.read(&uri).await.ok()?;
         let key = String::from_utf8(bytes).ok()?.trim().to_string();
         if key.is_empty() { None } else { Some(key) }
+    }
+
+    /// The first `llm.credential_ref` any agent declares (same pick as
+    /// [`resolve_in_process_llm_key`]).
+    pub(crate) fn declared_credential_ref(
+        merged_agents: &HashMap<String, AgentConfig>,
+    ) -> Option<String> {
+        merged_agents
+            .values()
+            .find_map(|agent| agent.llm.credential_ref.clone())
+    }
+
+    /// Where the in-process LLM key comes from. A credential the agent names
+    /// explicitly beats the process-wide env key; the env key is only the
+    /// fallback.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LlmKeySource {
+        /// The agent's `credential_ref` resolved from the secrets store.
+        Store,
+        /// No `credential_ref` declared; the env key is used.
+        Env,
+        /// A `credential_ref` is declared but did not resolve; the env key is
+        /// used (warn-worthy: the host key goes to the agent's provider).
+        EnvAfterUnresolvedRef,
+        /// No key anywhere (a keyless provider may still run).
+        None,
+    }
+
+    /// Pure precedence decision: store-resolved key, then env key.
+    pub(crate) fn llm_key_source(
+        store_resolved: bool,
+        env_present: bool,
+        credential_ref_declared: bool,
+    ) -> LlmKeySource {
+        match (store_resolved, env_present, credential_ref_declared) {
+            (true, _, _) => LlmKeySource::Store,
+            (false, true, true) => LlmKeySource::EnvAfterUnresolvedRef,
+            (false, true, false) => LlmKeySource::Env,
+            (false, false, _) => LlmKeySource::None,
+        }
     }
 
     /// Build a vault-style `BridgeCredential` from resolved parts. `None` when
@@ -2135,10 +2173,13 @@ mod aw {
                 (ext_runtime, llm)
             }
             None => {
-                // Zero-env LLM: with no bridge extension and no env key, resolve
-                // the agent's `credential_ref` from the per-tenant store (the same
-                // manager whose candidate fallback bridges the gtc-setup scope).
-                // An env key still wins (legacy single-provider runs unaffected).
+                // Zero-env LLM: with no bridge extension, an agent that names an
+                // explicit `credential_ref` has that credential tried FIRST, even
+                // when a process-wide env key exists (otherwise the host's own key
+                // is sent to whatever provider the agent names). When there is no
+                // `credential_ref`, or it does not resolve, the env key
+                // (`GREENTIC_LLM_API_KEY`, then `OPENAI_API_KEY`) is used exactly
+                // as before — `in_process_llm_backend_with_key` reads it.
                 let env_key_present = std::env::var("GREENTIC_LLM_API_KEY")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
@@ -2148,16 +2189,26 @@ mod aw {
                             .filter(|value| !value.trim().is_empty())
                     })
                     .is_some();
-                let store_key = if env_key_present {
-                    None
-                } else {
-                    resolve_in_process_llm_key(&secrets, &tenant, &merged_agents).await
-                };
-                if store_key.is_some() {
-                    tracing::info!(
+                let credential_ref = declared_credential_ref(&merged_agents);
+                let store_key = resolve_in_process_llm_key(&secrets, &tenant, &merged_agents).await;
+                match llm_key_source(
+                    store_key.is_some(),
+                    env_key_present,
+                    credential_ref.is_some(),
+                ) {
+                    LlmKeySource::Store => tracing::info!(
                         tenant = %tenant,
                         "AW LLM key resolved from store via credential_ref (zero-env)"
-                    );
+                    ),
+                    LlmKeySource::EnvAfterUnresolvedRef => tracing::warn!(
+                        tenant = %tenant,
+                        credential_ref = credential_ref.as_deref().unwrap_or_default(),
+                        provider = configured_llm_provider(&merged_agents)
+                            .unwrap_or_default(),
+                        "agent credential_ref did not resolve; falling back to the \
+                         process-wide env LLM key"
+                    ),
+                    LlmKeySource::Env | LlmKeySource::None => {}
                 }
                 // This path DOES see the agent configs, so a worker that
                 // declares a keyless provider (Ollama) reaches the
@@ -4341,6 +4392,34 @@ mod aw {
                     usage_note: None,
                 }]
             );
+        }
+
+        #[test]
+        fn llm_key_source_store_beats_env() {
+            use super::{LlmKeySource, llm_key_source};
+            assert_eq!(llm_key_source(true, true, true), LlmKeySource::Store);
+        }
+
+        #[test]
+        fn llm_key_source_env_without_credential_ref() {
+            use super::{LlmKeySource, llm_key_source};
+            assert_eq!(llm_key_source(false, true, false), LlmKeySource::Env);
+        }
+
+        #[test]
+        fn llm_key_source_env_after_unresolved_ref_is_distinct() {
+            use super::{LlmKeySource, llm_key_source};
+            assert_eq!(
+                llm_key_source(false, true, true),
+                LlmKeySource::EnvAfterUnresolvedRef
+            );
+        }
+
+        #[test]
+        fn llm_key_source_store_without_env() {
+            use super::{LlmKeySource, llm_key_source};
+            assert_eq!(llm_key_source(true, false, true), LlmKeySource::Store);
+            assert_eq!(llm_key_source(false, false, true), LlmKeySource::None);
         }
 
         #[test]
