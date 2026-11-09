@@ -1172,6 +1172,14 @@ mod aw {
                 std::thread::spawn(|| {
                     greentic_ext_runtime::reqwest::blocking::Client::builder()
                         .timeout(std::time::Duration::from_secs(30))
+                        // Connect-time half of the infra network grant: names
+                        // the runtime granted get public answers only. It must
+                        // share `infra_granted_hosts()` with the settings below.
+                        .dns_resolver(std::sync::Arc::new(
+                            greentic_ext_runtime::infra_grant::PublicOnlyResolver::new(
+                                infra_granted_hosts(),
+                            ),
+                        ))
                         .build()
                         .ok()
                 })
@@ -1180,6 +1188,33 @@ mod aw {
                 .flatten()
             })
             .clone()
+    }
+
+    /// The one `GrantedHosts` shared by every extension runtime in this
+    /// process and by the resolver of [`shared_blocking_http_client`], so the
+    /// grant (made per dispatch) and the connect-time filter agree.
+    fn infra_granted_hosts() -> greentic_ext_runtime::infra_grant::GrantedHosts {
+        use std::sync::OnceLock;
+        static HOSTS: OnceLock<greentic_ext_runtime::infra_grant::GrantedHosts> = OnceLock::new();
+        HOSTS.get_or_init(Default::default).clone()
+    }
+
+    /// Whether `infra://` network grants are on. `GREENTIC_INFRA_GRANT=0`
+    /// (also `false`/`off`/`no`) is the operator kill switch, mirroring
+    /// `GREENTIC_AW_MCP=0`; it can only turn grants off.
+    fn infra_grant_enabled(value: Option<&str>) -> bool {
+        !matches!(
+            value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    }
+
+    pub(crate) fn infra_grant_settings() -> greentic_ext_runtime::infra_grant::InfraGrantSettings {
+        greentic_ext_runtime::infra_grant::InfraGrantSettings::default()
+            .enabled(infra_grant_enabled(
+                std::env::var("GREENTIC_INFRA_GRANT").ok().as_deref(),
+            ))
+            .granted_hosts(infra_granted_hosts())
     }
 
     pub(crate) fn env_var_name_for_secret(uri: &str) -> String {
@@ -1550,7 +1585,7 @@ mod aw {
         };
         let config = RuntimeConfig::from_paths(paths).with_host_overrides(overrides);
         let mut runtime = match ExtensionRuntime::new(config) {
-            Ok(runtime) => runtime,
+            Ok(runtime) => runtime.with_infra_grants(infra_grant_settings()),
             Err(error) => {
                 tracing::warn!(error = %error, "extension runtime init failed; DwAgent nodes disabled");
                 return None;
@@ -6072,6 +6107,33 @@ mod aw {
         /// it regardless of order. Every row here has at least the winning
         /// candidate plus, for every row but the all-absent one, a losing
         /// candidate the function must reject in favour of it.
+        #[test]
+        fn infra_grant_kill_switch_only_turns_grants_off() {
+            use super::infra_grant_enabled;
+            assert!(infra_grant_enabled(None));
+            assert!(infra_grant_enabled(Some("1")));
+            assert!(infra_grant_enabled(Some("garbage")));
+            for off in ["0", "false", "OFF", " no "] {
+                assert!(!infra_grant_enabled(Some(off)), "{off}");
+            }
+        }
+
+        #[test]
+        fn infra_grant_settings_share_the_resolver_granted_hosts() {
+            // The grant side (settings) and the connect-time resolver of the
+            // shared client must be one `GrantedHosts`, or rebinding protection
+            // silently covers nothing.
+            let src = include_str!("agent_node.rs");
+            let client = src
+                .find("fn shared_blocking_http_client")
+                .expect("client fn");
+            let body = &src[client..client + 1200];
+            assert!(body.contains("PublicOnlyResolver::new("));
+            assert!(body.contains("infra_granted_hosts()"));
+            let build = src.find("pub(crate) fn build_ext_runtime(").expect("fn");
+            assert!(src[build..].contains("with_infra_grants(infra_grant_settings())"));
+        }
+
         #[test]
         fn select_ext_llm_port_precedence_table() {
             use super::ExtLlmTier;

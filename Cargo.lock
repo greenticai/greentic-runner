@@ -2895,9 +2895,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-ext-runtime"
-version = "1.2.38697752260"
+version = "1.2.42617795385"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "191c4518b0d10810eb3ceddc37a66bc967093b11cbd8f6f3efc41adb9f0ee864"
+checksum = "894afe30025806ef7cd455aa8d23f3481a980a388ea35b49433b791bc5b305a0"
 dependencies = [
  "anyhow",
  "arc-swap",
