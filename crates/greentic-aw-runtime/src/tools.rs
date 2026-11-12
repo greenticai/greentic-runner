@@ -439,6 +439,8 @@ pub(crate) fn host_ctx_from_tenant(t: &TenantContext) -> HostCallContext {
             Some(t.tenant_id.clone())
         },
         user_email: t.user_email.clone(),
+        team: t.team.clone(),
+        session_id: t.session_id.clone(),
     }
 }
 
@@ -1061,6 +1063,20 @@ mod ctx_tests {
             c3.tenant, None,
             "empty tenant_id must map to None, not Some(\"\")"
         );
+    }
+
+    #[test]
+    fn host_ctx_carries_team_and_session_id() {
+        let c = host_ctx_from_tenant(
+            &TenantContext::new("acme", "prod")
+                .with_team(Some("sales".into()))
+                .with_session_id(Some("sess-1".into())),
+        );
+        assert_eq!(c.team.as_deref(), Some("sales"));
+        assert_eq!(c.session_id.as_deref(), Some("sess-1"));
+        let none = host_ctx_from_tenant(&TenantContext::new("acme", "prod"));
+        assert_eq!(none.team, None);
+        assert_eq!(none.session_id, None);
     }
 }
 

@@ -42,6 +42,15 @@ pub struct TenantContext {
     /// the honest answer and the same one an anonymous caller gets.
     #[serde(default)]
     pub caller: Option<VerifiedCaller>,
+    /// Slug of the team the turn runs in, when the host scopes below the
+    /// tenant. Forwarded to extension host ports (`HostCallContext::team`).
+    /// `None` when unscoped.
+    #[serde(default)]
+    pub team: Option<String>,
+    /// Id of the host session this turn belongs to, forwarded to extension
+    /// host ports (`HostCallContext::session_id`). `None` when there is none.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// The caller a tool may trust, as opposed to the one the model describes.
@@ -107,7 +116,23 @@ impl TenantContext {
             user_email: None,
             project_id: None,
             caller: None,
+            team: None,
+            session_id: None,
         }
+    }
+
+    /// Set the team slug forwarded to extension host ports.
+    #[must_use]
+    pub fn with_team(mut self, team: Option<String>) -> Self {
+        self.team = team;
+        self
+    }
+
+    /// Set the host session id forwarded to extension host ports.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
     }
 
     /// Set an optional user email for per-user LLM resolution.
