@@ -271,6 +271,7 @@ impl Knowledge for ExtensionKnowledge {
         let ctx = HostCallContext {
             tenant: Some(tenant.tenant.as_str().to_string()),
             user_email: None,
+            ..HostCallContext::default()
         };
 
         // `invoke_tool_ctx` is synchronous (wasmtime sync) and instantiates a

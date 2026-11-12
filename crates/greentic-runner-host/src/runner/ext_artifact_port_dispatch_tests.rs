@@ -165,6 +165,7 @@ fn call(fixture: &Fixture, tenant: Option<&str>) -> String {
     let ctx = HostCallContext {
         tenant: tenant.map(str::to_string),
         user_email: None,
+        ..HostCallContext::default()
     };
     fixture
         .runtime
@@ -253,6 +254,7 @@ fn a_door_failure_reaches_the_guest_as_unavailable_without_the_token() {
                     &HostCallContext {
                         tenant: Some("acme".into()),
                         user_email: None,
+                        ..HostCallContext::default()
                     },
                 )
                 .unwrap()

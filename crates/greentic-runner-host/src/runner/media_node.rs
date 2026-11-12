@@ -119,6 +119,7 @@ pub async fn create(payload: &Value, tenant: &str, port: Option<&Arc<dyn Artifac
     let ctx = HostCallContext {
         tenant: Some(tenant.to_string()).filter(|t| !t.trim().is_empty()),
         user_email: None,
+        ..HostCallContext::default()
     };
     let port = Arc::clone(port);
     // `ArtifactPort::put` is synchronous and blocks on the door; run it on the
