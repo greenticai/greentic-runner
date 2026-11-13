@@ -172,6 +172,7 @@ impl HostServer {
                 None,
                 // Process-level path: no embedding host, so no artifact port.
                 None,
+                None,
                 &[],
             ),
             host,

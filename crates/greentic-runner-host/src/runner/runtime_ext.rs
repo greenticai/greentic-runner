@@ -356,6 +356,28 @@ mod tests {
         );
     }
 
+    /// Same rule for the knowledge port: an extension instantiated before it
+    /// is installed would hold a runtime whose `host.knowledge.*` answers
+    /// `unavailable`.
+    #[test]
+    fn build_ext_runtime_installs_the_knowledge_port_before_any_extension_loads() {
+        let src = include_str!("agent_node.rs");
+        let start = src
+            .find("pub(crate) fn build_ext_runtime(")
+            .expect("fn present");
+        let body = &src[start..];
+        let install = body
+            .find("with_knowledge_port(")
+            .expect("the port must be installed");
+        let first_load = body
+            .find("register_loaded_from_dir(")
+            .expect("loads follow");
+        assert!(
+            install < first_load,
+            "the knowledge port must be installed before the first extension is registered"
+        );
+    }
+
     #[test]
     fn boot_ingests_before_any_runtime_is_built() {
         let source =

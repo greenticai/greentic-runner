@@ -66,6 +66,14 @@ pub type ArtifactReaderPort = Arc<dyn greentic_aw_runtime::ArtifactReader>;
 #[cfg(feature = "agentic-worker")]
 pub type ExtArtifactPort = Arc<dyn greentic_ext_runtime::host_ports::ArtifactPort>;
 
+/// Port backing `host.knowledge.*` (list, search, read and write a worker's
+/// bound knowledge bases), installed on the extension runtime
+/// `build_ext_runtime` builds. Without one every knowledge call answers
+/// `unavailable`. See [`HostBuilder::with_ext_knowledge_port`] and
+/// [`crate::runtime::RevisionHostOptions::with_ext_knowledge_port`].
+#[cfg(feature = "agentic-worker")]
+pub type ExtKnowledgePort = Arc<dyn greentic_ext_runtime::host_ports::KnowledgePort>;
+
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
@@ -81,6 +89,7 @@ pub struct HostBuilder {
     artifact_reader: Option<ArtifactReaderPort>,
     #[cfg(feature = "agentic-worker")]
     ext_artifact_port: Option<ExtArtifactPort>,
+    ext_knowledge_port: Option<ExtKnowledgePort>,
     #[cfg(feature = "agentic-worker")]
     artifact_env_fallback: bool,
 }
@@ -101,6 +110,7 @@ impl HostBuilder {
             artifact_reader: None,
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            ext_knowledge_port: None,
             #[cfg(feature = "agentic-worker")]
             artifact_env_fallback: false,
         }
@@ -230,6 +240,19 @@ impl HostBuilder {
         self
     }
 
+    /// Inject the port backing `host.knowledge.*` for every extension the
+    /// host loads. Same tenant rule as [`Self::with_ext_artifact_port`], and
+    /// no env fallback: a single-tenant host keeps the port, a host serving
+    /// several tenants drops it with a warning (inject per unit with
+    /// [`crate::runtime::RevisionHostOptions::with_ext_knowledge_port`]).
+    ///
+    /// Without a port every knowledge operation answers `unavailable`.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_ext_knowledge_port(mut self, port: Option<ExtKnowledgePort>) -> Self {
+        self.ext_knowledge_port = port;
+        self
+    }
+
     /// Opt in to the `GREENTIC_ARTIFACT_ENDPOINT` + `GREENTIC_ARTIFACT_TOKEN`
     /// fallback for the attachment reader AND the extension artifact port.
     /// Default `false`: without it the env variables are never read.
@@ -278,6 +301,9 @@ impl HostBuilder {
             self.artifact_env_fallback,
             crate::runner::ext_artifact_port::artifact_port_from_env,
         );
+        #[cfg(feature = "agentic-worker")]
+        let ext_knowledge_port =
+            host_ext_knowledge_port(self.ext_knowledge_port, self.configs.len());
         let configs = self
             .configs
             .into_iter()
@@ -344,6 +370,8 @@ impl HostBuilder {
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port,
             #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port,
+            #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: self.telemetry,
         })
@@ -373,6 +401,28 @@ pub(crate) fn host_artifact_reader(
             None
         }
         (None, 1) if env_fallback => env(),
+        (None, _) => None,
+    }
+}
+
+/// The extension knowledge port a `HostBuilder` host hands its runtimes; see
+/// [`HostBuilder::with_ext_knowledge_port`]. Never read from the environment.
+#[cfg(feature = "agentic-worker")]
+pub(crate) fn host_ext_knowledge_port(
+    injected: Option<ExtKnowledgePort>,
+    tenants: usize,
+) -> Option<ExtKnowledgePort> {
+    match (injected, tenants) {
+        (Some(port), 1) => Some(port),
+        (Some(_), _) => {
+            tracing::warn!(
+                code = "knowledge_port_multi_tenant_host",
+                tenants,
+                "host-wide extension knowledge port dropped: this host serves several tenants; \
+                 inject one per unit with RevisionHostOptions::with_ext_knowledge_port"
+            );
+            None
+        }
         (None, _) => None,
     }
 }
@@ -455,6 +505,7 @@ pub struct RunnerHost {
     /// Extension artifact port, decided at build (single-tenant hosts only).
     #[cfg(feature = "agentic-worker")]
     ext_artifact_port: Option<ExtArtifactPort>,
+    ext_knowledge_port: Option<ExtKnowledgePort>,
     /// Session-id → active streaming observer, shared by every `dw.agent`
     /// node handler this host builds (writer: the `POST /agent/chat/stream`
     /// SSE handler via `ServerState`; reader: `RuntimeAgentNodeHandler::execute`).
@@ -1116,6 +1167,13 @@ impl RunnerHost {
         self.ext_artifact_port.clone()
     }
 
+    /// The extension knowledge port decided for this host, if any (see
+    /// [`HostBuilder::with_ext_knowledge_port`]).
+    #[cfg(feature = "agentic-worker")]
+    pub fn ext_knowledge_port(&self) -> Option<ExtKnowledgePort> {
+        self.ext_knowledge_port.clone()
+    }
+
     /// The shared session-keyed streaming-observer registry (R2). Cloning
     /// this `Arc` and handing it to both `TenantRuntime` construction (so
     /// `RuntimeAgentNodeHandler::execute` can read it) and `ServerState` (so
@@ -1189,6 +1247,7 @@ impl RunnerHost {
             artifact_reader: None,
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            ext_knowledge_port: None,
             #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: None,
@@ -1232,6 +1291,8 @@ impl RunnerHost {
             self.artifact_reader(),
             #[cfg(feature = "agentic-worker")]
             self.ext_artifact_port(),
+            #[cfg(feature = "agentic-worker")]
+            self.ext_knowledge_port(),
             #[cfg(feature = "agentic-worker")]
             Some(self.stream_observers()),
         )
@@ -1967,6 +2028,7 @@ mod identify_endpoints_tests {
             artifact_reader: None,
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            ext_knowledge_port: None,
             #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             configs: HashMap::new(),
