@@ -1344,6 +1344,9 @@ impl TenantRuntime {
             // `media.create` flow nodes store through the SAME artifact port the
             // agent runtime hands extensions as `host.artifact.put`.
             engine.set_ext_artifact_port(ext_artifact_port.clone());
+            // `knowledge.search` flow nodes ask the SAME knowledge port the agent
+            // runtime hands extensions as `host.knowledge`.
+            engine.set_ext_knowledge_port(ext_knowledge_port.clone());
 
             // First-boot ingest of any pack-baked knowledge corpus (W4 4c), handed
             // to every registered agent-runtime extension. Runs BEFORE the agent
