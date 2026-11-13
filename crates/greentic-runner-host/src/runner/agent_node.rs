@@ -1474,6 +1474,7 @@ mod aw {
         host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         agent_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         artifact_port: Option<crate::host::ExtArtifactPort>,
+        knowledge_port: Option<crate::host::ExtKnowledgePort>,
         packs: &[Arc<crate::pack::PackRuntime>],
     ) -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
         use greentic_ext_runtime::{
@@ -1605,6 +1606,13 @@ mod aw {
             None => tracing::info!(
                 "extension runtime artifact port not configured (host.artifact.put answers unsupported)"
             ),
+        }
+
+        // The knowledge door, installed the same way and for the same reason
+        // (before any extension is registered).
+        if let Some(port) = knowledge_port {
+            tracing::info!("extension runtime knowledge port wired");
+            runtime = runtime.with_knowledge_port(port);
         }
 
         // Initial load of on-disk design extensions (agentic-worker tools live
@@ -2126,6 +2134,7 @@ mod aw {
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
         artifact_reader: Option<crate::host::ArtifactReaderPort>,
         ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+        ext_knowledge_port: Option<crate::host::ExtKnowledgePort>,
     ) -> Option<Arc<AgentRuntime>> {
         use std::time::Duration;
 
@@ -2183,6 +2192,7 @@ mod aw {
                     ext_llm_port,
                     None,
                     ext_artifact_port,
+                    ext_knowledge_port,
                     &packs,
                 )?;
 
@@ -2287,6 +2297,7 @@ mod aw {
                     ext_llm_port,
                     agent_llm_port,
                     ext_artifact_port,
+                    ext_knowledge_port,
                     &packs,
                 )?;
                 (ext_runtime, llm)
@@ -2508,6 +2519,7 @@ mod aw {
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
         artifact_reader: Option<crate::host::ArtifactReaderPort>,
         ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+        ext_knowledge_port: Option<crate::host::ExtKnowledgePort>,
     ) -> Option<AgentNodeWiring> {
         // The deployed unit (`bundle_id`) doubles as the MCP credential scope:
         // the same identity billing attributes this runtime's spend to.
@@ -2525,6 +2537,7 @@ mod aw {
             user_ledger,
             artifact_reader,
             ext_artifact_port,
+            ext_knowledge_port,
         )
         .await?;
         let handler: Arc<dyn AgentNodeHandler> = Arc::new(RuntimeAgentNodeHandler::new(
@@ -2650,6 +2663,7 @@ mod aw {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -2701,6 +2715,7 @@ mod aw {
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
         artifact_reader: Option<crate::host::ArtifactReaderPort>,
         ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+        ext_knowledge_port: Option<crate::host::ExtKnowledgePort>,
     ) -> Option<AgentNodeWiring> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
@@ -2731,6 +2746,7 @@ mod aw {
             user_ledger,
             artifact_reader,
             ext_artifact_port,
+            ext_knowledge_port,
         )
         .await
     }
@@ -2806,6 +2822,7 @@ mod aw {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -2827,6 +2844,7 @@ mod aw {
         user_ledger: Option<greentic_aw_runtime::user_ledger::UserLedgerTarget>,
         artifact_reader: Option<crate::host::ArtifactReaderPort>,
         ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+        ext_knowledge_port: Option<crate::host::ExtKnowledgePort>,
     ) -> Option<AgentNodeWiring> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
@@ -2870,6 +2888,7 @@ mod aw {
             user_ledger,
             artifact_reader,
             ext_artifact_port,
+            ext_knowledge_port,
         )
         .await
     }
@@ -2929,7 +2948,8 @@ mod aw {
              not wired to tier 2 (the worker's own backend); an extension's host.llm.complete \
              here still falls through to tier 3 (env-keyed) or tier 4 (unconfigured)"
         );
-        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, None, &[])?;
+        let ext_runtime =
+            build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, None, None, &[])?;
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
@@ -3813,6 +3833,7 @@ mod aw {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("handler should build from mock stores")
@@ -3920,6 +3941,7 @@ mod aw {
                 None,
                 Some("support-bot".to_string()),
                 chosen,
+                None,
                 None,
                 None,
                 None,
@@ -5064,6 +5086,7 @@ mod aw {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             }
@@ -5658,6 +5681,7 @@ mod aw {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("runtime should build")
@@ -5713,6 +5737,7 @@ mod aw {
                     Arc::new(MockTokenMeter::new(0)),
                     Arc::new(NoopToolLedger),
                     Some("worker-a".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -5786,6 +5811,7 @@ mod aw {
                     Some("worker-a".to_string()),
                     None,
                     user_ledger,
+                    None,
                     None,
                     None,
                 )

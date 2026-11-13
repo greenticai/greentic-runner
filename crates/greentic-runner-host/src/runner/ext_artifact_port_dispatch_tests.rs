@@ -145,7 +145,7 @@ fn runtime_with(port: Option<ExtArtifactPort>) -> Fixture {
     writer.finish().unwrap();
     let pack = Arc::new(crate::pack::tests::pack_runtime_for_dir(&pack_path));
 
-    let runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, port, &[pack])
+    let runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, None, port, None, &[pack])
         .expect("runtime builds");
     unsafe {
         std::env::remove_var("GREENTIC_HOME");

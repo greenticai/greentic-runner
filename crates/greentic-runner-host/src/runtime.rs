@@ -369,6 +369,7 @@ pub struct RevisionHostOptions {
     artifact_reader: Option<crate::host::ArtifactReaderPort>,
     #[cfg(feature = "agentic-worker")]
     ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+    ext_knowledge_port: Option<crate::host::ExtKnowledgePort>,
 }
 
 impl std::fmt::Debug for RevisionHostOptions {
@@ -384,6 +385,8 @@ impl std::fmt::Debug for RevisionHostOptions {
         out.field("artifact_reader", &self.artifact_reader.is_some());
         #[cfg(feature = "agentic-worker")]
         out.field("ext_artifact_port", &self.ext_artifact_port.is_some());
+        #[cfg(feature = "agentic-worker")]
+        out.field("ext_knowledge_port", &self.ext_knowledge_port.is_some());
         out.finish()
     }
 }
@@ -507,6 +510,18 @@ impl RevisionHostOptions {
         self.ext_artifact_port = Some(port);
         self
     }
+
+    /// Port backing `host.knowledge.*` for THIS revision's extension runtime.
+    ///
+    /// Per REVISION like the artifact port: one process serves every unit,
+    /// each with its own scope. Without one every knowledge operation answers
+    /// `unavailable`.
+    #[cfg(feature = "agentic-worker")]
+    #[must_use]
+    pub fn with_ext_knowledge_port(mut self, port: crate::host::ExtKnowledgePort) -> Self {
+        self.ext_knowledge_port = Some(port);
+        self
+    }
 }
 
 /// Block on a future whether or not we're already inside a tokio runtime.
@@ -562,6 +577,8 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
             stream_observers,
         )
         .await
@@ -587,6 +604,9 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
         #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+        #[cfg(feature = "agentic-worker")] ext_knowledge_port: Option<
+            crate::host::ExtKnowledgePort,
+        >,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -625,6 +645,8 @@ impl TenantRuntime {
             artifact_reader,
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port,
             #[cfg(feature = "agentic-worker")]
             stream_observers,
         )
@@ -689,6 +711,8 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             None,
             None,
+            None,
+            #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
             None,
@@ -774,6 +798,7 @@ impl TenantRuntime {
             options.artifact_reader,
             #[cfg(feature = "agentic-worker")]
             options.ext_artifact_port,
+            options.ext_knowledge_port,
         )
         .await
     }
@@ -806,6 +831,9 @@ impl TenantRuntime {
         >,
         #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
         #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+        #[cfg(feature = "agentic-worker")] ext_knowledge_port: Option<
+            crate::host::ExtKnowledgePort,
+        >,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -907,6 +935,8 @@ impl TenantRuntime {
             artifact_reader,
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port,
             #[cfg(feature = "agentic-worker")]
             None,
             rollout,
@@ -1035,6 +1065,8 @@ impl TenantRuntime {
             #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
             stream_observers,
         )
         .await
@@ -1055,6 +1087,9 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
         #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+        #[cfg(feature = "agentic-worker")] ext_knowledge_port: Option<
+            crate::host::ExtKnowledgePort,
+        >,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -1076,6 +1111,8 @@ impl TenantRuntime {
             artifact_reader,
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port,
             #[cfg(feature = "agentic-worker")]
             stream_observers,
             RolloutIds::default(),
@@ -1110,6 +1147,9 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] artifact_reader: Option<crate::host::ArtifactReaderPort>,
         #[cfg(feature = "agentic-worker")] ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+        #[cfg(feature = "agentic-worker")] ext_knowledge_port: Option<
+            crate::host::ExtKnowledgePort,
+        >,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -1368,6 +1408,7 @@ impl TenantRuntime {
                     user_ledger.clone(),
                     artifact_reader.clone(),
                     ext_artifact_port.clone(),
+                    ext_knowledge_port.clone(),
                 )
                 .await
             } else {
@@ -1386,6 +1427,7 @@ impl TenantRuntime {
                         user_ledger.clone(),
                         artifact_reader.clone(),
                         ext_artifact_port.clone(),
+                        ext_knowledge_port.clone(),
                     )
                     .await
                 }
@@ -1404,6 +1446,7 @@ impl TenantRuntime {
                         user_ledger.clone(),
                         artifact_reader.clone(),
                         ext_artifact_port.clone(),
+                        ext_knowledge_port.clone(),
                     )
                     .await
                 }
