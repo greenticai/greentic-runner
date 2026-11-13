@@ -68,6 +68,7 @@ const NATIVE_OP_KEYS: &[&str] = &[
     "mcp",
     "a2a",
     "media.create",
+    "knowledge.search",
 ];
 
 /// Whether `key` is a runner-native flow op-key that the engine dispatches

@@ -139,6 +139,11 @@ pub struct FlowEngine {
     /// answer an `artifact_unavailable` value.
     #[cfg(feature = "agentic-worker")]
     ext_artifact_port: Option<crate::host::ExtArtifactPort>,
+    /// The port `knowledge.search` asks: the SAME port the agent runtime hands
+    /// extensions as `host.knowledge`. `None` makes the node answer a
+    /// `knowledge_not_configured` value.
+    #[cfg(feature = "agentic-worker")]
+    ext_knowledge_port: Option<crate::host::ExtKnowledgePort>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -448,6 +453,11 @@ enum NodeKind {
     /// payload. Renders a `txt`/`md`/`csv`/`pdf` file and stores it through the
     /// engine's artifact port. See [`crate::runner::media_node`].
     MediaCreate,
+    /// Flow-execution knowledge search node (LOCKED ENCODING v1): `component ==
+    /// "knowledge.search"` with `query`/`knowledge_base`/`top_k`/`output` in the
+    /// node payload. Asks the engine's knowledge port. See
+    /// [`crate::runner::knowledge_node`].
+    KnowledgeSearch,
 }
 
 #[derive(Clone, Debug)]
@@ -759,6 +769,8 @@ impl FlowEngine {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
         })
     }
 
@@ -929,6 +941,13 @@ impl FlowEngine {
     #[cfg(feature = "agentic-worker")]
     pub fn set_ext_artifact_port(&mut self, port: Option<crate::host::ExtArtifactPort>) {
         self.ext_artifact_port = port;
+    }
+
+    /// Set the knowledge port `knowledge.search` nodes ask. Pass the same port
+    /// the agent runtime receives, so a flow and a worker search one library.
+    #[cfg(feature = "agentic-worker")]
+    pub fn set_ext_knowledge_port(&mut self, port: Option<crate::host::ExtKnowledgePort>) {
+        self.ext_knowledge_port = port;
     }
 
     /// Set the handler that bridges `DwAgentGraph` flow nodes into the durable
@@ -2000,6 +2019,10 @@ impl FlowEngine {
                 .execute_media_create(ctx, payload, node_has_error_route(&node.routing))
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::KnowledgeSearch => self
+                .execute_knowledge_search(ctx, payload, node_has_error_route(&node.routing))
+                .await
+                .map(DispatchOutcome::complete),
         }
     }
 
@@ -2043,6 +2066,51 @@ impl FlowEngine {
             "error": {
                 "code": "artifact_unavailable",
                 "message": "media.create requires the agentic-worker feature"
+            }
+        })))
+    }
+
+    /// Execute a `component == "knowledge.search"` flow node (LOCKED ENCODING v1).
+    ///
+    /// `payload` is the already-rendered node input mapping, shaped
+    /// `{ query, knowledge_base, top_k?, output? }`. A failure is a value
+    /// (`{ok:false, error:{code,message}}`), never an aborted run; the node is
+    /// marked failed only when it has an `on_error` edge, like `media.create`.
+    #[cfg(feature = "agentic-worker")]
+    async fn execute_knowledge_search(
+        &self,
+        ctx: &FlowContext<'_>,
+        payload: Value,
+        has_error_route: bool,
+    ) -> Result<NodeOutput> {
+        let result = crate::runner::knowledge_node::search(
+            &payload,
+            ctx.tenant,
+            ctx.session_id,
+            self.ext_knowledge_port.as_ref(),
+        )
+        .await;
+        Ok(knowledge_node_output(
+            bind_node_result(&payload, result.clone()),
+            &result,
+            has_error_route,
+        ))
+    }
+
+    /// Compile-time stub when the agentic-worker feature (which carries the
+    /// knowledge port) is disabled: the node degrades to an error value.
+    #[cfg(not(feature = "agentic-worker"))]
+    async fn execute_knowledge_search(
+        &self,
+        _ctx: &FlowContext<'_>,
+        _payload: Value,
+        _has_error_route: bool,
+    ) -> Result<NodeOutput> {
+        Ok(NodeOutput::new(json!({
+            "ok": false,
+            "error": {
+                "code": "knowledge_not_configured",
+                "message": "knowledge.search requires the agentic-worker feature"
             }
         })))
     }
@@ -5054,6 +5122,21 @@ fn media_node_output(bound: Value, result: &Value, has_error_route: bool) -> Nod
     ))
 }
 
+/// Build a `knowledge.search` node's output. A failure is a value; only a node
+/// with an `on_error` edge is marked failed (the same gate `media.create` and
+/// `a2a` use: a failed node without a route would park the run).
+#[cfg(feature = "agentic-worker")]
+fn knowledge_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeOutput {
+    if !crate::runner::knowledge_node::is_failure(result) || !has_error_route {
+        return NodeOutput::new(bound);
+    }
+    NodeOutput::errored(normalize_mcp_tool_error(
+        &bound,
+        &crate::runner::knowledge_node::failure_code(result),
+        &crate::runner::knowledge_node::failure_message(result),
+    ))
+}
+
 /// Turn a `sorla.call` HTTP failure (a malformed route document, an unknown
 /// action, or the SoR request itself failing) into a `DispatchOutcome`: a
 /// structured `{"error": msg}` node output when the node has an error route
@@ -5440,6 +5523,10 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("approval.")
             || full_ref.starts_with("var.")
             || full_ref.starts_with("media.")
+            // `knowledge.search` is dispatched on its full dotted id. Split into
+            // component `knowledge` + operation `search` it would ask the pack
+            // for a component no pack contains.
+            || full_ref.starts_with("knowledge.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
             || full_ref.starts_with("mcp:")
@@ -5575,6 +5662,9 @@ impl From<Node> for HostNode {
                 // LOCKED ENCODING v1: `component == "media.create"` with
                 // `format`/`name`/`text`/`rows`/`output` in the node payload.
                 "media.create" => NodeKind::MediaCreate,
+                // LOCKED ENCODING v1: `component == "knowledge.search"` with
+                // `query`/`knowledge_base`/`top_k`/`output` in the node payload.
+                "knowledge.search" => NodeKind::KnowledgeSearch,
                 other => NodeKind::PackComponent {
                     component_ref: other.to_string(),
                 },
@@ -5601,6 +5691,7 @@ impl From<Node> for HostNode {
             NodeKind::Mcp { server_id, tool } => format!("mcp:{server_id}/{tool}"),
             NodeKind::A2a { agent_id } => format!("a2a:{agent_id}"),
             NodeKind::MediaCreate => "media.create".to_string(),
+            NodeKind::KnowledgeSearch => "knowledge.search".to_string(),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
@@ -6933,6 +7024,7 @@ mod tests {
             NodeKind::BuiltinStateSet => Some("state.set"),
             NodeKind::VarSet { .. } => Some("var.set"),
             NodeKind::MediaCreate => Some("media.create"),
+            NodeKind::KnowledgeSearch => Some("knowledge.search"),
             NodeKind::Wait => Some("session.wait"),
             NodeKind::DwAgent { .. } => Some("dw.agent"),
             NodeKind::DwAgentGraph { .. } => Some("dw.agent_graph"),
@@ -6965,6 +7057,7 @@ mod tests {
             "telco-x.call",
             "approval.call",
             "media.create",
+            "knowledge.search",
         ] {
             assert!(
                 crate::runner::flow_adapter::is_native_op_key(key),
@@ -7020,6 +7113,49 @@ mod tests {
             native_op_key_for(&NodeKind::MediaCreate),
             Some("media.create")
         );
+    }
+
+    /// `knowledge.search` is dispatched on its dotted component id, which must be
+    /// a valid `ComponentId` and be classified (not split into `knowledge` +
+    /// `search`) by the loader.
+    #[test]
+    fn the_knowledge_search_component_ref_is_a_valid_component_id() {
+        assert!(greentic_types::ComponentId::from_str("knowledge.search").is_ok());
+        assert!(crate::runner::flow_adapter::is_native_op_key(
+            "knowledge.search"
+        ));
+        assert_eq!(
+            native_op_key_for(&NodeKind::KnowledgeSearch),
+            Some("knowledge.search")
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn a_knowledge_failure_is_an_errored_node_only_with_an_error_route() {
+        let result =
+            json!({"ok": false, "error": {"code": "knowledge_not_configured", "message": "none"}});
+        let payload = json!({ "query": "q", "knowledge_base": "kb", "output": "found" });
+        let quiet =
+            knowledge_node_output(bind_node_result(&payload, result.clone()), &result, false);
+        assert!(quiet.ok, "no error route: stays a value");
+        assert_eq!(
+            quiet.payload["found"]["error"]["code"],
+            "knowledge_not_configured"
+        );
+        let routed =
+            knowledge_node_output(bind_node_result(&payload, result.clone()), &result, true);
+        assert!(!routed.ok, "an on_error edge opts the node into failing");
+        assert_eq!(routed.payload["error"]["code"], "knowledge_not_configured");
+        assert!(
+            routed.payload["found"].is_object(),
+            "the output key survives"
+        );
+
+        let found = json!({"ok": true, "passages": [], "count": 0});
+        let out = knowledge_node_output(bind_node_result(&payload, found.clone()), &found, true);
+        assert!(out.ok);
+        assert_eq!(out.payload["found"]["count"], json!(0));
     }
 
     #[cfg(feature = "agentic-worker")]
@@ -7567,6 +7703,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         }
     }
@@ -8628,6 +8766,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -8853,6 +8993,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
 
@@ -9024,6 +9166,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
         let ctx = FlowContext {
@@ -9176,6 +9320,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
         let ctx = FlowContext {
@@ -9359,6 +9505,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
 
@@ -9488,6 +9636,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         }
     }
@@ -10238,6 +10388,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
         }
     }
 
@@ -10882,6 +11034,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -11803,6 +11957,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
 
@@ -12251,6 +12407,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
 
@@ -12374,6 +12532,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
 
@@ -12527,6 +12687,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -13092,6 +13254,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
@@ -13291,6 +13455,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         }
     }
@@ -13995,6 +14161,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         }
     }
@@ -14559,6 +14727,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         }
     }
@@ -14708,6 +14878,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: handler,
         }
     }
@@ -15402,6 +15574,8 @@ mod tests {
             a2a_sources: RwLock::new(HashMap::new()),
             #[cfg(feature = "agentic-worker")]
             ext_artifact_port: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_knowledge_port: None,
             operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();

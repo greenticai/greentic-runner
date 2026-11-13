@@ -51,6 +51,8 @@ pub mod knowledge_corpus;
 pub mod knowledge_ext;
 #[cfg(feature = "agentic-worker")]
 pub mod knowledge_index;
+#[cfg(feature = "agentic-worker")]
+pub mod knowledge_node;
 pub mod mcp_node;
 pub mod mcp_pack_routes;
 #[cfg(feature = "agentic-worker")]
